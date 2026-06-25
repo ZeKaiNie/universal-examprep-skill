@@ -29,6 +29,22 @@ description: "通用期末考试 1 天极速备考教练。能够根据用户导
 1. 最后一阶段，智能体读取 `study_progress.md` 中的错题记录，针对性出 4 道以上的综合扫雷自测题。
 2. 确认全部正确后，在工作区为用户生成一份复习总结报告 `walkthrough.md`，内含该科目的**考前极简速记小抄（Cheat Sheet）**。
 
+## 🧠 物理防幻觉与记忆锁定协议 (Anti-Hallucination & Memory Protocol)
+
+为了确保智能体在复习过程中绝对不丢题、不跳步、不产生计算/知识幻觉，本技能强制推行以下物理文件锁定协议：
+
+1. **唯一题库锁定 (`references/exam_questions.md`)**：
+   * 智能体必须将用户的所有考试重点固化为 `references/exam_questions.md` 文件（可参考 `templates/exam_questions_template.md`）。
+   * 智能体在教学时，必须以该文件中的题目列表作为复习的唯一依据，禁止自行编造非大纲范围的题目。
+
+2. **答案与解析锁定 (`references/reference_answers.md`)**：
+   * 智能体在开始第一阶段的交互教学前，应先通过背景子任务（或提示用户）在 `references/reference_answers.md` 中为所有重点题目编写好详细的解题步骤、数学公式及物理图表。
+   * 在随后的教学和答疑中，智能体必须以此答案文件作为基准进行校验，严禁现场随机推导复杂的数学或编程计算，以此根除计算幻觉。
+
+3. **进度断点锁定 (`study_progress.md` 与 `study_plan.md`)**：
+   * 智能体在每一次交互后，必须更新用户工作区根目录下的 `study_progress.md` 进度打卡表（可参考 `templates/study_progress_template.md`）。
+   * 每一次新会话开始时，智能体必须第一步读取该进度表，以此重建复习断点状态，确保即使会话中断重连，AI 也能完美接续记忆。
+
 ---
 
 ## 💡 全科通用辅导风格约束

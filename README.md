@@ -23,11 +23,13 @@
 
 ```text
 universal-examprep-skill/
-  ├── SKILL.md            # 技能定义核心文件（含全科通用辅导系统提示词）
+  ├── SKILL.md            # 技能定义核心文件（含全科通用辅导系统提示词及物理防幻觉协议）
   ├── README.md           # 本使用说明
-  └── templates/          # 学习计划与进度跟踪模板
-        ├── study_plan_template.md     # 6阶段备考突击表模板
-        └── study_progress_template.md # 知识点打卡自测追踪表模板
+  └── templates/          # 极速备考防幻觉记忆模板
+        ├── study_plan_template.md        # 6阶段备考突击表模板
+        ├── study_progress_template.md    # 知识点打卡自测追踪表模板
+        ├── exam_questions_template.md    # 唯一重点题库锁定模板
+        └── reference_answers_template.md # 考前标准答案锁定模板
 ```
 
 ---
