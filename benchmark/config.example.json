@@ -1,0 +1,13 @@
+{
+  "items_path": "items/items.jsonl",
+  "materials_text": "materials/_combined.txt",
+  "skill_workspace": "skill_workspace",
+  "results_dir": "results",
+  "generator_cmd": "claude",
+  "generator_model": "",
+  "judge_cmd": "claude",
+  "judge_model": "",
+  "allowed_tools": "Read Glob Grep",
+  "judge_repeats": 3,
+  "mock": false
+}

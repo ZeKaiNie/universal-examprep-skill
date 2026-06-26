@@ -1,0 +1,8 @@
+# 这是金标集示例（answer_type: definition / factual / numeric；answerable=false 为越界探针）。
+# 真实使用时复制为 items.jsonl 并按 items/README.md 的规范，依据你自己的课件/作业改写。
+{"id": "q1", "question": "栈的存取顺序是什么？", "gold_answer": "后进先出（LIFO）", "supporting_span": "栈是一种后进先出（LIFO）的线性表，只能在栈顶进行插入和删除。", "source_file": "materials/ds/slides/ch3_stack.pdf", "answer_type": "definition", "answerable": true}
+{"id": "q2", "question": "对长度为 n 的有序数组做二分查找，最坏情况时间复杂度的数量级是？", "gold_answer": "O(log n)", "supporting_span": "二分查找每次将待查区间减半，最坏时间复杂度为 O(log n)。", "source_file": "materials/ds/slides/ch5_search.pdf", "answer_type": "factual", "answerable": true}
+{"id": "q3", "question": "若某计算机字长为 32 位、按字节编址，一个字包含多少个字节？", "gold_answer": "4", "supporting_span": "字长 32 位，每字节 8 位，故一个字 = 32/8 = 4 个字节。", "source_file": "materials/co/slides/ch1_basics.pdf", "answer_type": "numeric", "tolerance": 0, "answerable": true}
+{"id": "q4", "question": "队列的存取顺序是什么？", "gold_answer": "先进先出（FIFO）", "supporting_span": "队列是一种先进先出（FIFO）的线性表，队尾入队、队头出队。", "source_file": "materials/ds/slides/ch3_queue.pdf", "answer_type": "definition", "answerable": true}
+{"id": "q5", "question": "冒泡排序在最坏情况下的时间复杂度是？", "gold_answer": "O(n^2)", "supporting_span": "冒泡排序最坏与平均时间复杂度均为 O(n^2)，最好情况（已有序）为 O(n)。", "source_file": "materials/ds/slides/ch7_sort.pdf", "answer_type": "factual", "answerable": true}
+{"id": "q6", "question": "这门课的期末考试在哪个教室举行？", "gold_answer": "", "supporting_span": "", "source_file": "", "answer_type": "factual", "answerable": false}

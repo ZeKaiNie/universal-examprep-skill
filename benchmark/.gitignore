@@ -1,0 +1,22 @@
+# 运行产物
+results/
+__pycache__/
+*.py[cod]
+
+# 个人配置
+config.json
+
+# 真实金标集（保留示例，忽略你的真实题集）
+items/items.jsonl
+
+# 你的课件/作业 —— 可能含版权或隐私，绝不提交到公开仓库
+materials/*
+!materials/README.md
+
+# skill 臂生成的知识库
+skill_workspace/*
+!skill_workspace/README.md
+
+# 人工校准标注（可能含答案细节）
+calibration/*
+!calibration/README.md
