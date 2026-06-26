@@ -50,6 +50,16 @@ REFERENCES = [
      "弃答与置信度校准评测协议。", "Abstention & confidence-calibration protocol."),
 ]
 
+# 测试用名校公开课资料：(课程, 机构, 中文学科, 英文学科, URL)
+MATERIALS = [
+    ("6.006 Introduction to Algorithms", "MIT OCW", "算法", "Algorithms", "https://ocw.mit.edu/courses/6-006-introduction-to-algorithms-spring-2020/"),
+    ("18.06 Linear Algebra (G. Strang)", "MIT OCW", "线性代数", "Linear Algebra", "https://ocw.mit.edu/courses/18-06sc-linear-algebra-fall-2011/"),
+    ("8.01SC Classical Mechanics", "MIT OCW", "物理·力学", "Physics", "https://ocw.mit.edu/courses/8-01sc-classical-mechanics-fall-2016/"),
+    ("PHIL 176 Death (S. Kagan)", "Open Yale", "哲学", "Philosophy", "https://oyc.yale.edu/death/phil-176"),
+    ("PSYC 110 Introduction to Psychology (P. Bloom)", "Open Yale", "心理学", "Psychology", "https://oyc.yale.edu/introduction-psychology/psyc-110"),
+    ("HIST 116 The American Revolution (J. Freeman)", "Open Yale", "历史", "History", "https://oyc.yale.edu/history/hist-116"),
+]
+
 # metric key -> (中文名, 英文名, 中文人话, 英文人话, aggregate键)
 METRICS = [
     ("faithfulness", "忠实度", "Faithfulness",
@@ -269,6 +279,12 @@ def _block(lang, scored, b, s, mc, d_h, d_f, sig, mock, charts):
     o.append("</table>")
 
     # References
+    o.append(f'<h2>{tr("📂 数据来源 Materials", "📂 Materials")}</h2>')
+    o.append(f'<p class="muted">{tr("测试材料全部取自名校公开课（MIT OpenCourseWare / Open Yale Courses，CC BY-NC-SA），仅本地用于评测、不二次分发：", "All test materials are public open-courseware (MIT OpenCourseWare / Open Yale Courses, CC BY-NC-SA), used locally for evaluation and not redistributed:")}</p><ul>')
+    for course, inst, zh_s, en_s, url in MATERIALS:
+        subj = en_s if en else zh_s
+        o.append(f'<li><a href="{url}" target="_blank" rel="noopener">{html.escape(course)}</a> — <span class="muted">{html.escape(inst)} · {html.escape(subj)}</span></li>')
+    o.append("</ul>")
     o.append(f'<h2 id="refs-{lang}">{tr("📚 参考基准 References", "📚 References")}</h2><ol class="refs">')
     for title, url, zh, eng in REFERENCES:
         note = eng if en else zh
