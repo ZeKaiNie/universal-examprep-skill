@@ -1,0 +1,39 @@
+<svg viewBox="0 0 680 320" xmlns="http://www.w3.org/2000/svg" role="img">
+<line x1="48" y1="264" x2="666" y2="264" stroke="#eee"/>
+<text x="42" y="268" font-size="11" fill="#888" text-anchor="end">0%</text>
+<line x1="48" y1="206" x2="666" y2="206" stroke="#eee"/>
+<text x="42" y="210" font-size="11" fill="#888" text-anchor="end">25%</text>
+<line x1="48" y1="147" x2="666" y2="147" stroke="#eee"/>
+<text x="42" y="151" font-size="11" fill="#888" text-anchor="end">50%</text>
+<line x1="48" y1="88" x2="666" y2="88" stroke="#eee"/>
+<text x="42" y="92" font-size="11" fill="#888" text-anchor="end">75%</text>
+<line x1="48" y1="30" x2="666" y2="30" stroke="#eee"/>
+<text x="42" y="34" font-size="11" fill="#888" text-anchor="end">100%</text>
+<rect x="89" y="124" width="41" height="140" fill="#d93025" rx="2"/>
+<text x="110" y="120" font-size="10" fill="#444" text-anchor="middle">60</text>
+<rect x="141" y="241" width="41" height="23" fill="#f9ab00" rx="2"/>
+<text x="161" y="237" font-size="10" fill="#444" text-anchor="middle">10</text>
+<rect x="192" y="30" width="41" height="234" fill="#1a7f64" rx="2"/>
+<text x="213" y="26" font-size="10" fill="#444" text-anchor="middle">100</text>
+<text x="151" y="282" font-size="12" fill="#333" text-anchor="middle">Opus 4.8</text>
+<rect x="295" y="147" width="41" height="117" fill="#d93025" rx="2"/>
+<text x="316" y="143" font-size="10" fill="#444" text-anchor="middle">50</text>
+<rect x="347" y="264" width="41" height="0" fill="#f9ab00" rx="2"/>
+<text x="367" y="260" font-size="10" fill="#444" text-anchor="middle">0</text>
+<rect x="398" y="30" width="41" height="234" fill="#1a7f64" rx="2"/>
+<text x="419" y="26" font-size="10" fill="#444" text-anchor="middle">100</text>
+<text x="357" y="282" font-size="12" fill="#333" text-anchor="middle">Sonnet 4.6</text>
+<rect x="501" y="124" width="41" height="140" fill="#d93025" rx="2"/>
+<text x="522" y="120" font-size="10" fill="#444" text-anchor="middle">60</text>
+<rect x="553" y="264" width="41" height="0" fill="#f9ab00" rx="2"/>
+<text x="573" y="260" font-size="10" fill="#444" text-anchor="middle">0</text>
+<rect x="604" y="30" width="41" height="234" fill="#1a7f64" rx="2"/>
+<text x="625" y="26" font-size="10" fill="#444" text-anchor="middle">100</text>
+<text x="563" y="282" font-size="12" fill="#333" text-anchor="middle">Haiku 4.5</text>
+<rect x="48" y="302" width="11" height="11" fill="#d93025"/>
+<text x="63" y="312" font-size="11" fill="#444">Closed-book (no materials)</text>
+<rect x="250.4" y="302" width="11" height="11" fill="#f9ab00"/>
+<text x="265.4" y="312" font-size="11" fill="#444">Full materials dumped</text>
+<rect x="420.8" y="302" width="11" height="11" fill="#1a7f64"/>
+<text x="435.8" y="312" font-size="11" fill="#444">Skill (lazy retrieval)</text>
+</svg>

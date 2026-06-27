@@ -1,13 +1,22 @@
-# 运行产物
-results/
+# 运行产物：默认忽略，但放行「发布用」图表/报告/汇总（原始逐题日志 raw*.jsonl / answers / scores 仍本地保留）
+results/*
+!results/*.svg
+!results/*.html
+!results/*.md
+!results/matrix/
+results/matrix/*
+!results/matrix/*.svg
+!results/matrix/report.html
+!results/matrix/summary.json
 __pycache__/
 *.py[cod]
 
 # 个人配置
 config.json
 
-# 真实金标集（保留示例，忽略你的真实题集）
+# 真实金标集：放行「仅题面」题集(_q)做公开可见的测试集；含答案 key 的完整金标本地保留（可能逐字引用讲义）
 items/items.jsonl
+items/items_*_full.jsonl
 
 # 你的课件/作业 —— 可能含版权或隐私，绝不提交到公开仓库
 materials/*

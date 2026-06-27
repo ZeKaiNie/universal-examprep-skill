@@ -1,0 +1,33 @@
+<svg viewBox="0 0 680 400" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+<text x="340.0" y="28" text-anchor="middle" font-size="16" font-weight="700" fill="#202124">装了 skill vs 没装：各项指标对比（越高越好）</text>
+<line x1="56" y1="312.0" x2="656" y2="312.0" stroke="#e8eaed"/>
+<text x="48" y="316.0" text-anchor="end" font-size="11" fill="#5f6368">0%</text>
+<line x1="56" y1="183.0" x2="656" y2="183.0" stroke="#e8eaed"/>
+<text x="48" y="187.0" text-anchor="end" font-size="11" fill="#5f6368">50%</text>
+<line x1="56" y1="54.0" x2="656" y2="54.0" stroke="#e8eaed"/>
+<text x="48" y="58.0" text-anchor="end" font-size="11" fill="#5f6368">100%</text>
+<rect x="83.8" y="183.0" width="45.0" height="129.0" rx="3" fill="#9aa0a6"/>
+<text x="106.2" y="178.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">50%</text>
+<rect x="133.2" y="54.0" width="45.0" height="258.0" rx="3" fill="#1a7f64"/>
+<text x="155.8" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">100%</text>
+<text x="131.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">忠实度</text>
+<rect x="233.8" y="183.0" width="45.0" height="129.0" rx="3" fill="#9aa0a6"/>
+<text x="256.2" y="178.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">50%</text>
+<rect x="283.2" y="54.0" width="45.0" height="258.0" rx="3" fill="#1a7f64"/>
+<text x="305.8" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">100%</text>
+<text x="281.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">正确率</text>
+<rect x="383.8" y="312.0" width="45.0" height="0.0" rx="3" fill="#9aa0a6"/>
+<text x="406.2" y="307.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">0%</text>
+<rect x="433.2" y="54.0" width="45.0" height="258.0" rx="3" fill="#1a7f64"/>
+<text x="455.8" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">100%</text>
+<text x="431.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">越界弃答率</text>
+<rect x="533.8" y="208.8" width="45.0" height="103.2" rx="3" fill="#9aa0a6"/>
+<text x="556.2" y="203.8" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">40%</text>
+<rect x="583.2" y="54.0" width="45.0" height="258.0" rx="3" fill="#1a7f64"/>
+<text x="605.8" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">100%</text>
+<text x="581.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">无幻觉率</text>
+<rect x="56" y="374" width="13" height="13" rx="2" fill="#9aa0a6"/>
+<text x="74" y="385" font-size="12" fill="#5f6368">没装 skill（基线）</text>
+<rect x="241" y="374" width="13" height="13" rx="2" fill="#1a7f64"/>
+<text x="259" y="385" font-size="12" fill="#5f6368">装了 skill</text>
+</svg>

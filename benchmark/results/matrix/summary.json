@@ -1,0 +1,128 @@
+{
+  "n_items": 65,
+  "models": [
+    "opus",
+    "sonnet",
+    "haiku"
+  ],
+  "arms": [
+    "closedbook",
+    "material",
+    "skill"
+  ],
+  "judge_model": "sonnet",
+  "judge_repeats": 1,
+  "total_cost_usd": 64.1553,
+  "matrix": {
+    "opus|closedbook": {
+      "n": 65,
+      "n_answerable": 55,
+      "n_oos": 10,
+      "correct": 0.0727,
+      "faithfulness": 0.0727,
+      "hallucination": 0.5846,
+      "abstention_oos": 0.6
+    },
+    "opus|material": {
+      "n": 65,
+      "n_answerable": 55,
+      "n_oos": 10,
+      "correct": 0.3091,
+      "faithfulness": 0.3091,
+      "hallucination": 0.7231,
+      "abstention_oos": 0.1
+    },
+    "opus|skill": {
+      "n": 65,
+      "n_answerable": 55,
+      "n_oos": 10,
+      "correct": 0.3818,
+      "faithfulness": 0.3818,
+      "hallucination": 0.5231,
+      "abstention_oos": 1.0
+    },
+    "sonnet|closedbook": {
+      "n": 65,
+      "n_answerable": 55,
+      "n_oos": 10,
+      "correct": 0.2364,
+      "faithfulness": 0.2364,
+      "hallucination": 0.6154,
+      "abstention_oos": 0.5
+    },
+    "sonnet|material": {
+      "n": 65,
+      "n_answerable": 55,
+      "n_oos": 10,
+      "correct": 0.2364,
+      "faithfulness": 0.2364,
+      "hallucination": 0.8,
+      "abstention_oos": 0.0
+    },
+    "sonnet|skill": {
+      "n": 65,
+      "n_answerable": 55,
+      "n_oos": 10,
+      "correct": 0.3818,
+      "faithfulness": 0.3818,
+      "hallucination": 0.5231,
+      "abstention_oos": 1.0
+    },
+    "haiku|closedbook": {
+      "n": 65,
+      "n_answerable": 55,
+      "n_oos": 10,
+      "correct": 0.1091,
+      "faithfulness": 0.1091,
+      "hallucination": 0.5692,
+      "abstention_oos": 0.6
+    },
+    "haiku|material": {
+      "n": 65,
+      "n_answerable": 55,
+      "n_oos": 10,
+      "correct": 0.0364,
+      "faithfulness": 0.0364,
+      "hallucination": 0.9692,
+      "abstention_oos": 0.0
+    },
+    "haiku|skill": {
+      "n": 65,
+      "n_answerable": 55,
+      "n_oos": 10,
+      "correct": 0.3818,
+      "faithfulness": 0.3818,
+      "hallucination": 0.5231,
+      "abstention_oos": 1.0
+    }
+  },
+  "convergence": {
+    "conv_r1": {
+      "n": 49,
+      "n_answerable": 39,
+      "n_oos": 10,
+      "correct": 0.1538,
+      "faithfulness": 0.1538,
+      "hallucination": 0.4082,
+      "abstention_oos": 1.0
+    },
+    "conv_r2": {
+      "n": 49,
+      "n_answerable": 39,
+      "n_oos": 10,
+      "correct": 0.3333,
+      "faithfulness": 0.3333,
+      "hallucination": 0.4286,
+      "abstention_oos": 1.0
+    },
+    "conv_r3": {
+      "n": 49,
+      "n_answerable": 39,
+      "n_oos": 10,
+      "correct": 0.4615,
+      "faithfulness": 0.4615,
+      "hallucination": 0.4286,
+      "abstention_oos": 1.0
+    }
+  }
+}

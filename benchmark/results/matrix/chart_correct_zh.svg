@@ -1,0 +1,39 @@
+<svg viewBox="0 0 680 320" xmlns="http://www.w3.org/2000/svg" role="img">
+<line x1="48" y1="264" x2="666" y2="264" stroke="#eee"/>
+<text x="42" y="268" font-size="11" fill="#888" text-anchor="end">0%</text>
+<line x1="48" y1="206" x2="666" y2="206" stroke="#eee"/>
+<text x="42" y="210" font-size="11" fill="#888" text-anchor="end">25%</text>
+<line x1="48" y1="147" x2="666" y2="147" stroke="#eee"/>
+<text x="42" y="151" font-size="11" fill="#888" text-anchor="end">50%</text>
+<line x1="48" y1="88" x2="666" y2="88" stroke="#eee"/>
+<text x="42" y="92" font-size="11" fill="#888" text-anchor="end">75%</text>
+<line x1="48" y1="30" x2="666" y2="30" stroke="#eee"/>
+<text x="42" y="34" font-size="11" fill="#888" text-anchor="end">100%</text>
+<rect x="89" y="247" width="41" height="17" fill="#d93025" rx="2"/>
+<text x="110" y="243" font-size="10" fill="#444" text-anchor="middle">7</text>
+<rect x="141" y="192" width="41" height="72" fill="#f9ab00" rx="2"/>
+<text x="161" y="188" font-size="10" fill="#444" text-anchor="middle">31</text>
+<rect x="192" y="175" width="41" height="89" fill="#1a7f64" rx="2"/>
+<text x="213" y="171" font-size="10" fill="#444" text-anchor="middle">38</text>
+<text x="151" y="282" font-size="12" fill="#333" text-anchor="middle">Opus 4.8</text>
+<rect x="295" y="209" width="41" height="55" fill="#d93025" rx="2"/>
+<text x="316" y="205" font-size="10" fill="#444" text-anchor="middle">24</text>
+<rect x="347" y="209" width="41" height="55" fill="#f9ab00" rx="2"/>
+<text x="367" y="205" font-size="10" fill="#444" text-anchor="middle">24</text>
+<rect x="398" y="175" width="41" height="89" fill="#1a7f64" rx="2"/>
+<text x="419" y="171" font-size="10" fill="#444" text-anchor="middle">38</text>
+<text x="357" y="282" font-size="12" fill="#333" text-anchor="middle">Sonnet 4.6</text>
+<rect x="501" y="238" width="41" height="26" fill="#d93025" rx="2"/>
+<text x="522" y="234" font-size="10" fill="#444" text-anchor="middle">11</text>
+<rect x="553" y="255" width="41" height="9" fill="#f9ab00" rx="2"/>
+<text x="573" y="251" font-size="10" fill="#444" text-anchor="middle">4</text>
+<rect x="604" y="175" width="41" height="89" fill="#1a7f64" rx="2"/>
+<text x="625" y="171" font-size="10" fill="#444" text-anchor="middle">38</text>
+<text x="563" y="282" font-size="12" fill="#333" text-anchor="middle">Haiku 4.5</text>
+<rect x="48" y="302" width="11" height="11" fill="#d93025"/>
+<text x="63" y="312" font-size="11" fill="#444">闭卷（无材料）</text>
+<rect x="161" y="302" width="11" height="11" fill="#f9ab00"/>
+<text x="176" y="312" font-size="11" fill="#444">给全材料（dump）</text>
+<rect x="307" y="302" width="11" height="11" fill="#1a7f64"/>
+<text x="322" y="312" font-size="11" fill="#444">skill（惰性检索）</text>
+</svg>

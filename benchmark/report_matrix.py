@@ -171,8 +171,21 @@ def block(lang, S):
     o.append("</ol></div>")
     return "\n".join(o)
 
+def _write_standalone_svgs(S):
+    """Also emit standalone chart SVGs (zh/en) so the README can embed the comparison charts."""
+    m, conv = S.get("matrix", {}), S.get("convergence", {})
+    for en, suf in ((False, "zh"), (True, "en")):
+        for metric, name in (("correct", "correct"), ("hallucination", "hallu"),
+                             ("abstention_oos", "oos")):
+            open(os.path.join(OUT, f"chart_{name}_{suf}.svg"), "w", encoding="utf-8").write(
+                svg_grouped(m, metric, en))
+        open(os.path.join(OUT, f"chart_convergence_{suf}.svg"), "w", encoding="utf-8").write(
+            svg_convergence(conv, en))
+
+
 def main():
     S = json.load(open(os.path.join(OUT, "summary.json"), encoding="utf-8"))
+    _write_standalone_svgs(S)
     css = ("body{max-width:860px;margin:0 auto;padding:24px 18px;color:#202124;"
            "font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;line-height:1.65}"
            "h1{font-size:24px}h2{font-size:19px;margin-top:32px;border-bottom:2px solid #e8eaed;padding-bottom:6px}"

@@ -1,0 +1,74 @@
+<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content='width=device-width,initial-scale=1'>
+<title>迭代逼近 / Convergence</title>
+<style>body{max-width:860px;margin:0 auto;padding:22px 18px;color:#202124;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;line-height:1.6}h1{font-size:24px}h2{font-size:18px;margin-top:28px;border-bottom:2px solid #e8eaed;padding-bottom:6px}.card{background:#f1f8f5;border:1px solid #cfe8de;border-radius:12px;padding:14px 18px;margin:16px 0}.warn{background:#fff4e5;border-color:#ffd699}table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px}th,td{border:1px solid #e8eaed;padding:7px 9px;text-align:center}th{background:#f8f9fa}.muted{color:#5f6368;font-size:12px}svg{width:100%;height:auto;margin:6px 0}.langbar{position:sticky;top:0;background:#fff;padding:8px 0;border-bottom:1px solid #e8eaed;margin-bottom:8px}.langbar button{font:inherit;cursor:pointer;border:1px solid #cfe8de;background:#f1f8f5;border-radius:20px;padding:4px 14px;margin-right:6px}.langbar button.on{background:#1a7f64;color:#fff;border-color:#1a7f64}</style></head><body>
+<div class='langbar'><button id='btn-zh' class='on' onclick="setLang('zh')">中文</button><button id='btn-en' onclick="setLang('en')">English</button></div>
+<div id="zh" class="langblock"><h1>逐轮反馈，看 skill 怎样一步步逼近上限</h1><div class="card">📌 读法：每一轮做「答题 → 看哪里错了 / 漏了哪段资料 → 补上 → 再答」，各指标就往上爬一截；爬到几乎不动（收敛）就说明 skill 能补的都补齐了、逼近了这套题的上限。本例第 — 轮收敛，最终忠实度 100%、无幻觉率 100%、漏的资料从 25 条降到 0 条。</div><svg viewBox="0 0 720 430" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+<text x="360.0" y="28" text-anchor="middle" font-size="16" font-weight="700" fill="#202124">各指标随反馈轮次逼近上限</text>
+<line x1="54" y1="380.0" x2="582" y2="380.0" stroke="#e8eaed"/>
+<text x="46" y="384.0" text-anchor="end" font-size="11" fill="#5f6368">0%</text>
+<line x1="54" y1="218.0" x2="582" y2="218.0" stroke="#e8eaed"/>
+<text x="46" y="222.0" text-anchor="end" font-size="11" fill="#5f6368">50%</text>
+<line x1="54" y1="56.0" x2="582" y2="56.0" stroke="#e8eaed"/>
+<text x="46" y="60.0" text-anchor="end" font-size="11" fill="#5f6368">100%</text>
+<line x1="54" y1="56.0" x2="582" y2="56.0" stroke="#5f6368" stroke-dasharray="5 4"/>
+<text x="582" y="50.0" text-anchor="end" font-size="11" fill="#5f6368">上限 100%</text>
+<text x="54.0" y="400.0" text-anchor="middle" font-size="11.5" fill="#202124">第1轮</text>
+<text x="318.0" y="400.0" text-anchor="middle" font-size="11.5" fill="#202124">第2轮</text>
+<text x="582.0" y="400.0" text-anchor="middle" font-size="11.5" fill="#202124">第3轮</text>
+<polyline points="54.0,258.5 318.0,145.1 582.0,56.0" fill="none" stroke="#1a7f64" stroke-width="2.5"/>
+<circle cx="54.0" cy="258.5" r="3.5" fill="#1a7f64"/>
+<circle cx="318.0" cy="145.1" r="3.5" fill="#1a7f64"/>
+<circle cx="582.0" cy="56.0" r="3.5" fill="#1a7f64"/>
+<text x="590.0" y="60.0" font-size="11.5" font-weight="600" fill="#1a7f64">忠实度 100%</text>
+<polyline points="54.0,258.5 318.0,145.1 582.0,56.0" fill="none" stroke="#1a73e8" stroke-width="2.5"/>
+<circle cx="54.0" cy="258.5" r="3.5" fill="#1a73e8"/>
+<circle cx="318.0" cy="145.1" r="3.5" fill="#1a73e8"/>
+<circle cx="582.0" cy="56.0" r="3.5" fill="#1a73e8"/>
+<text x="590.0" y="60.0" font-size="11.5" font-weight="600" fill="#1a73e8">正确率 100%</text>
+<polyline points="54.0,56.0 318.0,56.0 582.0,56.0" fill="none" stroke="#8e44ad" stroke-width="2.5"/>
+<circle cx="54.0" cy="56.0" r="3.5" fill="#8e44ad"/>
+<circle cx="318.0" cy="56.0" r="3.5" fill="#8e44ad"/>
+<circle cx="582.0" cy="56.0" r="3.5" fill="#8e44ad"/>
+<text x="590.0" y="60.0" font-size="11.5" font-weight="600" fill="#8e44ad">弃答率 100%</text>
+<polyline points="54.0,56.0 318.0,56.0 582.0,56.0" fill="none" stroke="#e67e22" stroke-width="2.5"/>
+<circle cx="54.0" cy="56.0" r="3.5" fill="#e67e22"/>
+<circle cx="318.0" cy="56.0" r="3.5" fill="#e67e22"/>
+<circle cx="582.0" cy="56.0" r="3.5" fill="#e67e22"/>
+<text x="590.0" y="60.0" font-size="11.5" font-weight="600" fill="#e67e22">无幻觉率 100%</text>
+</svg><h2>逐轮明细</h2><table><tr><th>轮次</th><th>忠实度</th><th>正确率</th><th>弃答率</th><th>无幻觉率</th><th>缺失资料</th><th>状态</th></tr><tr><td>第1轮</td><td>38%</td><td>38%</td><td>100%</td><td>100%</td><td>25</td><td><b>起点</b></td></tr><tr><td>第2轮</td><td>72% <span class='muted'>(+35)</span></td><td>72% <span class='muted'>(+35)</span></td><td>100% <span class='muted'>(+0)</span></td><td>100% <span class='muted'>(+0)</span></td><td>11</td><td><b>↑ 改进中</b></td></tr><tr><td>第3轮</td><td>100% <span class='muted'>(+28)</span></td><td>100% <span class='muted'>(+28)</span></td><td>100% <span class='muted'>(+0)</span></td><td>100% <span class='muted'>(+0)</span></td><td>0</td><td><b>↑ 改进中</b></td></tr></table><p class='muted'>括号内为相对上一轮的变化（百分点）。收敛判据：忠实度连续两轮变化 < 2 个百分点。</p></div>
+<div id="en" class="langblock" hidden><h1>Round-by-round feedback: how the skill climbs toward its ceiling</h1><div class="card">📌 How to read: each round runs ‘answer → see what was wrong / which material was missing → fill it in → answer again’, so every metric climbs a bit; once it barely moves (converges), the skill has filled what it can and approached this set's ceiling. Here it converges at round —: final faithfulness 100%, non-hallucination 100%, missing materials down from 25 to 0.</div><svg viewBox="0 0 720 430" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+<text x="360.0" y="28" text-anchor="middle" font-size="16" font-weight="700" fill="#202124">Metrics converging toward the ceiling across feedback rounds</text>
+<line x1="54" y1="380.0" x2="582" y2="380.0" stroke="#e8eaed"/>
+<text x="46" y="384.0" text-anchor="end" font-size="11" fill="#5f6368">0%</text>
+<line x1="54" y1="218.0" x2="582" y2="218.0" stroke="#e8eaed"/>
+<text x="46" y="222.0" text-anchor="end" font-size="11" fill="#5f6368">50%</text>
+<line x1="54" y1="56.0" x2="582" y2="56.0" stroke="#e8eaed"/>
+<text x="46" y="60.0" text-anchor="end" font-size="11" fill="#5f6368">100%</text>
+<line x1="54" y1="56.0" x2="582" y2="56.0" stroke="#5f6368" stroke-dasharray="5 4"/>
+<text x="582" y="50.0" text-anchor="end" font-size="11" fill="#5f6368">ceiling 100%</text>
+<text x="54.0" y="400.0" text-anchor="middle" font-size="11.5" fill="#202124">R1</text>
+<text x="318.0" y="400.0" text-anchor="middle" font-size="11.5" fill="#202124">R2</text>
+<text x="582.0" y="400.0" text-anchor="middle" font-size="11.5" fill="#202124">R3</text>
+<polyline points="54.0,258.5 318.0,145.1 582.0,56.0" fill="none" stroke="#1a7f64" stroke-width="2.5"/>
+<circle cx="54.0" cy="258.5" r="3.5" fill="#1a7f64"/>
+<circle cx="318.0" cy="145.1" r="3.5" fill="#1a7f64"/>
+<circle cx="582.0" cy="56.0" r="3.5" fill="#1a7f64"/>
+<text x="590.0" y="60.0" font-size="11.5" font-weight="600" fill="#1a7f64">Faithfulness 100%</text>
+<polyline points="54.0,258.5 318.0,145.1 582.0,56.0" fill="none" stroke="#1a73e8" stroke-width="2.5"/>
+<circle cx="54.0" cy="258.5" r="3.5" fill="#1a73e8"/>
+<circle cx="318.0" cy="145.1" r="3.5" fill="#1a73e8"/>
+<circle cx="582.0" cy="56.0" r="3.5" fill="#1a73e8"/>
+<text x="590.0" y="60.0" font-size="11.5" font-weight="600" fill="#1a73e8">Correctness 100%</text>
+<polyline points="54.0,56.0 318.0,56.0 582.0,56.0" fill="none" stroke="#8e44ad" stroke-width="2.5"/>
+<circle cx="54.0" cy="56.0" r="3.5" fill="#8e44ad"/>
+<circle cx="318.0" cy="56.0" r="3.5" fill="#8e44ad"/>
+<circle cx="582.0" cy="56.0" r="3.5" fill="#8e44ad"/>
+<text x="590.0" y="60.0" font-size="11.5" font-weight="600" fill="#8e44ad">Abstention 100%</text>
+<polyline points="54.0,56.0 318.0,56.0 582.0,56.0" fill="none" stroke="#e67e22" stroke-width="2.5"/>
+<circle cx="54.0" cy="56.0" r="3.5" fill="#e67e22"/>
+<circle cx="318.0" cy="56.0" r="3.5" fill="#e67e22"/>
+<circle cx="582.0" cy="56.0" r="3.5" fill="#e67e22"/>
+<text x="590.0" y="60.0" font-size="11.5" font-weight="600" fill="#e67e22">Non-hallucination 100%</text>
+</svg><h2>Per-round detail</h2><table><tr><th>Round</th><th>Faithfulness</th><th>Correctness</th><th>Abstention</th><th>Non-hallucination</th><th>Missing</th><th>Status</th></tr><tr><td>R1</td><td>38%</td><td>38%</td><td>100%</td><td>100%</td><td>25</td><td><b>start</b></td></tr><tr><td>R2</td><td>72% <span class='muted'>(+35)</span></td><td>72% <span class='muted'>(+35)</span></td><td>100% <span class='muted'>(+0)</span></td><td>100% <span class='muted'>(+0)</span></td><td>11</td><td><b>↑ improving</b></td></tr><tr><td>R3</td><td>100% <span class='muted'>(+28)</span></td><td>100% <span class='muted'>(+28)</span></td><td>100% <span class='muted'>(+0)</span></td><td>100% <span class='muted'>(+0)</span></td><td>0</td><td><b>↑ improving</b></td></tr></table><p class='muted'>Parentheses show change vs. the previous round (pts). Convergence: faithfulness changes < 2 pts for two consecutive rounds.</p></div>
+<script>function setLang(l){for(const x of ['zh','en']){document.getElementById(x).hidden=(x!==l);document.getElementById('btn-'+x).className=(x===l?'on':'')}}window.addEventListener('DOMContentLoaded',function(){setLang('zh')});</script></body></html>
