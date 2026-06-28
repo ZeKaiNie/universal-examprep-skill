@@ -9,14 +9,14 @@
 <text x="44" y="84" font-size="11" fill="#888" text-anchor="end">75%</text>
 <line x1="50" y1="24" x2="542" y2="24" stroke="#eee"/>
 <text x="44" y="28" font-size="11" fill="#888" text-anchor="end">100%</text>
-<polyline fill="none" stroke="#1a7f64" stroke-width="2.5" points="50,215 296,175 542,146"/>
-<circle cx="50" cy="215" r="4" fill="#1a7f64"/>
-<text x="50" y="206" font-size="11" fill="#1a7f64" text-anchor="middle">15%</text>
+<polyline fill="none" stroke="#1a7f64" stroke-width="2.5" points="50,186 296,111 542,53"/>
+<circle cx="50" cy="186" r="4" fill="#1a7f64"/>
+<text x="50" y="177" font-size="11" fill="#1a7f64" text-anchor="middle">28%</text>
 <text x="50" y="268" font-size="12" fill="#333" text-anchor="middle">7 ch</text>
-<circle cx="296" cy="175" r="4" fill="#1a7f64"/>
-<text x="296" y="166" font-size="11" fill="#1a7f64" text-anchor="middle">33%</text>
+<circle cx="296" cy="111" r="4" fill="#1a7f64"/>
+<text x="296" y="102" font-size="11" fill="#1a7f64" text-anchor="middle">62%</text>
 <text x="296" y="268" font-size="12" fill="#333" text-anchor="middle">14 ch</text>
-<circle cx="542" cy="146" r="4" fill="#1a7f64"/>
-<text x="542" y="137" font-size="11" fill="#1a7f64" text-anchor="middle">46%</text>
+<circle cx="542" cy="53" r="4" fill="#1a7f64"/>
+<text x="542" y="44" font-size="11" fill="#1a7f64" text-anchor="middle">87%</text>
 <text x="542" y="268" font-size="12" fill="#333" text-anchor="middle">20 ch</text>
 </svg>

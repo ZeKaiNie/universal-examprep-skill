@@ -26,10 +26,37 @@ ABSTAIN_MARKERS = [
 
 _NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
+_GOLD_MIN_LEN = 2
+_NEG_TOKENS = ("不是", "并非", "不叫", "不属于", "not", "no", "never", "未", "非")
+
 
 def looks_abstained(answer):
     a = (answer or "").lower()
     return any(m.lower() in a for m in ABSTAIN_MARKERS)
+
+
+def _norm(s):
+    """Lowercase + drop all whitespace, so 'Word-RAM' / 'word-ram' / 'word - ram' compare equal."""
+    return re.sub(r"\s+", "", (s or "").lower())
+
+
+def contains_gold(answer, gold):
+    """Deterministic: True if the canonical gold answer appears verbatim inside the answer
+    (whitespace/case-insensitive) and isn't immediately negated.
+
+    A cheap, noise-free CORRECTNESS signal for canonical short answers — the same spirit as the
+    numeric path. It exists because the LLM judge was demonstrably marking exact-match answers
+    (e.g. answer 'Word-RAM。' vs gold 'Word-RAM') as unsupported. Short golds (< 2 chars) defer to
+    the numeric/LLM paths to avoid spurious substring hits."""
+    g = _norm(gold)
+    if len(g) < _GOLD_MIN_LEN:
+        return False
+    a = _norm(answer)
+    idx = a.find(g)
+    if idx < 0:
+        return False
+    pre = a[max(0, idx - 6):idx]                       # light guard: reject '不是 Word-RAM' / 'not X'
+    return not any(_norm(n) in pre for n in _NEG_TOKENS)
 
 
 def check_numeric(answer, gold, tolerance):
@@ -64,16 +91,20 @@ def _faithfulness_prompt(question, answer, context):
 
 
 def _parse_judge_json(text):
-    """Pull the JSON object out of a judge reply (tolerant of surrounding prose)."""
+    """Pull the JSON object out of a judge reply (tolerant of surrounding prose / ``` fences).
+
+    Tries a greedy match (outermost braces) then a lazy one, so both a clean object and one wrapped
+    in prose parse. Returns None ONLY when nothing parses — and the caller treats that as a judge
+    ERROR (flagged), never as a silent 'wrong/hallucinated' verdict."""
     if not text:
         return None
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return None
+    for m in (re.search(r"\{.*\}", text, re.DOTALL), re.search(r"\{.*?\}", text, re.DOTALL)):
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except json.JSONDecodeError:
+                continue
+    return None
 
 
 def mock_judge(prompt):
@@ -124,23 +155,48 @@ def judge_answer(item, answer, ask_judge, judge_repeats=1):
         out["hallucinated"] = 0 if (correct or out["abstained"]) else 1
         return out
 
-    # Factual / definition: claim-level entailment via the (blinded) LLM judge,
-    # run judge_repeats times for self-consistency and majority-voted.
-    context = (item.get("supporting_span") or "") + "\n" + (item.get("gold_answer") or "")
+    # Factual / definition.
+    gold = item.get("gold_answer") or ""
+    # (a) DETERMINISTIC lexical fast-path: the canonical gold answer is present verbatim -> correct,
+    #     no LLM call. This both removes judge cost/noise AND fixes the observed failure where the
+    #     LLM judge scored exact-match answers (answer 'Word-RAM。' vs gold 'Word-RAM') as wrong.
+    if not out["abstained"] and contains_gold(answer, gold):
+        out["faithfulness"] = 1.0
+        out["correct"] = True
+        out["hallucinated"] = 0
+        out["scored_by"] = "lexical"
+        return out
+
+    # (b) Otherwise claim-level entailment via the (blinded) LLM judge, run judge_repeats times.
+    context = (item.get("supporting_span") or "") + "\n" + gold
     prompt = _faithfulness_prompt(item["question"], answer, context)
-    faiths, corrects, absts = [], [], []
+    faiths, corrects, absts, parsed_any = [], [], [], False
     for _ in range(max(1, judge_repeats)):
-        verdict = _parse_judge_json(ask_judge(prompt)) or {}
+        verdict = _parse_judge_json(ask_judge(prompt)) if ask_judge else None
+        if verdict is None:
+            continue                       # this reply didn't parse — don't count it as a verdict
+        parsed_any = True
         claims = verdict.get("claims") or []
         supported = sum(1 for c in claims if c.get("supported") == 1)
         faiths.append(supported / len(claims) if claims else (1.0 if verdict.get("correct") else 0.0))
         corrects.append(1 if verdict.get("correct") else 0)
         absts.append(1 if verdict.get("abstained") else 0)
+    if not parsed_any:
+        # The judge produced NO parseable verdict (or wasn't supplied). A judge failure is NOT
+        # evidence of a hallucination — flag it, don't silently score the answer as a fabrication
+        # (that exact bug is what suppressed the skill arm to a fake 38%).
+        out["faithfulness"] = None
+        out["correct"] = False
+        out["hallucinated"] = 0
+        out["judge_error"] = True
+        out["scored_by"] = "judge_error"
+        return out
     out["faithfulness"] = sum(faiths) / len(faiths)
     out["correct"] = (sum(corrects) / len(corrects)) >= 0.5
     out["abstained"] = (sum(absts) / len(absts)) >= 0.5
     out["judge_self_consistency"] = _agreement(corrects)
     out["hallucinated"] = 0 if (out["faithfulness"] >= 0.999 or out["abstained"]) else 1
+    out["scored_by"] = "llm"
     return out
 
 

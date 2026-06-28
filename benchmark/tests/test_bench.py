@@ -78,6 +78,48 @@ class JudgeTest(unittest.TestCase):
         self.assertTrue(J.judge_answer(item, "答案是 4", J.mock_judge)["correct"])
         self.assertEqual(J.judge_answer(item, "答案是 8", J.mock_judge)["hallucinated"], 1)
 
+    # ---- regression: the judge must NOT mark exact-match answers as wrong/hallucinated ----
+    def _factual(self, gold, span="x"):
+        return {"id": "f", "question": "q", "gold_answer": gold, "supporting_span": span,
+                "answer_type": "definition", "answerable": True}
+
+    def test_exact_gold_is_correct_without_llm(self):
+        # 'Word-RAM。' contains gold 'Word-RAM' -> correct deterministically (the exact failure we found)
+        def boom(_):
+            raise AssertionError("LLM judge must not be called when the gold matches verbatim")
+        r = J.judge_answer(self._factual("Word-RAM"), "Word-RAM。", boom)
+        self.assertTrue(r["correct"])
+        self.assertEqual(r["hallucinated"], 0)
+        self.assertEqual(r["scored_by"], "lexical")
+
+    def test_gold_match_is_case_and_space_insensitive(self):
+        r = J.judge_answer(self._factual("Collision"), "**Collision**(碰撞)。", lambda _: "")
+        self.assertTrue(r["correct"])
+
+    def test_negated_gold_is_not_a_free_pass(self):
+        # '不是 Word-RAM' must NOT count as correct via the lexical path
+        r = J.judge_answer(self._factual("Word-RAM"), "这门课用的不是 Word-RAM。", lambda _: '{"correct":0}')
+        self.assertFalse(r["correct"])
+
+    def test_judge_parse_failure_is_flagged_not_hallucination(self):
+        # an unparseable judge reply must be a judge_error, NOT a silent 'hallucinated=1' (the root bug)
+        r = J.judge_answer(self._factual("photosynthesis"), "some open-ended answer", lambda _: "sorry, no JSON here")
+        self.assertTrue(r.get("judge_error"))
+        self.assertEqual(r["hallucinated"], 0)      # judge failure is not evidence of fabrication
+        self.assertFalse(r["correct"])
+
+    def test_no_judge_supplied_is_judge_error(self):
+        r = J.judge_answer(self._factual("photosynthesis"), "an answer with no gold match", None)
+        self.assertTrue(r.get("judge_error"))
+        self.assertEqual(r["hallucinated"], 0)
+
+    def test_llm_path_still_used_when_no_lexical_match(self):
+        # no gold substring -> falls through to the (mock) LLM judge and aggregates normally
+        r = J.judge_answer(self._factual("photosynthesis", span="plants make sugar from light"),
+                           "plants make sugar from light", J.mock_judge)
+        self.assertEqual(r["scored_by"], "llm")
+        self.assertIn("faithfulness", r)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
