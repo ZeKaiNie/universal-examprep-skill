@@ -121,6 +121,42 @@
       "n_judge_error": 0,
       "n_lexical": 17,
       "n_infra_error": 0
+    },
+    "opus|rawfiles": {
+      "n": 65,
+      "n_answerable": 55,
+      "n_oos": 10,
+      "correct": 0.9091,
+      "faithfulness": 0.8833,
+      "hallucination": 0.1273,
+      "abstention_oos": 1.0,
+      "n_judge_error": 0,
+      "n_lexical": 15,
+      "n_infra_error": 0
+    },
+    "sonnet|rawfiles": {
+      "n": 65,
+      "n_answerable": 55,
+      "n_oos": 10,
+      "correct": 0.8182,
+      "faithfulness": 0.7834,
+      "hallucination": 0.2909,
+      "abstention_oos": 1.0,
+      "n_judge_error": 1,
+      "n_lexical": 18,
+      "n_infra_error": 0
+    },
+    "haiku|rawfiles": {
+      "n": 65,
+      "n_answerable": 55,
+      "n_oos": 10,
+      "correct": 0.8545,
+      "faithfulness": 0.7647,
+      "hallucination": 0.3273,
+      "abstention_oos": 1.0,
+      "n_judge_error": 0,
+      "n_lexical": 18,
+      "n_infra_error": 0
     }
   },
   "convergence": {
@@ -241,6 +277,66 @@
       "n_judge_error": 6,
       "n_lexical": 15,
       "n_infra_error": 0
+    },
+    "psyc|opus|rawfiles": {
+      "n": 50,
+      "n_answerable": 40,
+      "n_oos": 10,
+      "correct": 0.95,
+      "faithfulness": 0.8997,
+      "hallucination": 0.15,
+      "abstention_oos": 1.0,
+      "n_judge_error": 1,
+      "n_lexical": 12,
+      "n_infra_error": 0
+    },
+    "psyc|sonnet|rawfiles": {
+      "n": 5,
+      "n_answerable": 5,
+      "n_oos": 0,
+      "correct": 0.8,
+      "faithfulness": 0.95,
+      "hallucination": 0.2,
+      "abstention_oos": null,
+      "n_judge_error": 0,
+      "n_lexical": 2,
+      "n_infra_error": 0
     }
+  },
+  "cost_per_q": {
+    "algo": {
+      "closedbook": 0.0366,
+      "rawfiles": 0.0793,
+      "skill": 0.0668,
+      "material": 0.9448
+    },
+    "psyc": {
+      "closedbook": 0.0474,
+      "rawfiles": 0.1584,
+      "skill": 0.1015,
+      "material": null
+    }
+  },
+  "arms_note": "主对比为 不给资料/裸文件agent/使用skill 三条公平条件；material(一股脑全塞)为naive对照",
+  "material_reliability": {
+    "opus": {
+      "answered": 45,
+      "failed": 10,
+      "full": 0.71,
+      "surv": 0.87
+    },
+    "sonnet": {
+      "answered": 27,
+      "failed": 28,
+      "full": 0.45,
+      "surv": 0.93
+    },
+    "haiku": {
+      "answered": 2,
+      "failed": 53,
+      "full": 0.02,
+      "surv": 0.5
+    },
+    "n_answerable": 55
   }
 }

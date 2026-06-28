@@ -108,6 +108,10 @@ def unified_rows(course):
                 ans = rerun[(d["model"], d["id"])]                 # patch error with a clean rerun
             rows.append({"course": "algo", "tag": d["tag"], "model": d["model"],
                          "arm": d["arm"], "id": d["id"], "answer": ans})
+        for d in gen:                                              # NEW: fair no-skill agentic arm
+            if d["course"] == "algo" and d["arm"] == "rawfiles":
+                rows.append({"course": "algo", "tag": "matrix", "model": d["model"],
+                             "arm": "rawfiles", "id": d["id"], "answer": d.get("answer", "")})
     if course in ("psyc", "both"):
         for d in gen:                                              # REAL psyc answers, 3 arms x 3 models
             if d["course"] == "psyc":
