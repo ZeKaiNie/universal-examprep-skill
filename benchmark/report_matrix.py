@@ -147,19 +147,27 @@ def block(lang, S):
             "同等甚至更高精度下，本技能每题成本低于裸文件 agent——它只取压缩过的相关章节，而裸文件 agent 每题都要翻检整堆原始文件。",
             "At equal-or-better accuracy the skill costs less per question than the raw-files agent — it pulls one "
             "condensed chapter, whereas the raw-files agent must search the whole pile of source files every time.") + '</p>')
-    # naive 对照脚注：一股脑全塞
-    mn = S.get("material_n", {})
-    if cost.get("material"):
-        hn = mn.get("haiku|material", "?")
+    # naive 对照脚注：一股脑全塞（没返回=算错，避免幸存者偏差）
+    rel = S.get("material_reliability", {})
+    if cost.get("material") and rel:
         mult = round(cost["material"] / cost["skill"]) if cost.get("skill") else "数"
+        def fp(m): return pct((rel.get(m) or {}).get("full"))
+        def sp(m): return pct((rel.get(m) or {}).get("surv"))
+        def fl(m): return (rel.get(m) or {}).get("failed", "?")
         o.append('<p class="muted">' + tr(
             f"脚注·naive 对照「一股脑全塞」：把整门课全文塞进一次提问，每题成本高达 ${cost.get('material')}"
-            f"（约为本技能的 {mult} 倍），且文本过大会撞用量/上下文上限——Haiku 上 65 题仅 {hn} 题成功返回，"
-            f"故不纳入上面的公平对比。这也说明「丢一大坨给模型」是最差选择。",
+            f"（约为本技能的 {mult} 倍），且提问过大常触发用量/上下文上限而根本返回不了答案"
+            f"（Sonnet {fl('sonnet')}/55、Haiku {fl('haiku')}/55 道没返回）。把没返回的如实算作答错，"
+            f"它的真实正确率只有 Opus {fp('opus')} / Sonnet {fp('sonnet')} / Haiku {fp('haiku')}——"
+            f"远低于裸文件 agent 与本技能；只看“侥幸跑通”的题会虚高到 {sp('opus')}/{sp('sonnet')}/{sp('haiku')}"
+            f"（幸存者偏差）。故未列入上面的公平对比——它最贵、也最不稳，是最差选择。",
             f"Footnote — the naive 'dump everything' control: stuffing the whole course into one prompt costs "
-            f"~${cost.get('material')}/question (~{mult}x the skill) and is too large, hitting usage/context limits "
-            f"(only {hn}/65 Haiku items returned), so it is excluded from the fair comparison above — and shows "
-            f"that dumping a big blob at the model is the worst option.") + '</p>')
+            f"~${cost.get('material')}/question (~{mult}x the skill); the oversized prompt often hits usage/context "
+            f"limits and returns NOTHING (Sonnet {fl('sonnet')}/55, Haiku {fl('haiku')}/55 items had no reply). "
+            f"Counting those non-replies as wrong, its real correctness is only Opus {fp('opus')} / Sonnet "
+            f"{fp('sonnet')} / Haiku {fp('haiku')} — well below the raw-files agent and the skill; looking only at "
+            f"the lucky completions inflates it to {sp('opus')}/{sp('sonnet')}/{sp('haiku')} (survivorship bias). "
+            f"So it is left out of the fair comparison above — the most expensive and least reliable option.") + '</p>')
     # 幻觉率 + 越界弃答
     o.append(f'<h2>{tr("🧪 幻觉率 & 越界弃答","🧪 Hallucination & out-of-scope abstention")}</h2>')
     o.append(f'<p class="muted">{tr("幻觉率＝答案里出现材料未支持/相矛盾论断的比例（越低越好，按整篇讲义为依据判，会惩罚“正确但材料没写”的展开）；越界弃答率＝材料没覆盖的探针题上老实说“未涵盖”的比例（越高越好）。","Hallucination = share of answers with claims not supported by (or contradicting) the source (lower is better; judged against the full lecture, so it penalizes correct-but-unsourced elaboration). OOS abstention = share of not-covered probes where the model honestly says “not covered” (higher is better).")}</p>')

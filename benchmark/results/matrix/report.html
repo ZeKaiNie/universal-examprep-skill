@@ -63,7 +63,7 @@
 <h3 style="font-size:16px;margin-top:18px">💵 平均每题成本（同精度下更省才是 skill 的差异）</h3>
 <table><tr><th>不给资料</th><th>裸文件 + 通用 agent</th><th>使用本技能</th></tr><tr><td>$0.0366</td><td>$0.0793</td><td>$0.0668</td></tr></table>
 <p class="muted">同等甚至更高精度下，本技能每题成本低于裸文件 agent——它只取压缩过的相关章节，而裸文件 agent 每题都要翻检整堆原始文件。</p>
-<p class="muted">脚注·naive 对照「一股脑全塞」：把整门课全文塞进一次提问，每题成本高达 $0.9448（约为本技能的 14 倍），且文本过大会撞用量/上下文上限——Haiku 上 65 题仅 2 题成功返回，故不纳入上面的公平对比。这也说明「丢一大坨给模型」是最差选择。</p>
+<p class="muted">脚注·naive 对照「一股脑全塞」：把整门课全文塞进一次提问，每题成本高达 $0.9448（约为本技能的 14 倍），且提问过大常触发用量/上下文上限而根本返回不了答案（Sonnet 28/55、Haiku 53/55 道没返回）。把没返回的如实算作答错，它的真实正确率只有 Opus 71% / Sonnet 45% / Haiku 2%——远低于裸文件 agent 与本技能；只看“侥幸跑通”的题会虚高到 87%/93%/50%（幸存者偏差）。故未列入上面的公平对比——它最贵、也最不稳，是最差选择。</p>
 <h2>🧪 幻觉率 & 越界弃答</h2>
 <p class="muted">幻觉率＝答案里出现材料未支持/相矛盾论断的比例（越低越好，按整篇讲义为依据判，会惩罚“正确但材料没写”的展开）；越界弃答率＝材料没覆盖的探针题上老实说“未涵盖”的比例（越高越好）。</p>
 <table><tr><th class=l>模型 / 指标</th><th>不给资料</th><th>裸文件 + 通用 agent</th><th>使用本技能</th></tr>
@@ -246,7 +246,7 @@
 <h3 style="font-size:16px;margin-top:18px">💵 Cost per question (the skill's real edge: same accuracy, lower cost)</h3>
 <table><tr><th>Closed-book</th><th>Raw files + plain agent</th><th>With the skill</th></tr><tr><td>$0.0366</td><td>$0.0793</td><td>$0.0668</td></tr></table>
 <p class="muted">At equal-or-better accuracy the skill costs less per question than the raw-files agent — it pulls one condensed chapter, whereas the raw-files agent must search the whole pile of source files every time.</p>
-<p class="muted">Footnote — the naive 'dump everything' control: stuffing the whole course into one prompt costs ~$0.9448/question (~14x the skill) and is too large, hitting usage/context limits (only 2/65 Haiku items returned), so it is excluded from the fair comparison above — and shows that dumping a big blob at the model is the worst option.</p>
+<p class="muted">Footnote — the naive 'dump everything' control: stuffing the whole course into one prompt costs ~$0.9448/question (~14x the skill); the oversized prompt often hits usage/context limits and returns NOTHING (Sonnet 28/55, Haiku 53/55 items had no reply). Counting those non-replies as wrong, its real correctness is only Opus 71% / Sonnet 45% / Haiku 2% — well below the raw-files agent and the skill; looking only at the lucky completions inflates it to 87%/93%/50% (survivorship bias). So it is left out of the fair comparison above — the most expensive and least reliable option.</p>
 <h2>🧪 Hallucination & out-of-scope abstention</h2>
 <p class="muted">Hallucination = share of answers with claims not supported by (or contradicting) the source (lower is better; judged against the full lecture, so it penalizes correct-but-unsourced elaboration). OOS abstention = share of not-covered probes where the model honestly says “not covered” (higher is better).</p>
 <table><tr><th class=l>Model / metric</th><th>Closed-book</th><th>Raw files + plain agent</th><th>With the skill</th></tr>

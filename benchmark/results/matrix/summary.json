@@ -317,5 +317,26 @@
       "material": null
     }
   },
-  "arms_note": "主对比为 不给资料/裸文件agent/使用skill 三条公平条件；material(一股脑全塞)为naive对照"
+  "arms_note": "主对比为 不给资料/裸文件agent/使用skill 三条公平条件；material(一股脑全塞)为naive对照",
+  "material_reliability": {
+    "opus": {
+      "answered": 45,
+      "failed": 10,
+      "full": 0.71,
+      "surv": 0.87
+    },
+    "sonnet": {
+      "answered": 27,
+      "failed": 28,
+      "full": 0.45,
+      "surv": 0.93
+    },
+    "haiku": {
+      "answered": 2,
+      "failed": 53,
+      "full": 0.02,
+      "surv": 0.5
+    },
+    "n_answerable": 55
+  }
 }
