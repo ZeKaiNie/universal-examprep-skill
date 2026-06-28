@@ -14,16 +14,20 @@ ARMS = [("closedbook", "闭卷（无材料）", "Closed-book (no materials)", "#
         ("material", "给全材料（dump）", "Full materials dumped", "#f9ab00"),
         ("skill", "skill（惰性检索）", "Skill (lazy retrieval)", "#1a7f64")]
 MODELS = [("opus", "Opus 4.8"), ("sonnet", "Sonnet 4.6"), ("haiku", "Haiku 4.5")]
+# PSYC 110 只有两种条件（不给资料 / 使用本技能），键名形如 "psyc|<model>|<arm>"
+PSYC_ARMS = [("closedbook", "不给资料", "No materials", "#d93025"),
+             ("skill", "使用本技能", "With the skill", "#1a7f64")]
 
 def pct(x):
     return "—" if x is None else f"{round(x*100)}%"
 
 # ---------- SVG ----------
-def svg_grouped(matrix, metric, en, w=680, h=320):
-    """按模型分组、每组三臂的柱状图。metric: 'correct' 或 'abstention_oos'。"""
+def svg_grouped(matrix, metric, en, w=680, h=320, arms=ARMS, key_prefix=""):
+    """按模型分组、每组若干条件的柱状图。metric: 'correct' / 'hallucination' / 'abstention_oos'。
+    arms/key_prefix 可复用于 PSYC（两条件、键名带 'psyc|' 前缀）。"""
     pl, pb, pt, pr = 48, 56, 30, 14
     gw = (w - pl - pr) / len(MODELS)
-    bw = gw / (len(ARMS) + 1)
+    bw = gw / (len(arms) + 1)
     s = [f'<svg viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg" role="img">']
     # y 轴网格 0-100%
     for g in range(0, 101, 25):
@@ -32,8 +36,8 @@ def svg_grouped(matrix, metric, en, w=680, h=320):
         s.append(f'<text x="{pl-6}" y="{y+4:.0f}" font-size="11" fill="#888" text-anchor="end">{g}%</text>')
     for mi, (mk, mlabel) in enumerate(MODELS):
         gx = pl + mi * gw
-        for ai, (ak, zh, en_l, color) in enumerate(ARMS):
-            cell = matrix.get(f"{mk}|{ak}")
+        for ai, (ak, zh, en_l, color) in enumerate(arms):
+            cell = matrix.get(f"{key_prefix}{mk}|{ak}")
             v = (cell or {}).get(metric)
             x = gx + (ai + 0.5) * bw + bw * 0.3
             if v is None:
@@ -45,7 +49,7 @@ def svg_grouped(matrix, metric, en, w=680, h=320):
         s.append(f'<text x="{gx+gw/2:.0f}" y="{h-pb+18:.0f}" font-size="12" fill="#333" text-anchor="middle">{html.escape(mlabel)}</text>')
     # 图例
     lx = pl
-    for ak, zh, en_l, color in ARMS:
+    for ak, zh, en_l, color in arms:
         s.append(f'<rect x="{lx}" y="{h-18}" width="11" height="11" fill="{color}"/>')
         lab = en_l if en else zh
         s.append(f'<text x="{lx+15}" y="{h-8}" font-size="11" fill="#444">{html.escape(lab)}</text>')
@@ -157,6 +161,16 @@ def block(lang, S):
         o.append(f'<h2>{tr("📈 迭代逼近：知识库越全，越答得对","📈 Convergence: more wiki coverage → more correct")}</h2>')
         o.append(f'<p class="muted">{tr("skill 臂分 3 轮，知识库从 7 章逐步补到 14、20 章（讲义题+探针，Haiku）。","Skill arm over 3 rounds as the wiki grows 7 → 14 → 20 chapters (lecture items + probes, Haiku).")}</p>')
         o.append(svg_convergence(conv, en))
+    # PSYC 110（另一门：文科课，只对比 不给资料 / 使用本技能）
+    psyc = S.get("psyc") or {}
+    if psyc:
+        o.append(f'<h2>{tr("🧩 第二门课：Yale PSYC 110 心理学","🧩 Second course: Yale PSYC 110")}</h2>')
+        o.append(f'<p class="muted">{tr("文科课 50 题（40 题有答案 + 10 题资料中没有答案）。全文约 24 万字，超出一次读入上限，故没有“给全部资料”一栏，只比 不给资料 与 使用本技能。","A humanities course, 50 items (40 answerable + 10 with no answer in the material). Its full text is ~240K tokens, beyond one-shot context, so there is no full-materials column — only no-materials vs with-the-skill.")}</p>')
+        o.append(f'<p><b>{tr("正确率","Correctness")}</b></p>')
+        o.append(svg_grouped(psyc, "correct", en, arms=PSYC_ARMS, key_prefix="psyc|"))
+        o.append(f'<p><b>{tr("资料里没有答案时如实承认的比例","Honest abstention when the answer is absent")}</b></p>')
+        o.append(svg_grouped(psyc, "abstention_oos", en, arms=PSYC_ARMS, key_prefix="psyc|"))
+        o.append(f'<p class="muted">{tr("结论与 6.006 一致：使用本技能正确率最高（Opus 98% / Sonnet 92% / Haiku 80%），且对没有答案的题全部如实承认。","Same conclusion as 6.006: the skill gives the highest correctness (Opus 98% / Sonnet 92% / Haiku 80%) and abstains honestly on every unanswerable item.")}</p>')
     # caveats
     o.append(f'<h2>{tr("⚠️ 诚实声明 Caveats","⚠️ Caveats")}</h2><ul>')
     cav = [
@@ -179,10 +193,12 @@ def block(lang, S):
     # Materials + References（复用 report.py）
     o.append(f'<h2>{tr("📂 数据来源 Materials","📂 Materials")}</h2><ul>')
     for course, inst, zh_s, en_s, url in R.MATERIALS:
-        if "6.006" not in course:  # 本报告只用了 6.006
+        if "6.006" not in course and "PSYC 110" not in course:  # 本报告用了这两门
             continue
         subj = en_s if en else zh_s
-        o.append(f'<li><a href="{url}" target="_blank" rel="noopener">{html.escape(course)}</a> — <span class="muted">{html.escape(inst)} · {html.escape(subj)} · {tr("讲义 L1–L20 + 习题 PS0–8（含官方解答）","lectures L1–L20 + problem sets PS0–8 with official solutions")}</span></li>')
+        detail = (tr("讲义 L1–L20 + 习题 PS0–8（含官方解答）", "lectures L1–L20 + problem sets PS0–8 with official solutions")
+                  if "6.006" in course else tr("讲义 L1–L20 转录（事实题以原文为依据）", "lecture transcripts L1–L20 (facts grounded in the transcript)"))
+        o.append(f'<li><a href="{url}" target="_blank" rel="noopener">{html.escape(course)}</a> — <span class="muted">{html.escape(inst)} · {html.escape(subj)} · {detail}</span></li>')
     o.append("</ul>")
     o.append(f'<h2>{tr("📚 参考基准 References","📚 References")}</h2><ol class="refs">')
     for title, url, zh, eng in R.REFERENCES:
@@ -193,7 +209,7 @@ def block(lang, S):
 
 def _write_standalone_svgs(S):
     """Also emit standalone chart SVGs (zh/en) so the README can embed the comparison charts."""
-    m, conv = S.get("matrix", {}), S.get("convergence", {})
+    m, conv, psyc = S.get("matrix", {}), S.get("convergence", {}), S.get("psyc", {})
     for en, suf in ((False, "zh"), (True, "en")):
         for metric, name in (("correct", "correct"), ("hallucination", "hallu"),
                              ("abstention_oos", "oos")):
@@ -201,6 +217,10 @@ def _write_standalone_svgs(S):
                 svg_grouped(m, metric, en))
         open(os.path.join(OUT, f"chart_convergence_{suf}.svg"), "w", encoding="utf-8").write(
             svg_convergence(conv, en))
+        if psyc:   # PSYC 110：两条件（不给资料 / 使用本技能）× 三模型
+            for metric, name in (("correct", "psyc_correct"), ("abstention_oos", "psyc_oos")):
+                open(os.path.join(OUT, f"chart_{name}_{suf}.svg"), "w", encoding="utf-8").write(
+                    svg_grouped(psyc, metric, en, arms=PSYC_ARMS, key_prefix="psyc|"))
 
 
 def main():
