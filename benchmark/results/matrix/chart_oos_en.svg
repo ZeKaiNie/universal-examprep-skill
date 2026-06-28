@@ -18,18 +18,22 @@
 <text x="151" y="282" font-size="12" fill="#333" text-anchor="middle">Opus 4.8</text>
 <rect x="295" y="147" width="41" height="117" fill="#d93025" rx="2"/>
 <text x="316" y="143" font-size="10" fill="#444" text-anchor="middle">50</text>
+<rect x="347" y="30" width="41" height="234" fill="#f9ab00" rx="2"/>
+<text x="367" y="26" font-size="10" fill="#444" text-anchor="middle">100</text>
 <rect x="398" y="30" width="41" height="234" fill="#1a7f64" rx="2"/>
 <text x="419" y="26" font-size="10" fill="#444" text-anchor="middle">100</text>
 <text x="357" y="282" font-size="12" fill="#333" text-anchor="middle">Sonnet 4.6</text>
 <rect x="501" y="124" width="41" height="140" fill="#d93025" rx="2"/>
 <text x="522" y="120" font-size="10" fill="#444" text-anchor="middle">60</text>
+<rect x="553" y="30" width="41" height="234" fill="#f9ab00" rx="2"/>
+<text x="573" y="26" font-size="10" fill="#444" text-anchor="middle">100</text>
 <rect x="604" y="30" width="41" height="234" fill="#1a7f64" rx="2"/>
 <text x="625" y="26" font-size="10" fill="#444" text-anchor="middle">100</text>
 <text x="563" y="282" font-size="12" fill="#333" text-anchor="middle">Haiku 4.5</text>
 <rect x="48" y="302" width="11" height="11" fill="#d93025"/>
-<text x="63" y="312" font-size="11" fill="#444">Closed-book (no materials)</text>
-<rect x="250.4" y="302" width="11" height="11" fill="#f9ab00"/>
-<text x="265.4" y="312" font-size="11" fill="#444">Full materials dumped</text>
-<rect x="420.8" y="302" width="11" height="11" fill="#1a7f64"/>
-<text x="435.8" y="312" font-size="11" fill="#444">Skill (lazy retrieval)</text>
+<text x="63" y="312" font-size="11" fill="#444">Closed-book</text>
+<rect x="154.4" y="302" width="11" height="11" fill="#f9ab00"/>
+<text x="169.4" y="312" font-size="11" fill="#444">Raw files + plain agent</text>
+<rect x="337.6" y="302" width="11" height="11" fill="#1a7f64"/>
+<text x="352.6" y="312" font-size="11" fill="#444">With the skill</text>
 </svg>

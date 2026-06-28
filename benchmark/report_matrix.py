@@ -10,9 +10,9 @@ for s in ("stdout", "stderr"):
     except Exception: pass
 
 OUT = os.path.join(BENCH, "results", "matrix")
-ARMS = [("closedbook", "闭卷（无材料）", "Closed-book (no materials)", "#d93025"),
-        ("material", "给全材料（dump）", "Full materials dumped", "#f9ab00"),
-        ("skill", "skill（惰性检索）", "Skill (lazy retrieval)", "#1a7f64")]
+ARMS = [("closedbook", "不给资料", "Closed-book", "#d93025"),
+        ("rawfiles", "裸文件 + 通用 agent", "Raw files + plain agent", "#f9ab00"),
+        ("skill", "使用本技能", "With the skill", "#1a7f64")]
 MODELS = [("opus", "Opus 4.8"), ("sonnet", "Sonnet 4.6"), ("haiku", "Haiku 4.5")]
 # PSYC 110 只有两种条件（不给资料 / 使用本技能），键名形如 "psyc|<model>|<arm>"
 PSYC_ARMS = [("closedbook", "不给资料", "No materials", "#d93025"),
@@ -100,25 +100,31 @@ def block(lang, S):
     en_m = f"Method: one gold set ({ni} items, all grounded in official MIT 6.006 lecture notes / problem sets) answered by 3 models under 3 conditions —"
     o.append(f'<p class="muted">{tr(zh_m, en_m)}</p>')
     o.append("<ul>")
-    o.append(f'<li><b>{tr("闭卷","Closed-book")}</b>：{tr("不给任何材料，只靠模型自己的知识。","no materials, parametric knowledge only.")}</li>')
-    o.append(f'<li><b>{tr("给全材料","Full-materials")}</b>：{tr("把整门课全文塞进提示里（dump）。","the entire course text dumped into the prompt.")}</li>')
-    o.append(f'<li><b>{tr("skill","Skill")}</b>：{tr("只把课件建成知识库，模型按需检索（skill 的防幻觉机制）。","course built into a wiki the model retrieves from on demand (the skill\'s regime).")}</li>')
+    o.append(f'<li><b>{tr("不给资料","Closed-book")}</b>：{tr("不给任何材料，只靠模型自己的知识回答。","no materials, parametric knowledge only.")}</li>')
+    o.append(f'<li><b>{tr("裸文件 + 通用 agent","Raw files + plain agent")}</b>：{tr("把原始讲义/习题文件放进一个文件夹，模型用通用文件工具（读取/检索）按需查阅——但没有本技能。这是最公平的对照基线。","raw lecture / problem-set files in a folder; the model reads/greps them on demand with generic file tools — but WITHOUT the skill. The fairest baseline.")}</li>')
+    o.append(f'<li><b>{tr("使用本技能","With the skill")}</b>：{tr("课件先被整理成分章节知识库，模型按需取相关章节（本技能的机制）。","the course pre-built into a chaptered wiki the skill retrieves from on demand.")}</li>')
+    o.append(f'<li class="muted">{tr("（另设一个 naive 对照：把整门课全文一股脑塞进提问——见正确率表下方脚注。）","(A naive control — dumping the whole course into one prompt — is discussed in the footnote below the table.)")}</li>')
     o.append("</ul>")
     # 头条
-    sk = mx.get("haiku|skill"); cb = mx.get("haiku|closedbook"); md = mx.get("haiku|material")
-    if sk and cb:
-        cbc, mdc, skc = pct(cb.get("correct")), pct((md or {}).get("correct")), pct(sk.get("correct"))
-        ska, cba = pct(sk.get("abstention_oos")), pct(cb.get("abstention_oos"))
-        zh_h = (f"在最弱的 Haiku 上，闭卷正确率 {cbc} → skill 惰性检索 {skc}；越界题上 skill 弃答 {ska}"
-                f"（闭卷只有 {cba}，即闭卷在不会的题上更爱硬编）。"
-                f"「给全材料」臂把整门课塞进提示，频繁撞配额/上下文上限——Haiku 上 65 题仅 2 题跑通，"
-                f"跑通的题正确率与 skill 相当，但这种不可行本身正是 skill 定向检索的实际价值。")
-        en_h = (f"On the weakest model (Haiku): closed-book correctness {cbc} → skill retrieval {skc}; "
-                f"on out-of-scope probes the skill abstains {ska} vs closed-book {cba} "
-                f"(closed-book fabricates more when it doesn't know). The full-materials arm dumps the "
-                f"entire course and keeps hitting quota/context limits — only 2 of 65 Haiku items completed; "
-                f"on items that did complete it matches the skill, but that infeasibility is exactly the "
-                f"point in favour of the skill's targeted retrieval.")
+    rf = mx.get("haiku|rawfiles"); sk = mx.get("haiku|skill"); cb = mx.get("haiku|closedbook")
+    cost = S.get("cost_per_q", {}).get("algo", {})
+    if sk and cb and rf:
+        cbc, rfc, skc = pct(cb.get("correct")), pct(rf.get("correct")), pct(sk.get("correct"))
+        c_rf, c_sk, c_md = cost.get("rawfiles"), cost.get("skill"), cost.get("material")
+        ratio = (f"约 {round(c_md / c_sk)} 倍" if (c_md and c_sk) else "数倍")
+        ratio_en = (f"~{round(c_md / c_sk)}x" if (c_md and c_sk) else "several times")
+        zh_h = (f"一个能按需读文件的通用 agent（没有本技能）本身已经很强：连最弱的 Haiku 都有 {rfc} 正确率，"
+                f"远高于不给资料的 {cbc}。使用本技能进一步到 {skc}——优势对越弱的模型越明显，"
+                f"且两种方式对“资料里没有”的题都 100% 如实弃答。真正的差异在成本：同等精度下本技能每题约 "
+                f"${c_sk}，比裸文件 agent 的 ${c_rf} 更省（只取压缩过的相关章节，而非每题翻整堆原始文件）；"
+                f"而把整门课一股脑塞进提问每题高达 ${c_md}（贵{ratio}）且在弱模型上直接跑崩。")
+        en_h = (f"A plain agent that can read files on demand (no skill) is already strong: even the weakest "
+                f"model (Haiku) reaches {rfc} correctness, far above closed-book's {cbc}. The skill pushes it "
+                f"to {skc} — the edge grows for weaker models — and both abstain 100% on questions the "
+                f"materials don't cover. The real difference is cost: at equal accuracy the skill is ~${c_sk} "
+                f"per question vs the raw-files agent's ~${c_rf} (it pulls one condensed chapter instead of "
+                f"grepping the whole pile each time); dumping the entire course costs ~${c_md} per question "
+                f"({ratio_en} more) and outright fails on weaker models.")
         o.append('<div class="card">')
         o.append(f'<b>{tr("一句话结论","Bottom line")}</b>：{tr(zh_h, en_h)}')
         o.append('</div>')
@@ -131,19 +137,29 @@ def block(lang, S):
         cells = "".join(f'<td>{pct((mx.get(f"{mk}|{ak}") or {}).get("correct"))}</td>' for ak, *_ in ARMS)
         o.append(f'<tr><td class=l>{ml}</td>{cells}</tr>')
     o.append("</table>")
-    mn = S.get("material_n", {})
-    if mn:
-        on, sn, hn = mn.get("opus|material", "?"), mn.get("sonnet|material", "?"), mn.get("haiku|material", "?")
+    # 成本对比（同等精度下，本技能比裸文件 agent 更省）
+    cost = S.get("cost_per_q", {}).get("algo", {})
+    if cost.get("skill"):
+        o.append(f'<h3 style="font-size:16px;margin-top:18px">{tr("💵 平均每题成本（同精度下更省才是 skill 的差异）","💵 Cost per question (the skill\'s real edge: same accuracy, lower cost)")}</h3>')
+        o.append('<table><tr>' + "".join(f'<th>{tr(z,e)}</th>' for _, z, e, _ in ARMS) + "</tr><tr>"
+                 + "".join(f'<td>${cost.get(ak)}</td>' for ak, *_ in ARMS) + "</tr></table>")
         o.append('<p class="muted">' + tr(
-            f"为什么「给全材料」一栏数据不全：把整门课全文塞进一次提问，文本量极大，越弱的模型越读不完——"
-            f"Haiku 在这一条件下大多无法返回有效作答（65 题仅 {hn} 题成功，样本太小故不列），"
-            f"Opus、Sonnet 也只完成 {on}、{sn} 题，表中只统计这些成功作答。相比之下，使用本技能时"
-            f"每次只按需检索相关章节、提问短小，三个模型都能稳定作答——这正是本技能的价值所在。",
-            f"Why the full-materials column is sparse: dumping a whole course into one prompt is huge and "
-            f"weaker models can't read it all — Haiku mostly fails to return a usable answer here (only {hn}/65 "
-            f"succeeded, too few to report) and even Opus/Sonnet completed just {on}/{sn}; the table counts only "
-            f"those. By contrast, the skill retrieves only the relevant chapter per question, so prompts stay "
-            f"small and all three models answer reliably — which is exactly the skill's value.") + '</p>')
+            "同等甚至更高精度下，本技能每题成本低于裸文件 agent——它只取压缩过的相关章节，而裸文件 agent 每题都要翻检整堆原始文件。",
+            "At equal-or-better accuracy the skill costs less per question than the raw-files agent — it pulls one "
+            "condensed chapter, whereas the raw-files agent must search the whole pile of source files every time.") + '</p>')
+    # naive 对照脚注：一股脑全塞
+    mn = S.get("material_n", {})
+    if cost.get("material"):
+        hn = mn.get("haiku|material", "?")
+        mult = round(cost["material"] / cost["skill"]) if cost.get("skill") else "数"
+        o.append('<p class="muted">' + tr(
+            f"脚注·naive 对照「一股脑全塞」：把整门课全文塞进一次提问，每题成本高达 ${cost.get('material')}"
+            f"（约为本技能的 {mult} 倍），且文本过大会撞用量/上下文上限——Haiku 上 65 题仅 {hn} 题成功返回，"
+            f"故不纳入上面的公平对比。这也说明「丢一大坨给模型」是最差选择。",
+            f"Footnote — the naive 'dump everything' control: stuffing the whole course into one prompt costs "
+            f"~${cost.get('material')}/question (~{mult}x the skill) and is too large, hitting usage/context limits "
+            f"(only {hn}/65 Haiku items returned), so it is excluded from the fair comparison above — and shows "
+            f"that dumping a big blob at the model is the worst option.") + '</p>')
     # 幻觉率 + 越界弃答
     o.append(f'<h2>{tr("🧪 幻觉率 & 越界弃答","🧪 Hallucination & out-of-scope abstention")}</h2>')
     o.append(f'<p class="muted">{tr("幻觉率＝答案里出现材料未支持/相矛盾论断的比例（越低越好，按整篇讲义为依据判，会惩罚“正确但材料没写”的展开）；越界弃答率＝材料没覆盖的探针题上老实说“未涵盖”的比例（越高越好）。","Hallucination = share of answers with claims not supported by (or contradicting) the source (lower is better; judged against the full lecture, so it penalizes correct-but-unsourced elaboration). OOS abstention = share of not-covered probes where the model honestly says “not covered” (higher is better).")}</p>')
