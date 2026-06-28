@@ -1,0 +1,47 @@
+# Skill Architecture — 技能集合结构说明
+
+本文档解释这套备考技能从「单体 SKILL.md」走向「可移植技能集合」后的结构，以及 V2.1 各协议落在哪里。
+**本次重构只加结构、文档与测试，不改 `scripts/ingest.py` 逻辑，不改变任何既有行为。**
+
+## 1. 兼容入口（不破坏现有用法）
+- 根目录 **`SKILL.md`** 保持为**默认 / 兼容入口**，仍承载完整 V2.1 协议。已经按旧方式安装本技能的 host 不受影响。
+- 新支持技能集合的 host 可改用 **`skills/exam-cram/SKILL.md`** 作主入口——它与根 `SKILL.md` 描述同一行为。
+- **`AGENTS.md`** 是给「不读完整 SKILL.md 的通用代理」的一屏浓缩契约（防幻觉核心底线）。
+
+## 2. 技能集合布局
+```
+skills/
+  exam-cram/        # 主技能：编排者，承载阶梯/模式/契约
+  exam-ingest/      # 子：从学生材料初始化工作区（wiki + 题库 + 进度）
+  exam-tutor/       # 子：按章惰性加载授课（含零基础重点题精讲、画图协议）
+  exam-quiz/        # 子：题库抽题判分，支持 6 大题型
+  exam-review/      # 子：错题 + 概念疑难点复盘
+  exam-cheatsheet/  # 子：考前小抄 / 总复习走查
+  exam-audit/       # 子：只读体检工作区，报告问题不改
+  exam-help/        # 子：速查卡
+confusion-tracker/  # 既有子技能（概念疑难点追踪，写 study_progress.md）
+```
+每个子技能**单一职责**、各自有 frontmatter（`name` / `description` / `license`）与「触发 / 输入 / 工作流 / 输出 / 边界」五段；彼此**交叉引用而非复制**。
+
+## 3. 子技能 ↔ 备考生命周期
+| 阶段 | 子技能 |
+| --- | --- |
+| 冷启动建库 | `exam-ingest` |
+| 按章授课 | `exam-tutor`（+ `confusion-tracker` 记疑难点） |
+| 刷题判分 | `exam-quiz` |
+| 错题/疑难复盘 | `exam-review` |
+| 考前小抄 | `exam-cheatsheet` |
+| 工作区体检 | `exam-audit` |
+| 速查 | `exam-help` |
+
+## 4. V2.1 协议落点
+- **知识来源透明化（provenance）**：贯穿全部子技能——🟢来自资料 / 🟡AI 补充 / ⚠️AI 生成答案；契约写在 `exam-cram` 的 *Knowledge provenance* 与 `AGENTS.md` 规则 4–5、8。
+- **零基础「重点题精讲」模式**：`exam-cram` 的 `panic` 模式 + `exam-tutor` 的对应工作流。
+- **画图题确定性处理（`type: "diagram"`）**：`exam-tutor`（讲）与 `exam-quiz`（判）的「先跑算法再画图」流程。
+- **6 大题型**（`choice / subjective / diagram / fill_blank / true_false / code`）：`exam-quiz`，与 `scripts/ingest.py` 的 `VALID_QUIZ_TYPES` 一致。
+- **confusion-tracker**：保留为既有子技能，由 `exam-review` 在复盘阶段调起。
+
+## 5. Future work（后续 PR，本 PR 不含）
+- **schema 校验 + workspace validator**：用 stdlib JSON Schema 校验 `quiz_bank.json` / `raw_input.json`，并加一个「检查已建工作区是否健康」的脚本（`exam-audit` 的程序化版本）。
+- **规则副本对齐测试**：把 `AGENTS.md` 作为单一事实源，为各 host 规则副本加一个 stdlib 对齐检查（副本须等于 `AGENTS.md` 正文；`SKILL.md` 与 `AGENTS.md` 共有的防幻觉不变式逐字出现）。
+- **long-horizon drift benchmark**：模拟 15–30 轮长会话 + 中途干扰，量化目标保持率 / 编题率 / 断点恢复一致性（对照「裸文件 agent」vs「使用本技能」），坐实本技能真正要解决的「长程漂移」痛点。

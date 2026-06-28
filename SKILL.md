@@ -95,3 +95,15 @@ metadata:
 * **理科/工科**：重在公式解剖与一题一练。先讲标准 Wiki 里的步骤，再抽取类似题练习。
 * **文科/社科**：拒绝长篇大论。将知识梳理成脑图（Mermaid）或表格，用口诀或谐音记忆法帮助背诵。
 * **语言与代码**：采用“改错题 (Bug Hunting)”或“填空题”模式，让用户在改错中领悟语法和结构。
+
+---
+
+## 🧩 技能结构与兼容性说明 (Skill Collection & Compatibility)
+
+为便于移植与维护，本技能的行为也被整理成了 `skills/` 下的可移植技能集合，但**既有用法与行为完全不变**：
+
+* **本文件（根目录 `SKILL.md`）仍是默认 / 兼容入口**，承载完整 V2.1 协议；已经安装本技能的用户无需做任何改动。
+* **支持技能集合的新版 host** 可改用主技能 `skills/exam-cram/SKILL.md`；它与本文件描述的是同一套行为。
+* **子技能是按任务拆分的单一职责模块**：`exam-ingest`（建库）/ `exam-tutor`（授课）/ `exam-quiz`（抽题判分）/ `exam-review`（复盘）/ `exam-cheatsheet`（小抄）/ `exam-audit`（只读体检）/ `exam-help`（速查），以及既有的 `confusion-tracker`。
+* **不读完整协议的通用代理**可读根目录 `AGENTS.md`（一屏防幻觉浓缩契约）。
+* 详见 [`docs/skill-architecture.md`](docs/skill-architecture.md) 与 [`docs/agent-portability.md`](docs/agent-portability.md)。
