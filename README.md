@@ -82,6 +82,10 @@
 | Sonnet 4.6 | 55% | 92% | 90% | 100% |
 | Haiku 4.5 | 55% | 80% | 80% | 100% |
 
+![PSYC 110 正确率对比](benchmark/results/matrix/chart_psyc_correct_zh.svg)
+
+![PSYC 110 如实承认资料里没有的比例](benchmark/results/matrix/chart_psyc_oos_zh.svg)
+
 文科课上结论一致：使用本技能后正确率提高 25 到 38 个百分点，对没有答案的问题全部如实承认。
 
 **结论**

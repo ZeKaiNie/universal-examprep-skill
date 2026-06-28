@@ -168,5 +168,79 @@
     "opus|material": 50,
     "sonnet|material": 27,
     "haiku|material": 2
+  },
+  "psyc": {
+    "psyc|opus|closedbook": {
+      "n": 50,
+      "n_answerable": 40,
+      "n_oos": 10,
+      "correct": 0.6,
+      "faithfulness": 0.6308,
+      "hallucination": 0.225,
+      "abstention_oos": 0.8,
+      "n_judge_error": 0,
+      "n_lexical": 9,
+      "n_infra_error": 0
+    },
+    "psyc|sonnet|closedbook": {
+      "n": 50,
+      "n_answerable": 40,
+      "n_oos": 10,
+      "correct": 0.55,
+      "faithfulness": 0.5707,
+      "hallucination": 0.3,
+      "abstention_oos": 0.9,
+      "n_judge_error": 6,
+      "n_lexical": 8,
+      "n_infra_error": 0
+    },
+    "psyc|haiku|closedbook": {
+      "n": 50,
+      "n_answerable": 40,
+      "n_oos": 10,
+      "correct": 0.55,
+      "faithfulness": 0.5876,
+      "hallucination": 0.4,
+      "abstention_oos": 0.8,
+      "n_judge_error": 2,
+      "n_lexical": 10,
+      "n_infra_error": 0
+    },
+    "psyc|opus|skill": {
+      "n": 50,
+      "n_answerable": 40,
+      "n_oos": 10,
+      "correct": 0.975,
+      "faithfulness": 0.8938,
+      "hallucination": 0.2,
+      "abstention_oos": 1.0,
+      "n_judge_error": 0,
+      "n_lexical": 16,
+      "n_infra_error": 0
+    },
+    "psyc|sonnet|skill": {
+      "n": 50,
+      "n_answerable": 40,
+      "n_oos": 10,
+      "correct": 0.925,
+      "faithfulness": 0.7558,
+      "hallucination": 0.4,
+      "abstention_oos": 1.0,
+      "n_judge_error": 2,
+      "n_lexical": 15,
+      "n_infra_error": 0
+    },
+    "psyc|haiku|skill": {
+      "n": 50,
+      "n_answerable": 40,
+      "n_oos": 10,
+      "correct": 0.8,
+      "faithfulness": 0.7885,
+      "hallucination": 0.325,
+      "abstention_oos": 1.0,
+      "n_judge_error": 6,
+      "n_lexical": 15,
+      "n_infra_error": 0
+    }
   }
 }
