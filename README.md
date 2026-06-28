@@ -1,13 +1,24 @@
-# 🎓 通用期末考试 1天极速备考智能教练 (Universal Exam Cram Coach - LLM Wiki V2.0)
+# 🎓 通用期末考试 1天极速备考智能教练 (Universal Exam Cram Coach - LLM Wiki V2.1)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Agent: Antigravity](https://img.shields.io/badge/Agent-Antigravity-orange.svg)](#)
-[![Version: 2.0](https://img.shields.io/badge/Version-2.0--LLM--Wiki-brightgreen.svg)](#)
+[![Version: 2.1](https://img.shields.io/badge/Version-2.1--LLM--Wiki-brightgreen.svg)](#)
 [![CI Build](https://github.com/ZeKaiNie/universal-examprep-skill/actions/workflows/ci.yml/badge.svg)](https://github.com/ZeKaiNie/universal-examprep-skill/actions)
 
-这是一个**基于 LLM Wiki 架构重构**、**全科通用**的期末考试极速备考 AI 智能体技能（Agent Skill）V2.0 版本。
+这是一个**基于 LLM Wiki 架构重构**、**全科通用**的期末考试极速备考 AI 智能体技能（Agent Skill）V2.1 版本。
 
 只要将本技能导入支持的智能体（如 VS Code 智能体插件、Claude Code、Codex、Cursor、Windsurf、Devin 或网页版 GPTs/Gemini），并提供你想要复习的科目资料，智能体就会化身你的**物理防幻觉私人专属备考教练**，带你在 1 天内突击通关。
+
+---
+
+## 🚀 V2.1 突破性更新特性 (New in V2.1)
+
+针对“明天就要考试、几乎完全没学过、只求通过”这一极限备考场景，V2.1 补齐了以下 4 个被实测验证发现的防幻觉与提分缺口：
+
+* **🟢🟡 知识来源透明化协议**：强制 AI 严格区分并标注 wiki 章节与答案的来源。如果是来自学生上传的课件/重点，标注“🟢 来自资料”；如果是 AI 自己脑补的背景知识，强制显著标注“🟡 AI补充，可能与老师讲的不一致”；如果是 AI 自动为重点题生成的参考答案，强制标注“⚠️ 此答案由 AI 生成、非老师提供”，绝不欺骗学生。
+* **📚 零基础「重点题精讲」模式**：针对几乎没学过这门课的学生，授课模式自动从“系统性概念复习”切换为“精准攻克老师画的每道重点题”。自动为每题提供：【考点拆解】+【标准答题模板/步骤】+【易错点】+【3分钟速记口诀】。目标是能在考场上直接默写框架拿分。
+* **📊 画图题确定性处理协议 (`type: "diagram"`)**：针对二叉树旋转、图遍历、状态机等画图题目，禁止 AI 凭空脑补想象最终图像。强制 AI “先在后台写 Python 代码运行标准算法 -> 自动求得正确拓扑结构 -> 渲染并输出实体图片”，确保作图 100% 精准，并优先遵循老师的画图流派。
+* **🧩 6 大试题题型支持**：题库题型从原本的 {选择题、主观题} 扩展支持 `{选择、主观、画图、填空、判断、代码}` 等 6 大经典期末考试题型，更贴合高校真实考卷结构。
 
 ---
 
