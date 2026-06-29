@@ -1,0 +1,37 @@
+[
+  {
+    "id": "w1",
+    "chapter": 1,
+    "type": "subjective",
+    "question": "无keywords主观题",
+    "answer": "答案",
+    "source": "teacher"
+  },
+  {
+    "id": "w2",
+    "chapter": 2,
+    "type": "diagram",
+    "question": "无diagram_type画图题",
+    "answer": "图",
+    "source": "teacher"
+  },
+  {
+    "id": "w3",
+    "chapter": 1,
+    "type": "code",
+    "question": "无language代码题",
+    "answer": "修复",
+    "source": "teacher"
+  },
+  {
+    "id": "w4",
+    "chapter": 2,
+    "type": "subjective",
+    "question": "无答案但标unknown",
+    "answer_status": "unknown",
+    "keywords": [
+      "x"
+    ],
+    "source": "unknown"
+  }
+]

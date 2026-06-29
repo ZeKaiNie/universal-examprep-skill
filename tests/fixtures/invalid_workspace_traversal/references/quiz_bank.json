@@ -1,0 +1,14 @@
+[
+  {
+    "id": "t1",
+    "chapter": 1,
+    "type": "choice",
+    "question": "正常题",
+    "options": [
+      "A",
+      "B"
+    ],
+    "answer": "A",
+    "source": "teacher"
+  }
+]

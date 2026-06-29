@@ -1,0 +1,84 @@
+[
+  {
+    "id": "q1",
+    "chapter": 1,
+    "type": "choice",
+    "question": "栈的存取顺序?",
+    "options": [
+      "A. LIFO",
+      "B. FIFO"
+    ],
+    "answer": "A",
+    "explanation": "后进先出",
+    "source": "teacher"
+  },
+  {
+    "id": "q2",
+    "chapter": 1,
+    "type": "subjective",
+    "question": "二分查找最坏复杂度?",
+    "answer": "O(log n)",
+    "keywords": [
+      "log",
+      "减半"
+    ],
+    "explanation": "每次减半",
+    "source": "teacher"
+  },
+  {
+    "id": "q3",
+    "chapter": 2,
+    "type": "diagram",
+    "question": "画 AVL 插入 [3,2,1]",
+    "answer": "根2左1右3",
+    "diagram_type": "avl_tree",
+    "render_hint": "跑AVL算法再画",
+    "explanation": "先右旋",
+    "source": "teacher"
+  },
+  {
+    "id": "q4",
+    "chapter": 2,
+    "type": "true_false",
+    "question": "快排最坏是 O(n log n)?",
+    "answer": false,
+    "explanation": "最坏 O(n^2)",
+    "source": "teacher"
+  },
+  {
+    "id": "q5",
+    "chapter": 1,
+    "type": "fill_blank",
+    "question": "队列是____表",
+    "answer": "先进先出",
+    "acceptable_answers": [
+      "先进先出",
+      "FIFO"
+    ],
+    "explanation": "FIFO",
+    "source": "teacher"
+  },
+  {
+    "id": "q6",
+    "chapter": 2,
+    "type": "code",
+    "question": "修复冒泡排序边界 bug",
+    "answer": "内层 j<n-i-1",
+    "language": "python",
+    "expected_behavior": "升序排序数组",
+    "explanation": "边界",
+    "source": "teacher"
+  },
+  {
+    "id": "q7",
+    "chapter": 1,
+    "type": "subjective",
+    "question": "老师没给答案的拓展题",
+    "answer": "AI 参考解",
+    "keywords": [
+      "参考"
+    ],
+    "explanation": "AI 补",
+    "source": "ai_generated"
+  }
+]

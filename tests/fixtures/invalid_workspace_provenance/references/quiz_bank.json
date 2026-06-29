@@ -1,0 +1,24 @@
+[
+  {
+    "id": "p1",
+    "chapter": 1,
+    "type": "subjective",
+    "question": "缺答案且无来源标注",
+    "keywords": [
+      "a"
+    ],
+    "source": "teacher"
+  },
+  {
+    "id": "p2",
+    "chapter": 1,
+    "type": "subjective",
+    "question": "把AI答案伪装成老师",
+    "answer": "AI编的",
+    "keywords": [
+      "a"
+    ],
+    "ai_generated": true,
+    "source": "teacher"
+  }
+]

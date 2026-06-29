@@ -201,7 +201,7 @@ def main():
         print("\n[!] 注意：以下题目缺少标准答案（answer 为空）：")
         print("    " + ", ".join(missing_answer_ids))
         print("    这些题在测验时没有可对照的标准答案；请先补全，或在对话中让 AI 为它们生成答案后再录入。")
-        print("    ⚠️ 若由 AI 代为生成答案，必须向学生明确标注「此答案由 AI 生成、非老师提供」，")
+        print("    ⚠️ 若由 AI 代为生成答案，必须向学生明确标注「⚠️ AI生成答案，非老师/教材提供」，")
         print("       严禁把 AI 生成的答案伪装成老师的标准答案（详见 SKILL.md 知识来源透明化协议）。")
 
     output_dir = os.path.abspath(args.output_dir)

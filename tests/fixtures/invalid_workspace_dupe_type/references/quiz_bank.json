@@ -1,0 +1,29 @@
+[
+  {
+    "id": "d1",
+    "chapter": 1,
+    "type": "choice",
+    "question": "无options选择题",
+    "answer": "A",
+    "source": "teacher"
+  },
+  {
+    "id": "d1",
+    "chapter": 1,
+    "type": "subjective",
+    "question": "重复id",
+    "answer": "x",
+    "keywords": [
+      "a"
+    ],
+    "source": "teacher"
+  },
+  {
+    "id": "d2",
+    "chapter": 1,
+    "type": "essay",
+    "question": "未知题型",
+    "answer": "x",
+    "source": "teacher"
+  }
+]
