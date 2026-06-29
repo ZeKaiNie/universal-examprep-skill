@@ -111,6 +111,6 @@ metadata:
 
 * **本文件（根目录 `SKILL.md`）仍是默认 / 兼容入口**，承载完整 V2.1 协议；已经安装本技能的用户无需做任何改动。
 * **支持技能集合的新版 host** 可改用主技能 `skills/exam-cram/SKILL.md`；它与本文件描述的是同一套行为。
-* **子技能是按任务拆分的单一职责模块**：`exam-ingest`（建库）/ `exam-tutor`（授课）/ `exam-quiz`（抽题判分）/ `exam-review`（复盘）/ `exam-cheatsheet`（小抄）/ `exam-audit`（只读体检）/ `exam-help`（速查），以及既有的 `confusion-tracker`。
+* **子技能是按任务拆分的单一职责模块**：`exam-ingest`（建库）/ `exam-tutor`（授课）/ `exam-quiz`（抽题判分）/ `exam-review`（复盘）/ `exam-cheatsheet`（小抄）/ `exam-audit`（只读体检）/ `exam-help`（速查）/ `confusion-tracker`（概念疑难追踪），均在 `skills/` 下。
 * **不读完整协议的通用代理**可读根目录 `AGENTS.md`（一屏防幻觉浓缩契约）。
 * 详见 [`docs/skill-architecture.md`](docs/skill-architecture.md) 与 [`docs/agent-portability.md`](docs/agent-portability.md)。

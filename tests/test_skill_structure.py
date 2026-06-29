@@ -16,6 +16,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SKILL_DIRS = [
     "exam-cram", "exam-ingest", "exam-tutor", "exam-quiz",
     "exam-review", "exam-cheatsheet", "exam-audit", "exam-help",
+    "confusion-tracker",
 ]
 
 # core anti-hallucination rules the compact fallback must carry (invariants, see docs/skill-architecture.md)
@@ -93,8 +94,8 @@ class TestSkillCollectionStructure(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(ROOT, "docs", "skill-architecture.md")))
 
     def test_existing_confusion_tracker_skill_preserved(self):
-        # the pre-existing sub-skill must not be removed by this refactor
-        self.assertTrue(os.path.isfile(os.path.join(ROOT, "confusion-tracker", "SKILL.md")))
+        # the confusion-tracker sub-skill now lives inside skills/ (moved in PR E)
+        self.assertTrue(os.path.isfile(os.path.join(ROOT, "skills", "confusion-tracker", "SKILL.md")))
 
 
 if __name__ == "__main__":

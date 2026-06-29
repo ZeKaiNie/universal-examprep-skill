@@ -9,7 +9,7 @@
 > 能指就别抄：host 支持 skills 时让它指向现有 `skills/`；只有 host 逼你复制时才复制，且复制后要能验证它没跑偏。
 
 两层心智模型：
-- **技能层（skill-tier）** host —— 加载完整 `skills/*/SKILL.md`（主技能 + 子技能）**外加技能包根目录的 `confusion-tracker/SKILL.md`**——它在 `skills/` 树外，但 `exam-tutor` 概念记录与 `exam-review` 疑难复盘依赖它，**必须一并加载**（否则疑难点追踪能力缺失）。最稳妥是安装整个技能包。
+- **技能层（skill-tier）** host —— 加载完整 `skills/*/SKILL.md`，**含 `skills/confusion-tracker/SKILL.md`**（它现已并入 `skills/`，是 `exam-tutor` 概念记录与 `exam-review` 疑难复盘所用的子技能）。仍建议整仓安装，以便拿到 `scripts/`、`templates/`、`docs/`、`prompts/`。
 - **指令层（instruction-tier）** host —— 只能吃一份「项目规则」，给它一份与 `AGENTS.md` 对齐的浓缩规则。
 
 ## 支持矩阵

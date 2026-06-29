@@ -13,7 +13,8 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 SKILLS = ["exam-cram", "exam-ingest", "exam-tutor", "exam-quiz",
-          "exam-review", "exam-cheatsheet", "exam-audit", "exam-help"]
+          "exam-review", "exam-cheatsheet", "exam-audit", "exam-help",
+          "confusion-tracker"]
 
 REQUIRED_HEADINGS = ["## Purpose", "## Activation", "## Inputs",
                      "## Workflow", "## Output Contract", "## Boundaries"]

@@ -19,7 +19,7 @@ skills/
   exam-cheatsheet/  # 子：考前小抄 / 总复习走查
   exam-audit/       # 子：只读体检工作区，报告问题不改
   exam-help/        # 子：速查卡
-confusion-tracker/  # 既有子技能（概念疑难点追踪，写 study_progress.md）
+  confusion-tracker/  # 子：概念疑难点追踪（写 study_progress.md），被 exam-tutor / exam-review 调用
 ```
 每个子技能**单一职责**、各自有 frontmatter（`name` / `description` / `license`）与「触发 / 输入 / 工作流 / 输出 / 边界」五段；彼此**交叉引用而非复制**。
 
@@ -27,9 +27,9 @@ confusion-tracker/  # 既有子技能（概念疑难点追踪，写 study_progre
 | 阶段 | 子技能 |
 | --- | --- |
 | 冷启动建库 | `exam-ingest` |
-| 按章授课 | `exam-tutor`（+ `confusion-tracker` 记疑难点） |
+| 按章授课 | `exam-tutor`（+ `skills/confusion-tracker` 记疑难点） |
 | 刷题判分 | `exam-quiz` |
-| 错题/疑难复盘 | `exam-review` |
+| 错题/疑难复盘 | `exam-review`（+ `skills/confusion-tracker`） |
 | 考前小抄 | `exam-cheatsheet` |
 | 工作区体检 | `exam-audit` |
 | 速查 | `exam-help` |
@@ -41,7 +41,7 @@ confusion-tracker/  # 既有子技能（概念疑难点追踪，写 study_progre
 - **零基础「重点题精讲」模式**：`exam-cram` 的 `panic` 模式 + `exam-tutor` 的对应工作流。
 - **画图题确定性处理（`type: "diagram"`）**：`exam-tutor`（讲）与 `exam-quiz`（判）的「先跑算法再画图」流程。
 - **6 大题型**（`choice / subjective / diagram / fill_blank / true_false / code`）：`exam-quiz`，与 `scripts/ingest.py` 的 `VALID_QUIZ_TYPES` 一致。
-- **confusion-tracker**：保留为既有子技能，由 `exam-review` 在复盘阶段调起。
+- **confusion-tracker**：位于 `skills/confusion-tracker/` 的子技能（与其他子技能同级），由 `exam-tutor` 在教学时记录概念疑难点、`exam-review` 在复盘阶段调起。
 
 ## 5. Future work（后续 PR，本 PR 不含）
 - **schema 校验 + workspace validator**：用 stdlib JSON Schema 校验 `quiz_bank.json` / `raw_input.json`，并加一个「检查已建工作区是否健康」的脚本（`exam-audit` 的程序化版本）。

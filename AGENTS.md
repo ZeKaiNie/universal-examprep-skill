@@ -29,4 +29,4 @@
 学生可见输出（讲解 / 判分 / 复盘 / 小抄 / 进度）默认**简体中文**，除非用户另有要求；控制指令保持英文 / 精确。详见 `docs/language-policy.md`。
 
 ## 完整协议
-读 `skills/exam-cram/SKILL.md`（主技能）+ `skills/exam-*/SKILL.md`（子技能：ingest / tutor / quiz / review / cheatsheet / audit / help），或根目录 `SKILL.md`。本文件是它们的对齐浓缩版，规则措辞应与之保持一致。
+读 `skills/exam-cram/SKILL.md`（主技能）+ 其余 `skills/*/SKILL.md` 子技能（ingest / tutor / quiz / review / cheatsheet / audit / help / confusion-tracker），或根目录 `SKILL.md`。本文件是它们的对齐浓缩版，规则措辞应与之保持一致。
