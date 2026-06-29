@@ -107,5 +107,5 @@ This coordinator orchestrates the following single-responsibility subskills (eac
 
 > 注：`confusion-tracker`（被 `exam-review` / `exam-tutor` 用来记录概念疑难点）现位于 [`skills/confusion-tracker/SKILL.md`](../confusion-tracker/SKILL.md)，与其他子技能同级——加载 `skills/` 时即一并带上，不会再静默丢失「💡 概念疑难点记录」能力。
 >
-> 兼容性：根目录 `SKILL.md` 仍是默认/兼容入口，承载完整 V2.1 协议；本文件是同一行为的模块化主入口。
+> 兼容性：根目录 `SKILL.md` 仍是默认/兼容入口，承载完整防幻觉协议；本文件是同一行为的模块化主入口。
 > 通用代理的一屏速记见根目录 `AGENTS.md`。

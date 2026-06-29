@@ -20,10 +20,10 @@
 | Codex | `AGENTS.md` / `skills/*` | `AGENTS.md` 作指令兜底，或作为技能包加载 `skills/`；指令/技能层 |
 | Cursor | `AGENTS.md`（或未来 `.cursor/rules/`） | 项目规则兜底，规则文本须与 `AGENTS.md` 对齐 |
 | Windsurf | `AGENTS.md`（或未来 rules 文件） | 同上，项目规则兜底 |
-| ChatGPT / Claude Web | `prompts/web_prompt.md` | 无本地写盘；该提示词已含 V2.1 来源标注/防编题规则。用文本「进度 Summary」做断点，手动挂载题库后只从中出题 |
+| ChatGPT / Claude Web | `prompts/web_prompt.md` | 无本地写盘；该提示词已含来源标注/防编题规则。用文本「进度 Summary」做断点，手动挂载题库后只从中出题 |
 | Generic agents | `AGENTS.md` | 一屏浓缩兜底契约 |
 
-> 兼容性：根目录 `SKILL.md` 仍是默认/兼容入口（承载完整 V2.1 协议）。新支持技能集合的 host 可改用
+> 兼容性：根目录 `SKILL.md` 仍是默认/兼容入口（承载完整防幻觉协议）。新支持技能集合的 host 可改用
 > `skills/exam-cram/SKILL.md` 作主入口；二者描述同一行为。
 
 ## 未来适配（本 PR 不实现）

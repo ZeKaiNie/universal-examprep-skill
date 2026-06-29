@@ -1,10 +1,10 @@
 # Skill Architecture — 技能集合结构说明
 
-本文档解释这套备考技能从「单体 SKILL.md」走向「可移植技能集合」后的结构，以及 V2.1 各协议落在哪里。
+本文档解释这套备考技能从「单体 SKILL.md」走向「可移植技能集合」后的结构，以及各防幻觉协议落在哪里。
 **本次重构只加结构、文档与测试，不改 `scripts/ingest.py` 逻辑，不改变任何既有行为。**
 
 ## 1. 兼容入口（不破坏现有用法）
-- 根目录 **`SKILL.md`** 保持为**默认 / 兼容入口**，仍承载完整 V2.1 协议。已经按旧方式安装本技能的 host 不受影响。
+- 根目录 **`SKILL.md`** 保持为**默认 / 兼容入口**，仍承载完整防幻觉协议。已经按旧方式安装本技能的 host 不受影响。
 - 新支持技能集合的 host 可改用 **`skills/exam-cram/SKILL.md`** 作主入口——它与根 `SKILL.md` 描述同一行为。
 - **`AGENTS.md`** 是给「不读完整 SKILL.md 的通用代理」的一屏浓缩契约（防幻觉核心底线）。
 
@@ -36,7 +36,7 @@ skills/
 
 > **双语分层**：模块化 `skills/exam-*` 用**英文控制段**（Purpose / Activation / Inputs / Workflow / Output Contract / Boundaries）+ `Student-facing Output` 下的**简体中文学生示例**；根 `SKILL.md` 维持中文优先作兼容入口。详见 [`language-policy.md`](language-policy.md)。
 
-## 4. V2.1 协议落点
+## 4. 防幻觉协议落点
 - **知识来源透明化（provenance）**：贯穿全部子技能——🟢 来自资料 / 🟡 AI补充，可能与你老师讲的不完全一致 / ⚠️ AI生成答案，非老师/教材提供（canonical 见 `docs/language-policy.md`）；契约写在 `exam-cram` 的 *Knowledge provenance* 与 `AGENTS.md` 规则 4–5、8。
 - **零基础「重点题精讲」模式**：`exam-cram` 的 `panic` 模式 + `exam-tutor` 的对应工作流。
 - **画图题确定性处理（`type: "diagram"`）**：`exam-tutor`（讲）与 `exam-quiz`（判）的「先跑算法再画图」流程。

@@ -23,7 +23,7 @@
 ## 文件约定
 - `references/wiki/chN_*.md` 唯一知识源 · `references/quiz_bank.json` 唯一答案源（题带 `source`: teacher / ai_generated）
 - `study_plan.md` 阶段计划 · `study_progress.md` 进度 + 错题 + 疑难点（每轮更新、重启先读）
-- 无本地写盘的纯网页端：用 `prompts/web_prompt.md`（已含 V2.1 来源标注与防编题规则）；测验仍只从用户挂载的题库出题、答案按 🟢/🟡/⚠️ 标注来源。每轮末尾输出可复制的进度 Summary 作断点。
+- 无本地写盘的纯网页端：用 `prompts/web_prompt.md`（已含来源标注与防编题规则）；测验仍只从用户挂载的题库出题、答案按 🟢/🟡/⚠️ 标注来源。每轮末尾输出可复制的进度 Summary 作断点。
 
 ## 语言 / Language
 学生可见输出（讲解 / 判分 / 复盘 / 小抄 / 进度）默认**简体中文**，除非用户另有要求；控制指令保持英文 / 精确。详见 `docs/language-policy.md`。

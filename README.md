@@ -1,19 +1,21 @@
-# 🎓 通用期末考试 1天极速备考智能教练 (Universal Exam Cram Coach - LLM Wiki V2.1)
+# 🎓 通用期末考试 1天极速备考智能教练 (Universal Exam Cram Coach - LLM Wiki Edition)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Agent: Antigravity](https://img.shields.io/badge/Agent-Antigravity-orange.svg)](#)
-[![Version: 2.1](https://img.shields.io/badge/Version-2.1--LLM--Wiki-brightgreen.svg)](#)
+[![Architecture: LLM Wiki](https://img.shields.io/badge/Architecture-LLM--Wiki-brightgreen.svg)](#)
 [![CI Build](https://github.com/ZeKaiNie/universal-examprep-skill/actions/workflows/ci.yml/badge.svg)](https://github.com/ZeKaiNie/universal-examprep-skill/actions)
 
-这是一个**基于 LLM Wiki 架构重构**、**全科通用**的期末考试极速备考 AI 智能体技能（Agent Skill）V2.1 版本。
+这是一个**基于 LLM Wiki 架构**、**全科通用**的期末考试极速备考 AI 智能体技能（Agent Skill）。
 
 只要将本技能导入支持的智能体（如 VS Code 智能体插件、Claude Code、Codex、Cursor、Windsurf、Devin 或网页版 GPTs/Gemini），并提供你想要复习的科目资料，智能体就会化身你的**物理防幻觉私人专属备考教练**，带你在 1 天内突击通关。
 
+> 📜 完整版本沿革见 [CHANGELOG.md](CHANGELOG.md)。
+
 ---
 
-## 🚀 V2.1 突破性更新特性 (New in V2.1)
+## 🚀 核心防幻觉与提分能力
 
-针对“明天就要考试、几乎完全没学过、只求通过”这一极限备考场景，V2.1 补齐了以下 4 个被实测验证发现的防幻觉与提分缺口：
+针对“明天就要考试、几乎完全没学过、只求通过”这一极限备考场景，本技能提供以下 4 个被实测验证的防幻觉与提分能力：
 
 * **🟢🟡 知识来源透明化协议**：强制 AI 严格区分并标注 wiki 章节与答案的来源。如果是来自学生上传的课件/重点，标注“🟢 来自资料”；如果是 AI 自己脑补的背景知识，强制显著标注“🟡 AI补充，可能与你老师讲的不完全一致”；如果是 AI 自动为重点题生成的参考答案，强制标注“⚠️ AI生成答案，非老师/教材提供”，绝不欺骗学生。
 * **📚 零基础「重点题精讲」模式**：针对几乎没学过这门课的学生，授课模式自动从“系统性概念复习”切换为“精准攻克老师画的每道重点题”。自动为每题提供：【考点拆解】+【标准答题模板/步骤】+【易错点】+【3分钟速记口诀】。目标是能在考场上直接默写框架拿分。
@@ -24,27 +26,27 @@
 
 ## 🏗️ 工程化重构 (Engineering Restructuring)
 
-在 V2.1 功能特性的基础上，项目完成了一次大规模的工程化重构（[PR #11](https://github.com/ZeKaiNie/universal-examprep-skill/pull/11)），不改变任何既有行为，专注于可移植性、可维护性和测试基础设施：
+项目还完成了一次大规模的工程化重构（[PR #11](https://github.com/ZeKaiNie/universal-examprep-skill/pull/11)），不改变任何既有行为，专注于可移植性、可维护性和测试基础设施：
 
 * **🧩 模块化技能集合**：将单体 `SKILL.md` 拆分为 `skills/` 下的 9 个单一职责子技能（`exam-cram` 主协调器 + `exam-ingest` / `exam-tutor` / `exam-quiz` / `exam-review` / `exam-cheatsheet` / `exam-audit` / `exam-help` + `confusion-tracker` 疑难追踪），便于不同 agent 按需加载。根目录 `SKILL.md` 仍为默认兼容入口，不影响已安装用户。
 * **📄 AGENTS.md 通用代理兜底**：新增一屏浓缩的防幻觉核心契约，供 Codex、Cursor 规则、Antigravity 等不读完整 SKILL.md 的通用代理使用。
 * **🌐 双语控制层**：英文控制指令（精确、可测）+ 简体中文学生可见输出，统一来源标注 canonical 用词（🟢/🟡/⚠️），避免多入口措辞不一致。语言策略详见 [`docs/language-policy.md`](docs/language-policy.md)。
 * **🔍 工作区校验器**：新增 [`scripts/validate_workspace.py`](scripts/validate_workspace.py)（纯标准库），可零成本校验已建工作区的结构、题库 schema、来源标注和路径安全。
-* **🔬 测试覆盖大幅扩展**：从 12 个测试扩展到 **94 个**，覆盖 ingest、工作区校验、技能结构完整性、语言策略一致性、控制层双语等维度。CI 矩阵覆盖 Ubuntu/Python 3.8 + 3.12 + Windows。
+* **🔬 测试覆盖大幅扩展**：从 12 个测试扩展到 **98 个**，覆盖 ingest、工作区校验、技能结构完整性、语言策略一致性、控制层双语等维度。CI 矩阵覆盖 Ubuntu/Python 3.8 + 3.12 + Windows。
 * **📚 架构文档补全**：新增 [`docs/skill-architecture.md`](docs/skill-architecture.md)（技能集合结构）、[`docs/agent-portability.md`](docs/agent-portability.md)（不同代理加载方式）、[`docs/file-format.md`](docs/file-format.md)（工作区文件格式规范）。
 
 ---
 
-## 🚀 V2.0 重大更新特性 (What's New)
+## ⚙️ 核心运行机制 (Core Mechanics)
 
 * **⚡ LLM Wiki 目录结构化加载**：丢弃了原先庞大且容易撑爆上下文的单个 Markdown 答案文件。升级为按章节/阶段的 Wiki 物理切片（`references/wiki/`），Agent 会根据复习进度 **Lazy Load (惰性加载)** 对应章节，**Token 消耗直降 90%**，长对话不再卡顿。
 * **🛠️ 一键无缝冷启动**：告别了手动建立题库与 Markdown 文件的繁琐操作。**学生完全不需要理会复杂的 JSON 格式**，只需提供大纲或真题，Agent 将在后台自动解析大纲、拼装 JSON 并通过脚本完成 Wiki 物理切片的切割与进度初始化。
-* **🔌 无 Python 环境自动降级**：新版增加了降级执行能力。即使学生电脑里没有安装 Python，Agent 也会无缝切换为“手动写入模式”，利用自身的文件写入功能直接在本地铺设 Wiki 目录，**100% 免配置、零摩擦运行**。
+* **🔌 无 Python 环境自动降级**：内置降级执行能力。即使学生电脑里没有安装 Python，Agent 也会无缝切换为“手动写入模式”，利用自身的文件写入功能直接在本地铺设 Wiki 目录，**100% 免配置、零摩擦运行**。
 * **🎯 标准真题库 quiz_bank.json 抽题**：测试题由“AI 即兴编造”升级为“标准真题库抽测”，规避了 AI 出无解错题、弱智题的毛病。
 * **🏃 测试逃生通道 (Hint & Skip)**：针对测试关卡设计了“查看提示”与“2次答错跳过并归档”机制，防止学生因主观题表述差异或卡壳而被死锁在当前阶段。
 * **🧠 概念疑难点自动追踪**：内置 `skills/confusion-tracker` 子技能，自动捕获并记录复习过程中的概念疑问（如“为什么/怎么推导”），形成考前盲区扫雷清单。
 * **🛡️ 运行安全与进度保护**：引入文件名安全过滤、路径防穿透防篡改、进度覆盖前自动备份，并强制 UTF-8 打印完美解决 Windows 终端中文乱码。
-* **🔬 单元测试与 CI 集成**：内置覆盖导入、工作区校验、技能结构、语言策略、控制层双语等 94 个单元测试，由 GitHub Actions 在云端多平台（Windows & Linux、Python 3.8/3.12）自动运行质量检测。
+* **🔬 单元测试与 CI 集成**：内置覆盖导入、工作区校验、技能结构、语言策略、控制层双语等 98 个单元测试，由 GitHub Actions 在云端多平台（Windows & Linux、Python 3.8/3.12）自动运行质量检测。
 
 ---
 
@@ -163,9 +165,9 @@ python scripts/validate_workspace.py path/to/workspace
 
 这是一个结构完备的备考智能体技能包，包含以下核心文件：
 
-* 📄 **`SKILL.md`**：**【智能体技能核心 / 兼容入口】** —— 承载完整 V2.1 协议，Cursor / VS Code / Claude Code / Windsurf 等工具自动读取。已安装的用户无需做任何改动。
+* 📄 **`SKILL.md`**：**【智能体技能核心 / 兼容入口】** —— 承载完整防幻觉协议，Cursor / VS Code / Claude Code / Windsurf 等工具自动读取。已安装的用户无需做任何改动。
 * 📄 **`AGENTS.md`**：**【通用代理一屏兜底契约】** —— 给不读完整 SKILL.md 的通用代理（Codex、Cursor 规则、Antigravity 等）的防幻觉核心浓缩版。
-* 📂 **`skills/`**：**【模块化技能集合】** —— 按职责拆分的可移植子技能，支持技能集合的新版 host 可用 `skills/exam-cram/SKILL.md` 作主入口。
+* 📂 **`skills/`**：**【模块化技能集合】** —— 按职责拆分的可移植子技能，支持技能集合的 host 可用 `skills/exam-cram/SKILL.md` 作主入口。
   * 📂 `exam-cram/`：主协调器（编排四步工作流 + 模式路由）
   * 📂 `exam-ingest/`：从学生材料初始化工作区（wiki + 题库 + 进度）
   * 📂 `exam-tutor/`：按章惰性加载授课（含零基础重点题精讲、画图协议）
@@ -189,7 +191,7 @@ python scripts/validate_workspace.py path/to/workspace
   * 📄 `study_plan_template.md`：复习计划表模板。
   * 📄 `study_progress_template.md`：进度追踪与错题打卡表模板。
   * 📄 `quiz_bank_template.json`：真题抽测 JSON 模板。
-* 📂 **`tests/`**：【单元测试包】 —— 94 个自动化测试，覆盖 ingest、工作区校验、技能结构、语言策略、控制层双语、技能集合自洽等。
+* 📂 **`tests/`**：【单元测试包】 —— 98 个自动化测试，覆盖 ingest、工作区校验、技能结构、语言策略、控制层双语、技能集合自洽、运行时去版本化等。
 
 ---
 
@@ -233,7 +235,7 @@ python scripts/validate_workspace.py path/to/workspace
 | **Cursor / VS Code / Windsurf** | 指令层 | `AGENTS.md`（或未来项目规则） | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | AI 在侧边栏直接写盘，文件结构清晰可见。`AGENTS.md` 作防幻觉规则兜底。 |
 | **Codex** | 技能/指令层 | `AGENTS.md` / `skills/*` | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | `AGENTS.md` 作指令兜底，或作为技能包加载 `skills/`。 |
 | **Devin / Antigravity** | 技能/指令层 | `AGENTS.md` / `skills/*` | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | 自主文件修改与工具执行权限强，克隆项目、运行脚本极快。 |
-| **网页端 AI (ChatGPT / Claude / Gemini / 豆包等)** | 提示词 | [`prompts/web_prompt.md`](prompts/web_prompt.md) | ⭐⭐☆☆☆ | ❌ | 网页端无法修改本地文件。**强烈推荐直接复制使用网页端平替备考提示词**，已含 V2.1 来源标注与防编题规则。 |
+| **网页端 AI (ChatGPT / Claude / Gemini / 豆包等)** | 提示词 | [`prompts/web_prompt.md`](prompts/web_prompt.md) | ⭐⭐☆☆☆ | ❌ | 网页端无法修改本地文件。**强烈推荐直接复制使用网页端平替备考提示词**，已含来源标注与防编题规则。 |
 | **其他通用代理** | 指令层 | `AGENTS.md` | 视 host | 视 host | 一屏浓缩兜底契约，适配任意支持项目规则/指令的代理。 |
 
 ---
@@ -241,7 +243,7 @@ python scripts/validate_workspace.py path/to/workspace
 ## ❓ 常见问题与故障排除
 
 * **Q：我的电脑没有安装 Python，或者报错“python 不是内部或外部命令”怎么办？**
-  * **A**：**完全不用担心！** V2.0 增加了无 Python 环境的自动降级机制。当 Agent 在执行脚本发现你的电脑没有 Python 环境时，它会**自动且静默地切换为“手动写盘模式”**——由 AI 自己直接在本地创建 Wiki 目录并拼写章节文件。用户不会感受到任何差别，依然能够顺利开始复习。
+  * **A**：**完全不用担心！** 本技能内置无 Python 环境的自动降级机制。当 Agent 在执行脚本发现你的电脑没有 Python 环境时，它会**自动且静默地切换为“手动写盘模式”**——由 AI 自己直接在本地创建 Wiki 目录并拼写章节文件。用户不会感受到任何差别，依然能够顺利开始复习。
 * **Q：如果我的 Claude Code / Codex 接入的是纯文本 API（如 DeepSeek，没有多模态视觉），但老师给的重点是照片或 PDF 扫描件，可以使用本技能吗？**
   * **A**：**完全可以！** 备考教练的核心授课和测验逻辑是 100% 纯文本的。在初始导入阶段，你只需多花 2 分钟进行一次“文本化中转”即可：
     1. **多模态转录**：把拍的照片或 PDF 扫描件发给任意一个**免费的网页版多模态 AI**（如 ChatGPT 网页版、Gemini、Kimi、豆包、通义千问），发送指令：

@@ -90,6 +90,6 @@ Everything the student actually reads **defaults to Simplified Chinese unless th
 - 不要把整套技能翻成纯英文或纯中文。
 - 不要为了「统一语言」把英文控制指令改成中文而牺牲精确性。
 - 不要把学生看的中文写成翻译腔 / 学术腔。
-- 不要借语言改写**削弱 V2.1 行为**：知识来源标注、零基础重点题精讲、画图先跑算法、6 大题型、quiz_bank 抽题、`study_progress.md` 进度断点、疑难追踪、路径 / 进度安全、网页可移植。
+- 不要借语言改写**削弱以下行为**：知识来源标注、零基础重点题精讲、画图先跑算法、6 大题型、quiz_bank 抽题、`study_progress.md` 进度断点、疑难追踪、路径 / 进度安全、网页可移植。
 
 > 相关文档：[`skill-architecture.md`](skill-architecture.md)（技能结构）· [`agent-portability.md`](agent-portability.md)（跨 host 可移植）· 根目录 `SKILL.md` / `AGENTS.md`（完整 / 浓缩协议）。
