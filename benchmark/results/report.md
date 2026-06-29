@@ -1,4 +1,4 @@
-# 防幻觉实测报告 / Hallucination Benchmark（MOCK 占位，非真实数据）
+# 防幻觉实测报告 / Hallucination Benchmark
 
 > 完整可视化、中英双语、带引用的版本见 `report.html`（用浏览器打开）。
 
@@ -9,13 +9,13 @@
 ## 数字 / Numbers
 | 指标 Metric | 没装 skill | 装了 skill | 依据 Basis |
 | :-- | :--: | :--: | :-- |
-| 忠实度 Faithfulness | 50% | 100% | [RAGAS faithfulness](https://arxiv.org/abs/2309.15217), [FACTS Grounding](https://arxiv.org/abs/2501.03200) |
-| 幻觉率 Hallucination rate | 60% | 0% | [Vectara HHEM](https://github.com/vectara/hallucination-leaderboard), [HalluLens](https://arxiv.org/abs/2504.17550) |
-| 正确率 Correctness | 50% | 100% | [TRUE (NAACL 2022)](https://arxiv.org/abs/2204.04991) |
-| 计算题准确率 Numeric accuracy | — | — | 确定性判分 |
-| 越界弃答率 Abstention (out-of-scope) | 0% | 100% | [RGB negative rejection](https://arxiv.org/abs/2309.01431), [SimpleQA abstention](https://arxiv.org/abs/2411.04368) |
+| 忠实度 Faithfulness | 87% | 97% | [RAGAS faithfulness](https://arxiv.org/abs/2309.15217), [FACTS Grounding](https://arxiv.org/abs/2501.03200) |
+| 幻觉率 Hallucination rate | 8% | 8% | [Vectara HHEM](https://github.com/vectara/hallucination-leaderboard), [HalluLens](https://arxiv.org/abs/2504.17550) |
+| 正确率 Correctness | 90% | 100% | [TRUE (NAACL 2022)](https://arxiv.org/abs/2204.04991) |
+| 计算题准确率 Numeric accuracy | 50% | 100% | 确定性判分 |
+| 越界弃答率 Abstention (out-of-scope) | 100% | 100% | [RGB negative rejection](https://arxiv.org/abs/2309.01431), [SimpleQA abstention](https://arxiv.org/abs/2411.04368) |
 
-n=50；McNemar p=0.000；幻觉率差值 95% CI [-74, -46] 个百分点。差异显著。
+n=13；McNemar p=1.000；幻觉率差值 95% CI [+0, +0] 个百分点。题量偏小，暂未达显著，按趋势看待、不夸大。
 
 ## 参考基准 / References
 - [FACTS Grounding (Google DeepMind, 2025)](https://arxiv.org/abs/2501.03200) — 仅依据给定文档作答的有据性基准——与本测试最贴合。

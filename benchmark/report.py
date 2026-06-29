@@ -241,13 +241,11 @@ def _block(lang, scored, b, s, mc, d_h, d_f, sig, mock, charts):
         head = tr(f"装了 skill 这组明显更好（幻觉率 {_pct(b['hallucination'])} → {_pct(s['hallucination'])}），但题量偏小，暂不能 100% 排除运气——属于「方向对、需更多题坐实」。",
                   f"The skill arm looks clearly better (hallucination {_pct(b['hallucination'])} → {_pct(s['hallucination'])}), but the sample is small, so luck isn't fully ruled out yet — right direction, needs more items to confirm.")
     o.append(f'<div class="card">📌 <b>{tr("一句话结论：", "Bottom line: ")}</b>{html.escape(head)}</div>')
-    o.append(f'<p class="muted">{tr("怎么测的：拿同样的题，分别让「没装 skill 的普通 AI」和「装了 skill 的 AI」来答，再逐题对照你材料里的标准答案打分。同一道题两边都答，对比最公平。",
-                                    "How: the same questions are answered by a plain AI (no skill) and by the AI with the skill, then graded against your gold answers. Each item goes through both arms, for a fair paired comparison.")}</p>')
+    o.append(f'<p class="muted">{tr("怎么测的：拿同样的题，分别让「没装 skill 的普通 AI」和「装了 skill 的 AI」来答，再逐题对照你材料里的标准答案打分。同一道题两边都答，对比最公平。", "How: the same questions are answered by a plain AI (no skill) and by the AI with the skill, then graded against your gold answers. Each item goes through both arms, for a fair paired comparison.")}</p>')
 
     o.append(f'<h2>{tr("📊 一眼看懂：两组对比", "📊 At a glance: the two arms")}</h2>{c1}')
     o.append(f'<h2>{tr("📈 到底提升了多少？（带误差范围）", "📈 How much did it actually help? (with error bars)")}</h2>{c2}')
-    o.append(f'<p class="muted">{tr("点是实测提升，横线是 95% 置信区间。横线<b>整段都在 0 右边</b>才能说「真有提升、不是运气」。题量越多，横线越短、结论越硬。",
-                                    "The dot is the measured gain; the bar is the 95% CI. Only when the whole bar sits right of 0 can we claim a real gain. More items → shorter bar → firmer conclusion.")}</p>')
+    o.append(f'<p class="muted">{tr("点是实测提升，横线是 95% 置信区间。横线<b>整段都在 0 右边</b>才能说「真有提升、不是运气」。题量越多，横线越短、结论越硬。", "The dot is the measured gain; the bar is the 95% CI. Only when the whole bar sits right of 0 can we claim a real gain. More items → shorter bar → firmer conclusion.")}</p>')
 
     o.append(f'<h2>{tr("🔤 这些指标都是啥意思 & 出处", "🔤 What each metric means & its source")}</h2><ul>')
     for m in METRICS:
@@ -290,8 +288,7 @@ def _block(lang, scored, b, s, mc, d_h, d_f, sig, mock, charts):
         note = eng if en else zh
         o.append(f'<li><a href="{url}" target="_blank" rel="noopener">{html.escape(title)}</a> — <span class="muted">{html.escape(note)}</span></li>')
     o.append("</ol>")
-    o.append(f'<p class="muted">{tr("统计方法：配对设计 + McNemar 检验 + bootstrap 置信区间 + Cohen’s kappa 裁判校准。数据与脚本全部开源、可复现。",
-                                    "Statistics: paired design + McNemar test + bootstrap CIs + Cohen’s kappa judge calibration. All data and code are open and reproducible.")}</p>')
+    o.append(f'<p class="muted">{tr("统计方法：配对设计 + McNemar 检验 + bootstrap 置信区间 + Cohen’s kappa 裁判校准。数据与脚本全部开源、可复现。", "Statistics: paired design + McNemar test + bootstrap CIs + Cohen’s kappa judge calibration. All data and code are open and reproducible.")}</p>')
     o.append("</div>")
     return "\n".join(o)
 

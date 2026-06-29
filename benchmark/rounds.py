@@ -144,8 +144,7 @@ def _block(lang, rounds, round_labels_map, series, conv, charts, mock):
     o.append(charts[lang])
     o.append(f"<h2>{tr('逐轮明细', 'Per-round detail')}</h2>")
     o.append(_table(round_labels_map[lang], rounds, series, conv, en))
-    o.append(f"<p class='muted'>{tr('括号内为相对上一轮的变化（百分点）。收敛判据：忠实度连续两轮变化 < 2 个百分点。',
-                                    'Parentheses show change vs. the previous round (pts). Convergence: faithfulness changes < 2 pts for two consecutive rounds.')}</p>")
+    o.append(f"<p class='muted'>{tr('括号内为相对上一轮的变化（百分点）。收敛判据：忠实度连续两轮变化 < 2 个百分点。', 'Parentheses show change vs. the previous round (pts). Convergence: faithfulness changes < 2 pts for two consecutive rounds.')}</p>")
     o.append("</div>")
     return "".join(o)
 

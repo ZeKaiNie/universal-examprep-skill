@@ -23,6 +23,9 @@ import sys
 import json
 import argparse
 import subprocess
+import urllib.request
+import urllib.error
+import time
 
 import judge as J
 import report as R
@@ -55,6 +58,9 @@ DEFAULT_CFG = {
     "allowed_tools": "Read Glob Grep",
     "judge_repeats": 3,
     "mock": False,
+    "gemini_api_key": "",
+    "openai_api_key": "",
+    "openai_api_base": "https://api.deepseek.com/v1"
 }
 
 
@@ -80,6 +86,116 @@ def read_text(path):
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
     return ""
+
+
+# ---------------- API Helpers ----------------
+def run_gemini_api(prompt, api_key, model="gemini-2.5-flash", format_json=False):
+    if not api_key:
+        sys.exit("[-] 错误：选择 'gemini' 作为 generator 或 judge 时，必须在 config.json 中配置 'gemini_api_key'。")
+        
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ]
+    }
+    
+    if format_json:
+        payload["generationConfig"] = {
+            "responseMimeType": "application/json"
+        }
+        
+    data = json.dumps(payload).encode("utf-8")
+    
+    max_retries = 10
+    backoff_factor = 2
+    for attempt in range(max_retries):
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                res_data = json.loads(response.read().decode("utf-8"))
+                text = res_data["candidates"][0]["content"]["parts"][0]["text"]
+                return text
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 503):
+                err_msg = e.read().decode("utf-8")
+                sleep_time = (backoff_factor ** attempt) + 5
+                print(f"[!] 触发 API 限制/暂不可用 ({e.code}): {err_msg}\n等待 {sleep_time} 秒后重试...")
+                time.sleep(sleep_time)
+                continue
+            else:
+                err_msg = e.read().decode("utf-8")
+                print(f"[-] Gemini API 错误 (HTTP {e.code}): {err_msg}")
+                raise e
+        except Exception as e:
+            print(f"[-] API 请求异常: {e}")
+            raise e
+            
+    sys.exit("[-] 达到最大重试次数，Gemini API 调用失败。")
+
+
+def run_openai_api(prompt, api_key, api_base="https://api.deepseek.com/v1", model="deepseek-chat", format_json=False):
+    if not api_key:
+        sys.exit("[-] 错误：选择 'openai' 或 'deepseek' 作为 generator 或 judge 时，必须在 config.json 中配置 'openai_api_key'。")
+        
+    url = f"{api_base.rstrip('/')}/chat/completions"
+    
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.0
+    }
+    
+    if format_json:
+        payload["response_format"] = {
+            "type": "json_object"
+        }
+        
+    data = json.dumps(payload).encode("utf-8")
+    
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+    )
+    
+    max_retries = 5
+    backoff_factor = 2
+    for attempt in range(max_retries):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                res_data = json.loads(response.read().decode("utf-8"))
+                text = res_data["choices"][0]["message"]["content"]
+                return text
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 502, 503, 504):
+                sleep_time = (backoff_factor ** attempt) + 2
+                print(f"[!] 触发 API 限制/错误 ({e.code})，等待 {sleep_time} 秒后重试...")
+                time.sleep(sleep_time)
+                continue
+            else:
+                err_msg = e.read().decode("utf-8")
+                print(f"[-] API 错误 (HTTP {e.code}): {err_msg}")
+                raise e
+        except Exception as e:
+            print(f"[-] API 请求异常: {e}")
+            raise e
+            
+    sys.exit("[-] 达到最大重试次数，API 调用失败。")
 
 
 # ---------------- generators ----------------
@@ -122,19 +238,103 @@ def make_generator(cfg):
     if not materials:
         print("[!] 警告：未找到 materials_text，基线臂将缺少课程材料；请先准备 materials/_combined.txt")
 
+    # Pre-load quiz bank lookup table to emulate skill's lazy-load retrieval
+    quiz_bank_by_id = {}
+    if cfg["generator_cmd"] in ("gemini", "openai", "deepseek"):
+        qb_path = os.path.join(cfg["skill_workspace"], "references", "quiz_bank.json")
+        if os.path.exists(qb_path):
+            try:
+                with open(qb_path, "r", encoding="utf-8") as f:
+                    qb_list = json.load(f)
+                    quiz_bank_by_id = {q["id"]: q for q in qb_list}
+            except Exception as e:
+                print(f"[!] 警告：加载 quiz_bank.json 失败: {e}")
+
     def gen(item, arm):
-        if arm == "skill":
-            return run_claude(SKILL_PROMPT.format(q=item["question"]), cfg["skill_workspace"],
-                              cfg["generator_cmd"], cfg["generator_model"], cfg["allowed_tools"])[0]
-        return run_claude(BASELINE_PROMPT.format(material=materials, q=item["question"]), ".",
-                          cfg["generator_cmd"], cfg["generator_model"], "")[0]
+        if arm == "skill" and cfg["generator_cmd"] in ("gemini", "openai", "deepseek"):
+            # Find matching chapter
+            chapter = 1
+            q_id = item["id"]
+            if q_id in quiz_bank_by_id:
+                chapter = quiz_bank_by_id[q_id].get("chapter", 1)
+            
+            # Search for wiki file `references/wiki/ch{chapter}_*.md`
+            wiki_dir = os.path.join(cfg["skill_workspace"], "references", "wiki")
+            wiki_content = ""
+            if os.path.exists(wiki_dir):
+                for f in os.listdir(wiki_dir):
+                    if f.startswith(f"ch{chapter}_") and f.endswith(".md"):
+                        with open(os.path.join(wiki_dir, f), "r", encoding="utf-8") as wf:
+                            wiki_content = wf.read()
+                        break
+            
+            # Construct the prompt imitating the skill behavior
+            prompt = (
+                "你是备考教练。请依据我们为你提供的相关 Wiki 知识库章节内容和题库解析回答问题；"
+                "材料未涵盖的内容请直接回答“材料中未涵盖”，不要现场编造或重新推导。\n\n"
+                f"【相关 Wiki 章节内容】\n{wiki_content}\n\n"
+                f"【问题】{item['question']}\n\n请直接给出简洁答案。"
+            )
+            
+            if cfg["generator_cmd"] == "gemini":
+                # Add delay to avoid QPS issues
+                time.sleep(13)
+                return run_gemini_api(prompt, cfg["gemini_api_key"], cfg.get("generator_model", "gemini-2.5-flash"), format_json=False)
+            else:
+                time.sleep(0.5)
+                return run_openai_api(
+                    prompt,
+                    cfg["openai_api_key"],
+                    cfg.get("openai_api_base", "https://api.deepseek.com/v1"),
+                    cfg.get("generator_model", "deepseek-chat"),
+                    format_json=False
+                )
+        
+        # Baseline arm or other commands
+        if cfg["generator_cmd"] == "gemini":
+            prompt = BASELINE_PROMPT.format(material=materials, q=item["question"])
+            time.sleep(13)
+            return run_gemini_api(prompt, cfg["gemini_api_key"], cfg.get("generator_model", "gemini-2.5-flash"), format_json=False)
+        elif cfg["generator_cmd"] in ("openai", "deepseek"):
+            prompt = BASELINE_PROMPT.format(material=materials, q=item["question"])
+            time.sleep(0.5)
+            return run_openai_api(
+                prompt,
+                cfg["openai_api_key"],
+                cfg.get("openai_api_base", "https://api.deepseek.com/v1"),
+                cfg.get("generator_model", "deepseek-chat"),
+                format_json=False
+            )
+        else:
+            if arm == "skill":
+                return run_claude(SKILL_PROMPT.format(q=item["question"]), cfg["skill_workspace"],
+                                  cfg["generator_cmd"], cfg["generator_model"], cfg["allowed_tools"])[0]
+            return run_claude(BASELINE_PROMPT.format(material=materials, q=item["question"]), ".",
+                              cfg["generator_cmd"], cfg["generator_model"], "")[0]
     return gen
 
 
 def make_judge(cfg):
     if cfg["mock"]:
         return J.mock_judge
-    return lambda prompt: run_claude(prompt, ".", cfg["judge_cmd"], cfg["judge_model"], "")[0]
+    if cfg["judge_cmd"] == "gemini":
+        def judge(prompt):
+            time.sleep(13)
+            return run_gemini_api(prompt, cfg["gemini_api_key"], cfg.get("judge_model", "gemini-2.5-flash"), format_json=True)
+        return judge
+    elif cfg["judge_cmd"] in ("openai", "deepseek"):
+        def judge(prompt):
+            time.sleep(0.5)
+            return run_openai_api(
+                prompt,
+                cfg["openai_api_key"],
+                cfg.get("openai_api_base", "https://api.deepseek.com/v1"),
+                cfg.get("judge_model", "deepseek-chat"),
+                format_json=True
+            )
+        return judge
+    else:
+        return lambda prompt: run_claude(prompt, ".", cfg["judge_cmd"], cfg["judge_model"], "")[0]
 
 
 # ---------------- main ----------------

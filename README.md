@@ -22,6 +22,19 @@
 
 ---
 
+## 🏗️ 工程化重构 (Engineering Restructuring)
+
+在 V2.1 功能特性的基础上，项目完成了一次大规模的工程化重构（[PR #11](https://github.com/ZeKaiNie/universal-examprep-skill/pull/11)），不改变任何既有行为，专注于可移植性、可维护性和测试基础设施：
+
+* **🧩 模块化技能集合**：将单体 `SKILL.md` 拆分为 `skills/` 下的 8 个单一职责子技能（`exam-cram` 主协调器 + `exam-ingest` / `exam-tutor` / `exam-quiz` / `exam-review` / `exam-cheatsheet` / `exam-audit` / `exam-help`），便于不同 agent 按需加载。根目录 `SKILL.md` 仍为默认兼容入口，不影响已安装用户。
+* **📄 AGENTS.md 通用代理兜底**：新增一屏浓缩的防幻觉核心契约，供 Codex、Cursor 规则、Antigravity 等不读完整 SKILL.md 的通用代理使用。
+* **🌐 双语控制层**：英文控制指令（精确、可测）+ 简体中文学生可见输出，统一来源标注 canonical 用词（🟢/🟡/⚠️），避免多入口措辞不一致。语言策略详见 [`docs/language-policy.md`](docs/language-policy.md)。
+* **🔍 工作区校验器**：新增 [`scripts/validate_workspace.py`](scripts/validate_workspace.py)（纯标准库），可零成本校验已建工作区的结构、题库 schema、来源标注和路径安全。
+* **🔬 测试覆盖大幅扩展**：从 12 个测试扩展到 **88 个**，覆盖 ingest、工作区校验、技能结构完整性、语言策略一致性、控制层双语等维度。CI 矩阵覆盖 Ubuntu/Python 3.8 + 3.12 + Windows。
+* **📚 架构文档补全**：新增 [`docs/skill-architecture.md`](docs/skill-architecture.md)（技能集合结构）、[`docs/agent-portability.md`](docs/agent-portability.md)（不同代理加载方式）、[`docs/file-format.md`](docs/file-format.md)（工作区文件格式规范）。
+
+---
+
 ## 🚀 V2.0 重大更新特性 (What's New)
 
 * **⚡ LLM Wiki 目录结构化加载**：丢弃了原先庞大且容易撑爆上下文的单个 Markdown 答案文件。升级为按章节/阶段的 Wiki 物理切片（`references/wiki/`），Agent 会根据复习进度 **Lazy Load (惰性加载)** 对应章节，**Token 消耗直降 90%**，长对话不再卡顿。
@@ -31,7 +44,7 @@
 * **🏃 测试逃生通道 (Hint & Skip)**：针对测试关卡设计了“查看提示”与“2次答错跳过并归档”机制，防止学生因主观题表述差异或卡壳而被死锁在当前阶段。
 * **🧠 概念疑难点自动追踪**：集成 `confusion-tracker` 插件，自动捕获并记录复习过程中的概念疑问（如“为什么/怎么推导”），形成考前盲区扫雷清单。
 * **🛡️ 运行安全与进度保护**：引入文件名安全过滤、路径防穿透防篡改、进度覆盖前自动备份，并强制 UTF-8 打印完美解决 Windows 终端中文乱码。
-* **🔬 12 个单元测试与 CI 集成**：内置覆盖正常导入、防路径遍历、缺漏报错等 12 个单元测试，由 GitHub Actions 在云端多平台（Windows & Linux）自动运行质量检测。
+* **🔬 单元测试与 CI 集成**：内置覆盖导入、工作区校验、技能结构、语言策略、控制层双语等 88 个单元测试，由 GitHub Actions 在云端多平台（Windows & Linux、Python 3.8/3.12）自动运行质量检测。
 
 ---
 
@@ -150,19 +163,34 @@ python scripts/validate_workspace.py path/to/workspace
 
 这是一个结构完备的备考智能体技能包，包含以下核心文件：
 
-* 📂 **`prompts/`**：存放提示词。
-  * 📄 `web_prompt.md`：**【网页端一键平替提示词】** —— 专为不支持本地写盘的网页版 AI（ChatGPT / DeepSeek 网页端 / 豆包）准备，复制直接用。
-* 📂 **`scripts/`**：自动化脚本。
-  * 🐍 `ingest.py`：**【一键环境初始化脚本】** —— 由 AI 助手在后台自动调用，负责一键切分 Wiki 章节、题库并部署进度表。
+* 📄 **`SKILL.md`**：**【智能体技能核心 / 兼容入口】** —— 承载完整 V2.1 协议，Cursor / VS Code / Claude Code / Windsurf 等工具自动读取。已安装的用户无需做任何改动。
+* 📄 **`AGENTS.md`**：**【通用代理一屏兜底契约】** —— 给不读完整 SKILL.md 的通用代理（Codex、Cursor 规则、Antigravity 等）的防幻觉核心浓缩版。
+* 📂 **`skills/`**：**【模块化技能集合】** —— 按职责拆分的可移植子技能，支持技能集合的新版 host 可用 `skills/exam-cram/SKILL.md` 作主入口。
+  * 📂 `exam-cram/`：主协调器（编排四步工作流 + 模式路由）
+  * 📂 `exam-ingest/`：从学生材料初始化工作区（wiki + 题库 + 进度）
+  * 📂 `exam-tutor/`：按章惰性加载授课（含零基础重点题精讲、画图协议）
+  * 📂 `exam-quiz/`：题库抽题判分（6 大题型）
+  * 📂 `exam-review/`：错题与概念疑难点复盘
+  * 📂 `exam-cheatsheet/`：考前速记小抄生成
+  * 📂 `exam-audit/`：只读检查工作区健康度
+  * 📂 `exam-help/`：速查卡（一屏看懂工作流 / 模式 / 文件约定）
 * 📂 **`confusion-tracker/`**：【概念疑难点追踪技能】。
   * 📄 `SKILL.md`：自动捕获并记录对话中的概念疑惑，将其整理到进度表中。
+* 📂 **`scripts/`**：自动化脚本。
+  * 🐍 `ingest.py`：**【一键环境初始化脚本】** —— 由 AI 助手在后台自动调用，负责一键切分 Wiki 章节、题库并部署进度表。
+  * 🐍 `validate_workspace.py`：**【工作区校验器】** —— 静态校验已建工作区的结构、题库 schema、来源标注与路径安全（纯标准库，零成本）。
+* 📂 **`docs/`**：架构与策略文档。
+  * 📄 `language-policy.md`：双语语言策略（英文控制层 + 简体中文学生层）与来源标注的唯一权威定义。
+  * 📄 `skill-architecture.md`：技能集合结构说明（子技能 ↔ 备考生命周期映射）。
+  * 📄 `agent-portability.md`：不同代理的加载方式与支持矩阵。
+  * 📄 `file-format.md`：工作区文件格式规范（quiz_bank.json schema、6 大题型字段、来源标注规则）。
+* 📂 **`prompts/`**：存放提示词。
+  * 📄 `web_prompt.md`：**【网页端一键平替提示词】** —— 专为不支持本地写盘的网页版 AI（ChatGPT / DeepSeek 网页端 / 豆包）准备，复制直接用。
 * 📂 **`templates/`**：备考基准模板文件。
   * 📄 `study_plan_template.md`：复习计划表模板。
   * 📄 `study_progress_template.md`：进度追踪与错题打卡表模板。
   * 📄 `quiz_bank_template.json`：真题抽测 JSON 模板。
-* 📂 **`tests/`**：【单元测试包】。
-  * 📄 `test_ingest.py`：包含 12 个自动化测试用例，用于校验核心环境配置与脚本安全防线。
-* 📄 **`SKILL.md`**：**【智能体技能核心】** —— 包含备考教练的系统指令、惰性加载协议和物理防幻觉协议（Cursor / VS Code / Claude Code / Windsurf 等工具在运行后会自动读取此文件）。
+* 📂 **`tests/`**：【单元测试包】 —— 88 个自动化测试，覆盖 ingest、工作区校验、技能结构、语言策略、控制层双语等。
 
 ---
 
@@ -178,9 +206,12 @@ python scripts/validate_workspace.py path/to/workspace
    > **“帮我在当前目录下创建 `.claude/skills/` 文件夹，并把 GitHub 仓库 `https://github.com/ZeKaiNie/universal-examprep-skill` 克隆到 `.claude/skills/universal-exam-cram-coach/`，完成技能的本地安装。”**
    * *AI 行为：AI 助手会在后台默默下载并新建隐藏目录，完全不需要你手动拖拽文件。*
    * *📌 路径说明：Claude Code 读取技能的位置是 `~/.claude/skills/` 或项目内 `.claude/skills/`；而 `.agents/skills/` 是 Codex / Cursor 的约定，Claude Code 不会扫描该路径。请按你实际使用的工具选择对应目录。*
+   * *⚠️ 重要：请克隆**整个仓库**，不要只复制 `skills/` 目录。子技能依赖仓库根目录下的 `scripts/`、`templates/`、`confusion-tracker/` 和 `docs/`，单独复制 `skills/` 会导致部分功能缺失。*
 3. **一键初始化并开始复习 (Prompt 2)**：安装成功后，直接上传你的复习大纲或重点图片，发送：
    > **“这是我的【马原】复习大纲，请遵循刚才安装的 `universal-exam-cram-coach` 技能，在后台解析大纲并自动初始化我的备考 Wiki 空间。”**
    * *AI 行为：AI 将自动大纲解析、完成 Wiki 物理切片和进度计划生成。你只需要跟着 AI 的节奏答题复习即可！*
+
+> **📌 多入口说明**：本技能提供多个入口文件适配不同代理——根 `SKILL.md`（默认兼容入口）、`skills/exam-cram/SKILL.md`（模块化主入口，与根 SKILL.md 描述同一行为）、`AGENTS.md`（一屏兜底契约）。详见 [`docs/agent-portability.md`](docs/agent-portability.md)。
 
 ---
 
@@ -195,13 +226,16 @@ python scripts/validate_workspace.py path/to/workspace
 
 ## 💻 智能助手软件兼容性矩阵
 
-本技能在各大主流 AI 开发软件中的运行效果如下：
+本技能在各大主流 AI 开发软件中的运行效果如下（详细加载方式见 [`docs/agent-portability.md`](docs/agent-portability.md)）：
 
-| AI 客户端 | 物理文件锁定支持度 | Python 脚本运行支持 | 零基础推荐度 | 使用方式 |
-| :--- | :---: | :---: | :---: | :--- |
-| **Cursor / VS Code / Windsurf (Gemini / Antigravity 等)** | ⭐⭐⭐⭐⭐<br>(完美) | ⭐⭐⭐⭐⭐<br>(自动) | ⭐⭐⭐⭐⭐<br>(极力推荐) | AI 能在侧边栏直接写盘，文件结构清晰可见。完美支持终端自动执行脚本。 |
-| **Claude Code / Devin / Codex (终端 CLI / 自主智能体)** | ⭐⭐⭐⭐⭐<br>(完美) | ⭐⭐⭐⭐⭐<br>(自动) | ⭐⭐⭐⭐☆<br>(适合有终端环境的小白) | 具备极强的自主文件修改与工具执行权限，克隆项目、运行脚本极快。 |
-| **网页端 AI (ChatGPT / Claude / Gemini / 豆包等)** | ⭐⭐☆☆☆<br>(受限) | ❌<br>(网页端不支持) | ⭐⭐⭐⭐☆<br>(一键复制平替) | 网页端无法修改本地文件。**强烈推荐直接复制使用 [prompts/web_prompt.md](prompts/web_prompt.md) 中的【网页端平替备考提示词】**，发送给网页 AI 即可免配置完美体验核心功能！ |
+| AI 客户端 | 加载层级 | 读取的入口文件 | 物理文件锁定 | Python 脚本 | 使用方式 |
+| :--- | :---: | :--- | :---: | :---: | :--- |
+| **Claude Code** | 技能层 | 根 `SKILL.md` 或 `skills/*` | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | 项目内 `.claude/skills/` 或全局 `~/.claude/skills/` 安装，完美支持文件写盘与脚本执行。 |
+| **Cursor / VS Code / Windsurf** | 指令层 | `AGENTS.md`（或未来项目规则） | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | AI 在侧边栏直接写盘，文件结构清晰可见。`AGENTS.md` 作防幻觉规则兜底。 |
+| **Codex** | 技能/指令层 | `AGENTS.md` / `skills/*` | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | `AGENTS.md` 作指令兜底，或作为技能包加载 `skills/`。 |
+| **Devin / Antigravity** | 技能/指令层 | `AGENTS.md` / `skills/*` | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | 自主文件修改与工具执行权限强，克隆项目、运行脚本极快。 |
+| **网页端 AI (ChatGPT / Claude / Gemini / 豆包等)** | 提示词 | [`prompts/web_prompt.md`](prompts/web_prompt.md) | ⭐⭐☆☆☆ | ❌ | 网页端无法修改本地文件。**强烈推荐直接复制使用网页端平替备考提示词**，已含 V2.1 来源标注与防编题规则。 |
+| **其他通用代理** | 指令层 | `AGENTS.md` | 视 host | 视 host | 一屏浓缩兜底契约，适配任意支持项目规则/指令的代理。 |
 
 ---
 

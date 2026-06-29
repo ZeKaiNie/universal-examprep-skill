@@ -92,8 +92,7 @@ def block(lang, S):
     tr = lambda zh, eng: eng if en else zh
     mx = S["matrix"]; conv = S.get("convergence") or {}
     o = [f'<div id="{lang}">']
-    o.append(f'<h1>{tr("装了这个备考 skill，AI 真的更少「胡编」吗？——MIT 6.006 实测",
-                         "Does the exam-prep skill cut hallucination? A MIT 6.006 benchmark")}</h1>')
+    o.append(f'<h1>{tr("装了这个备考 skill，AI 真的更少「胡编」吗？——MIT 6.006 实测", "Does the exam-prep skill cut hallucination? A MIT 6.006 benchmark")}</h1>')
     # 方法
     ni = S["n_items"]
     zh_m = f"测法：同一套金标题（{ni} 题，全部锚定 MIT 6.006 官方讲义/习题），让 3 个模型在 3 种条件下作答——"
@@ -104,6 +103,7 @@ def block(lang, S):
     o.append(f'<li><b>{tr("裸文件 + 通用 agent","Raw files + plain agent")}</b>：{tr("把原始讲义/习题文件放进一个文件夹，模型用通用文件工具（读取/检索）按需查阅——但没有本技能。这是最公平的对照基线。","raw lecture / problem-set files in a folder; the model reads/greps them on demand with generic file tools — but WITHOUT the skill. The fairest baseline.")}</li>')
     o.append(f'<li><b>{tr("使用本技能","With the skill")}</b>：{tr("课件先被整理成分章节知识库，模型按需取相关章节（本技能的机制）。","the course pre-built into a chaptered wiki the skill retrieves from on demand.")}</li>')
     o.append(f'<li class="muted">{tr("（另设一个 naive 对照：把整门课全文一股脑塞进提问——见正确率表下方脚注。）","(A naive control — dumping the whole course into one prompt — is discussed in the footnote below the table.)")}</li>')
+
     o.append("</ul>")
     # 头条
     rf = mx.get("haiku|rawfiles"); sk = mx.get("haiku|skill"); cb = mx.get("haiku|closedbook")
@@ -140,7 +140,7 @@ def block(lang, S):
     # 成本对比（同等精度下，本技能比裸文件 agent 更省）
     cost = S.get("cost_per_q", {}).get("algo", {})
     if cost.get("skill"):
-        o.append(f'<h3 style="font-size:16px;margin-top:18px">{tr("💵 平均每题成本（同精度下更省才是 skill 的差异）","💵 Cost per question (the skill\'s real edge: same accuracy, lower cost)")}</h3>')
+        o.append(f"""<h3 style="font-size:16px;margin-top:18px">{tr("💵 平均每题成本（同精度下更省才是 skill 的差异）","💵 Cost per question (the skill's real edge: same accuracy, lower cost)")}</h3>""")
         o.append('<table><tr>' + "".join(f'<th>{tr(z,e)}</th>' for _, z, e, _ in ARMS) + "</tr><tr>"
                  + "".join(f'<td>${cost.get(ak)}</td>' for ak, *_ in ARMS) + "</tr></table>")
         o.append('<p class="muted">' + tr(

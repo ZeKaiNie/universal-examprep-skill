@@ -5,8 +5,7 @@
 <div class='langbar'><button id='btn-zh' class='on' onclick="setLang('zh')">中文</button><button id='btn-en' onclick="setLang('en')">English</button></div>
 <div id="zh" class="langblock">
 <h1>这个备考 skill，真的更不容易「胡编」吗？——一份实测报告</h1>
-<div class="card warn">⚠️ 这是 <b>MOCK 占位运行</b>，下面的数字仅用于演示报告样式，<b>不是真实结论</b>。换上真实课件与题目重跑后才作数。</div>
-<div class="card">📌 <b>一句话结论：</b>装了 skill 后，幻觉率从 60% 降到 0%，差异在统计上站得住（不是运气）。</div>
+<div class="card">📌 <b>一句话结论：</b>装了 skill 这组明显更好（幻觉率 8% → 8%），但题量偏小，暂不能 100% 排除运气——属于「方向对、需更多题坐实」。</div>
 <p class="muted">怎么测的：拿同样的题，分别让「没装 skill 的普通 AI」和「装了 skill 的 AI」来答，再逐题对照你材料里的标准答案打分。同一道题两边都答，对比最公平。</p>
 <h2>📊 一眼看懂：两组对比</h2><svg viewBox="0 0 680 400" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
 <text x="340.0" y="28" text-anchor="middle" font-size="16" font-weight="700" fill="#202124">装了 skill vs 没装：各项指标对比（越高越好）</text>
@@ -16,26 +15,31 @@
 <text x="48" y="187.0" text-anchor="end" font-size="11" fill="#5f6368">50%</text>
 <line x1="56" y1="54.0" x2="656" y2="54.0" stroke="#e8eaed"/>
 <text x="48" y="58.0" text-anchor="end" font-size="11" fill="#5f6368">100%</text>
-<rect x="83.8" y="183.0" width="45.0" height="129.0" rx="3" fill="#9aa0a6"/>
-<text x="106.2" y="178.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">50%</text>
-<rect x="133.2" y="54.0" width="45.0" height="258.0" rx="3" fill="#1a7f64"/>
-<text x="155.8" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">100%</text>
-<text x="131.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">忠实度</text>
-<rect x="233.8" y="183.0" width="45.0" height="129.0" rx="3" fill="#9aa0a6"/>
-<text x="256.2" y="178.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">50%</text>
-<rect x="283.2" y="54.0" width="45.0" height="258.0" rx="3" fill="#1a7f64"/>
-<text x="305.8" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">100%</text>
-<text x="281.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">正确率</text>
-<rect x="383.8" y="312.0" width="45.0" height="0.0" rx="3" fill="#9aa0a6"/>
-<text x="406.2" y="307.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">0%</text>
-<rect x="433.2" y="54.0" width="45.0" height="258.0" rx="3" fill="#1a7f64"/>
-<text x="455.8" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">100%</text>
-<text x="431.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">越界弃答率</text>
-<rect x="533.8" y="208.8" width="45.0" height="103.2" rx="3" fill="#9aa0a6"/>
-<text x="556.2" y="203.8" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">40%</text>
-<rect x="583.2" y="54.0" width="45.0" height="258.0" rx="3" fill="#1a7f64"/>
-<text x="605.8" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">100%</text>
-<text x="581.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">无幻觉率</text>
+<rect x="78.2" y="88.4" width="36.0" height="223.6" rx="3" fill="#9aa0a6"/>
+<text x="96.2" y="83.4" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">87%</text>
+<rect x="117.8" y="62.6" width="36.0" height="249.4" rx="3" fill="#1a7f64"/>
+<text x="135.8" y="57.6" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">97%</text>
+<text x="116.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">忠实度</text>
+<rect x="198.2" y="79.8" width="36.0" height="232.2" rx="3" fill="#9aa0a6"/>
+<text x="216.2" y="74.8" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">90%</text>
+<rect x="237.8" y="54.0" width="36.0" height="258.0" rx="3" fill="#1a7f64"/>
+<text x="255.8" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">100%</text>
+<text x="236.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">正确率</text>
+<rect x="318.2" y="183.0" width="36.0" height="129.0" rx="3" fill="#9aa0a6"/>
+<text x="336.2" y="178.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">50%</text>
+<rect x="357.8" y="54.0" width="36.0" height="258.0" rx="3" fill="#1a7f64"/>
+<text x="375.8" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">100%</text>
+<text x="356.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">计算题准确率</text>
+<rect x="438.2" y="54.0" width="36.0" height="258.0" rx="3" fill="#9aa0a6"/>
+<text x="456.2" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">100%</text>
+<rect x="477.8" y="54.0" width="36.0" height="258.0" rx="3" fill="#1a7f64"/>
+<text x="495.8" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">100%</text>
+<text x="476.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">越界弃答率</text>
+<rect x="558.2" y="73.8" width="36.0" height="238.2" rx="3" fill="#9aa0a6"/>
+<text x="576.2" y="68.8" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">92%</text>
+<rect x="597.8" y="73.8" width="36.0" height="238.2" rx="3" fill="#1a7f64"/>
+<text x="615.8" y="68.8" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">92%</text>
+<text x="596.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">无幻觉率</text>
 <rect x="56" y="374" width="13" height="13" rx="2" fill="#9aa0a6"/>
 <text x="74" y="385" font-size="12" fill="#5f6368">没装 skill（基线）</text>
 <rect x="241" y="374" width="13" height="13" rx="2" fill="#1a7f64"/>
@@ -45,18 +49,18 @@
 <text x="340.0" y="26" text-anchor="middle" font-size="16" font-weight="700" fill="#202124">skill 带来的提升（点=实测，横线=95% 置信区间）</text>
 <line x1="367.0" y1="50" x2="367.0" y2="256" stroke="#5f6368" stroke-dasharray="4 3"/>
 <text x="367.0" y="278.0" text-anchor="middle" font-size="11" fill="#5f6368">0（没差别）</text>
-<line x1="484.3" y1="101.5" x2="555.7" y2="101.5" stroke="#1a7f64" stroke-width="3"/>
-<line x1="484.3" y1="95.5" x2="484.3" y2="107.5" stroke="#1a7f64" stroke-width="2"/>
+<line x1="367.0" y1="101.5" x2="555.7" y2="101.5" stroke="#1a7f64" stroke-width="3"/>
+<line x1="367.0" y1="95.5" x2="367.0" y2="107.5" stroke="#1a7f64" stroke-width="2"/>
 <line x1="555.7" y1="95.5" x2="555.7" y2="107.5" stroke="#1a7f64" stroke-width="2"/>
-<circle cx="520.0" cy="101.5" r="5" fill="#1a7f64"/>
+<circle cx="429.9" cy="101.5" r="5" fill="#1a7f64"/>
 <text x="138" y="105.5" text-anchor="end" font-size="12.5" fill="#202124">忠实度提升</text>
-<text x="563.7" y="105.5" font-size="11.5" font-weight="600" fill="#1a7f64">+60 个百分点</text>
-<line x1="484.3" y1="204.5" x2="555.7" y2="204.5" stroke="#1a7f64" stroke-width="3"/>
-<line x1="484.3" y1="198.5" x2="484.3" y2="210.5" stroke="#1a7f64" stroke-width="2"/>
-<line x1="555.7" y1="198.5" x2="555.7" y2="210.5" stroke="#1a7f64" stroke-width="2"/>
-<circle cx="520.0" cy="204.5" r="5" fill="#1a7f64"/>
+<text x="563.7" y="105.5" font-size="11.5" font-weight="600" fill="#1a7f64">+8 个百分点</text>
+<line x1="367.0" y1="204.5" x2="367.0" y2="204.5" stroke="#c0392b" stroke-width="3"/>
+<line x1="367.0" y1="198.5" x2="367.0" y2="210.5" stroke="#c0392b" stroke-width="2"/>
+<line x1="367.0" y1="198.5" x2="367.0" y2="210.5" stroke="#c0392b" stroke-width="2"/>
+<circle cx="367.0" cy="204.5" r="5" fill="#c0392b"/>
 <text x="138" y="208.5" text-anchor="end" font-size="12.5" fill="#202124">幻觉率下降</text>
-<text x="563.7" y="208.5" font-size="11.5" font-weight="600" fill="#1a7f64">+60 个百分点</text>
+<text x="375.0" y="208.5" font-size="11.5" font-weight="600" fill="#c0392b">+0 个百分点</text>
 </svg>
 <p class="muted">点是实测提升，横线是 95% 置信区间。横线<b>整段都在 0 右边</b>才能说「真有提升、不是运气」。题量越多，横线越短、结论越硬。</p>
 <h2>🔤 这些指标都是啥意思 & 出处</h2><ul>
@@ -67,64 +71,27 @@
 <li><b>越界弃答率</b>：材料没讲的问题，AI 有没有老实说“不知道”而不是硬编。越高越好——最能体现防幻觉。 <span class="muted">依据: <a href="https://arxiv.org/abs/2309.01431" target="_blank" rel="noopener">RGB negative rejection↗</a>, <a href="https://arxiv.org/abs/2411.04368" target="_blank" rel="noopener">SimpleQA abstention↗</a></span></li>
 </ul>
 <h2>🔢 详细数字</h2><table><tr><th class=l>指标</th><th>没装 skill</th><th>装了 skill</th></tr>
-<tr><td class=l>忠实度</td><td>50%</td><td>100%</td></tr>
-<tr><td class=l>幻觉率</td><td>60%</td><td>0%</td></tr>
-<tr><td class=l>正确率</td><td>50%</td><td>100%</td></tr>
-<tr><td class=l>计算题准确率</td><td>—</td><td>—</td></tr>
-<tr><td class=l>越界弃答率</td><td>0%</td><td>100%</td></tr>
+<tr><td class=l>忠实度</td><td>87%</td><td>97%</td></tr>
+<tr><td class=l>幻觉率</td><td>8%</td><td>8%</td></tr>
+<tr><td class=l>正确率</td><td>90%</td><td>100%</td></tr>
+<tr><td class=l>计算题准确率</td><td>50%</td><td>100%</td></tr>
+<tr><td class=l>越界弃答率</td><td>100%</td><td>100%</td></tr>
 </table>
-<p class="muted">题量=50；McNemar p=0.000；幻觉率差值 95% 区间 [-74, -46] 个百分点。 差异显著。</p>
+<p class="muted">题量=13；McNemar p=1.000；幻觉率差值 95% 区间 [+0, +0] 个百分点。 题量偏小、暂未达统计显著，按实测趋势看待、不夸大。</p>
 <h2>🧪 逐题明细</h2><table><tr><th>题号</th><th>类型</th><th>可答</th><th>base 幻觉</th><th>skill 幻觉</th></tr>
-<tr><td>psyc_01</td><td>factual</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_02</td><td>factual</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_03</td><td>factual</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_04</td><td>factual</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_05</td><td>definition</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_06</td><td>factual</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_07</td><td>factual</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_08</td><td>definition</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_09</td><td>factual</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_10</td><td>definition</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_11</td><td>definition</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_12</td><td>factual</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_13</td><td>definition</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_14</td><td>factual</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_15</td><td>definition</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_16</td><td>factual</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_17</td><td>factual</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_18</td><td>definition</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_19</td><td>definition</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_20</td><td>factual</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_21</td><td>factual</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_22</td><td>definition</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_23</td><td>factual</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_24</td><td>factual</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_25</td><td>factual</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_26</td><td>factual</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_27</td><td>definition</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_28</td><td>definition</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_29</td><td>factual</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_30</td><td>definition</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_31</td><td>factual</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_32</td><td>factual</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_33</td><td>factual</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_34</td><td>factual</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_35</td><td>factual</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_36</td><td>definition</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_37</td><td>factual</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_38</td><td>definition</td><td>是</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_39</td><td>factual</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_40</td><td>factual</td><td>是</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_p01</td><td>factual</td><td>否</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_p02</td><td>factual</td><td>否</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_p03</td><td>factual</td><td>否</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_p04</td><td>factual</td><td>否</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_p05</td><td>factual</td><td>否</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_p06</td><td>factual</td><td>否</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_p07</td><td>factual</td><td>否</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_p08</td><td>factual</td><td>否</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_p09</td><td>factual</td><td>否</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_p10</td><td>factual</td><td>否</td><td>❌</td><td>✅</td></tr>
+<tr><td>algo_q1</td><td>factual</td><td>是</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_q2</td><td>factual</td><td>是</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_q3</td><td>definition</td><td>是</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_q4</td><td>definition</td><td>是</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_q5</td><td>numeric</td><td>是</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_q6</td><td>numeric</td><td>是</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_q7</td><td>factual</td><td>是</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_q8</td><td>factual</td><td>是</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_q9</td><td>factual</td><td>是</td><td>❌</td><td>❌</td></tr>
+<tr><td>algo_q10</td><td>definition</td><td>是</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_u1</td><td>factual</td><td>否</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_u2</td><td>factual</td><td>否</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_u3</td><td>factual</td><td>否</td><td>✅</td><td>✅</td></tr>
 </table>
 <h2>📂 数据来源 Materials</h2>
 <p class="muted">测试材料全部取自名校公开课（MIT OpenCourseWare / Open Yale Courses，CC BY-NC-SA），仅本地用于评测、不二次分发：</p><ul>
@@ -148,8 +115,7 @@
 </div>
 <div id="en" class="langblock" hidden>
 <h1>Does this exam-prep skill really hallucinate less? A benchmark report</h1>
-<div class="card warn">⚠️ This is a <b>MOCK run</b>. The numbers below only demo the report layout and are <b>not real results</b> — rerun on real materials to get actual numbers.</div>
-<div class="card">📌 <b>Bottom line: </b>With the skill, the hallucination rate dropped from 60% to 0%, and the difference is statistically solid (not luck).</div>
+<div class="card">📌 <b>Bottom line: </b>The skill arm looks clearly better (hallucination 8% → 8%), but the sample is small, so luck isn&#x27;t fully ruled out yet — right direction, needs more items to confirm.</div>
 <p class="muted">How: the same questions are answered by a plain AI (no skill) and by the AI with the skill, then graded against your gold answers. Each item goes through both arms, for a fair paired comparison.</p>
 <h2>📊 At a glance: the two arms</h2><svg viewBox="0 0 680 400" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
 <text x="340.0" y="28" text-anchor="middle" font-size="16" font-weight="700" fill="#202124">With vs without the skill (higher is better)</text>
@@ -159,26 +125,31 @@
 <text x="48" y="187.0" text-anchor="end" font-size="11" fill="#5f6368">50%</text>
 <line x1="56" y1="54.0" x2="656" y2="54.0" stroke="#e8eaed"/>
 <text x="48" y="58.0" text-anchor="end" font-size="11" fill="#5f6368">100%</text>
-<rect x="83.8" y="183.0" width="45.0" height="129.0" rx="3" fill="#9aa0a6"/>
-<text x="106.2" y="178.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">50%</text>
-<rect x="133.2" y="54.0" width="45.0" height="258.0" rx="3" fill="#1a7f64"/>
-<text x="155.8" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">100%</text>
-<text x="131.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">Faithfulness</text>
-<rect x="233.8" y="183.0" width="45.0" height="129.0" rx="3" fill="#9aa0a6"/>
-<text x="256.2" y="178.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">50%</text>
-<rect x="283.2" y="54.0" width="45.0" height="258.0" rx="3" fill="#1a7f64"/>
-<text x="305.8" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">100%</text>
-<text x="281.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">Correctness</text>
-<rect x="383.8" y="312.0" width="45.0" height="0.0" rx="3" fill="#9aa0a6"/>
-<text x="406.2" y="307.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">0%</text>
-<rect x="433.2" y="54.0" width="45.0" height="258.0" rx="3" fill="#1a7f64"/>
-<text x="455.8" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">100%</text>
-<text x="431.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">Abstention (out-of-scope)</text>
-<rect x="533.8" y="208.8" width="45.0" height="103.2" rx="3" fill="#9aa0a6"/>
-<text x="556.2" y="203.8" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">40%</text>
-<rect x="583.2" y="54.0" width="45.0" height="258.0" rx="3" fill="#1a7f64"/>
-<text x="605.8" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">100%</text>
-<text x="581.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">Non-hallucination</text>
+<rect x="78.2" y="88.4" width="36.0" height="223.6" rx="3" fill="#9aa0a6"/>
+<text x="96.2" y="83.4" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">87%</text>
+<rect x="117.8" y="62.6" width="36.0" height="249.4" rx="3" fill="#1a7f64"/>
+<text x="135.8" y="57.6" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">97%</text>
+<text x="116.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">Faithfulness</text>
+<rect x="198.2" y="79.8" width="36.0" height="232.2" rx="3" fill="#9aa0a6"/>
+<text x="216.2" y="74.8" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">90%</text>
+<rect x="237.8" y="54.0" width="36.0" height="258.0" rx="3" fill="#1a7f64"/>
+<text x="255.8" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">100%</text>
+<text x="236.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">Correctness</text>
+<rect x="318.2" y="183.0" width="36.0" height="129.0" rx="3" fill="#9aa0a6"/>
+<text x="336.2" y="178.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">50%</text>
+<rect x="357.8" y="54.0" width="36.0" height="258.0" rx="3" fill="#1a7f64"/>
+<text x="375.8" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">100%</text>
+<text x="356.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">Numeric accuracy</text>
+<rect x="438.2" y="54.0" width="36.0" height="258.0" rx="3" fill="#9aa0a6"/>
+<text x="456.2" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">100%</text>
+<rect x="477.8" y="54.0" width="36.0" height="258.0" rx="3" fill="#1a7f64"/>
+<text x="495.8" y="49.0" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">100%</text>
+<text x="476.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">Abstention (out-of-scope)</text>
+<rect x="558.2" y="73.8" width="36.0" height="238.2" rx="3" fill="#9aa0a6"/>
+<text x="576.2" y="68.8" text-anchor="middle" font-size="11.5" font-weight="600" fill="#9aa0a6">92%</text>
+<rect x="597.8" y="73.8" width="36.0" height="238.2" rx="3" fill="#1a7f64"/>
+<text x="615.8" y="68.8" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a7f64">92%</text>
+<text x="596.0" y="330.0" text-anchor="middle" font-size="11.5" fill="#202124">Non-hallucination</text>
 <rect x="56" y="374" width="13" height="13" rx="2" fill="#9aa0a6"/>
 <text x="74" y="385" font-size="12" fill="#5f6368">Without skill (baseline)</text>
 <rect x="241" y="374" width="13" height="13" rx="2" fill="#1a7f64"/>
@@ -188,18 +159,18 @@
 <text x="340.0" y="26" text-anchor="middle" font-size="16" font-weight="700" fill="#202124">Improvement from the skill (dot = measured, bar = 95% CI)</text>
 <line x1="367.0" y1="50" x2="367.0" y2="256" stroke="#5f6368" stroke-dasharray="4 3"/>
 <text x="367.0" y="278.0" text-anchor="middle" font-size="11" fill="#5f6368">0 (no difference)</text>
-<line x1="484.3" y1="101.5" x2="555.7" y2="101.5" stroke="#1a7f64" stroke-width="3"/>
-<line x1="484.3" y1="95.5" x2="484.3" y2="107.5" stroke="#1a7f64" stroke-width="2"/>
+<line x1="367.0" y1="101.5" x2="555.7" y2="101.5" stroke="#1a7f64" stroke-width="3"/>
+<line x1="367.0" y1="95.5" x2="367.0" y2="107.5" stroke="#1a7f64" stroke-width="2"/>
 <line x1="555.7" y1="95.5" x2="555.7" y2="107.5" stroke="#1a7f64" stroke-width="2"/>
-<circle cx="520.0" cy="101.5" r="5" fill="#1a7f64"/>
+<circle cx="429.9" cy="101.5" r="5" fill="#1a7f64"/>
 <text x="138" y="105.5" text-anchor="end" font-size="12.5" fill="#202124">Faithfulness gain</text>
-<text x="563.7" y="105.5" font-size="11.5" font-weight="600" fill="#1a7f64">+60 pts</text>
-<line x1="484.3" y1="204.5" x2="555.7" y2="204.5" stroke="#1a7f64" stroke-width="3"/>
-<line x1="484.3" y1="198.5" x2="484.3" y2="210.5" stroke="#1a7f64" stroke-width="2"/>
-<line x1="555.7" y1="198.5" x2="555.7" y2="210.5" stroke="#1a7f64" stroke-width="2"/>
-<circle cx="520.0" cy="204.5" r="5" fill="#1a7f64"/>
+<text x="563.7" y="105.5" font-size="11.5" font-weight="600" fill="#1a7f64">+8 pts</text>
+<line x1="367.0" y1="204.5" x2="367.0" y2="204.5" stroke="#c0392b" stroke-width="3"/>
+<line x1="367.0" y1="198.5" x2="367.0" y2="210.5" stroke="#c0392b" stroke-width="2"/>
+<line x1="367.0" y1="198.5" x2="367.0" y2="210.5" stroke="#c0392b" stroke-width="2"/>
+<circle cx="367.0" cy="204.5" r="5" fill="#c0392b"/>
 <text x="138" y="208.5" text-anchor="end" font-size="12.5" fill="#202124">Hallucination drop</text>
-<text x="563.7" y="208.5" font-size="11.5" font-weight="600" fill="#1a7f64">+60 pts</text>
+<text x="375.0" y="208.5" font-size="11.5" font-weight="600" fill="#c0392b">+0 pts</text>
 </svg>
 <p class="muted">The dot is the measured gain; the bar is the 95% CI. Only when the whole bar sits right of 0 can we claim a real gain. More items → shorter bar → firmer conclusion.</p>
 <h2>🔤 What each metric means & its source</h2><ul>
@@ -210,64 +181,27 @@
 <li><b>Abstention (out-of-scope)</b>：On questions the materials don&#x27;t cover, whether the AI honestly says ‘not covered’ instead of fabricating. Higher is better — the clearest sign of anti-hallucination. <span class="muted">Basis: <a href="https://arxiv.org/abs/2309.01431" target="_blank" rel="noopener">RGB negative rejection↗</a>, <a href="https://arxiv.org/abs/2411.04368" target="_blank" rel="noopener">SimpleQA abstention↗</a></span></li>
 </ul>
 <h2>🔢 Detailed numbers</h2><table><tr><th class=l>Metric</th><th>Without skill</th><th>With skill</th></tr>
-<tr><td class=l>Faithfulness</td><td>50%</td><td>100%</td></tr>
-<tr><td class=l>Hallucination rate</td><td>60%</td><td>0%</td></tr>
-<tr><td class=l>Correctness</td><td>50%</td><td>100%</td></tr>
-<tr><td class=l>Numeric accuracy</td><td>—</td><td>—</td></tr>
-<tr><td class=l>Abstention (out-of-scope)</td><td>0%</td><td>100%</td></tr>
+<tr><td class=l>Faithfulness</td><td>87%</td><td>97%</td></tr>
+<tr><td class=l>Hallucination rate</td><td>8%</td><td>8%</td></tr>
+<tr><td class=l>Correctness</td><td>90%</td><td>100%</td></tr>
+<tr><td class=l>Numeric accuracy</td><td>50%</td><td>100%</td></tr>
+<tr><td class=l>Abstention (out-of-scope)</td><td>100%</td><td>100%</td></tr>
 </table>
-<p class="muted">n=50；McNemar p=0.000；hallucination-rate 95% CI [-74, -46] pts. Significant.</p>
+<p class="muted">n=13；McNemar p=1.000；hallucination-rate 95% CI [+0, +0] pts. Sample small; not yet statistically significant — read as a trend, no over-claiming.</p>
 <h2>🧪 Per-item</h2><table><tr><th>ID</th><th>Type</th><th>Answerable</th><th>base halluc.</th><th>skill halluc.</th></tr>
-<tr><td>psyc_01</td><td>factual</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_02</td><td>factual</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_03</td><td>factual</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_04</td><td>factual</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_05</td><td>definition</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_06</td><td>factual</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_07</td><td>factual</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_08</td><td>definition</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_09</td><td>factual</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_10</td><td>definition</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_11</td><td>definition</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_12</td><td>factual</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_13</td><td>definition</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_14</td><td>factual</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_15</td><td>definition</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_16</td><td>factual</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_17</td><td>factual</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_18</td><td>definition</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_19</td><td>definition</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_20</td><td>factual</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_21</td><td>factual</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_22</td><td>definition</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_23</td><td>factual</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_24</td><td>factual</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_25</td><td>factual</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_26</td><td>factual</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_27</td><td>definition</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_28</td><td>definition</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_29</td><td>factual</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_30</td><td>definition</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_31</td><td>factual</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_32</td><td>factual</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_33</td><td>factual</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_34</td><td>factual</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_35</td><td>factual</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_36</td><td>definition</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_37</td><td>factual</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_38</td><td>definition</td><td>Y</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_39</td><td>factual</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_40</td><td>factual</td><td>Y</td><td>✅</td><td>✅</td></tr>
-<tr><td>psyc_p01</td><td>factual</td><td>N</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_p02</td><td>factual</td><td>N</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_p03</td><td>factual</td><td>N</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_p04</td><td>factual</td><td>N</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_p05</td><td>factual</td><td>N</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_p06</td><td>factual</td><td>N</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_p07</td><td>factual</td><td>N</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_p08</td><td>factual</td><td>N</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_p09</td><td>factual</td><td>N</td><td>❌</td><td>✅</td></tr>
-<tr><td>psyc_p10</td><td>factual</td><td>N</td><td>❌</td><td>✅</td></tr>
+<tr><td>algo_q1</td><td>factual</td><td>Y</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_q2</td><td>factual</td><td>Y</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_q3</td><td>definition</td><td>Y</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_q4</td><td>definition</td><td>Y</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_q5</td><td>numeric</td><td>Y</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_q6</td><td>numeric</td><td>Y</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_q7</td><td>factual</td><td>Y</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_q8</td><td>factual</td><td>Y</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_q9</td><td>factual</td><td>Y</td><td>❌</td><td>❌</td></tr>
+<tr><td>algo_q10</td><td>definition</td><td>Y</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_u1</td><td>factual</td><td>N</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_u2</td><td>factual</td><td>N</td><td>✅</td><td>✅</td></tr>
+<tr><td>algo_u3</td><td>factual</td><td>N</td><td>✅</td><td>✅</td></tr>
 </table>
 <h2>📂 Materials</h2>
 <p class="muted">All test materials are public open-courseware (MIT OpenCourseWare / Open Yale Courses, CC BY-NC-SA), used locally for evaluation and not redistributed:</p><ul>

@@ -9,5 +9,8 @@
   "judge_model": "",
   "allowed_tools": "Read Glob Grep",
   "judge_repeats": 3,
-  "mock": false
+  "mock": false,
+  "gemini_api_key": "",
+  "openai_api_key": "",
+  "openai_api_base": "https://api.deepseek.com/v1"
 }
