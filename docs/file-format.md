@@ -73,7 +73,9 @@
 
 ## 4. 资源依赖与原页引用 (asset-aware fields)
 
-讲义里很多 **Quiz / Example** 题依赖一张图：文氏图（Venn）、页内插图、表格等。题面文字本身不足以独立成题——**不显示那张图，学生根本无法作答**。为此题库项新增一组**可选、向后兼容**字段（老题库不带这些字段仍然有效）。配套的 **PDF 扫描器在下一个 PR（P0B）产出这些字段**；本规范只定义数据模型与安全规则，并让校验器 / 出题**fail-closed**。
+讲义里很多 **Quiz / Example** 题依赖一张图：文氏图（Venn）、页内插图、表格等。题面文字本身不足以独立成题——**不显示那张图，学生根本无法作答**。为此题库项新增一组**可选、向后兼容**字段（老题库不带这些字段仍然有效）。配套的官方入口 **[`scripts/build_raw_input_from_workspace.py`](../scripts/build_raw_input_from_workspace.py) 从 PDF 材料产出这些字段**（整页渲染成 asset、保留原页出处、抽取 Example/Quiz 题—解对）；校验器与出题在缺图时**fail-closed**。
+
+> 官方流程（脚本随 `python` 调用，无需可执行位）：`python scripts/build_raw_input_from_workspace.py --materials <dir> --out raw_input.json --asset-root <ws>/references/assets` → `python scripts/ingest.py -i raw_input.json -o <ws>` → `python scripts/validate_workspace.py <ws>`。PDF 文本/渲染为**可选依赖**——文本 `pip install pypdf`；渲染 `pip install pymupdf`（自带 PNG）或 `pypdfium2 Pillow`（缺 Pillow 时 pypdfium2 不算渲染后端）。缺依赖会清晰报错；纯 `.txt/.md` 无需依赖。渲染须用 `--asset-root` 指向 `<ws>/references/assets`，否则 auto 跳过渲染并告警、required 报错。
 
 ### 题项新增可选字段
 

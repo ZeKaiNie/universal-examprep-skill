@@ -179,6 +179,7 @@ python scripts/validate_workspace.py path/to/workspace
   * 📂 `exam-help/`：速查卡（一屏看懂工作流 / 模式 / 文件约定）
   * 📂 `confusion-tracker/`：概念疑难点追踪——被 `exam-tutor` / `exam-review` 调用，自动把概念疑惑记录到进度表（已并入 `skills/`，模块化安装时不会再丢）。
 * 📂 **`scripts/`**：自动化脚本。
+  * 🐍 `build_raw_input_from_workspace.py`：**【官方课程材料入口】** —— 把一文件夹的讲义/作业 **PDF** 扫成 `ingest.py` 用的 `raw_input.json`：保留**原页出处**、把依赖图的页**整页渲染成 PNG asset**、抽取讲义 **Example/Quiz 题—解对**进题库、并产出解析报告。让 AI 不必再手写临时解析脚本而丢图丢题。PDF 文本/渲染为**可选依赖**（文本 `pip install pypdf`；渲染 `pip install pymupdf` 或 `pypdfium2 Pillow`，缺失会清晰报错）；纯 `.txt/.md` 无需依赖。官方流程：`build_raw_input_from_workspace.py → ingest.py → validate_workspace.py`（详见 [`docs/file-format.md`](docs/file-format.md) §4）。
   * 🐍 `ingest.py`：**【一键环境初始化脚本】** —— 由 AI 助手在后台自动调用，负责一键切分 Wiki 章节、题库并部署进度表。
   * 🐍 `validate_workspace.py`：**【工作区校验器】** —— 静态校验已建工作区的结构、题库 schema、来源标注与路径安全（纯标准库，零成本）。
 * 📂 **`docs/`**：架构与策略文档。
