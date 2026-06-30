@@ -58,4 +58,4 @@ Trigger when all study phases are basically cleared and review is wrapping up, O
 
 ## Boundaries
 - Do not put content into the cram sheet that the materials do not cover unless it is tagged 🟡 or ⚠️.
-- The cram sheet is a compression, not a replacement for systematic review, and not a shortcut around the anti-hallucination protocol.
+- The cram sheet is a compression, not a replacement for systematic review, and not a shortcut around the source-labeling and quiz_bank-only rules.

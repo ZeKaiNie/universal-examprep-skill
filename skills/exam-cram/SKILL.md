@@ -52,7 +52,7 @@ After each learning or checkpoint event, update `study_progress.md` (phase, chec
 
 ### Modes
 
-Selected by `argument-hint` or the user's tone; modes change emphasis only, not the workflow ladder or the anti-hallucination protocol:
+Selected by `argument-hint` or the user's tone; modes change emphasis only, not the workflow ladder or the source-labeling / quiz_bank-only rules:
 
 - **normal** — concept review plus drilling, balanced (default).
 - **sprint** — attack only high-frequency / high-score chapters and question types; less lecturing, more drilling.
@@ -97,7 +97,7 @@ This coordinator orchestrates the following single-responsibility subskills (eac
 | 子技能 | 何时用 |
 | --- | --- |
 | [`exam-ingest`](../exam-ingest/SKILL.md) | 工作区缺失：从学生材料初始化 LLM Wiki + 题库 + 进度 |
-| [`exam-tutor`](../exam-tutor/SKILL.md) | 讲解当前 wiki 章节（含零基础重点题精讲、画图题协议） |
+| [`exam-tutor`](../exam-tutor/SKILL.md) | 讲解当前 wiki 章节（含零基础重点题精讲、画图先跑算法） |
 | [`exam-quiz`](../exam-quiz/SKILL.md) | 从题库抽题判分，支持 6 大题型 |
 | [`exam-review`](../exam-review/SKILL.md) | 错题与概念疑难点复盘（与 `confusion-tracker` 协同） |
 | [`exam-cheatsheet`](../exam-cheatsheet/SKILL.md) | 生成考前速记小抄 / 总复习走查 |
@@ -107,5 +107,5 @@ This coordinator orchestrates the following single-responsibility subskills (eac
 
 > 注：`confusion-tracker`（被 `exam-review` / `exam-tutor` 用来记录概念疑难点）现位于 [`skills/confusion-tracker/SKILL.md`](../confusion-tracker/SKILL.md)，与其他子技能同级——加载 `skills/` 时即一并带上，不会再静默丢失「💡 概念疑难点记录」能力。
 >
-> 兼容性：根目录 `SKILL.md` 仍是默认/兼容入口，承载完整防幻觉协议；本文件是同一行为的模块化主入口。
+> 兼容性：根目录 `SKILL.md` 仍是默认/兼容入口，承载完整防编题与来源标注规则；本文件是同一行为的模块化主入口。
 > 通用代理的一屏速记见根目录 `AGENTS.md`。

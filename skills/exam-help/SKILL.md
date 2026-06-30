@@ -31,7 +31,7 @@ None. Take no files, no arguments, no workspace state. Emit the static card belo
 - Student-facing output defaults to Simplified Chinese unless the user asks otherwise.
 
 ## Student-facing Output
-一屏看懂这套备考技能。详细协议见根目录 `SKILL.md` 与各子技能。
+一屏看懂这套备考技能。详细规则见根目录 `SKILL.md` 与各子技能。
 
 ### 四步工作流
 1. **建库**（`exam-ingest`）：上传资料 → 自动建 wiki + 题库 + 进度。

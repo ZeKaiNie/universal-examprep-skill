@@ -15,7 +15,7 @@
   - 架构文档 `docs/`（skill-architecture / agent-portability / language-policy / file-format）；
   - 测试扩展（覆盖 ingest、工作区校验、技能结构、语言策略、控制层双语、技能集合自洽）+ CI 矩阵（Ubuntu/Windows × Python 3.8/3.12）。
 - **防幻觉实测（benchmark）公平性改进**：加「裸文件 + 通用 agent」对照、成本维度、人工 kappa 校准。
-- **confusion-tracker 并入 `skills/`**：疑难点追踪不再是 `skills/` 之外的外部依赖。
+- **confusion-tracker 并入 `skills/`**（`skills/confusion-tracker/SKILL.md`）：疑难点追踪不再是 `skills/` 之外的外部依赖；随后清理删除了根目录遗留的 `confusion-tracker/` 兼容文件夹（迁移说明只保留在本 CHANGELOG，不再保留持久根文件夹）。
 
 ## V2.0
 

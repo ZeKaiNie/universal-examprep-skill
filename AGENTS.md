@@ -1,7 +1,7 @@
 # AGENTS.md — Exam Cram Coach（通用代理一屏速记 / compact fallback）
 
 > 给**不读完整 SKILL.md** 的通用代理（Codex、Cursor/Windsurf 规则、Antigravity、网页/CLI 代理等）的浓缩契约。
-> 完整协议见根目录 `SKILL.md` 或 `skills/exam-cram/SKILL.md`；这一屏是其防幻觉核心的可执行底线。
+> 完整规则见根目录 `SKILL.md` 或 `skills/exam-cram/SKILL.md`；这一屏是其防幻觉核心的可执行底线。
 
 这是一个**临考极速备考教练**：把学生上传的课件/老师重点/真题建成分章节 LLM Wiki 与标准题库，
 按章授课、抽题判分、复盘错题、出考前小抄，并把进度固化到本地文件以防长会话漂移与编题。
@@ -28,5 +28,5 @@
 ## 语言 / Language
 学生可见输出（讲解 / 判分 / 复盘 / 小抄 / 进度）默认**简体中文**，除非用户另有要求；控制指令保持英文 / 精确。详见 `docs/language-policy.md`。
 
-## 完整协议
+## 完整规则
 读 `skills/exam-cram/SKILL.md`（主技能）+ 其余 `skills/*/SKILL.md` 子技能（ingest / tutor / quiz / review / cheatsheet / audit / help / confusion-tracker），或根目录 `SKILL.md`。本文件是它们的对齐浓缩版，规则措辞应与之保持一致。

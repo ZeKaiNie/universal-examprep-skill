@@ -28,9 +28,12 @@ class ConfusionTrackerMoveTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(ROOT, "skills", "confusion-tracker", "SKILL.md")),
                         "skills/confusion-tracker/SKILL.md 不存在")
 
-    def test_no_functional_skill_at_repo_root(self):
+    def test_no_root_confusion_tracker_folder(self):
+        # the legacy root confusion-tracker/ folder is removed entirely; confusion tracking lives in skills/
+        self.assertFalse(os.path.isdir(os.path.join(ROOT, "confusion-tracker")),
+                         "根目录 confusion-tracker/ 文件夹应已删除（疑难追踪现只在 skills/confusion-tracker/）")
         self.assertFalse(os.path.isfile(os.path.join(ROOT, "confusion-tracker", "SKILL.md")),
-                         "根目录仍残留可运行的 confusion-tracker/SKILL.md（应只剩 README 兼容说明）")
+                         "根目录不应再有 confusion-tracker/SKILL.md")
 
     def test_frontmatter_valid_and_name_preserved(self):
         fm = frontmatter(read("skills", "confusion-tracker", "SKILL.md"))

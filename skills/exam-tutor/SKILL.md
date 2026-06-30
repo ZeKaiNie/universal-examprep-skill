@@ -2,7 +2,7 @@
 name: exam-tutor
 description: >
   按章节惰性加载授课：每次只读当前阶段的一个 wiki 章节文件来讲，用生活隐喻讲概念、解剖公式，
-  对零基础学生切换为「重点题精讲」，对画图题走确定性「先跑算法再画图」协议，并严格标注知识来源。
+  对零基础学生切换为「重点题精讲」，对画图题走确定性「先跑算法再画图」流程，并严格标注知识来源。
   当用户在某一复习阶段需要把当前章节讲懂、或要求精讲老师勾的重点题时使用。
 license: MIT
 ---
@@ -25,7 +25,7 @@ Teach exactly one current wiki chapter. Explain concepts with real-life metaphor
 1. **Lazy-load one slice.** Call `view_file` on exactly ONE current chapter file `references/wiki/chN_*.md`. Never read the whole book and never load the entire library into context. If the chapter file is missing, abstain and tell the student which file is absent; do not fabricate content.
 2. **Teach with metaphor and formula dissection.** Give each concept one concrete real-life metaphor. For STEM material, dissect every formula: state each symbol's physical meaning and unit, then give one minimal hand-computable example.
 3. **Zero-basic key-question mode.** When the student says they have barely studied, walk each teacher-flagged key question in order and output these four blocks: 【考点拆解】 (what it tests) + 【标准答题模板/步骤】 (standard answer template/steps) + 【易错点】 (common mistakes) + 【3 分钟速记口诀】 (3-minute memory hook). Aim for an answer framework the student can reproduce from memory in the exam.
-4. **Diagram protocol.** For binary tree / AVL / red-black tree / B-tree / graph traversal / state machine diagrams, do not freehand from memory. First write and actually run the standard algorithm in Python (`matplotlib`/`graphviz`) to obtain the structure, then render it to an image. Tell the student "按通用教科书画法，老师有特殊要求以老师为准" (drawn per standard textbook convention; defer to the teacher for special requirements). If Python is unavailable, describe each step in ASCII/Mermaid and label it "未经程序验证" (not program-verified).
+4. **Diagram — run the algorithm first.** For binary tree / AVL / red-black tree / B-tree / graph traversal / state machine diagrams, do not freehand from memory. First write and actually run the standard algorithm in Python (`matplotlib`/`graphviz`) to obtain the structure, then render it to an image. Tell the student "按通用教科书画法，老师有特殊要求以老师为准" (drawn per standard textbook convention; defer to the teacher for special requirements). If Python is unavailable, describe each step in ASCII/Mermaid and label it "未经程序验证" (not program-verified).
 5. **Provenance labels.** Label every segment using the canonical markers (see [`docs/language-policy.md`](../../docs/language-policy.md)): 🟢 来自资料 for material-sourced content / 🟡 AI补充，可能与你老师讲的不完全一致 for AI additions. When the teacher did not provide the answer and the AI supplies it, label it ⚠️ AI生成答案，非老师/教材提供.
 6. **Confusion tracking.** When the student asks follow-up concept questions (why / what / how derived), invoke `confusion-tracker` to record the confusion point into `study_progress.md`.
 7. **Update progress.** After teaching the chapter, set its checkpoint status in `study_progress.md`, then hand control back to `exam-cram`.
