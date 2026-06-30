@@ -10,10 +10,13 @@
 
 ## 设计（为什么这么测）
 
-- **配对实验**：同一道金标题，分别过两臂——
-  - **baseline**：普通 `claude -p`，只给原始材料，要求"材料没有就说不知道"。
-  - **skill**：在 `skill_workspace/` 里跑 `claude -p`，skill 已激活、`references/wiki/` + `quiz_bank.json`
-    文件锁定知识库已建好（即 skill"读取而非现场推导"的防幻觉机制）。
+- **配对实验**：同一道金标题，分别过**主对照三臂（primary matrix arms）**——
+  - **`closedbook`**：提示里不给任何课程材料，只靠模型自身知识答（防幻觉下限对照）。
+  - **`rawfiles`**：把原始讲义/习题文件放进一个文件夹，模型用通用文件读取/检索工具按需查阅，但**不装本技能**。这是最公平的对照——直接回答「丢个文件夹给 AI 自己读不就行了，还要技能干嘛」。
+  - **`skill`**：在 `skill_workspace/` 里跑 `claude -p`，skill 已激活、`references/wiki/` + `quiz_bank.json`
+    文件锁定知识库已建好（即「读取相关章节而非现场推导」的防幻觉机制）。
+- **遗留/压力臂（legacy / stress footnote，非主对照）**：
+  - **`material` / dump-all**：把整门课全文一股脑塞进一次提问。它**不是公平对照**，仅保留为压力脚注——实测表明全文 dump 会淹没弱模型（Haiku）、且常触发上下文/用量上限而跑崩，恰好印证「整本贴进去」不可行。早期 `run_benchmark.py` 的 `baseline`（只给原始材料）即属此类，已被更公平的 `rawfiles` 取代为主对照。
 - **驱动方式**：直接调 **Claude Code 无头模式 `claude -p`**，用你登录的**订阅**身份，**不需要 API key**。
   （注意：**不要用 `--bare`**——它反而需要 API key，且会跳过 skill / CLAUDE.md 加载。）Codex 买了之后把
   生成器换成 `codex exec` 即可做跨 CLI 对比，其余不用动。
@@ -41,7 +44,7 @@
    ```
    用浏览器打开 `results/report.html` 看看产物长什么样（**中英双语、带图表和指标出处引用**；数字是占位的，仅验证管线）。
 
-1. **放材料**：把课件/作业丢进 `materials/<课程>/`，并生成 `materials/_combined.txt`（基线臂用）。见 `materials/README.md`。
+1. **放材料**：把课件/作业丢进 `materials/<课程>/`；如要跑遗留/压力臂，再生成 `materials/_combined.txt`（**仅 `material`/dump-all 脚注臂读它**；主对照三臂 `closedbook`/`rawfiles`/`skill` 都不读它）。见 `materials/README.md`。
 
 2. **建 skill 知识库**：在 `skill_workspace/` 里用 skill 把材料切成 `references/wiki/` + `references/quiz_bank.json`。见 `skill_workspace/README.md`。
 
@@ -50,10 +53,16 @@
 4. **配置**：复制 `config.example.json` 为 `config.json`，按需改 `generator_model` / `judge_repeats` 等。
 
 5. **真跑**：
-   ```
-   python run_benchmark.py --config config.json
-   ```
-   产出 `results/report.html`（**给用户看的中英双语可视化报告**：图表 + 每个指标超链接到对应权威基准 + 末尾 References）、`results/report.md`（数据版）、`results/raw.jsonl`（逐题原始答案+评分）。
+
+   - **用你自己的课程跑（目前唯一能一键端到端跑通的脚本）**：
+     ```
+     python run_benchmark.py --config config.json
+     ```
+     它读上面第 3–4 步的 `config.json` + `items/items.jsonl`，产出 `results/report.html`（**中英双语可视化报告**：图表 + 指标超链接到权威基准 + 末尾 References）、`results/report.md`、`results/raw.jsonl`（逐题原始答案+评分）。
+     > **它只跑两臂**：`baseline`（只给原始材料，≈ material/dump 类）vs `skill`，**不含 `closedbook` / `rawfiles`**——产出的是**遗留两臂报告**，不是主对照矩阵。
+
+   - **已发布的主对照三臂矩阵是怎么来的（provenance，非用户可一键复现）**：`closedbook` / `rawfiles` / `skill` 矩阵由内部管线 `gen.py`（生成答案）→ `rejudge.py`（判分）→ `report_matrix.py`（渲染）产出。**它专用于既有的 MIT/PSYC 矩阵，既不读你上面的 `config.json` / `items.jsonl`，也不能从干净 checkout 跑起来**：
+     > ⚠️ `gen.py` **硬编了 MIT/PSYC 的题面文件与工作区**、只接受 `--limit`；且 `build_tasks()` 会**无条件打开一份未提交的** `results/matrix/answers.jsonl` 种子——干净 checkout 上 `python gen.py` 会直接 `FileNotFoundError`、根本跑不起来。即便补上种子，`rejudge.py` 写的是 `summary_corrected.json`，而 `report_matrix.py` 只读 `summary.json`，二者间的**提交版聚合器尚缺（未来 PR T3）**。所以已发布的 `summary.json` 是预先计算的产物，本仓库脚本**无法从零端到端复现**（详见 [`docs/testing-audit.md`](docs/testing-audit.md)）。
 
 6. **裁判可信度校准（出报告前必做）**：人工标注 30~50 题子集放进 `calibration/`，用 `stats.cohen_kappa`
    算"人工 vs LLM 裁判"的一致性。**kappa ≥ 0.6 左右才信任裁判的数字**；否则先改进裁判/题目再说。
@@ -76,18 +85,24 @@
 
 ```
 benchmark/
-  run_benchmark.py     # 主运行器：两臂跑 claude -p（或 --mock）→ 判分 → 统计 → 报告
+  run_benchmark.py     # 较早的两臂脚手架（baseline vs skill）；--mock 可空跑验证管线
+  gen.py               # 较新的矩阵答案生成：按可行性增量补齐(依赖既有 answers.jsonl)、可断点续跑、记录每格成本
   judge.py             # 判分：数值题确定性 + 事实/定义题 claim 级忠实度（LLM 裁判）
+  rejudge.py           # 用修正后的 judge 重判已存答案，写 summary_corrected.json
   stats.py             # McNemar + 配对 bootstrap CI + Cohen's kappa（纯标准库）
+  report.py            # 两臂报告器（中英双语 HTML + 引用）
+  report_matrix.py     # 矩阵报告器：渲染预先算好的 results/matrix/summary.json，本身不计算
   config.example.json  # 配置模板（复制为 config.json）
   items/               # 金标题集（items.example.jsonl + 编写规范）
   materials/           # 你的原始课件/作业（+ _combined.txt）
   skill_workspace/     # skill 臂的运行目录（references/wiki + quiz_bank.json）
   calibration/         # 人工标注子集（裁判校准用）
-  results/             # 运行产物（raw.jsonl + report.md）
+  results/             # 运行产物（raw.jsonl + report.md + matrix/summary.json）
   tests/               # 脚本自测（python -m unittest discover -s tests）
   docs/related_benchmarks.md  # 权威幻觉基准综述（报告的 related work 草稿）
 ```
+
+> **管线现状（诚实标注）**：`run_benchmark.py` 是较早的两臂脚手架；矩阵结果由较新的 `gen.py` 生成答案、`rejudge.py` 判分、`report_matrix.py` 渲染。`report_matrix.py` 只**渲染**预先算好的 `results/matrix/summary.json`，本身不计算；而**从「生成的答案 + 判分缓存」聚合出 `summary.json` 的提交版聚合器目前尚缺**，当前 `summary.json` 是预先计算的产物——补齐这个聚合器是未来 PR T3。
 
 ## 路线（后续）
 - **v2 portfolio 升级**：买了 API key 后可移植到 **Inspect AI**（UK AISI，Task/Solver/Scorer + 模型判分），

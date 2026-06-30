@@ -32,7 +32,7 @@
 * **📄 AGENTS.md 通用代理兜底**：新增一屏浓缩的防幻觉核心契约，供 Codex、Cursor 规则、Antigravity 等不读完整 SKILL.md 的通用代理使用。
 * **🌐 双语控制层**：英文控制指令（精确、可测）+ 简体中文学生可见输出，统一来源标注 canonical 用词（🟢/🟡/⚠️），避免多入口措辞不一致。语言策略详见 [`docs/language-policy.md`](docs/language-policy.md)。
 * **🔍 工作区校验器**：新增 [`scripts/validate_workspace.py`](scripts/validate_workspace.py)（纯标准库），可零成本校验已建工作区的结构、题库 schema、来源标注和路径安全。
-* **🔬 测试覆盖大幅扩展**：从 12 个测试扩展到 **109 个**，覆盖 ingest、工作区校验、技能结构完整性、语言策略一致性、控制层双语等维度。CI 矩阵覆盖 Ubuntu/Python 3.8 + 3.12 + Windows。
+* **🔬 测试覆盖大幅扩展**：覆盖 ingest、工作区校验、技能结构完整性、语言策略一致性、控制层双语等维度的 stdlib 单元测试套件（数量随测试增减，运行 `python -m unittest discover -s tests -v` 查看当前值）。CI 矩阵覆盖 Ubuntu/Python 3.8 + 3.12 + Windows。
 * **📚 架构文档补全**：新增 [`docs/skill-architecture.md`](docs/skill-architecture.md)（技能集合结构）、[`docs/agent-portability.md`](docs/agent-portability.md)（不同代理加载方式）、[`docs/file-format.md`](docs/file-format.md)（工作区文件格式规范）。
 
 ---
@@ -46,7 +46,7 @@
 * **🏃 测试逃生通道 (Hint & Skip)**：针对测试关卡设计了“查看提示”与“2次答错跳过并归档”机制，防止学生因主观题表述差异或卡壳而被死锁在当前阶段。
 * **🧠 概念疑难点自动追踪**：内置 `skills/confusion-tracker` 子技能，自动捕获并记录复习过程中的概念疑问（如“为什么/怎么推导”），形成考前盲区扫雷清单。
 * **🛡️ 运行安全与进度保护**：引入文件名安全过滤、路径防穿透防篡改、进度覆盖前自动备份，并强制 UTF-8 打印完美解决 Windows 终端中文乱码。
-* **🔬 单元测试与 CI 集成**：内置覆盖导入、工作区校验、技能结构、语言策略、控制层双语等 109 个单元测试，由 GitHub Actions 在云端多平台（Windows & Linux、Python 3.8/3.12）自动运行质量检测。
+* **🔬 单元测试与 CI 集成**：内置覆盖导入、工作区校验、技能结构、语言策略、控制层双语等维度的 stdlib 单元测试套件，由 GitHub Actions 在云端多平台（Windows & Linux、Python 3.8/3.12）自动运行质量检测。
 
 ---
 
@@ -157,7 +157,7 @@ python scripts/validate_workspace.py path/to/workspace
 ```
 
 - 工作区文件格式规范见 [`docs/file-format.md`](docs/file-format.md)；校验器为 [`scripts/validate_workspace.py`](scripts/validate_workspace.py)。
-- **完整 benchmark 很贵**（一次单轮矩阵几十美元/几小时，长程漂移测试以天计额度），**不应为每个小改动跑全量**——分层策略见 [`benchmark/docs/test_tiers.md`](benchmark/docs/test_tiers.md)。日常开发与 CI 只跑 Tier 0–1。
+- **完整 benchmark 很贵**（一次单轮矩阵几十美元/几小时，长程漂移测试以天计额度），**不应为每个小改动跑全量**——分层策略见 [`benchmark/docs/test_tiers.md`](benchmark/docs/test_tiers.md)。**CI 实际只跑 Tier 0（单元测试）**；Tier 1 校验器是本地/手动步骤——它的校验逻辑已由 Tier 0 单测在 `tests/fixtures/` 上覆盖，但 CI 未单独在真实 ingest 产物上运行该 CLI。
 
 ---
 
@@ -192,7 +192,7 @@ python scripts/validate_workspace.py path/to/workspace
   * 📄 `study_plan_template.md`：复习计划表模板。
   * 📄 `study_progress_template.md`：进度追踪与错题打卡表模板。
   * 📄 `quiz_bank_template.json`：真题抽测 JSON 模板。
-* 📂 **`tests/`**：【单元测试包】 —— 109 个自动化测试，覆盖 ingest、工作区校验、技能结构、语言策略、控制层双语、技能集合自洽、运行时去版本化等。
+* 📂 **`tests/`**：【单元测试包】 —— stdlib 自动化测试套件，覆盖 ingest、工作区校验、技能结构、语言策略、控制层双语、技能集合自洽、运行时去版本化等（当前数量见 `python -m unittest discover -s tests -v`）。
 
 ---
 
