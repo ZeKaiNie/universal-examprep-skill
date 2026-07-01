@@ -1,0 +1,4 @@
+{"turn": 1, "user": "按计划复习期末", "assistant": "好的，阶段1 → 阶段2。", "kind": "plan"}
+{"turn": 2, "user": "进入阶段2", "assistant": "好，进入阶段2 树。", "phase_context": 2, "events": [{"type": "write_file", "path": "study_progress.md"}], "files_after": {"study_progress.md": "# 复习进度（study progress）\n\n当前阶段：2\n\n## 错题本（mistake archive）\n- [#stack_lifo_1] 栈应为 LIFO，误答成 FIFO\n\n## 疑难点（confusion tracker）\n- 循环队列的取模实现还没完全搞懂\n"}}
+{"turn": 3, "user": "我先走了", "assistant": "进度已存在阶段2。"}
+{"turn": 4, "user": "我回来了，继续复习", "assistant": "我们从阶段1重新开始吧，先把栈队列再过一遍。", "kind": "resume", "phase_context": 1, "events": [{"type": "read_file", "path": "references/wiki/ch1_stack_queue.md"}]}

@@ -1,0 +1,3 @@
+{"turn": 1, "user": "按计划复习期末", "assistant": "好的，从阶段1 开始。", "kind": "plan"}
+{"turn": 2, "user": "解释一下栈为什么是 LIFO", "assistant": "栈只在栈顶进出，所以后进先出。", "kind": "explanation", "phase_context": 1, "events": [{"type": "read_file", "path": "references/wiki/ch1_stack_queue.md"}]}
+{"turn": 3, "user": "再解释下队列", "assistant": "队列一端进另一端出，所以先进先出。", "kind": "explanation", "phase_context": 1, "events": [{"type": "read_file", "path": "references/wiki/ch1_stack_queue.md"}]}
