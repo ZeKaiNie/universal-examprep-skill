@@ -177,5 +177,123 @@ class IngestEndToEndTest(unittest.TestCase):
         self.assertNotIn("旧内容标记", read(prog_path))            # 新文件已重置
 
 
+    # ---------- 回归：缺 id 自动补全 ----------
+    def test_missing_ids_auto_filled_with_unique_ids(self):
+        data = {
+            "course_name": "测试",
+            "phases": [{"phase_num": 1, "phase_name": "P", "wiki_filename": "a.md", "wiki_content": "x"}],
+            "quiz_bank": [
+                {"type": "subjective", "question": "Q1", "answer": "A1"},
+                {"type": "subjective", "question": "Q2", "answer": "A2"},
+            ],
+        }
+        r = run_ingest(data, self.tmp)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        bank = json.loads(read(self.tmp, "references", "quiz_bank.json"))
+        ids = [q["id"] for q in bank]
+        self.assertEqual(len(ids), 2)
+        self.assertEqual(len(set(ids)), 2, f"ID 重复: {ids}")
+
+    # ---------- 回归：已有 id 不撞号 ----------
+    def test_auto_ids_skip_existing_ids(self):
+        data = {
+            "course_name": "测试",
+            "phases": [{"phase_num": 1, "phase_name": "P", "wiki_filename": "a.md", "wiki_content": "x"}],
+            "quiz_bank": [
+                {"id": "q2", "type": "subjective", "question": "已有q2", "answer": "A2"},
+                {"type": "subjective", "question": "缺id", "answer": "A"},
+                {"type": "subjective", "question": "缺id2", "answer": "B"},
+            ],
+        }
+        r = run_ingest(data, self.tmp)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        bank = json.loads(read(self.tmp, "references", "quiz_bank.json"))
+        ids = [q["id"] for q in bank]
+        self.assertIn("q2", ids)
+        # 自动补的 id 不能是 q2
+        auto_ids = [i for i in ids if i != "q2"]
+        self.assertNotIn("q2", auto_ids, f"撞号: {ids}")
+        self.assertEqual(len(set(ids)), 3, f"ID 重复: {ids}")
+
+    def test_auto_ids_preserve_zero_id(self):
+        data = {
+            "course_name": "测试",
+            "phases": [{"phase_num": 1, "phase_name": "P", "wiki_filename": "a.md", "wiki_content": "x"}],
+            "quiz_bank": [
+                {"id": 0, "type": "subjective", "question": "已有数字 id", "answer": "A"},
+                {"type": "subjective", "question": "缺 id", "answer": "B"},
+            ],
+        }
+        r = run_ingest(data, self.tmp)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        bank = json.loads(read(self.tmp, "references", "quiz_bank.json"))
+        self.assertEqual(bank[0]["id"], 0)
+        self.assertEqual(len({q["id"] for q in bank}), 2, f"ID 重复: {[q['id'] for q in bank]}")
+
+    # ---------- 回归：true_false 中英文规范化 ----------
+    def test_true_false_normalize_cn_en(self):
+        cases = [
+            ("正确", True), ("错误", False),
+            ("对", True), ("错", False),
+            ("是", True), ("否", False),
+            ("真", True), ("假", False),
+            ("true", True), ("false", False),
+            ("yes", True), ("no", False),
+            ("√", True), ("×", False),
+        ]
+        data = {
+            "course_name": "测试",
+            "phases": [{"phase_num": 1, "phase_name": "P", "wiki_filename": "a.md", "wiki_content": "x"}],
+            "quiz_bank": [
+                {"id": f"q{i}", "type": "true_false", "question": raw, "answer": raw}
+                for i, (raw, _) in enumerate(cases, 1)
+            ],
+        }
+        r = run_ingest(data, self.tmp)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        bank = json.loads(read(self.tmp, "references", "quiz_bank.json"))
+        for i, (raw, expected) in enumerate(cases):
+            q = bank[i]
+            self.assertIsInstance(q["answer"], bool,
+                                  f"q{i+1} 答案 {raw!r} 应为 bool，实际 {type(q['answer']).__name__}")
+            self.assertEqual(q["answer"], expected,
+                             f"q{i+1} 答案 {raw!r} 期望 {expected}，实际 {q['answer']}")
+
+    def test_true_false_boolean_false_not_reported_missing(self):
+        data = {
+            "course_name": "测试",
+            "phases": [{"phase_num": 1, "phase_name": "P", "wiki_filename": "a.md", "wiki_content": "x"}],
+            "quiz_bank": [
+                {"id": "q1", "type": "true_false", "question": "判断题", "answer": False},
+            ],
+        }
+        r = run_ingest(data, self.tmp)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("缺少标准答案", r.stdout)
+        bank = json.loads(read(self.tmp, "references", "quiz_bank.json"))
+        self.assertIs(bank[0]["answer"], False)
+
+    # ---------- 回归：无法识别的 true_false 答案不被静默强转 ----------
+    def test_true_false_unknown_answer_preserved(self):
+        data = {
+            "course_name": "测试",
+            "phases": [{"phase_num": 1, "phase_name": "P", "wiki_filename": "a.md", "wiki_content": "x"}],
+            "quiz_bank": [
+                {"id": "q1", "type": "true_false", "question": "未知答案", "answer": "maybe"},
+                {"id": "q2", "type": "true_false", "question": "数字", "answer": "1"},
+                {"id": "q3", "type": "choice", "question": "无关题型", "options": ["A.1","B.2","C.3","D.4"], "answer": "A"},
+            ],
+        }
+        r = run_ingest(data, self.tmp)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        bank = json.loads(read(self.tmp, "references", "quiz_bank.json"))
+        self.assertEqual(bank[0]["answer"], "maybe",
+                         f"无法识别的 true_false 答案应保留原值，实际 {bank[0]['answer']!r}")
+        self.assertEqual(bank[1]["answer"], "1",
+                         f"数字答案应保留原值，实际 {bank[1]['answer']!r}")
+        self.assertEqual(bank[2]["answer"], "A",
+                         "choice 题型不应受影响")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -28,6 +28,10 @@ SAFE_FILENAME = re.compile(r"^[\w.\-]+\.md$")      # 仅允许不含路径的 *.
 VALID_QUIZ_TYPES = {"choice", "subjective", "diagram", "fill_blank", "true_false", "code"}
 
 
+def is_blank(value):
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
 def get_template_path(template_name):
     # 脚本位于 <skill>/scripts/，模板位于 <skill>/templates/
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -98,7 +102,8 @@ def validate(data):
 
     missing_answer_ids = []
     for i, q in enumerate(quiz_bank):
-        tag = (q.get("id") if isinstance(q, dict) else None) or f"#{i + 1}"
+        raw_id = q.get("id") if isinstance(q, dict) else None
+        tag = str(raw_id) if not is_blank(raw_id) else f"#{i + 1}"
         if not isinstance(q, dict):
             errors.append(f"题目 {tag} 不是对象。")
             continue
@@ -109,7 +114,7 @@ def validate(data):
             errors.append(f"题目 {tag} 缺少题干 question。")
         if qtype == "choice" and not q.get("options"):
             errors.append(f"选择题 {tag} 缺少 options 选项。")
-        if not q.get("answer"):
+        if is_blank(q.get("answer")):
             missing_answer_ids.append(tag)
 
     if errors:
@@ -193,6 +198,30 @@ def main():
             fail([f"JSON 解析失败：{e}"])
 
     course_name, phases, quiz_bank, missing_answer_ids = validate(data)
+
+    # ── 后处理：补全 id + 规范化 true_false 答案 ──────────────────
+    TRUE_FALSE_NORMALIZE = {
+        "正确": True, "对": True, "是": True, "真": True,
+        "true": True, "yes": True, "√": True,
+        "错误": False, "错": False, "否": False, "假": False,
+        "false": False, "no": False, "×": False,
+    }
+    # 收集已有 id，避免补全时撞号
+    existing_ids = {q["id"] for q in quiz_bank if not is_blank(q.get("id"))}
+    next_id = 1
+    for q in quiz_bank:
+        # 补全 id（validate 不强制 id，但出口文件需要）
+        if is_blank(q.get("id")):
+            while f"q{next_id}" in existing_ids:
+                next_id += 1
+            new_id = f"q{next_id}"
+            q["id"] = new_id
+            existing_ids.add(new_id)
+        # 规范化 true_false 答案
+        if q.get("type") == "true_false" and isinstance(q.get("answer"), str):
+            normalized = TRUE_FALSE_NORMALIZE.get(q["answer"].strip().lower(), q["answer"])
+            q["answer"] = normalized
+    # ────────────────────────────────────────────────────────────────
 
     print(f"[+] 识别到科目: {course_name}")
     print(f"[+] 阶段数量: {len(phases)} 个")
