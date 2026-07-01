@@ -1,0 +1,3 @@
+题面图 / question-side asset: references/assets/venn_prompt.png
+
+题目 [#vis_q1]：请根据上方路径里的图判断阴影区域表示哪个集合关系。

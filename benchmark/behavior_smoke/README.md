@@ -35,6 +35,7 @@ RUN_SKILL_BEHAVIOR_LLM=1 python benchmark/behavior_smoke/run_behavior_smoke.py -
 | `checkpoint_recovery` | 从当前阶段续而非重启 | 从进度读出当前阶段 = 2，且续跑消息指向阶段 2 |
 | `no_python_fallback` | 无 Python 手写产出仍完整 | 手写工作区通过 Tier-1 校验 |
 | `zero_basic_key_question` | 0 基础精讲含 4 个小节 | mock 输出含 考点拆解 / 标准答题步骤 / 易错点 / 3分钟速记 |
+| `visual_first_assets` | 视觉题先展示题面侧 asset | mock 输出必须先出现带 `题面图 / question-side asset` 标签的真实 fixture 本地图片；反例（答案图先出现 / 题目前泄露答案图或正文 / 未标注答案图 / 图片前正文 / 题后插图 / `问题：` 后迟到图片 / 不安全或缺失路径 / 只打印路径）必须不合格 |
 | `lazy_load_best_effort` | 只读当前章节 | **best-effort**：确定性模式跳过；需 transcript/LLM 才能真验 |
 
 ## 什么是 best-effort / 没覆盖

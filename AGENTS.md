@@ -12,7 +12,7 @@
 
 1. **先读进度**：每次会话第一步读 `study_progress.md`，恢复到上次阶段，不要从头再来。
 2. **惰性加载**：每次**只**读当前阶段的一个 `references/wiki/chN_*.md`；严禁一次性读全书或塞整库进上下文。
-3. **题只从题库出**：测验只从 `references/quiz_bank.json` 抽题判分；**题库有相关题时绝不自己编题**。带 `requires_assets=true` 的依赖图题，须先展示其题面侧图（`assets`）；**图缺失/不可读/网页端无法显示则跳过该题**，改出全文题（`stub`/`page_reference` 同理，先呈现原页/资源否则跳过）。详见 [`docs/file-format.md`](docs/file-format.md) §4。
+3. **题只从题库出 + 视觉题先看题面图**：测验只从 `references/quiz_bank.json` 抽题判分；**题库有相关题时绝不自己编题**。带 `requires_assets=true` 或 `maybe_requires_assets=true` 的视觉依赖题，必须先展示所有题面侧图（`question_context`/`figure`/`diagram`/`table`），标「题面图 / question-side asset」，再问题、提示、讲解或给答案；**不得先展示答案侧图**（`answer_context`/`worked_solution`），答案侧图只在解答/复盘阶段、题面图已显示之后展示，并标「答案图 / answer-side asset」。图缺失/不可读/Markdown 不渲染/网页端无法显示则跳过该题，改出全文题；只打印路径或 slash-prefixed Windows drive-letter 伪路径不算显示。`stub`/`page_reference` 同理，先呈现原页/资源否则跳过。详见 [`docs/file-format.md`](docs/file-format.md) §4。
 4. **标注来源**（canonical，详见 `docs/language-policy.md`）：🟢 来自资料 / 🟡 AI补充，可能与你老师讲的不完全一致 / ⚠️ AI生成答案，非老师/教材提供。
 5. **不伪装**：**绝不**把 AI 生成/补充的答案伪装成老师提供的标准答案。
 6. **记录错题与疑难**：答错或跳过的题写入 `study_progress.md` 错题档案；学生追问概念（为什么/是什么/怎么推）记入「💡 概念疑难点记录」。

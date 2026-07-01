@@ -40,6 +40,8 @@ On every turn, run these preconditions FIRST (they are not a branch):
 
 Lazy-load rule: read only the single current wiki slice. Never preload `references/wiki/` or the whole `references/quiz_bank.json` on restore; pull only the relevant chapter or items when the current step needs them.
 
+Visual-first asset rule: whenever a delegated mode touches a stored item with `requires_assets=true` or `maybe_requires_assets=true`, apply [`docs/file-format.md`](../../docs/file-format.md) §4 before routing into teaching, quiz, hint, explanation, or review output. The prompt must show every question-side asset (`question_context` / `figure` / `diagram` / `table`) first, labelled `题面图 / question-side asset`; answer-side assets (`answer_context` / `worked_solution`) may appear only later during solution/review. If the UI cannot render the prompt image, or the output would only print an unrenderable path such as malformed slash-prefixed Windows drive-letter Markdown, skip/stop that visual item instead of pretending the image was shown.
+
 After restoring state, pick the ONE step that matches the user's intent and current phase, and route there:
 
 1. **Teaching**: when the current phase has a linked wiki chapter, read only that one chapter file (`view_file`); never read the whole book or load the full bank into context. Delegate to `exam-tutor`.

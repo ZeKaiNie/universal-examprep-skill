@@ -60,5 +60,25 @@
     "ai_generated": true,
     "source": "ai_generated",
     "explanation": "AI 生成的参考实现，需与老师/教材实现核对。"
+  },
+  {
+    "id": "vis_q1",
+    "chapter": 1,
+    "type": "choice",
+    "question": "请根据题面图判断阴影区域表示哪一个集合关系。",
+    "options": ["A. A 与 B 的交集", "B. A 与 B 的并集", "C. 只属于 A 的部分", "D. 只属于 B 的部分"],
+    "answer": "A",
+    "explanation": "题面图中阴影位于两个圆重叠区域，表示 A 与 B 的交集。",
+    "source": "teacher",
+    "requires_assets": true,
+    "question_text_status": "full",
+    "assets": [
+      {
+        "path": "references/assets/venn_prompt.svg",
+        "role": "figure",
+        "type": "diagram",
+        "caption": "Venn prompt"
+      }
+    ]
   }
 ]

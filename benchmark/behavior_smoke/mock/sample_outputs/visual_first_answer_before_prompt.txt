@@ -1,0 +1,5 @@
+![题面图 / question-side asset: Venn prompt](references/assets/venn_prompt.svg)
+
+![答案图 / answer-side asset: worked solution](references/assets/venn_solution.png)
+
+题目 [#vis_q1]：请根据上方题面图判断阴影区域表示哪一个集合关系。

@@ -87,6 +87,7 @@
 | `answer_source_pages` | list[int] | 答案所在页码（正整数） |
 | `assets` | list[asset] | 题目/答案依赖的图片等资源，见下 |
 | `requires_assets` | bool | 为 `true` 时：**没有有效 asset 就不能出这道题**（校验器报错、出题跳过） |
+| `maybe_requires_assets` | bool | 面向未来的保守标记；为 `true` 时运行时与校验器按 `requires_assets=true` 同样 fail-closed，直到题面侧 asset 能先显示出来 |
 | `question_text_status` | `"full"` \| `"stub"` \| `"page_reference"` | 题面完整度：`full` 可独立成题；`stub` 题面残缺、须配 `source_pages` 或 `assets`；`page_reference` 题面是“见某页”、须有 `source_file`+`source_pages`（依赖图时还须有效 assets） |
 
 ### asset 对象
@@ -101,15 +102,37 @@
 ```
 
 - **role** ∈ `question_context` / `answer_context` / `figure` / `table` / `diagram` / `worked_solution`
-  - **题面侧 role**（出题前会展示给学生）= `question_context` / `figure` / `diagram` / `table`。`requires_assets=true` 的题**至少要有一个题面侧的有效 asset**；只有答案侧 asset（`answer_context` / `worked_solution`）无法在出题前展示题目，会被判 fail-closed。
+  - **题面侧 role**（出题前会展示给学生）= `question_context` / `figure` / `diagram` / `table`。`requires_assets=true` 或 `maybe_requires_assets=true` 的题**至少要有一个题面侧的有效 asset**；只有答案侧 asset（`answer_context` / `worked_solution`）无法在出题前展示题目，会被判 fail-closed。
+  - **答案侧 role**（只在解答/复盘阶段展示）= `answer_context` / `worked_solution`。本 schema 不新增 `question` / `prompt` role；外部系统若使用这类名字，导入前应映射到现有题面侧 role。
 - **type** ∈ `page_image` / `crop_image` / `diagram` / `table_image` / `other_image`
-- `role` / `type` / `question_text_status` 若写成非字符串（数组/对象等）→ **报错**（校验器不崩溃）；`requires_assets` 必须是真正的布尔 `true`/`false`，字符串 `"false"` 之类 → **报错**。
+- `role` / `type` / `question_text_status` 若写成非字符串（数组/对象等）→ **报错**（校验器不崩溃）；`requires_assets` / `maybe_requires_assets` 必须是真正的布尔 `true`/`false`，字符串 `"false"` 之类 → **报错**。
+
+### Visual-first display contract（运行时强制）
+
+For any item with `requires_assets=true` or `maybe_requires_assets=true`:
+
+1. **Before asking, explaining, hinting, or solving**, display every question-side asset first.
+2. Use only question-side assets at first (`question_context` / `figure` / `diagram` / `table`).
+3. Label each displayed prompt image as `题面图 / question-side asset` and include its role/caption when available.
+4. Do not show answer-side assets (`answer_context` / `worked_solution`) before all question-side assets have already been shown.
+5. If the asset file is missing/unreadable, the UI cannot render it, or the runtime can only print an unrenderable path, **skip the item or stop with a clear explanation**. Do not proceed as if the image was shown.
+6. Show answer-side assets only during solution/review, after the question-side asset display has happened, and label them `答案图 / answer-side asset`.
+
+`stub` / `page_reference` items follow the same principle: the visible prompt context must appear before teaching, quizzing, hinting, or solving. If the original page/resource is not renderable in the current UI, the item is not safe to ask or explain as a complete prompt.
+
+### Markdown / local path display guidance
+
+- Prefer the workspace-relative asset path stored in the schema:
+  `![题面图 / question-side asset: Venn diagram](references/assets/ch01_p012_quiz_1_1.png)`.
+- Do **not** emit slash-prefixed Windows drive-letter pseudo-paths in Markdown image links.
+- If a host requires an absolute path and you have verified that it renders, use that host's supported form. Otherwise show the normal local path as an instruction (for example `D:\course\ws\references\assets\a.png`) and treat the image as **not displayed** for the contract above.
+- The skill must not claim that an image was displayed when it only printed a path or a non-rendering Markdown link.
 
 ### 路径安全规则（校验器强制）
 
 - 必须是**相对路径**，且停留在工作区内；**推荐放 `references/assets/`** 下。
 - **禁止**：绝对路径、`..` 穿越、URL/网络抓取、符号链接逃出工作区。
-- `requires_assets=true` 时：`assets` 非空，且每个 asset 路径安全、**文件必须真实存在**（缺失是**错误**不是告警）。
+- `requires_assets=true` 或 `maybe_requires_assets=true` 时：`assets` 非空，且每个 asset 路径安全、**文件必须真实存在**（缺失是**错误**不是告警）。
 - `requires_assets=false` 但带了 assets：合法；asset 文件缺失只**告警**。
 - `requires_assets=true` 而题型不是 `diagram` 也合法——很多文字题同样依赖一张表/图/Venn。
 
@@ -118,10 +141,10 @@
 | 情形 | 结果 |
 | --- | --- |
 | 老题库（不带这些字段） | ✅ 有效（向后兼容） |
-| `requires_assets=true` 但无 assets / asset 缺失或**不可读** / 路径不安全 | ❌ 错误（fail-closed） |
-| `requires_assets=true` 但只有答案侧 asset（无题面侧有效 asset） | ❌ 错误（出题前无可展示的题面） |
+| `requires_assets=true` 或 `maybe_requires_assets=true` 但无 assets / asset 缺失或**不可读** / 路径不安全 | ❌ 错误（fail-closed） |
+| `requires_assets=true` 或 `maybe_requires_assets=true` 但只有答案侧 asset（无题面侧有效 asset） | ❌ 错误（出题前无可展示的题面） |
 | `question_text_status=stub` 但无 `source_file`+`source_pages` 且无**题面侧有效** asset | ❌ 错误 |
 | `question_text_status=page_reference` 但缺 `source_file`/`source_pages`（或 `source_file` 非字符串） | ❌ 错误 |
 | asset `role`/`type` 取值非法、`source_pages` 非正整数、`source_file`/`answer_source_file` 非字符串 | ❌ 错误 |
 | `source_file`/`answer_source_file` 为绝对路径 / 含 `..` 穿越 / URL | ❌ 错误（provenance 名不得指出材料外） |
-| `requires_assets` 非布尔，或 `role`/`type`/`question_text_status` 为非字符串 | ❌ 错误（结构化报错，不崩溃） |
+| `requires_assets` / `maybe_requires_assets` 非布尔，或 `role`/`type`/`question_text_status` 为非字符串 | ❌ 错误（结构化报错，不崩溃） |

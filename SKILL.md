@@ -20,7 +20,7 @@ metadata:
 ### 第一步：一键大纲解析与本地化 (Zero-friction Ingestion)
 1. **智能解析**：快速阅读并解析用户上传的文件，提取所有的知识点、核心公式、高频题型和名词解释。
 2. **后台自动构建 JSON**：Agent 必须在后台自动构建一份符合 `ingest.py` 要求的 `raw_input.json` 格式数据，并将其以 `raw_input.json` 写入到临时目录（例如 scratch/ 目录）中。**绝对禁止要求或提示用户去手动创建、修改此 JSON 文件。**
-   * **依赖图的题带 asset 元数据**：若某道题依赖讲义里的一张图（文氏图/插图/表格），题项要带 `source_file`/`source_pages`、必要时 `assets`（放 `references/assets/` 下）、`requires_assets`、`question_text_status`（见 [`docs/file-format.md`](docs/file-format.md) §4）。**只有当你确实把图片文件写到 `<工作区>/references/assets/` 后，才设 `requires_assets=true`**（`ingest.py` 不会创建/拷贝该目录，要你自己写盘）；只有原页引用、没有图片时用 `question_text_status="page_reference"` 且不设 `requires_assets`。这样测验/复盘才不会让学生做看不到图的题。
+   * **依赖图的题带 asset 元数据**：若某道题依赖讲义里的一张图（文氏图/插图/表格），题项要带 `source_file`/`source_pages`、必要时 `assets`（放 `references/assets/` 下）、`requires_assets` / `maybe_requires_assets`、`question_text_status`（见 [`docs/file-format.md`](docs/file-format.md) §4）。**只有当你确实把图片文件写到 `<工作区>/references/assets/` 后，才设 `requires_assets=true` 或 `maybe_requires_assets=true`**（`ingest.py` 不会创建/拷贝该目录，要你自己写盘）；只有原页引用、没有图片时用 `question_text_status="page_reference"` 且不设视觉必需标记。这样测验/复盘才不会让学生做看不到图的题。
 3. **执行一键导入**：在技能目录下运行 `python scripts/ingest.py --input <temp_json_path>`（Claude Code 中可用 `python "${CLAUDE_SKILL_DIR}/scripts/ingest.py" --input <temp_json_path>`）。**注意**：本技能在 Claude Code 中应安装到 `~/.claude/skills/universal-exam-cram-coach/` 或项目内 `.claude/skills/universal-exam-cram-coach/`；早先文档中的 `.agents/skills/` 仅是 Codex/Cursor 的约定，Claude Code 不会扫描该路径。
 4. **【核心】无 Python 环境自动降级机制**：
    * 如果运行该 Python 脚本失败（报错如 `python is not recognized` 或环境限制），Agent **必须立即且无感地自动执行降级逻辑**：
@@ -40,7 +40,7 @@ metadata:
 
 ### 第三步：标准真题通关测验 (Quiz-Bank Assessment)
 1. **标准抽题**：从 `references/quiz_bank.json` 中过滤并提取属于当前章节的题目。**禁止**现场随机编造不符合大纲的题目。
-   * **依赖图的题 fail-closed**：题项可带 `requires_assets` / `assets` / `question_text_status`（见 [`docs/file-format.md`](docs/file-format.md) §4）。出 `requires_assets=true` 的题前必须先**把题面侧图片（`question_context`/`figure`/`diagram`/`table`）真正渲染/显示出来给学生看**（只打印路径不算）；**图缺失/不可读、只能引用无法显示、或网页端无法显示图时，绝不出这道题**，改从题库另选 `full` 全文题。`stub`/`page_reference` 题须先呈现原页/资源上下文，无法呈现则跳过。
+   * **依赖图的题 visual-first + fail-closed**：题项可带 `requires_assets` / `maybe_requires_assets` / `assets` / `question_text_status`（见 [`docs/file-format.md`](docs/file-format.md) §4）。出 `requires_assets=true` 或 `maybe_requires_assets=true` 的题前，必须先**把所有题面侧图片（`question_context`/`figure`/`diagram`/`table`）真正渲染/显示出来给学生看**，并标成「题面图 / question-side asset」；只打印路径不算。**不得先显示答案侧图片（`answer_context`/`worked_solution`）**，答案侧图片只能在解答/复盘阶段、题面图已显示之后再展示，并标成「答案图 / answer-side asset」。**图缺失/不可读、Markdown 链接不渲染、Windows 路径写成 slash-prefixed drive-letter 这类无法显示格式、或网页端无法显示图时，绝不出这道题**，改从题库另选 `full` 全文题；不得假装图片已经展示。`stub`/`page_reference` 题须先呈现原页/资源上下文，无法呈现则跳过。
 2. **主观题语义判分**：若为计算或简答题，执行**“要点检索制”**。核对学生作答是否覆盖了该题的 `keywords` 和解题步骤，只要意思对即判定通过，给出相似度反馈。
 3. **画图题：先跑算法再画 (`type: "diagram"`)**：若题目类型为画图题（如二叉树/AVL 旋转、红黑树、B 树、图遍历、哈夫曼树、状态机等），智能体**禁止凭记忆手绘或用文字脑补最终图形**，必须遵循以下流程，让图的正确性由确定性程序保证：
    * **先跑算法再画图**：写一段实现标准算法的 Python 代码（用 `matplotlib` / `graphviz` 等），真实运行得到结构，再渲染成图片供学生查看。绝不直接「想象」最终形态。
@@ -51,7 +51,7 @@ metadata:
    * 若学生**连续答错 2 次**，智能体必须主动提供选项：“*是否跳过此题并将该题自动归档至错题本？*” 如果用户选择跳过，立即在进度文件中记录并放行。
 
 ### 第四步：易错扫雷与冲刺 (Diagnostic & Review)
-1. **错题本重温**：进入最后一阶段，智能体必须读取 `study_progress.md` 中的错题记录，重新调取 `references/quiz_bank.json` 中的原题，进行扫雷测试。**重做错题时同样遵守第三步的「依赖图的题 fail-closed」门禁**：`requires_assets=true` / `stub` / `page_reference` 的错题，须先把图/原页上下文真正显示出来；显示不了就跳过，不让学生重做一道看不到题面的题。
+1. **错题本重温**：进入最后一阶段，智能体必须读取 `study_progress.md` 中的错题记录，重新调取 `references/quiz_bank.json` 中的原题，进行扫雷测试。**重做错题时同样遵守第三步的「依赖图的题 visual-first + fail-closed」门禁**：`requires_assets=true` / `maybe_requires_assets=true` / `stub` / `page_reference` 的错题，须先把题面侧图/原页上下文真正显示出来；显示不了就跳过，不让学生重做一道看不到题面的题。
 2. **生成 Cheat Sheet**：全员通关后，在工作区为用户生成复习总结报告 `walkthrough.md`，内含该科目的**考前极简速记小抄（Cheat Sheet）**。
 
 ---

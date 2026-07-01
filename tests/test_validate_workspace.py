@@ -599,6 +599,33 @@ class TestValidateWorkspace(unittest.TestCase):
         self.assertEqual(V._exit_code(errors), 1)   # source_pages alone (no source_file) is ambiguous
         self.assertIn("stub", err_text(errors))
 
+    # ---- P0-V1: visual-first future-compatible gate ----
+    def test_p0v1_maybe_requires_assets_valid_question_side_passes(self):
+        item = self._asset_item(requires_assets=False, maybe_requires_assets=True)
+        errors, _, _ = V.validate(self._ws_asset(item))
+        self.assertEqual(V._exit_code(errors), 0, err_text(errors))
+
+    def test_p0v1_maybe_requires_assets_missing_file_fails(self):
+        item = self._asset_item(requires_assets=False, maybe_requires_assets=True)
+        errors, _, _ = V.validate(self._ws_asset(item, create=False))
+        self.assertEqual(V._exit_code(errors), 1)
+        self.assertIn("maybe_requires_assets=true", err_text(errors))
+        self.assertIn("不存在", err_text(errors))
+
+    def test_p0v1_maybe_requires_assets_answer_side_only_fails(self):
+        item = self._asset_item(requires_assets=False, maybe_requires_assets=True,
+                                assets=[{"path": "references/assets/a.png", "role": "worked_solution",
+                                         "type": "page_image", "caption": "solution"}])
+        errors, _, _ = V.validate(self._ws_asset(item))
+        self.assertEqual(V._exit_code(errors), 1)
+        self.assertIn("题面侧", err_text(errors))
+
+    def test_p0v1_maybe_requires_assets_non_bool_rejected(self):
+        item = self._asset_item(requires_assets=False, maybe_requires_assets="true")
+        errors, _, _ = V.validate(self._ws_asset(item))
+        self.assertEqual(V._exit_code(errors), 1)
+        self.assertIn("maybe_requires_assets 必须是布尔型", err_text(errors))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

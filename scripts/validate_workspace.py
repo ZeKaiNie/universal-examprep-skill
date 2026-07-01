@@ -26,9 +26,10 @@ SAFE_WIKI = re.compile(r"^[\w.\-]+\.md$")
 WIKI_REF_RE = re.compile(r"([.\\/]*references/wiki/[\w.\-/\\]+)")
 TRUE_FALSE_OK = {"true", "false", "t", "f", "yes", "no", "真", "假", "对", "错", "是", "否"}
 
-# P0A: asset-aware quiz fields. A real EEC-160 test hit lecture Quiz/Example items that depend on a
-# slide figure (e.g. a Venn diagram). The bank must be able to attach the source page/image, and the
-# validator + quiz must fail-closed: never ask a diagram/figure-dependent item without its context.
+# P0A/P0-V1: asset-aware quiz fields. A real EEC-160 test hit lecture Quiz/Example items
+# that depend on a slide figure (e.g. a Venn diagram). The bank must be able to attach the
+# source page/image, and the validator + quiz must fail-closed: never ask a
+# diagram/figure-dependent item without its question-side context displayed first.
 ASSET_ROLES = {"question_context", "answer_context", "figure", "table", "diagram", "worked_solution"}
 # roles whose asset is shown to the student BEFORE asking — a requires_assets item needs one of these
 # (an answer-side-only asset doesn't let the question be asked).
@@ -270,7 +271,13 @@ def validate(ws):
             ra_raw = q.get("requires_assets")
             if ra_raw is not None and not isinstance(ra_raw, bool):
                 err(f"{tag} requires_assets 必须是布尔型 true/false（不能是字符串/数字），当前 {ra_raw!r}")
+            maybe_raw = q.get("maybe_requires_assets")
+            if maybe_raw is not None and not isinstance(maybe_raw, bool):
+                err(f"{tag} maybe_requires_assets 必须是布尔型 true/false（不能是字符串/数字），当前 {maybe_raw!r}")
             requires = ra_raw is True  # only a real boolean True triggers fail-closed; "false"/0 等不算
+            maybe_requires = maybe_raw is True
+            visual_required = requires or maybe_requires
+            visual_gate_label = "requires_assets=true" if requires else "maybe_requires_assets=true"
             for pf in ("source_pages", "answer_source_pages"):
                 pv = q.get(pf)
                 if pv is not None and not (isinstance(pv, list) and pv and all(
@@ -296,22 +303,22 @@ def validate(ws):
                 if unsafe:
                     err(f"{tag} assets[{ai}] 不安全的 path: {unsafe}（{apath!r}）")
                 elif not readable:
-                    if requires:
+                    if visual_required:
                         err(f"{tag} assets[{ai}] 必需资源文件不存在或不可读: {apath}"
-                            "（requires_assets=true 须存在且可读）")
+                            f"（{visual_gate_label} 须存在且可读）")
                     else:
                         warn(f"{tag} assets[{ai}] 资源文件不存在或不可读: {apath}（建议补齐 references/assets/ 下的文件）")
                 else:
                     asset_ok += 1
                     if isinstance(role, str) and role in QUESTION_SIDE_ROLES:
                         q_side_ok += 1
-            if requires and not (isinstance(assets, list) and assets):
-                err(f"{tag} requires_assets=true 但缺 assets——依赖图/表/Venn 的题没有上下文，"
+            if visual_required and not (isinstance(assets, list) and assets):
+                err(f"{tag} {visual_gate_label} 但缺 assets——依赖图/表/Venn 的题没有上下文，"
                     "测验须 fail-closed（不可在不显示该图的情况下出此题）")
-            elif requires and asset_ok == 0:
-                err(f"{tag} requires_assets=true 但没有任何有效（安全且存在）的 asset，须 fail-closed")
-            elif requires and q_side_ok == 0:
-                err(f"{tag} requires_assets=true 但没有『题面侧』有效 asset（role 须含 "
+            elif visual_required and asset_ok == 0:
+                err(f"{tag} {visual_gate_label} 但没有任何有效（安全且存在）的 asset，须 fail-closed")
+            elif visual_required and q_side_ok == 0:
+                err(f"{tag} {visual_gate_label} 但没有『题面侧』有效 asset（role 须含 "
                     f"{sorted(QUESTION_SIDE_ROLES)} 之一）——只有答案侧 asset（answer_context/worked_solution）"
                     "无法在出题前展示题面，测验须 fail-closed")
             # source_file / answer_source_file, when present, must be a non-empty string (not obj/list/blank)

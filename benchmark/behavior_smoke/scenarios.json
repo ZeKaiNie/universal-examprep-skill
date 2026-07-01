@@ -67,6 +67,24 @@
       "best_effort": false
     },
     {
+      "name": "visual_first_assets",
+      "claim": "视觉依赖题必须先显示题面侧 asset，答案侧 asset 和讲解不得抢在题面图前面",
+      "prompt": "请讲解/测验一道 requires_assets=true 的视觉题。",
+      "detector": "visual_first_asset_display_ok",
+      "mock_output": "mock/sample_outputs/visual_first_good.txt",
+      "mock_negative": "mock/sample_outputs/visual_first_answer_side_first.txt",
+      "mock_negative_leak": "mock/sample_outputs/visual_first_answer_before_prompt.txt",
+      "mock_negative_unlabeled": "mock/sample_outputs/visual_first_unlabeled_solution_before_prompt.txt",
+      "mock_negative_prose": "mock/sample_outputs/visual_first_prose_before_image.txt",
+      "mock_negative_after_prompt": "mock/sample_outputs/visual_first_answer_after_prompt.txt",
+      "mock_negative_unsafe_path": "mock/sample_outputs/visual_first_unsafe_url.txt",
+      "mock_negative_question_label_late": "mock/sample_outputs/visual_first_question_label_late_asset.txt",
+      "mock_negative_missing_asset": "mock/sample_outputs/visual_first_missing_asset.txt",
+      "mock_negative_answer_text": "mock/sample_outputs/visual_first_answer_text_before_prompt.txt",
+      "mock_negative_path": "mock/sample_outputs/visual_first_path_only.txt",
+      "best_effort": false
+    },
+    {
       "name": "lazy_load_best_effort",
       "claim": "只读当前阶段对应的 wiki 章节，而非加载全部（best-effort：需 LLM/transcript 才能真验）",
       "prompt": "出一组阶段 2 的小测验。",
