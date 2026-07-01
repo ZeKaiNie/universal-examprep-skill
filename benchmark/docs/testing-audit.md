@@ -70,7 +70,7 @@
   - `skill`：建好的 wiki + quiz_bank、使用本技能。
   - **遗留/压力臂 `material` / dump-all**：整门课全文塞进一次提问；**非主对照**，保留为**压力脚注**（实测会淹没弱模型并触发上下文/用量上限而跑崩）。
 - **`report_matrix.py` 只渲染、不计算**：默认渲染 `results/matrix/summary.json`；T3 起支持 `--summary <file> --out-dir <dir>`，可渲染**显式**的 summary（不再被迫只渲染那份已提交的）。
-- **`summary.json` 聚合器已由 T3 补上**：`benchmark/aggregate_matrix.py`（**T3 新增**，纯标准库）从**显式**的 answer/score 行聚合出 `summary.json` 兼容的矩阵 summary，并有 fixture 级可复现流水线（见 [`matrix_pipeline.md`](matrix_pipeline.md)）。**但已发布的 MIT/PSYC `summary.json` 仍是预先计算（precomputed）的产物**：完整矩阵依旧依赖**私有/中间产物 + 付费模型运行**（真实答案日志、私有金标未提交），聚合器本身**不**重现已发布数字。（另注：`rejudge.py` 重判后写的是 `summary_corrected.json`，其结构是**嵌套的** `algo` / `psyc` 块，**不是** `report_matrix.py` 读的顶层 `matrix`/`n_items` 形状，故**不能**直接 `--summary summary_corrected.json` 渲染——需先转成顶层 matrix 形状，重判结果才不会自动进矩阵报告。）
+- **`summary.json` 聚合器已由 T3 补上**：`benchmark/aggregate_matrix.py`（**T3 新增**，纯标准库）从**显式**的 answer/score 行聚合出 `summary.json` 兼容的矩阵 summary，并有 fixture 级可复现流水线（见 [`matrix_pipeline.md`](matrix_pipeline.md)）。**但已发布的 MIT/PSYC `summary.json` 仍是预先计算（precomputed）的产物**：完整矩阵依旧依赖**私有/中间产物 + 付费模型运行**（真实答案日志、私有金标未提交），聚合器本身**不**重现已发布数字。（另注：`rejudge.py` 重判后写的是 `summary_corrected.json`，其结构是**嵌套的** `algo` / `psyc` 块，**不是** `report_matrix.py` 读的顶层 `matrix`/`n_items` 形状，故**不能**直接 `--summary summary_corrected.json` 渲染——需先转成顶层 matrix 形状，重判结果才不会自动进矩阵报告。**T3.1 补上了这座桥**：`rejudge.py --scores-out`（**须同时给 `--answers-out`**）零成本、不调 LLM 地把每题判分导出成 `aggregate_matrix.py` 可读的 score/answer 行（answer 行带 `status`/`cost_usd`），于是 `judge/rejudge → aggregate_matrix → report_matrix` 成为一条有提交、可照跑的显式路径；默认行为不变，export 只写显式路径。）
 - **判分已有确定性快路径**：越界弃答 / 数值题 / 词面精确匹配在调用 LLM 裁判前就先确定，只有未决的事实/定义题才走 LLM 裁判。
 - **`--mock` 只验管线**：mock 答案与 mock 裁判都是预设的，能验证管线连通，**无法捕捉真实判分质量回归**。
 

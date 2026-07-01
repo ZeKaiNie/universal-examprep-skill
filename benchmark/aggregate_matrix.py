@@ -13,7 +13,8 @@ file inputs (never silently reads results/matrix/summary.json) and emits a fresh
 Inputs (JSONL, one JSON object per line). `id`→item_id and `cost`→cost_usd are accepted (this repo's
 gen.py / judge.py row shapes), and boolean flags accept JSON booleans OR 0/1 (judge.py emits integers):
   --answers : the ITEM UNIVERSE + each answer attempt. Required: course, model, arm, item_id.
-              Optional: answerable (bool/0/1 — may instead live on the score row, the gen.py→judge path),
+              Optional: answerable (bool/0/1 — may instead live on the score row, the gen.py→judge
+              path; if BOTH the answer and score rows carry it they must AGREE, a conflict fails loud),
               status ("ok" | "infra_error", default "ok"), cost_usd (number, default 0).
   --scores  : the JUDGMENTS. Required: course, model, arm, item_id. Optional: correct, hallucinated,
               abstained, judge_error (bool/0/1), faithfulness (number in [0,1]), answerable, scored_by.
@@ -160,13 +161,26 @@ def merge_rows(answers, scores):
             _die("answers %s 的 status 必须是 'ok' 或 'infra_error'，当前 %r" % (k, status))
         infra = status == "infra_error"
         s = score_by.get(k)
-        # `answerable` may live on the answer row OR (the documented gen.py→judge path) on the score row.
-        raw_ans = a["answerable"] if "answerable" in a else ((s or {}).get("answerable"))
-        if raw_ans is None:
+        # `answerable` may live on the answer row OR (the documented gen.py→judge path) on the score
+        # row. A side "provides" it only when the key exists AND is non-null. When BOTH sides provide
+        # it we REQUIRE agreement and fail loudly on a conflict — we never silently prefer one side.
+        a_has = "answerable" in a and a["answerable"] is not None
+        s_has = s is not None and "answerable" in s and s["answerable"] is not None
+        if not a_has and not s_has:
             _die("answers/scores %s 都没有 answerable（无法区分可答题/越界探针题）" % (k,))
-        answerable = _as_bool(raw_ans)
-        if answerable is None:
-            _die("answerable 必须是布尔或 0/1，%s 当前 %r" % (k, raw_ans))
+        a_val = s_val = None
+        if a_has:
+            a_val = _as_bool(a["answerable"])
+            if a_val is None:
+                _die("answers %s 的 answerable 必须是布尔或 0/1，当前 %r" % (k, a["answerable"]))
+        if s_has:
+            s_val = _as_bool(s["answerable"])
+            if s_val is None:
+                _die("scores %s 的 answerable 必须是布尔或 0/1，当前 %r" % (k, s["answerable"]))
+        if a_has and s_has and a_val != s_val:
+            _die("answers/scores %s 的 answerable 冲突：answer 行=%r、score 行=%r"
+                 "（两侧必须一致，或只在其中一侧给出）" % (k, a["answerable"], s["answerable"]))
+        answerable = a_val if a_has else s_val
         if s is not None:
             judge_error = bool(s.get("judge_error"))
             correct = s.get("correct")

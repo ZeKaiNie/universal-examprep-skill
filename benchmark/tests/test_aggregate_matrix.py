@@ -23,6 +23,11 @@ def _run_agg(args):
                           capture_output=True, text=True, encoding="utf-8")
 
 
+def _run(argv):
+    # run any benchmark script (argv[0] is the script path) under the same interpreter
+    return subprocess.run([sys.executable] + argv, capture_output=True, text=True, encoding="utf-8")
+
+
 class AggregateMatrix(unittest.TestCase):
     def _aggregate(self):
         out = os.path.join(tempfile.mkdtemp(), "s.json")
@@ -214,6 +219,219 @@ class AggregateMatrix(unittest.TestCase):
         r = _run_agg(["--answers", a, "--scores", sc, "--out", os.path.join(d, "o.json")])
         self.assertEqual(r.returncode, 2)
         self.assertIn("faithfulness", r.stderr)
+
+    def test_answerable_answer_side_only_ok(self):
+        # only the answer row carries answerable → used as-is (unchanged behavior)
+        d = tempfile.mkdtemp()
+        a, sc = os.path.join(d, "a.jsonl"), os.path.join(d, "s.jsonl")
+        with open(a, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"course": "c", "model": "m", "arm": "skill", "item_id": "q", "answerable": True}) + "\n")
+        with open(sc, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"course": "c", "model": "m", "arm": "skill", "item_id": "q", "correct": True}) + "\n")
+        out = os.path.join(d, "s.json")
+        A.main(["--answers", a, "--scores", sc, "--out", out])
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["matrix"]["m|skill"]["n_answerable"], 1)
+
+    def test_answerable_matching_on_both_sides_ok(self):
+        # both sides provide answerable and AGREE (bool vs 0/1) → accepted, no conflict
+        d = tempfile.mkdtemp()
+        a, sc = os.path.join(d, "a.jsonl"), os.path.join(d, "s.jsonl")
+        with open(a, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"course": "c", "model": "m", "arm": "skill", "item_id": "q", "answerable": True}) + "\n")
+        with open(sc, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"course": "c", "model": "m", "arm": "skill", "item_id": "q",
+                                "answerable": 1, "correct": True}) + "\n")   # 1 == True → agrees
+        out = os.path.join(d, "s.json")
+        A.main(["--answers", a, "--scores", sc, "--out", out])
+        with open(out, encoding="utf-8") as f:
+            cell = json.load(f)["matrix"]["m|skill"]
+        self.assertEqual(cell["n_answerable"], 1)
+        self.assertEqual(cell["correct"], 1.0)
+
+    def test_answerable_conflict_between_answer_and_score_fails(self):
+        # both sides provide answerable but DISAGREE → fail loud, naming the (course,model,arm,item_id);
+        # must NOT silently prefer either side.
+        d = tempfile.mkdtemp()
+        a, sc = os.path.join(d, "a.jsonl"), os.path.join(d, "s.jsonl")
+        with open(a, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"course": "c", "model": "m", "arm": "skill", "item_id": "q", "answerable": True}) + "\n")
+        with open(sc, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"course": "c", "model": "m", "arm": "skill", "item_id": "q",
+                                "answerable": False, "abstained": True}) + "\n")
+        r = _run_agg(["--answers", a, "--scores", sc, "--out", os.path.join(d, "o.json")])
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("冲突", r.stderr)
+        self.assertIn("'q'", r.stderr)            # the offending item is named
+
+    def test_answerable_malformed_on_answer_side_fails(self):
+        d = tempfile.mkdtemp()
+        a, sc = os.path.join(d, "a.jsonl"), os.path.join(d, "s.jsonl")
+        with open(a, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"course": "c", "model": "m", "arm": "skill", "item_id": "q", "answerable": "yes"}) + "\n")
+        with open(sc, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"course": "c", "model": "m", "arm": "skill", "item_id": "q", "correct": True}) + "\n")
+        r = _run_agg(["--answers", a, "--scores", sc, "--out", os.path.join(d, "o.json")])
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("answers", r.stderr)
+        self.assertIn("answerable", r.stderr)
+
+    def test_answerable_malformed_on_score_side_fails(self):
+        # answer row omits answerable; score row provides a malformed one → fail loud (score side named)
+        d = tempfile.mkdtemp()
+        a, sc = os.path.join(d, "a.jsonl"), os.path.join(d, "s.jsonl")
+        with open(a, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"course": "c", "model": "m", "arm": "skill", "item_id": "q"}) + "\n")
+        with open(sc, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"course": "c", "model": "m", "arm": "skill", "item_id": "q",
+                                "answerable": "maybe", "correct": True}) + "\n")
+        r = _run_agg(["--answers", a, "--scores", sc, "--out", os.path.join(d, "o.json")])
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("scores", r.stderr)
+        self.assertIn("answerable", r.stderr)
+
+    def test_rejudge_export_rows_accepted_by_aggregator(self):
+        # the committed bridge: rejudge.export_rows() rows must feed straight into aggregate_matrix.py
+        # with NO schema mismatch and NO LLM/private-file dependency. Exercise correct / OOS / infra.
+        try:
+            import rejudge as RJ
+        except Exception as e:   # pragma: no cover
+            self.skipTest("rejudge import unavailable: %s" % e)
+        cases = [
+            ({"course": "algo", "model": "haiku", "arm": "skill", "id": "i1"},
+             {"id": "i1", "answerable": True},
+             {"correct": True, "hallucinated": 0, "faithfulness": 1.0, "scored_by": "lexical"}, False),
+            ({"course": "algo", "model": "haiku", "arm": "skill", "id": "i2"},
+             {"id": "i2", "answerable": False},
+             {"correct": True, "abstained": True, "faithfulness": 1.0}, False),
+            ({"course": "algo", "model": "haiku", "arm": "skill", "id": "i3"},
+             {"id": "i3", "answerable": True},
+             {"infra_error": True, "correct": False, "abstained": False, "hallucinated": None,
+              "faithfulness": None, "scored_by": "infra_error"}, True),
+        ]
+        d = tempfile.mkdtemp()
+        a, sc = os.path.join(d, "a.jsonl"), os.path.join(d, "s.jsonl")
+        with open(a, "w", encoding="utf-8") as af, open(sc, "w", encoding="utf-8") as sf:
+            for row, item, verdict, infra in cases:
+                ar, sr = RJ.export_rows(row, item, verdict, infra)
+                af.write(json.dumps(ar, ensure_ascii=False) + "\n")
+                sf.write(json.dumps(sr, ensure_ascii=False) + "\n")
+        out = os.path.join(d, "summary.json")
+        A.main(["--answers", a, "--scores", sc, "--out", out])   # accepted with no schema mismatch
+        with open(out, encoding="utf-8") as f:
+            cell = json.load(f)["matrix"]["haiku|skill"]
+        self.assertEqual(cell["n_answerable"], 1)        # i1 (i3 infra → excluded)
+        self.assertEqual(cell["n_oos"], 1)               # i2
+        self.assertEqual(cell["n_infra_error"], 1)       # i3
+        self.assertEqual(cell["correct"], 1.0)
+        self.assertEqual(cell["abstention_oos"], 1.0)
+        self.assertEqual(cell["n_lexical"], 1)           # i1 scored_by 'lexical' preserved
+
+    def test_rejudge_export_rows_pure_and_offline(self):
+        # export_rows is pure: deterministic shape, judge's own scored_by preserved, unlabeled
+        # deterministic verdict defaults to "deterministic"; no LLM / file / network touched.
+        try:
+            import rejudge as RJ
+        except Exception as e:   # pragma: no cover
+            self.skipTest("rejudge import unavailable: %s" % e)
+        row = {"course": "algo", "model": "haiku", "arm": "skill", "id": "x"}
+        ar, sr = RJ.export_rows(row, {"id": "x", "answerable": True},
+                                {"correct": False, "judge_error": True, "faithfulness": None,
+                                 "hallucinated": 0, "scored_by": "judge_error"}, False)
+        self.assertEqual(ar, {"course": "algo", "model": "haiku", "arm": "skill",
+                              "item_id": "x", "answerable": True, "status": "ok"})
+        self.assertIs(sr["judge_error"], True)
+        self.assertEqual(sr["scored_by"], "judge_error")          # judge label preserved
+        self.assertIsNone(sr["faithfulness"])
+        ar2, sr2 = RJ.export_rows(row, {"id": "x", "answerable": True},
+                                  {"infra_error": True, "scored_by": "infra_error"}, True)
+        self.assertEqual(ar2["status"], "infra_error")            # infra → status flagged on answer row
+        self.assertEqual(sr2["scored_by"], "infra_error")
+        _, sr3 = RJ.export_rows(row, {"id": "x", "answerable": True}, {"correct": True}, False)
+        self.assertEqual(sr3["scored_by"], "deterministic")       # unlabeled deterministic path
+
+    def test_rejudge_export_rows_carry_cost(self):
+        # the per-answer generation cost must survive the bridge → real cost_per_q / totals, not a fake $0
+        try:
+            import rejudge as RJ
+        except Exception as e:   # pragma: no cover
+            self.skipTest("rejudge import unavailable: %s" % e)
+        row = {"course": "algo", "model": "haiku", "arm": "skill", "id": "i1", "cost": 0.07}
+        ar, sr = RJ.export_rows(row, {"id": "i1", "answerable": True}, {"correct": True}, False)
+        self.assertAlmostEqual(ar["cost_usd"], 0.07, places=4)    # cost carried onto the answer row
+        d = tempfile.mkdtemp()
+        a, sc = os.path.join(d, "a.jsonl"), os.path.join(d, "s.jsonl")
+        with open(a, "w", encoding="utf-8") as af, open(sc, "w", encoding="utf-8") as sf:
+            af.write(json.dumps(ar, ensure_ascii=False) + "\n")
+            sf.write(json.dumps(sr, ensure_ascii=False) + "\n")
+        out = os.path.join(d, "s.json")
+        A.main(["--answers", a, "--scores", sc, "--out", out])
+        with open(out, encoding="utf-8") as f:
+            summ = json.load(f)
+        self.assertAlmostEqual(summ["total_cost_usd"], 0.07, places=4)        # flows into totals
+        self.assertAlmostEqual(summ["cost_per_q"]["algo"]["skill"], 0.07, places=4)
+        # a row with NO cost omits cost_usd (aggregator defaults 0) — honest, no crash
+        ar2, _ = RJ.export_rows({"course": "algo", "model": "m", "arm": "skill", "id": "x"},
+                                {"id": "x", "answerable": True}, {"correct": True}, False)
+        self.assertNotIn("cost_usd", ar2)
+
+    def test_rejudge_scores_out_requires_answers_out(self):
+        # the bridge must emit BOTH halves; --scores-out alone is refused (the answer row carries the
+        # status/cost the aggregator needs). Fires on arg validation BEFORE any private file is read.
+        r = _run([os.path.join(BENCH, "rejudge.py"), "--scores-out",
+                  os.path.join(tempfile.mkdtemp(), "s.jsonl")])
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--answers-out", r.stderr)
+
+    def test_rejudge_scores_out_answers_out_must_differ(self):
+        # same filename for both halves would truncate over each other → refuse (exit 2), before any
+        # private file is read.
+        same = os.path.join(tempfile.mkdtemp(), "both.jsonl")
+        r = _run([os.path.join(BENCH, "rejudge.py"), "--scores-out", same, "--answers-out", same])
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("同一个文件", r.stderr)
+
+    def test_unified_rows_uses_rerun_cost_when_patching_material(self):
+        # when a material infra-error answer is patched with a clean rerun, the exported row must use
+        # the RERUN's cost, not the stale failed-attempt cost — else total_cost_usd/cost_per_q are wrong.
+        try:
+            import rejudge as RJ
+        except Exception as e:   # pragma: no cover
+            self.skipTest("rejudge import unavailable: %s" % e)
+        from unittest import mock
+        algo_ans = [{"tag": "matrix", "arm": "material", "model": "opus", "id": "m1",
+                     "answer": "usage limit reached", "cost": 0.9}]            # failed attempt, $0.9
+        gen = [{"course": "algo", "arm": "material", "model": "opus", "id": "m1",
+                "answer": "clean rerun answer", "cost": 0.5}]                  # clean rerun, $0.5
+        with mock.patch.object(RJ, "load_jsonl", return_value=algo_ans), \
+                mock.patch.object(RJ, "_gen_rows", return_value=gen):
+            rows = RJ.unified_rows("algo")
+        m1 = [r for r in rows if r["id"] == "m1" and r["arm"] == "material"][0]
+        self.assertEqual(m1["answer"], "clean rerun answer")    # answer patched from the rerun
+        self.assertAlmostEqual(m1["cost"], 0.5, places=4)       # ...and ITS cost, not the stale 0.9
+
+    def test_rejudge_export_fails_loud_on_duplicate_rows(self):
+        # a duplicate (course,model,arm,item_id) in the source rows must FAIL LOUD on export — never a
+        # silent drop that would diverge from rejudge.aggregate()'s own (duplicate-counting) output.
+        try:
+            import rejudge as RJ
+        except Exception as e:   # pragma: no cover
+            self.skipTest("rejudge import unavailable: %s" % e)
+        from unittest import mock
+        dup = [{"course": "algo", "tag": "matrix", "model": "m", "arm": "skill", "id": "d1", "answer": "x"},
+               {"course": "algo", "tag": "matrix", "model": "m", "arm": "skill", "id": "d1", "answer": "y"}]
+        gold_item = {"id": "d1", "answerable": True, "answer_type": "factual",
+                     "question": "q?", "gold_answer": "zzz", "supporting_span": "s"}
+        d = tempfile.mkdtemp()
+        argv = ["rejudge.py", "--scores-out", os.path.join(d, "s.jsonl"),
+                "--answers-out", os.path.join(d, "a.jsonl")]
+        with mock.patch.object(RJ, "unified_rows", return_value=dup), \
+                mock.patch.object(RJ, "load_gold",
+                                  side_effect=lambda p: {"d1": gold_item} if "algo" in p else {}), \
+                mock.patch.object(sys, "argv", argv):
+            with self.assertRaises(SystemExit) as cm:
+                RJ.main()
+        self.assertEqual(cm.exception.code, 2)
 
     def test_accepts_gen_row_aliases(self):
         # gen.py answer rows use `id`/`cost`; judge score dicts use `id` — aliased to item_id/cost_usd
