@@ -1,0 +1,3 @@
+{"turn": 1, "user": "按计划复习期末", "assistant": "好，从阶段1 开始。", "kind": "plan"}
+{"turn": 2, "user": "从阶段1考我", "assistant": "题目 [#stack_lifo_1] 栈遵循什么访问顺序？", "kind": "quiz", "phase_context": 1, "events": [{"type": "read_file", "path": "references/wiki/ch1_stack_queue.md"}]}
+{"turn": 3, "user": "再来一道阶段1的", "assistant": "题目 [#totally_made_up_9] 这题我自己编一个，题库里其实没有。", "kind": "quiz", "phase_context": 1, "events": [{"type": "read_file", "path": "references/wiki/ch1_stack_queue.md"}]}

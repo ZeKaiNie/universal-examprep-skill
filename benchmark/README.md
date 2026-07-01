@@ -91,6 +91,8 @@ benchmark/
   judge.py             # 判分：数值题确定性 + 事实/定义题 claim 级忠实度（LLM 裁判）
   rejudge.py           # 用修正后的 judge 重判已存答案，写 summary_corrected.json
   aggregate_matrix.py  # (T3) 显式 answer/score 行 → summary.json 兼容矩阵 summary；纯标准库、无网络/LLM
+  behavior_smoke/      # (T2) Tier 2 行为冒烟：自撰 fixture + 确定性探测器（进 CI）
+  drift/               # (T4) Tier 4 长程漂移：确定性 replay harness（回放脚本化 transcript + 快照；纯 stdlib、零成本）
   stats.py             # McNemar + 配对 bootstrap CI + Cohen's kappa（纯标准库）
   report.py            # 两臂报告器（中英双语 HTML + 引用）
   report_matrix.py     # 矩阵报告器：渲染 summary.json（默认 results/matrix/；T3 起支持 --summary/--out-dir）

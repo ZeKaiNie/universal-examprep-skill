@@ -1,0 +1,64 @@
+[
+  {
+    "id": "stack_lifo_1",
+    "phase": 1,
+    "chapter": "ch1_stack_queue",
+    "type": "choice",
+    "question": "栈遵循什么访问顺序？",
+    "options": [
+      "LIFO 后进先出",
+      "FIFO 先进先出",
+      "随机",
+      "按大小"
+    ],
+    "answer": "LIFO 后进先出",
+    "source": "material",
+    "ai_generated": false
+  },
+  {
+    "id": "queue_fifo_1",
+    "phase": 1,
+    "chapter": "ch1_stack_queue",
+    "type": "choice",
+    "question": "队列的出队顺序是什么？",
+    "options": [
+      "FIFO 先进先出",
+      "LIFO 后进先出",
+      "随机",
+      "按优先级"
+    ],
+    "answer": "FIFO 先进先出",
+    "source": "material",
+    "ai_generated": false
+  },
+  {
+    "id": "tree_height_1",
+    "phase": 2,
+    "chapter": "ch2_trees",
+    "type": "choice",
+    "question": "一棵只有根节点的树，高度是多少？",
+    "options": [
+      "0",
+      "1",
+      "2",
+      "无法确定"
+    ],
+    "answer": "0",
+    "source": "material",
+    "ai_generated": false
+  },
+  {
+    "id": "bst_property_1",
+    "phase": 2,
+    "chapter": "ch2_trees",
+    "type": "subjective",
+    "question": "二叉搜索树的中序遍历有什么特点？",
+    "answer_keywords": [
+      "有序",
+      "从小到大",
+      "升序"
+    ],
+    "source": "material",
+    "ai_generated": false
+  }
+]

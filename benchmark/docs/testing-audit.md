@@ -1,7 +1,7 @@
 # 测试与 Benchmark 审计 (Testing & Benchmark Audit)
 
 > 这是一份**诚实的现状快照**，用来在投入昂贵测试之前，把「我们到底测了什么、没测什么」说清楚。
-> 非营销文档。结论指向 PR 路线（见文末）。当前进度：**T1**（审计文档 + 一致性守卫）、**T2**（Tier 2 确定性行为冒烟层）、**T3**（提交版聚合器 `aggregate_matrix.py` + fixture 流水线）已落地；T2 的**真 LLM 行为**与 **T4–T5** 仍待做（完整发布矩阵仍需私有/付费产物）。本文件是跨 PR 维护的活快照，不跑付费 benchmark。
+> 非营销文档。结论指向 PR 路线（见文末）。当前进度：**T1**（审计文档 + 一致性守卫）、**T2**（Tier 2 确定性行为冒烟层）、**T3/T3.1**（提交版聚合器 `aggregate_matrix.py` + fixture 流水线 + 判分↔聚合桥）、**T4**（Tier 4 长程漂移**确定性 replay harness** [`drift/`](../drift/)）已落地；T2 的**真 LLM 行为**、T4 的**真 LLM 长会话**与 **T5** 仍待做（完整发布矩阵仍需私有/付费产物）。本文件是跨 PR 维护的活快照，不跑付费 benchmark。
 
 ---
 
@@ -13,7 +13,7 @@
 | **Tier 1** | `python scripts/validate_workspace.py <工作区>`（已建工作区结构/schema/来源标注/路径安全） | ❌ 仅文档化 | $0 | 校验器**逻辑**通过 Tier 0 的单测在 `tests/fixtures/` 上被执行；但**没有单独的 CI 步骤**在真实「ingest 产物」上跑该 CLI，也**没有 `ingest → validate` 的集成步骤** |
 | **Tier 2** | **行为冒烟**：确定性 mock 层（见 [`behavior_smoke/`](../behavior_smoke/)） | ✅ mock 进 CI | 近 $0 | 确定性层已落地；**真 LLM 行为验证尚未实现（opt-in skeleton）**，见 §4 |
 | **Tier 3** | 完整 benchmark（`gen.py` → 判分 → 矩阵报告） | ❌ | **昂贵**：单轮矩阵约几十美元 / 数小时 | 手动、临时触发 |
-| **Tier 4** | 长程漂移（long-horizon drift） | ❌ | 以天计额度 | **未来工作（future work）**，目前无 harness |
+| **Tier 4** | 长程漂移（long-horizon drift） | 🟡 replay 层进（根级）测试 | replay $0；真 LLM 以天计额度 | **确定性 replay harness 已落地**（[`drift/`](../drift/)，回放脚本化 transcript，纯 stdlib、零成本）；**真 LLM 长会话仍 opt-in、未实现、不进 CI** |
 
 **CI 现状**：`.github/workflows/ci.yml` 只有一步 `python -m unittest discover -s tests -v`，即只跑 Tier 0（**现已包含 `tests/test_behavior_smoke.py`——Tier 2 的确定性 mock 层**）；全部零成本。README 也已据此澄清为「CI 实际只跑 Tier 0」——Tier 1 校验器的逻辑由 Tier 0 单测在 `tests/fixtures/` 上覆盖，但该 CLI 本身不是独立 CI 步骤，也没有 `ingest → validate` 的集成步骤。
 
@@ -53,9 +53,9 @@
 
 跨 `课程 × 模型 × 臂` 的真实 LLM 矩阵，单轮约几十美元 / 数小时。它测的是**有据问答的 grounding / 幻觉 / 越界弃答**，不是交互式辅导流程。只在「故意改了技能行为 / 加了新课程材料 / 发布前」时手动触发，不应进 CI、不应为每个小改动跑。
 
-## 6. Tier 4 长程漂移：未来工作
+## 6. Tier 4 长程漂移：确定性 replay 已落地，真 LLM 长会话仍未来工作
 
-长对话（数十轮 + 中途干扰）下的目标保持 / 凭空编造率 / 断点恢复，按天计额度。**目前仅作为未来工作记录，无 harness。**
+长对话（数十轮 + 中途干扰）下的目标保持 / 计划遵守 / 编题率 / 断点恢复 / 来源标注 / 进度持久性。**T4 已落地一个确定性 replay harness** [`drift/`](../drift/)：回放脚本化的多轮 transcript + 工作区快照（自撰非版权 fixture），对上述维度做**确定性**测量并与阈值比对——纯 stdlib、零成本、进根级测试（`python benchmark/drift/run_drift.py --all`）。**但这是回放脚本化会话、不跑真 agent**：它度量「一段被记录的会话有没有漂移」，**不**证明在线模型不会漂移。**真 LLM 长会话仍 opt-in（`--llm` + `RUN_SKILL_DRIFT_LLM=1`）、未实现、绝不返回成功、不进 CI**；完整长程 LLM benchmark（以天计额度）仍为未来工作。
 
 ---
 
@@ -88,7 +88,7 @@
 2. **缓存生成与判分**：`gen.py` 已按格缓存答案+成本并可续跑；判分结果应缓存（理想按裁判提示哈希键控，使提示模板变更能正确失效）。
 3. **LLM 裁判只用于未决项**：仅对走不通确定性快路径的事实/定义题调用裁判。
 4. **Tier 2 要小且大多确定性**：约十几条行为场景、单一便宜模型（Haiku）、绝大多数是结构断言、只极少数需要一次便宜的 grounding 调用。
-5. **Tier 3 / Tier 4 必须手动触发**：完整 benchmark 与长程漂移绝不进 CI、绝不为小改动跑。
+5. **付费层必须手动触发**：完整 benchmark（Tier 3）与**真 LLM** 长程漂移（Tier 4 的 `--llm` 部分）绝不进 CI、绝不为小改动跑；Tier 4 的**确定性 replay 层**零成本、已进根级测试。
 
 ---
 
@@ -97,5 +97,5 @@
 - **T1** ✅：审计文档 + 覆盖矩阵 + benchmark 文档一致性守卫（零成本，纯文档/测试）。
 - **T2** ✅（确定性层）：Tier 2 行为冒烟——自撰非版权 fixture + harness + 确定性探测器（进 CI）；**真 LLM 行为冒烟为 opt-in、未进 CI、尚未实现**。
 - **T3** ✅（聚合层）：提交版 `summary.json` 聚合器 [`aggregate_matrix.py`](matrix_pipeline.md) + fixture 级可复现流水线 + `report_matrix.py --summary`。**完整发布矩阵仍依赖私有/付费产物**；benchmark 缓存/续跑/成本日志为后续增量。
-- **T4**：长程漂移 harness。
+- **T4** ✅（确定性 replay 层）：Tier 4 长程漂移 [`drift/`](../drift/)——回放脚本化 transcript + 快照的自撰非版权 fixture，确定性测量目标保持/计划遵守/编题率/断点恢复/来源标注/进度持久性/wiki 越章读（进根级测试）；**真 LLM 长会话为 opt-in、未进 CI、尚未实现**。
 - **T5**：判分校准（扩 kappa 样本、加 near-miss 越界探针、跨家族裁判、修正数值抽取）。
