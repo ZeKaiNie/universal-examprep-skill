@@ -1,0 +1,15 @@
+{
+  "name": "live_smoke_basic",
+  "fixture": "benchmark/drift/fixtures/mini_course_long",
+  "transcript": "benchmark/drift/fixtures/live_logs/live_smoke_golden.jsonl",
+  "notes": "T5c 专属：只含【文本可观察】阈值。wiki 惰性加载/越章读在一次性文本调用下不可观测，刻意不设阈值（由确定性 replay 层覆盖），避免空洞通过被误读为已验证。",
+  "thresholds": {
+    "goal_retention_min": 0.9,
+    "goal_marker_min": 1,
+    "quiz_invention_rate_max": 0.0,
+    "untagged_questions_max": 0,
+    "wrong_phase_quiz_max": 0,
+    "checkpoint_reset_max": 0,
+    "provenance_fidelity_min": 0.8
+  }
+}

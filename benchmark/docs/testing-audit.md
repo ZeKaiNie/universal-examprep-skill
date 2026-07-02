@@ -10,12 +10,12 @@
 | 层 | 是什么 | 进 CI？ | 成本 | 现实 |
 | :-- | :-- | :--: | :-- | :-- |
 | **Tier 0** | `python -m unittest discover -s tests`（stdlib 单元/静态测试套件） | ✅ Ubuntu + Windows × Py 3.8 + 3.12 | $0，纯标准库、无网络、无 API key | CI **唯一**实际运行的一层 |
-| **Tier 1** | `python scripts/validate_workspace.py <工作区>`（已建工作区结构/schema/来源标注/路径安全） | ❌ 仅文档化 | $0 | 校验器**逻辑**通过 Tier 0 的单测在 `tests/fixtures/` 上被执行；但**没有单独的 CI 步骤**在真实「ingest 产物」上跑该 CLI，也**没有 `ingest → validate` 的集成步骤** |
-| **Tier 2** | **行为冒烟**：确定性 mock 层（见 [`behavior_smoke/`](../behavior_smoke/)） | ✅ mock 进 CI | 近 $0 | 确定性层已落地；**真 LLM 行为验证尚未实现（opt-in skeleton）**，见 §4 |
+| **Tier 1** | `python scripts/validate_workspace.py <工作区>`（已建工作区结构/schema/来源标注/路径安全） | 🟡 集成测试随 Tier 0 进 CI | $0 | 校验器逻辑由 Tier 0 单测覆盖；**B6 起**另有确定性 `ingest → validate` 集成测试（`tests/test_ingest_validate_integration.py`：真跑两个 CLI，真实 ingest 产物必须过校验、篡改/缺图/坏 JSON 必须 1/2 退出）——经根测试进 CI，无独立 Actions 步骤（刻意不加 CI 配置） |
+| **Tier 2** | **行为冒烟**：确定性 mock 层（见 [`behavior_smoke/`](../behavior_smoke/)） | ✅ mock 进 CI | 近 $0 | 确定性层已落地；**T5c 起有 opt-in 真 agent 冒烟 runner**（[`drift/run_live_smoke.py`](../drift/run_live_smoke.py)：驱动→记录→T4 判分一条命令，env 门控、不进 CI）；**真实模型的验证运行尚未实现（未实际跑过真模型）**，见 §4 |
 | **Tier 3** | 完整 benchmark（`gen.py` → 判分 → 矩阵报告） | ❌ | **昂贵**：单轮矩阵约几十美元 / 数小时 | 手动、临时触发 |
 | **Tier 4** | 长程漂移（long-horizon drift） | 🟡 replay 层进（根级）测试 | replay $0；真 LLM 以天计额度 | **确定性 replay harness 已落地**（[`drift/`](../drift/)，回放脚本化 transcript，纯 stdlib、零成本）；**真 LLM 长会话仍 opt-in、未实现、不进 CI** |
 
-**CI 现状**：`.github/workflows/ci.yml` 只有一步 `python -m unittest discover -s tests -v`，即只跑 Tier 0（**现已包含 `tests/test_behavior_smoke.py`——Tier 2 的确定性 mock 层**）；全部零成本。README 也已据此澄清为「CI 实际只跑 Tier 0」——Tier 1 校验器的逻辑由 Tier 0 单测在 `tests/fixtures/` 上覆盖，但该 CLI 本身不是独立 CI 步骤，也没有 `ingest → validate` 的集成步骤。
+**CI 现状**：`.github/workflows/ci.yml` 只有一步 `python -m unittest discover -s tests -v`，即只跑 Tier 0（**现已包含 `tests/test_behavior_smoke.py`——Tier 2 的确定性 mock 层**）；全部零成本。README 也已据此澄清为「CI 实际只跑 Tier 0」——Tier 1 校验器的逻辑由 Tier 0 单测在 `tests/fixtures/` 上覆盖；**B6 起** `ingest → validate` 的确定性集成测试（真跑两个 CLI）也落在根 `tests/` 随 Tier 0 进 CI（仍无独立 Actions 步骤，刻意不加 CI 配置）。
 
 ---
 
@@ -33,7 +33,7 @@
 
 ## 3. Tier 1 校验什么
 
-`scripts/validate_workspace.py` 对一个**已建好的备考工作区**做零成本校验：目录结构、`quiz_bank.json` schema（题型/选项/答案在选项内/主观题关键词/diagram_type/true_false 布尔/source 枚举/`ai_generated` 标记）、`references/wiki/` 路径安全、进度文件一致性；退出码 `0` 通过 / `1` 有错 / `2` 致命（结构损坏或非法 JSON）。当前它由 Tier 0 单测在 fixtures 上驱动，缺少「真实 ingest 产物上跑 CLI」的独立 CI 步骤。
+`scripts/validate_workspace.py` 对一个**已建好的备考工作区**做零成本校验：目录结构、`quiz_bank.json` schema（题型/选项/答案在选项内/主观题关键词/diagram_type/true_false 布尔/source 枚举/`ai_generated` 标记）、`references/wiki/` 路径安全、进度文件一致性；退出码 `0` 通过 / `1` 有错 / `2` 致命（结构损坏或非法 JSON）。它由 Tier 0 单测在 fixtures 上驱动；**B6 起**另有 `tests/test_ingest_validate_integration.py` 在**真实 ingest 产物**上真跑该 CLI（happy 0 / 篡改 1 / 坏 JSON 2），随根测试进 CI。
 
 ## 4. Tier 2 行为冒烟：确定性层已落地，真 LLM 行为仍 opt-in（未进 CI）
 

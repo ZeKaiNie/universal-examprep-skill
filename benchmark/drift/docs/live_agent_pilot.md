@@ -19,6 +19,9 @@ Keep it small:
 - no external API calls unless a future task explicitly approves them
 - stop immediately if the session is clearly broken
 
+> **Automated mode (T5c)**: `run_live_smoke.py` runs this whole pilot as ONE command
+> (drive → record → convert → score); this runbook stays the manual/fallback path. See README §T5c.
+
 ## Three Modes
 
 | Mode | What Runs | What It Proves |

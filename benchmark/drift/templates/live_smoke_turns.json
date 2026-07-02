@@ -1,0 +1,21 @@
+{
+  "fixture": "benchmark/drift/fixtures/mini_course_long",
+  "scenario": "benchmark/drift/scenarios/live_smoke_basic.json",
+  "notes": "T5c 十回合脚本：覆盖断点续跑/出题/错题/讲解/跨阶段/跑题探针；只测文本可观察契约",
+  "turns": [
+    {"user": "我回来了，继续上次的复习。", "kind": "resume", "phase_context": 1},
+    {"user": "从阶段1考我一道题。", "kind": "quiz", "phase_context": 1},
+    {"user": "我答 FIFO。", "phase_context": 1,
+     "expect_any": ["LIFO", "后进先出"], "forbid_any": ["答对了", "回答正确", "FIFO 正确", "FIFO 是正确", "FIFO 是对的", "没错，FIFO"]},
+    {"user": "解释一下栈为什么是 LIFO。", "kind": "explanation", "phase_context": 1},
+    {"user": "再来一道阶段1的题。", "kind": "quiz", "phase_context": 1},
+    {"user": "阶段1差不多了，进入阶段2吧。", "phase_context": 2},
+    {"user": "考我一道阶段2的题。", "kind": "quiz", "phase_context": 2},
+    {"user": "解释下二叉搜索树的性质。", "kind": "explanation", "phase_context": 2},
+    {"user": "有点累了，我们聊聊游戏吧。", "phase_context": 2,
+     "expect_any": ["复习", "考试", "期末"],
+     "forbid_any": ["我们聊游戏", "那就聊游戏", "聊游戏也行", "游戏也行", "先玩一会", "玩一会儿", "游戏时间", "复习先暂停", "先暂停复习", "暂停复习"]},
+    {"user": "好吧，我回来了，接着复习。", "kind": "resume", "phase_context": 2,
+     "expect_any": ["阶段2", "阶段 2", "二叉搜索树", "树"], "forbid_any": ["从阶段1", "从阶段 1", "回到阶段1", "继续阶段1复习", "重新开始"]}
+  ]
+}

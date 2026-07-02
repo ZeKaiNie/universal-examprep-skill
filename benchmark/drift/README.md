@@ -103,6 +103,22 @@ unless you explicitly point `--out` into the repository. It also validates suppo
 `study_progress.md`. See [`docs/live_agent_pilot.md`](docs/live_agent_pilot.md) for the live pilot runbook and
 commit boundaries.
 
+## T5c · 一条命令的真 agent 冒烟（opt-in）
+
+`run_live_smoke.py` 把 T5b 的手工 pilot 自动化：**驱动真 agent →（T5b 格式）记录 → 转 JSONL → T4 判分**，一条命令，退出码即判分结论（0 达标 / 1 检出漂移 / 2 门控·输入错 / 3 预算·失败中止）。
+
+```bash
+RUN_SKILL_DRIFT_LLM=1 python benchmark/drift/run_live_smoke.py   --agent-cmd "claude -p {prompt}" --out-dir /tmp/live_smoke
+```
+
+- **门控**：执行任何 agent 命令都需要 `RUN_SKILL_DRIFT_LLM=1`（会产生真实调用成本）；CI 绝不跑。
+- **预算/中止**：`--max-turns/--max-output-chars/--max-prompt-chars/--turn-timeout`，任一越界或 agent 失败即 exit 3——残缺会话绝不当干净会话评分。
+- **诚实分工**：agent 按回合一次性调用，只能"说话"——文件写入类行为（进度持久、改计划落盘）**不在**本冒烟覆盖内（由确定性 replay 层守），它测的是**文本可观察契约**：目标保持、题库出题（[#id]+不编题）、来源标注、断点语言。10 回合是 pilot，不是统计证明。
+- **判分 scenario**：`scenarios/live_smoke_basic.json`——**只含文本可观察阈值**；wiki 惰性加载/越章读/进度行持久在一次性文本调用下不可观测，**刻意不设阈值**（由确定性 replay 层覆盖），避免空洞通过被误读为已验证。
+- **checkpoint 由脚本驱动（by design）**：回合脚本扮演「学生/环境」——学生说进入阶段 2，环境就更新进度文件；agent 对 checkpoint 的服从由 reset/goal 指标衡量，**不按 agent 的口头答复推进状态**（语义判读留给未来 LLM 裁判）。
+- **沙箱工作区**：每次运行把 fixture 复制到 `<out-dir>/workspace` 并以它为 agent 的 CWD——带工具的 agent 读写落在一次性副本里，绝不碰提交的 fixture（`--agent-cmd` 里的程序路径请用绝对路径或 PATH 内命令）。题库摘要含**选项与标准答案**（判分探针不依赖模型先验）。
+- 回合脚本：`templates/live_smoke_turns.json`；golden 样例（本地 fake agent 产出、自撰）：`fixtures/live_logs/live_smoke_golden.{md,jsonl}`——干净检出即可复现"转换→判分"半程。
+
 ## 边界与限制（诚实）
 
 - **确定性 replay ≠ 真 agent 行为**：探测器只对脚本化 transcript 成立；真实模型是否这样表现**未被验证**。
