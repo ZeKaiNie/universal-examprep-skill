@@ -148,3 +148,12 @@ For any item with `requires_assets=true` or `maybe_requires_assets=true`:
 | asset `role`/`type` 取值非法、`source_pages` 非正整数、`source_file`/`answer_source_file` 非字符串 | ❌ 错误 |
 | `source_file`/`answer_source_file` 为绝对路径 / 含 `..` 穿越 / URL | ❌ 错误（provenance 名不得指出材料外） |
 | `requires_assets` / `maybe_requires_assets` 非布尔，或 `role`/`type`/`question_text_status` 为非字符串 | ❌ 错误（结构化报错，不崩溃） |
+
+### 视觉双索引（P0-V2，召回优先）
+
+`scripts/build_visual_index.py --workspace <ws> --materials <课程文件夹>` 在 `references/` 下生成两个索引（可再生成物，可随时重建）：
+
+- **`image_question_index.json`** —— 每道题的视觉档案（requires/maybe、题面/答案 asset 路径、`source_file`/`source_pages`、有无官方答案、**答案页是否视觉页**）+ 按章汇总（总题数 × requires × maybe × 疑漏）+ **suspects 疑漏名单**：出处页命中视觉页、但题库未标图依赖且无题面 asset 的题。
+- **`figure_page_index.json`** —— 材料里**每个视觉页**（文件 + 页码 + 视觉类型 `figure/table/diagram/chart/graph/plot/screenshot/circuit/tree/map/geometry/flowchart`）。判定是**分层确定性启发式、不绑任何学科**：① 结构信号（页内嵌图/大量矢量对象，需 `pip install pymupdf`，**没有关键词的图页也能抓到**）→ ② 图号/表号与坐标轴排版 → ③ 多学科中英词面（最弱）。缺 PyMuPDF 时结构信号缺失，索引会如实标 `media_signals=false` 并告警。
+
+默认**只报告不改**；`--apply` 会把每个疑漏题的原页渲染成 PNG（挂 `question_context`/`page_image` 题面 asset）并标 `maybe_requires_assets=true`（先备份 `quiz_bank.json.bak`），因此回写后仍满足上表的 fail-closed 门控。配套官方工具：`list_image_questions.py`（按章 总数×requires×maybe×疑漏）、`list_figure_pages.py`（视觉页清单，可按类型过滤）、`show_question_assets.py`（输出某题应先展示的题面图 Markdown，POSIX 相对路径，违约即 exit 1）。

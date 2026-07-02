@@ -182,6 +182,7 @@ python scripts/validate_workspace.py path/to/workspace
   * 🐍 `build_raw_input_from_workspace.py`：**【官方课程材料入口】** —— 把一文件夹的讲义/作业 **PDF** 扫成 `ingest.py` 用的 `raw_input.json`：保留**原页出处**、把依赖图的页**整页渲染成 PNG asset**、抽取讲义 **Example/Quiz 题—解对**进题库、并产出解析报告。让 AI 不必再手写临时解析脚本而丢图丢题。PDF 文本/渲染为**可选依赖**（文本 `pip install pypdf`；渲染 `pip install pymupdf` 或 `pypdfium2 Pillow`，缺失会清晰报错）；纯 `.txt/.md` 无需依赖。官方流程：`build_raw_input_from_workspace.py → ingest.py → validate_workspace.py`（详见 [`docs/file-format.md`](docs/file-format.md) §4）。
   * 🐍 `ingest.py`：**【一键环境初始化脚本】** —— 由 AI 助手在后台自动调用，负责一键切分 Wiki 章节、题库并部署进度表。
   * 🐍 `validate_workspace.py`：**【工作区校验器】** —— 静态校验已建工作区的结构、题库 schema、来源标注与路径安全（纯标准库，零成本）。
+  * 🐍 `build_visual_index.py`：**【通用视觉双索引，召回优先】** —— 分层确定性识别（页内嵌图/矢量对象 → 图号/坐标轴排版 → 多学科中英词面，不绑任何学科）生成 `image_question_index.json`（每题视觉档案 + 按章 总数×requires×maybe×疑漏）与 `figure_page_index.json`（材料视觉页清单），并给出**疑似漏标图依赖题**报告；`--apply` 渲染原页挂题面 asset 并标 `maybe_requires_assets`。配套 `list_image_questions.py` / `list_figure_pages.py` / `show_question_assets.py`（图题统计与题面图展示的官方工具，替代临时脚本）。
 * 📂 **`docs/`**：架构与策略文档。
   * 📄 `language-policy.md`：双语语言策略（英文控制层 + 简体中文学生层）与来源标注的唯一权威定义。
   * 📄 `skill-architecture.md`：技能集合结构说明（子技能 ↔ 备考生命周期映射）。
