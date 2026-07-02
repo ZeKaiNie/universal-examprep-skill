@@ -158,7 +158,7 @@ python scripts/validate_workspace.py path/to/workspace
 ```
 
 - 工作区文件格式规范见 [`docs/file-format.md`](docs/file-format.md)；校验器为 [`scripts/validate_workspace.py`](scripts/validate_workspace.py)。
-- **完整 benchmark 很贵**（一次单轮矩阵几十美元/几小时，长程漂移测试以天计额度），**不应为每个小改动跑全量**——分层策略见 [`benchmark/docs/test_tiers.md`](benchmark/docs/test_tiers.md)。**CI 实际只跑 Tier 0（单元测试）**；Tier 1 校验器是本地/手动步骤——它的校验逻辑已由 Tier 0 单测在 `tests/fixtures/` 上覆盖，但 CI 未单独在真实 ingest 产物上运行该 CLI。
+- **完整 benchmark 很贵**（一次单轮矩阵几十美元/几小时，长程漂移测试以天计额度），**不应为每个小改动跑全量**——分层策略见 [`benchmark/docs/test_tiers.md`](benchmark/docs/test_tiers.md)。**CI 实际只跑 Tier 0（单元测试）**；Tier 1 校验器是本地/手动步骤——它的校验逻辑已由 Tier 0 单测在 `tests/fixtures/` 上覆盖，且有确定性 `ingest → validate` 集成测试（真跑两个 CLI，在真实 ingest 产物上）随根测试进 CI。
 
 ---
 
