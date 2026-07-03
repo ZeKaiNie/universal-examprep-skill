@@ -14,9 +14,11 @@ thresholds:
   * wiki lazy-load / overread — reads scoped to the phase's chapter; optional token/cost accounting.
 
 This is DETERMINISTIC REPLAY of a scripted transcript. It does NOT run a real agent — so it measures
-whether a *recorded* session drifts, not whether a live model will. Real long-session LLM runs remain a
-future/opt-in path (`--llm`, gated by RUN_SKILL_DRIFT_LLM=1) that is a SKELETON here and never returns
-success. Nothing in this file calls a model, reads a key, hits the network, or runs a paid benchmark.
+whether a *recorded* session drifts, not whether a live model will. The DEFAULT path calls no model,
+reads no key, hits no network, runs no paid benchmark. Real long-session LLM runs are the OPT-IN `--llm`
+path (B3): gated by RUN_SKILL_DRIFT_LLM=1, it delegates to `run_live_smoke.py` — drive a real agent
+turn-by-turn (token-capped, abort-on-failure, fixture-sandboxed) → record a T5b log → convert to JSONL
+→ score with THIS file's `compute_metrics`/thresholds → ledger. CI never runs it (env gate + real agent).
 
 Exit codes: 0 = all scenarios pass their thresholds · 1 = a threshold failed · 2 = malformed input / bad file.
 
@@ -30,6 +32,7 @@ import glob
 import json
 import os
 import re
+import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -39,10 +42,16 @@ ROOT = os.path.dirname(os.path.dirname(HERE))                      # repo root (
 # （否则「明天考/考前一天/今天」这些被 update_progress 认作 ≤1天 的别名会在 drift 侧被漏判为非紧迫）。
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 try:
-    from update_progress import _normalize_tier as _canon_tier, LEARNING_MODES as _LEARN_MODES
+    from update_progress import (_normalize_tier as _canon_tier, LEARNING_MODES as _LEARN_MODES,
+                                 _WINDOW_STATUSES as _WIN_STATUSES, _md_cell as _md_cell)
 except Exception:                                                 # 缺文件时退化为内置常量，不让 drift 崩
     _canon_tier = None
     _LEARN_MODES = ("零基础从头讲", "某章起步补弱", "查缺补漏")
+    _WIN_STATUSES = ("在窗口", "窗口外", "已实测")
+
+    def _md_cell(v, default="-"):                                # 缺 update_progress 时的等价兜底
+        s = str(v) if v not in (None, "") else default
+        return re.sub(r"\s*[\r\n]+\s*", " ", s).replace("|", "/").strip()
 
 
 def _tier_is_urgent(time_budget):
@@ -124,6 +133,12 @@ def load_scenario(path):
             raise DriftError("scenario 缺必需字段 %r" % k)
     if not isinstance(sc["thresholds"], dict):
         raise DriftError("scenario.thresholds 必须是对象")
+    for tk in sc["thresholds"]:
+        # 未知阈值 key（typo，如 nonsense_max）是坏 scenario——在**加载**即报，让确定性路径与 --llm 预检
+        # 都能在判分/付费之前拦下，而不是烧完 token 才在 check_thresholds 炸（Codex OSlL7）
+        if tk not in THRESHOLD_RULES:
+            raise DriftError("scenario.thresholds 出现未知阈值 %r（可用：%s）"
+                             % (tk, ", ".join(sorted(THRESHOLD_RULES))))
     for k in ("fixture", "transcript"):                           # path fields must be strings before _resolve()
         if k in sc and not isinstance(sc[k], str):
             raise DriftError("scenario.%s 必须是字符串路径" % k)
@@ -289,6 +304,36 @@ def _is_table_header(line):
     return sum(1 for w in _TABLE_HDR_WORDS if w in low) >= 2
 
 
+def _window_same_row(prev, cur):
+    """prev 行与 cur 行是否同一逻辑窗口条目（**方向性**）：精确相等，或 prev 无章、cur 补了章（backfill）。
+    反向——prev 有章 point@N、cur 抹成 point@（擦掉章节身份）——是**丢失**，不算同一行（Codex SGGq）；
+    只有 update_progress 真会做的补章节回填算同一行。"""
+    if prev == cur:
+        return True
+    # 键是 point@chapter；point 可能含 @（如 C@语言），章节不含 @——从右切（rpartition）才不会把 point
+    # 的一段误当章节（Codex OSZRp）。
+    pp, _, pc = prev.rpartition("@")
+    cp, _, cc = cur.rpartition("@")
+    return pp == cp and pc == "" and cc != ""   # 仅允许 backfill：prev 无章 → cur 有章
+
+
+def _window_diff(prev, cur):
+    """一对一方向性匹配统计窗口条目的 (added, lost)——一个 cur 行只能消费一个 prev 行（避免一条 unchaptered
+    行同时抵消多条 prev 行掩盖真丢失，Codex R_Xa），且只认精确/backfill 匹配（抹章=丢失，Codex SGGq）。
+    specific（有章）prev 先匹配，loose（point@）后，避免抢占。"""
+    avail = list(cur)
+    lost = 0
+    for a in sorted(prev, key=lambda k: k.endswith("@")):
+        idx = next((i for i, c in enumerate(avail) if c == a), None)                    # 先精确
+        if idx is None:
+            idx = next((i for i, c in enumerate(avail) if _window_same_row(a, c)), None)  # 再 backfill
+        if idx is None:
+            lost += 1
+        else:
+            avail.pop(idx)
+    return len(avail), lost                                  # 剩下没被消费的 cur 行 = 新增
+
+
 def parse_progress(text):
     """{'phase': int|None, 'mistake_rows': [...], 'confusion_rows': [...]} from a study_progress.md.
 
@@ -301,17 +346,37 @@ def parse_progress(text):
     phase = int(pm.group(1)) if pm else None
     mistake, confusion, cur = [], [], None
     mistake_st, confusion_st, cur_st = [], [], None
+    window_keys, window_st, window_nt = [], [], []   # A6 🪟 窗口区：point@chapter 键 + 状态 + 备注（可跨源比对）
+    in_window = False
     for ln in t.splitlines():
         h = ln.strip()
         is_heading = bool(re.match(r"^\s{0,3}(#{1,4}\s|\*\*)", ln))
         if is_heading and re.search(r"错题|mistake", h):
-            cur, cur_st = mistake, mistake_st
+            cur, cur_st, in_window = mistake, mistake_st, False   # 进归档区必须清 in_window（窗口区可能在前，OSlL9）
             continue
         if is_heading and re.search(r"疑难|困惑|confusion", h):
-            cur, cur_st = confusion, confusion_st
+            cur, cur_st, in_window = confusion, confusion_st, False
+            continue
+        if is_heading and re.search(r"🪟|知识点窗口", h):           # A6 知识点窗口区（生成视图）
+            cur, cur_st, in_window = None, None, True
             continue
         if re.match(r"^\s{0,3}#{1,4}\s", ln):                      # any OTHER heading ends the section
-            cur, cur_st = None, None
+            cur, cur_st, in_window = None, None, False
+            continue
+        if in_window:
+            # 🪟 表数据行：| 知识点 | 关联章节 | 状态 | 备注 |——结构化成 point@chapter 键 + 状态
+            if _TABLE_SEP.match(ln) or _is_table_header(ln) or not h.startswith("|"):
+                continue
+            cells = [c.strip() for c in h.strip("|").split("|")]
+            if not cells or not cells[0] or cells[0] == "-":
+                continue
+            pt = cells[0]
+            ch = cells[1] if len(cells) > 1 and cells[1] not in ("", "-") else ""
+            stt = cells[2] if len(cells) > 2 and cells[2] not in ("", "-") else None
+            note = cells[3] if len(cells) > 3 and cells[3] not in ("", "-") else ""
+            window_keys.append("%s@%s" % (pt, ch))
+            window_st.append(stt)
+            window_nt.append(note)
             continue
         if cur is None:
             continue
@@ -320,7 +385,8 @@ def parse_progress(text):
             # 占位判定按【整条】——真实笔记里含「（暂无）」字样（如问空集的行）不能被当占位丢掉
             if not _ROW_PLACEHOLDER.fullmatch(body):
                 cur.append(re.sub(r"\s+", " ", h))
-                cur_st.append(None)                                 # bullet 形没有状态列
+                if cur_st is not None:
+                    cur_st.append(None)                             # bullet 形没有状态列
         elif h.startswith("|") and not _TABLE_SEP.match(ln) and not _is_table_header(ln):
             cells = [c.strip() for c in h.strip("|").split("|")]
             if not any(c and c != "-" for c in cells):
@@ -332,9 +398,23 @@ def parse_progress(text):
             cur.append(re.sub(r"\s+", " ", h))                     # a table DATA row with real content
             # 生成表的状态列固定在最后一格（≥4 列才有状态列）——状态是自由文本
             # （已订正/已复盘/已解决…），词表白名单会漏掉合法值让陈旧状态钻空子
-            cur_st.append(cells[-1] if len(cells) >= 4 and cells[-1] not in ("", "-") else None)
+            if cur_st is not None:
+                cur_st.append(cells[-1] if len(cells) >= 4 and cells[-1] not in ("", "-") else None)
     return {"phase": phase, "mistake_rows": mistake, "confusion_rows": confusion,
-            "mistake_status": mistake_st, "confusion_status": confusion_st}
+            "mistake_status": mistake_st, "confusion_status": confusion_st,
+            "window_rows": window_keys, "window_status": window_st, "window_note": window_nt}
+
+
+def _window_state_map(snap):
+    """有序的 [(point@chapter, status, note)] 列表 —— 用于跨源比对 state 与生成视图 md 的窗口面板是否一致。
+    用**保留重数**的排序列表而非 dict：md 里同一窗口行出现两次（陈旧/手改）不能被 dict 折叠掉而漏判
+    （OSTZO）。带上 note：只改 note 的 state 更新若 md 面板没跟上（备注列陈旧）也要抓（OSZRm）。
+    省略 status 归一到渲染默认 在窗口。"""
+    keys = snap.get("window_rows", []) or []
+    sts = snap.get("window_status", []) or []
+    nts = snap.get("window_note", []) or []
+    return sorted((k, (sts[i] if i < len(sts) and sts[i] else "在窗口"), (nts[i] if i < len(nts) else ""))
+                  for i, k in enumerate(keys))
 
 
 # ---------------- provenance + quiz (mirror T2 semantics) ----------------
@@ -440,10 +520,49 @@ def parse_state_json(text, plan_phases=None):
         stat[field] = sts
         return out
     stat = {}
-    return {"phase": phase, "mistake_rows": _rows("mistake_archive"),
-            "confusion_rows": _rows("confusion_log"),
-            "mistake_status": stat["mistake_archive"],
-            "confusion_status": stat["confusion_log"]}
+    m_rows, c_rows = _rows("mistake_archive"), _rows("confusion_log")
+
+    # A6 知识点窗口行：point 必填、chapter 选填、status 选填——键为 point@chapter（同名不同章不折叠），
+    # 与 update_progress 的窗口 schema 同口径；坏行（缺 point / 非字符串）按畸形输入 fail-loud。
+    wv = st.get("knowledge_window")
+    if wv is None:
+        wv = []
+    if not isinstance(wv, list):
+        raise DriftError("files_after 里的 study_state.json 字段 knowledge_window 必须是数组，实际 %s"
+                         % type(wv).__name__)
+    window_rows, window_status, window_note = [], [], []
+    for r in wv:
+        if not isinstance(r, dict) or not isinstance(r.get("point"), str) or not r["point"].strip():
+            raise DriftError("study_state.json 快照的 knowledge_window 行必须是含非空 point 的对象: %r" % r)
+        ch = r.get("chapter")
+        if ch is not None and not isinstance(ch, (str, int)) or isinstance(ch, bool):
+            raise DriftError("study_state.json 快照的 knowledge_window 行 chapter 必须是字符串/整数或省略: %r" % r)
+        stt = r.get("status")
+        if stt is not None and stt not in _WIN_STATUSES:
+            # update_progress 只接受 在窗口/窗口外/已实测——非 canonical（typo/任意串）是坏写入，
+            # 静默收下会让「状态迁移」指标把乱码变化也当成真窗口进出（Codex R_Xd）
+            raise DriftError("study_state.json 快照的 knowledge_window 行 status 必须是 %s 或省略: %r"
+                             % ("/".join(_WIN_STATUSES), r))
+        # 键按 _md_cell 归一（| → /、换行折叠），与 render_md 写进生成视图的单元格一致——否则含 | 的
+        # point 名（DFS|BFS → DFS/BFS）会让正确重渲染的 md 被误判为陈旧面板（Codex OSTZP）
+        window_rows.append("%s@%s" % (_md_cell(r["point"]), "" if ch in (None, "") else _md_cell(ch)))
+        # 省略 status 归一到渲染默认「在窗口」——update_progress.render_md 也把缺省 status 渲成 在窗口，
+        # 否则 {point,chapter} 无 status 的合法行会让 state 图（None）与 md 图（在窗口）误判不一致（SGGn）
+        window_status.append(stt if isinstance(stt, str) else "在窗口")
+        # 备注也按 _md_cell 归一（与 render_md 的备注列一致），省略 → ""，用于生成视图一致性比对（OSZRm）
+        wn = r.get("note")
+        window_note.append(_md_cell(wn, default="") if wn not in (None, "") else "")
+
+    if len(set(window_rows)) != len(window_rows):
+        # 同一 point@chapter 出现多次 = 追加而非更新的坏写入（update_progress 的 window-add 会去重）；
+        # 静默收下会让 _window_diff 把重复当"新增"、迁移循环把它当迁移、生成视图折叠掉——矛盾的重复行
+        # 却报 lost=0（Codex OSL86）。按畸形输入 fail-loud。
+        dups = sorted({k for k in window_rows if window_rows.count(k) > 1})
+        raise DriftError("study_state.json 快照的 knowledge_window 有重复条目（同一 point@chapter 多次出现，"
+                         "窗口进出应更新同一行而非追加）: %s" % dups)
+    return {"phase": phase, "mistake_rows": m_rows, "confusion_rows": c_rows,
+            "mistake_status": stat["mistake_archive"], "confusion_status": stat["confusion_log"],
+            "window_rows": window_rows, "window_status": window_status, "window_note": window_note}
 
 
 def _snap_text(fa, name):
@@ -534,6 +653,11 @@ def _session_snapshots(turns, state_established=False, plan_phases=None, init_du
                         != len(snap["mistake_rows"]) + len(snap["confusion_rows"])):
                     # 双向都算：md 多行=手加，md 少行=state 进了新行而给学生看的生成视图没跟上
                     #（官方更新每次写 state 都重渲染 md，双快照行数必然一致）
+                    stale_md += 1
+                elif _window_state_map(md_snap) != _window_state_map(snap):
+                    # A6：生成视图的 🪟 区必须与事实源一致——不只行数，连每条 point@chapter 的状态都要匹配。
+                    # state 把某条从 在窗口 迁到 窗口外 而 md 面板还停在旧状态（漏渲染/陈旧面板）→ 计入
+                    # md_write_after_state（学生看到错的窗口状态，Codex R5LE + R_XY）
                     stale_md += 1
                 elif prev_dual is not None and md_keys != prev_dual[0] \
                         and st_keys == prev_dual[1]:
@@ -926,6 +1050,7 @@ def compute_metrics(scenario, fixture_dir, turns):
         if snap is not None:
             parsed.append(snap)
     mistake_added = confusion_added = rows_lost = 0
+    window_added = window_lost = window_status_migrations = 0
     for prev, cur in zip(parsed, parsed[1:]):
         for field, is_m in (("mistake_rows", True), ("confusion_rows", False)):
             pset = {_row_key(r) for r in prev[field]}
@@ -936,6 +1061,23 @@ def compute_metrics(scenario, fixture_dir, turns):
             else:
                 confusion_added += gained
             rows_lost += lost
+        # A6 知识点窗口持久化：新增可以（讲了新点），但**丢失**（静默掉行）不行。身份用 compat 判定
+        # ——null-章节键 point@ 与 point@N 相容（工具补章节回填是同一行），补章节不算 丢+加（R5LA）。
+        pw, cw = prev.get("window_rows", []), cur.get("window_rows", [])
+        ps, cs = prev.get("window_status", []), cur.get("window_status", [])
+        _add, _lost = _window_diff(pw, cw)
+        window_added += _add
+        window_lost += _lost
+        # 状态迁移：同一（相容）条目状态变了（在窗口→窗口外→已实测）计一次——只保留行不迁移状态
+        # 的转写不算真的窗口进出（R5LB）。
+        pstat = list(zip(pw, ps))
+        for c, st in zip(cw, cs):
+            if st is None:
+                continue
+            for a, pst in pstat:
+                if _window_same_row(a, c) and pst is not None and pst != st:
+                    window_status_migrations += 1
+                    break
 
     # 7) wiki lazy-load / overread — read events checked against the RUNNING phase (see turn_phase)
     wiki_reads = 0
@@ -982,6 +1124,8 @@ def compute_metrics(scenario, fixture_dir, turns):
         "explanation_turns": len(expl), "provenance_fidelity": provenance_fidelity,
         "mistake_rows_added": mistake_added, "confusion_rows_added": confusion_added,
         "progress_rows_lost": rows_lost, "md_write_after_state": md_after_state,
+        "window_rows_added": window_added, "window_rows_lost": window_lost,
+        "window_status_migrations": window_status_migrations,
         "wiki_reads": wiki_reads, "unique_wiki_files": wiki_files, "overread_flag": overread,
         "cost": cost,
     }
@@ -1002,6 +1146,9 @@ THRESHOLD_RULES = {
     "checkpoint_reset_max": ("reset_detected", "max"),
     "provenance_fidelity_min": ("provenance_fidelity", "min"),
     "progress_rows_lost_max": ("progress_rows_lost", "max"),
+    "window_rows_added_min": ("window_rows_added", "min"),   # A6：长会话里至少登记过 N 个窗口条目
+    "window_rows_lost_max": ("window_rows_lost", "max"),     # A6：窗口条目不得静默丢失（进出是状态迁移）
+    "window_status_migrations_min": ("window_status_migrations", "min"),  # A6：窗口条目须真的迁移状态
     "md_write_after_state_max": ("md_write_after_state", "max"),   # A4: state 确立后手改生成视图的次数
     "wiki_unique_files_max": ("unique_wiki_files", "max"),
     "overread_max": ("overread_flag", "max"),
@@ -1062,13 +1209,88 @@ def _fmt(result):
     return "\n".join(lines)
 
 
-def run_llm_skeleton():
-    """Opt-in real-agent long-session mode — NOT IMPLEMENTED. Never returns success (exit 0)."""
+def run_llm(argv):
+    """B3：opt-in 真 agent 长会话漂移测量——不再是 skeleton。委托给 run_live_smoke.py 的真管线
+    （驱动真 agent 逐回合 → 录 T5b 会话日志 → 转 JSONL → 本文件的 compute_metrics/阈值判分 → 记账），
+    它已实现 token 上限、失败中止、fixture 沙箱、opt-in env 门控。用 `--turns <spec>`（内含 fixture/
+    scenario/turns）指定回合脚本，`--agent-cmd`/`--out-dir`/`--max-*` 等透传。CI 绝不跑（env 门控 + 需真 agent）。"""
     if os.environ.get("RUN_SKILL_DRIFT_LLM") != "1":
-        sys.stderr.write("run_drift: --llm 需 RUN_SKILL_DRIFT_LLM=1 显式开启（真 agent 长会话，opt-in）\n")
+        sys.stderr.write("run_drift: --llm 需 RUN_SKILL_DRIFT_LLM=1 显式开启（真 agent 长会话，会产生真实"
+                         "调用成本，opt-in、CI 绝不运行）\n")
         return 2
-    sys.stderr.write("run_drift: 真 LLM 长会话漂移测量尚未实现（本 PR 只交付确定性 replay）；不接入、不计成功\n")
-    return 3
+    live = os.path.join(HERE, "run_live_smoke.py")
+    if not os.path.isfile(live):
+        sys.stderr.write("run_drift: 缺 run_live_smoke.py，无法运行真 agent 长会话\n")
+        return 3
+    # 透传 --llm 之外的所有参数给 live runner（--agent-cmd/--out-dir/--turns/--max-* 由它校验）
+    passthrough = [a for a in (argv or []) if a != "--llm"]
+
+    def _flag_val(flag):
+        for i, a in enumerate(passthrough):
+            if a == flag and i + 1 < len(passthrough):
+                return passthrough[i + 1]
+            if a.startswith(flag + "="):
+                return a.split("=", 1)[1]
+        return None
+
+    def _absolutize(flag):
+        # --turns/--out-dir 与 run_live_smoke 一样是 **CWD 相对**——在此绝对化并回写 passthrough，
+        # 让本处预检与委托的 live runner（及它内部再调本 harness 判分）用同一份绝对路径，
+        # 避免路径口径不一致导致预检漏判、或付费跑完才在判分处「找不到 transcript」（Codex OSfRR/OSfRS）。
+        for i, a in enumerate(passthrough):
+            if a == flag and i + 1 < len(passthrough):
+                passthrough[i + 1] = os.path.abspath(passthrough[i + 1])
+                return passthrough[i + 1]
+            if a.startswith(flag + "="):
+                v = os.path.abspath(a.split("=", 1)[1])
+                passthrough[i] = flag + "=" + v
+                return v
+        return None
+
+    # run_live_smoke 的 --turns 有默认值（短 smoke live_smoke_basic）——委托时不带 --turns 会静默跑成
+    # 短 smoke 而非调用者想要的长会话漂移探针。这里强制要求显式 --turns（Codex R_Xg）。
+    if not _flag_val("--turns"):
+        sys.stderr.write("run_drift: --llm 长会话漂移必须显式指定 --turns <回合脚本>（否则委托的 live "
+                         "runner 会默认跑短 smoke 而非长会话漂移）\n")
+        return 2
+    turns_abs = _absolutize("--turns")
+    _absolutize("--out-dir")
+
+    # 预检：坏 turns / 坏 scenario / 依赖 state 的 scenario 都在**付费 agent 循环之前**拦下——
+    # run_live_smoke 只在进 agent 循环前查 scenario 文件是否存在、不校验其内容，坏阈值会烧完 token 才在
+    # 判分处炸（Codex OSfRP）。
+    try:
+        spec = json.loads(_read(turns_abs))
+    except (IOError, OSError, ValueError):
+        # turns 文件缺失/坏 JSON——交给 live runner 报（它在进 agent 循环前就会校验并 _die，不烧 token）
+        return subprocess.run([sys.executable, live] + passthrough).returncode
+    scen_ref = spec.get("scenario") if isinstance(spec, dict) else None
+    sc = None
+    if isinstance(scen_ref, str) and scen_ref:
+        try:
+            sc = load_scenario(_resolve(scen_ref))           # scenario ref 是 repo-root 相对（同 live runner）
+        except DriftError as e:
+            sys.stderr.write("run_drift: --llm 的 scenario 无法解析/校验（%s），拒绝在付费 agent 循环之前"
+                             "委托：%s\n" % (scen_ref, e))
+            return 2
+    # run_live_smoke 只录对话 + 阶段切换时的合成 study_progress.md 快照，**不录 agent 写的 study_state.json**。
+    # 因此依赖 state 快照的 scenario（requires_state / fixture 自带 study_state.json / state·窗口阈值）在 live
+    # 判分里会看不到 state 写入而恒 0、谎报成 agent 失败——付费前显式拒绝（Codex OSL85/OSTZM/OSZRj）。
+    # 只拒真正需 study_state.json 的：窗口行只来自 state、urgent_mode_persisted 读 state；checkpoint/
+    # md_write_after/progress_rows_lost 由合成 md 快照支持，不该把默认 live_smoke_basic 也挡下。
+    _STATE_THRESH = {"window_rows_added_min", "window_rows_lost_max", "window_status_migrations_min",
+                     "urgent_mode_persisted_min"}
+    fixture_has_state = (sc is not None and isinstance(sc.get("fixture"), str)
+                         and os.path.isfile(os.path.join(_resolve(sc["fixture"]), "study_state.json")))
+    if sc is not None and (sc.get("requires_state") or fixture_has_state
+                           or (set(sc.get("thresholds", {})) & _STATE_THRESH)):
+        sys.stderr.write("run_drift: --llm 暂不支持依赖 study_state.json 的 scenario（%s：requires_state / "
+                         "fixture 自带 study_state.json / state·窗口阈值）——run_live_smoke 只录对话+合成 md、"
+                         "不录 agent 写的 state 快照，会看不到 state/窗口写入而误判。请用无 state 的 scenario "
+                         "跑 live，或走确定性 replay（--scenario ... --transcript ...）。捕获真实 state 快照是"
+                         "后续工作。\n" % sc.get("name"))
+        return 2
+    return subprocess.run([sys.executable, live] + passthrough).returncode
 
 
 def main(argv=None):
@@ -1082,11 +1304,15 @@ def main(argv=None):
     ap.add_argument("--transcript", help="transcript JSONL 路径（覆盖 scenario 里的默认 transcript）")
     ap.add_argument("--all", action="store_true", help="跑 scenarios/ 下所有 scenario 各自的 transcript")
     ap.add_argument("--json-out", default=None, help="把汇总写到显式路径的 JSON（默认只打印，不写任何 results 目录）")
-    ap.add_argument("--llm", action="store_true", help="opt-in 真 agent 长会话（未实现的 skeleton，绝不计成功）")
-    args = ap.parse_args(argv)
-
+    ap.add_argument("--llm", action="store_true",
+                    help="opt-in 真 agent 长会话（委托 run_live_smoke.py 真管线；需 RUN_SKILL_DRIFT_LLM=1，CI 绝不跑）")
+    # --llm 下把未知参数（--agent-cmd/--turns/--out-dir/--max-* 等）透传给 live runner；
+    # 确定性 replay 路径仍严格解析——未识别参数报错，防 typo 静默吞掉
+    args, extra = ap.parse_known_args(argv)
     if args.llm:
-        return run_llm_skeleton()
+        return run_llm(argv if argv is not None else sys.argv[1:])
+    if extra:
+        ap.error("未识别的参数: %s" % " ".join(extra))
 
     results = []
     try:
