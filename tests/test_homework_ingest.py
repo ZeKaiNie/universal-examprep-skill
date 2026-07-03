@@ -2826,6 +2826,220 @@ class HomeworkIngest(unittest.TestCase):
         for q in hw:
             self.assertEqual(q["type"], "subjective")              # 计分书写行不是挖空
 
+    # ---- D5: wiki 配图 + 图题召回补强 regression guards ----
+
+    def test_visual_cue_vocabulary_bidirectional(self):
+        for good in ("如下图所示，求阴影面积。", "见下图的电路。", "as shown in Figure 3, compute x.",
+                     "下表所示的数据分布。"):
+            self.assertTrue(B.requires_assets_heuristic(good, renderable=False), good)
+        for pdf_only in ("见上页图，求电流方向。", "见下页图。", "See next page for the formula.",
+                         "The matrix below is singular."):
+            self.assertTrue(B.requires_assets_heuristic(pdf_only, renderable=True), pdf_only)
+            self.assertFalse(B.requires_assets_heuristic(pdf_only, renderable=False), pdf_only)
+        for bad in ("求下列区域的定义域。", "draw a histogram of the data.",
+                    "用图示法说明（自行作图）。"):
+            self.assertFalse(B.requires_assets_heuristic(bad, renderable=False), bad)
+
+    def test_lecture_footer_does_not_defeat_marker_only(self):
+        tmp = tempfile.mkdtemp()
+        mat = os.path.join(tmp, "mat")
+        os.makedirs(mat, exist_ok=True)
+        with open(os.path.join(mat, "lec01.pdf"), "wb") as f:
+            f.write(b"%PDF-fake")
+        be = FakeBackend({"lec01.pdf": ["Quiz 1.1 Problem\nPage 12 of 20"]})
+        code, payload, report = _run(mat, be)
+        lec = [q for q in payload["quiz_bank"] if q["id"].startswith("lecture_quiz")]
+        self.assertTrue(lec)
+        self.assertEqual(lec[0]["question_text_status"], "page_reference")   # 页脚不算正文
+
+    def test_hw_footer_does_not_defeat_marker_only(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw126.pdf": ["Problem 1\nSlide 3"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["question_text_status"], "page_reference")    # 同规
+
+    def test_adjacent_page_rendered_for_next_page_figure(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw127.pdf": ["Problem 1\n见下页图，求最短路径。", "图在此页。"]})
+        asset_root = os.path.join(tmp, "ws", "references", "assets")
+        code, payload, report = _run(mat, be, ["--asset-root", asset_root])
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        paths = [a.get("path", "") for a in hw[0].get("assets", [])]
+        self.assertTrue(any("p002" in pth for pth in paths), paths)          # 下页图一并渲染
+
+    def test_wiki_figure_pages_injected(self):
+        tmp = tempfile.mkdtemp()
+        mat = os.path.join(tmp, "mat")
+        os.makedirs(mat, exist_ok=True)
+        with open(os.path.join(mat, "lec01.pdf"), "wb") as f:
+            f.write(b"%PDF-fake")
+        be = FakeBackend({"lec01.pdf": ["Figure 1: 排序流程示例\n本章正文知识点。"]})
+        asset_root = os.path.join(tmp, "ws", "references", "assets")
+        code, payload, report = _run(mat, be, ["--asset-root", asset_root])
+        wiki_all = " ".join(ph.get("wiki_content", "") for ph in payload.get("phases", []))
+        self.assertIn("本章图示页", wiki_all)                     # 图示区注入章节
+        self.assertIn("../assets/", wiki_all)
+        self.assertTrue(any(n.endswith("_fig.png") for n in os.listdir(asset_root)))
+
+    def test_wiki_figures_skipped_warns(self):
+        tmp = tempfile.mkdtemp()
+        mat = os.path.join(tmp, "mat")
+        os.makedirs(mat, exist_ok=True)
+        with open(os.path.join(mat, "lec01.pdf"), "wb") as f:
+            f.write(b"%PDF-fake")
+        be = FakeBackend({"lec01.pdf": ["Figure 1: 排序流程示例\n本章正文知识点。"]})
+        code, payload, report = _run(mat, be)                    # 无 asset-root
+        self.assertTrue(any(w.startswith("wiki_figures_skipped") for w in report["warnings"]))
+        wiki_all = " ".join(ph.get("wiki_content", "") for ph in payload.get("phases", []))
+        self.assertIn("本章正文知识点", wiki_all)                 # 纯文字 wiki 照常完整
+
+    def test_adjacent_answer_page_never_becomes_prompt_asset(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw128.pdf": ["Problem 1\n见下页图，求最短路径。",
+                                          "Answer 1: 官方答案在此页。"]})
+        asset_root = os.path.join(tmp, "ws", "references", "assets")
+        code, payload, report = _run(mat, be, ["--asset-root", asset_root])
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        q_ctx = [a for a in hw[0].get("assets", []) if a.get("role") == "question_context"]
+        self.assertFalse(any("p002" in a.get("path", "") for a in q_ctx))   # 答案页绝不进题面资产
+
+    def test_residue_figure_page_still_renderable_as_adjacent(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw129.pdf": ["Problem 1\n见下页图，求电路电流。", "37"]})
+        asset_root = os.path.join(tmp, "ws", "references", "assets")
+        code, payload, report = _run(mat, be, ["--asset-root", asset_root])
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        paths = [a.get("path", "") for a in hw[0].get("assets", [])]
+        self.assertTrue(any("p002" in pth for pth in paths), paths)   # 残渣图页照样能当相邻图渲
+
+    def test_lecture_needs_item_uses_original_prompt_for_adjacent(self):
+        tmp = tempfile.mkdtemp()
+        mat = os.path.join(tmp, "mat")
+        os.makedirs(mat, exist_ok=True)
+        with open(os.path.join(mat, "lec01.pdf"), "wb") as f:
+            f.write(b"%PDF-fake")
+        be = FakeBackend({"lec01.pdf": ["Quiz 1.1 Problem\n如图，见下页图作答。", "图在此页。"]})
+        asset_root = os.path.join(tmp, "ws", "references", "assets")
+        code, payload, report = _run(mat, be, ["--asset-root", asset_root])
+        lec = [q for q in payload["quiz_bank"] if q["id"].startswith("lecture_quiz")]
+        paths = [a.get("path", "") for a in lec[0].get("assets", [])]
+        self.assertTrue(any("p002" in pth for pth in paths), paths)   # 指引句替换不吞跨页线索
+        self.assertNotIn("_prompt_text", lec[0])                      # 内部字段不出库
+
+    def test_collapsed_multi_footer_still_marker_only(self):
+        tmp = tempfile.mkdtemp()
+        mat = os.path.join(tmp, "mat")
+        os.makedirs(mat, exist_ok=True)
+        with open(os.path.join(mat, "lec01.pdf"), "wb") as f:
+            f.write(b"%PDF-fake")
+        be = FakeBackend({"lec01.pdf": ["Quiz 1.1 Problem\nPage 12 of 20\nSlide 3"]})
+        code, payload, report = _run(mat, be)
+        lec = [q for q in payload["quiz_bank"] if q["id"].startswith("lecture_quiz")]
+        self.assertEqual(lec[0]["question_text_status"], "page_reference")   # 折叠多页脚不击穿
+
+    def test_wiki_caption_must_anchor_line_start(self):
+        tmp = tempfile.mkdtemp()
+        mat = os.path.join(tmp, "mat")
+        os.makedirs(mat, exist_ok=True)
+        with open(os.path.join(mat, "lec01.pdf"), "wb") as f:
+            f.write(b"%PDF-fake")
+        be = FakeBackend({"lec01.pdf": ["正文顺带提到表 1: 的数据，但本页没有图。\n更多正文。"]})
+        asset_root = os.path.join(tmp, "ws", "references", "assets")
+        code, payload, report = _run(mat, be, ["--asset-root", asset_root])
+        wiki_all = " ".join(ph.get("wiki_content", "") for ph in payload.get("phases", []))
+        self.assertNotIn("本章图示页", wiki_all)                      # 行中提及不算图表标题
+
+    def test_wiki_figure_names_do_not_collide(self):
+        tmp = tempfile.mkdtemp()
+        mat = os.path.join(tmp, "mat")
+        os.makedirs(os.path.join(mat, "a"), exist_ok=True)
+        for rel in ("a/b.pdf", "a_b.pdf"):
+            with open(os.path.join(mat, *rel.split("/")), "wb") as f:
+                f.write(b"%PDF-fake")
+
+        class TwoBackend(FakeBackend):
+            def page_texts(self, pdf_path):
+                return ["Figure 1: 示例图\n正文。"]
+        asset_root = os.path.join(tmp, "ws", "references", "assets")
+        code, payload, report = _run(mat, TwoBackend({}), ["--asset-root", asset_root])
+        figs = [n for n in os.listdir(asset_root) if n.endswith("_fig.png")]
+        self.assertEqual(len(figs), 2)                                # 同净化名不同源不互撞
+
+    def test_cn_adjacent_answer_page_never_prompt_asset(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw130.pdf": ["Problem 1\n见下页图，求值。", "答案：42。"]})
+        asset_root = os.path.join(tmp, "ws", "references", "assets")
+        code, payload, report = _run(mat, be, ["--asset-root", asset_root])
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertIn("42", hw[0].get("answer", ""))
+        q_ctx = [a for a in hw[0].get("assets", []) if a.get("role") == "question_context"]
+        self.assertFalse(any("p002" in a.get("path", "") for a in q_ctx))   # 中文答案页双保险排除
+
+    def test_continued_page_cross_page_cue_detected(self):
+        tmp = tempfile.mkdtemp()
+        mat = os.path.join(tmp, "mat")
+        os.makedirs(mat, exist_ok=True)
+        with open(os.path.join(mat, "lec01.pdf"), "wb") as f:
+            f.write(b"%PDF-fake")
+        be = FakeBackend({"lec01.pdf": ["Quiz 1.1 Problem\n题干开头。",
+                                        "Quiz 1.1 Problem (Continued)\n见下页图作答。",
+                                        "图在此页。"]})
+        asset_root = os.path.join(tmp, "ws", "references", "assets")
+        code, payload, report = _run(mat, be, ["--asset-root", asset_root])
+        lec = [q for q in payload["quiz_bank"] if q["id"].startswith("lecture_quiz")]
+        paths = [a.get("path", "") for a in lec[0].get("assets", [])]
+        self.assertTrue(any("p003" in pth for pth in paths), paths)   # 续页上的跨页线索也生效
+
+    def test_cn_caption_without_punct_detected(self):
+        tmp = tempfile.mkdtemp()
+        mat = os.path.join(tmp, "mat")
+        os.makedirs(mat, exist_ok=True)
+        with open(os.path.join(mat, "lec01.pdf"), "wb") as f:
+            f.write(b"%PDF-fake")
+        be = FakeBackend({"lec01.pdf": ["图 1 排序流程示例\n本章正文知识点。"]})
+        asset_root = os.path.join(tmp, "ws", "references", "assets")
+        code, payload, report = _run(mat, be, ["--asset-root", asset_root])
+        wiki_all = " ".join(ph.get("wiki_content", "") for ph in payload.get("phases", []))
+        self.assertIn("本章图示页", wiki_all)                     # 无标点中文标题也算
+
+    def test_txt_captions_do_not_consume_render_cap(self):
+        tmp = tempfile.mkdtemp()
+        mat = os.path.join(tmp, "mat")
+        os.makedirs(mat, exist_ok=True)
+        with open(os.path.join(mat, "notes.txt"), "wb") as f:
+            f.write("Figure 1: 文本示意，不可渲染。\n正文。".encode("utf-8"))
+        with open(os.path.join(mat, "lec01.pdf"), "wb") as f:
+            f.write(b"%PDF-fake")
+        be = FakeBackend({"lec01.pdf": ["Figure 1: 真图页\n正文知识点。"]})
+        asset_root = os.path.join(tmp, "ws", "references", "assets")
+        code, payload, report = _run(mat, be, ["--asset-root", asset_root])
+        figs = [n for n in os.listdir(asset_root) if n.endswith("_fig.png")]
+        self.assertEqual(len(figs), 1)                            # txt 标题不占渲染名额
+
+    def test_adjacent_render_anchored_to_cue_page(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw131.pdf": ["Problem 1\n见下页图，求值。", "题面续页，无线索。",
+                                          "Problem 2\n下一题的题面。"]})
+        asset_root = os.path.join(tmp, "ws", "references", "assets")
+        code, payload, report = _run(mat, be, ["--asset-root", asset_root])
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        q1 = next(q for q in hw if q["homework_number"] == 1)
+        paths = [a.get("path", "") for a in q1.get("assets", [])]
+        self.assertFalse(any("p003" in pth for pth in paths), paths)   # 无线索的续页不 +1 卷走下一题
+
+    def test_compact_cn_caption_detected(self):
+        tmp = tempfile.mkdtemp()
+        mat = os.path.join(tmp, "mat")
+        os.makedirs(mat, exist_ok=True)
+        with open(os.path.join(mat, "lec01.pdf"), "wb") as f:
+            f.write(b"%PDF-fake")
+        be = FakeBackend({"lec01.pdf": ["图1排序流程示例\n本章正文知识点。"]})
+        asset_root = os.path.join(tmp, "ws", "references", "assets")
+        code, payload, report = _run(mat, be, ["--asset-root", asset_root])
+        wiki_all = " ".join(ph.get("wiki_content", "") for ph in payload.get("phases", []))
+        self.assertIn("本章图示页", wiki_all)                     # 紧凑中文标题也算
+
     def test_no_network_or_llm(self):
 
 

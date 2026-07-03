@@ -25,6 +25,7 @@ Usage:
   python scripts/validate_workspace.py skill_workspace
 """
 import argparse
+import zlib
 import json
 import os
 import re
@@ -206,7 +207,12 @@ STRONG_CUES = [re.compile(p, re.I) for p in (
     r"venn", r"at right", r"to the right", r"shown (on the right|below|above)", r"as shown",
     r"\bshaded?\b",
     r"(figure|diagram|table|image|picture|chart|graph|tree|plot)s?\s+(below|above|at right|to the right)",
-    "文氏图", "图示", "如图", "阴影", "区域", "示意图",
+    r"(shown|given)\s+in\s+(figure|table|fig\.?)\s*\d*",
+    # 复合形才算「图已给出」——裸「区域/图示」会把 求定义域区域 这类纯文字题误封（审计实测），
+    # 尤其 .txt 课程会被 fail-closed 卡死
+    "文氏图", "如图", "阴影", "示意图",
+    "如下图", "见下图", "如上图", "见上图", "下图所示", "上图所示",
+    "如下表", "见下表", "如上表", "见上表", "下表所示", "上表所示",
 )]
 # WEAK: a figure NOUN that might instead be a "produce" prompt ("draw the graph of y=x^2", "sketch the
 # tree"). Asset-dependent only for a renderable PDF source (where over-flagging just renders an extra
@@ -214,6 +220,11 @@ STRONG_CUES = [re.compile(p, re.I) for p in (
 WEAK_CUES = [re.compile(p, re.I) for p in (
     r"\bdiagram\b", r"\bfigure\b", r"\btable\b", r"\bgraph\b", r"\bplot\b", r"\btree\b", r"\bcircuit\b",
     r"\bdraw\b", r"\bdrawn\b", r"\baxes\b", r"\brectangle\b", r"\btriangle\b",
+    r"\bhistograms?\b", r"\bflow\s*charts?\b", "流程图", "柱状图", "折线图", "饼图", "图示", "区域",
+    # 跨页指涉只对可渲染 PDF 生效——.txt 里的 see next page 是文字指引，fail-closed 会误封；
+    # matrix below 同理：.txt 的矩阵常直接写在题面里
+    r"[见如]\s*[上下]一?页", r"(?:see|on)\s+(?:the\s+)?(?:next|previous)\s+page",
+    r"matrix\s+(below|above|shown)",
 )]
 
 
@@ -412,9 +423,18 @@ def extract_lecture_items(pages):
         # heading (not a char-length cutoff — a terse CJK prompt like "求导"/"证明" is a real question).
         # real prompt content = a LETTER, CJK char, or math operator/relation. A bare page-number body
         # ("Quiz 1.1\n12") is a slide footer → marker_only; a symbolic prompt ("2+2=?", "√4=?") is real.
+        _mo_body = "\n".join(l for l in _body_after_marker(stmt, kind, key[1], key[2]).splitlines()
+                              if not _PAGE_RESIDUE_RE.match(l.strip()))   # 页脚残渣行不算正文
+        # _problem_statement 已把页面折叠成单行——行内再清一遍词形页脚（Page 12 of 20 Slide 3）
+        _mo_body = re.sub(r"(?i)(?:pages?|slides?)\s*\d+(?:\s*(?:of|/)\s*\d+)?"
+                          r"|第\s*\d+\s*[页张]", " ", _mo_body)
         marker_only = ((not needs) and len(prob_idxs) == 1
-                       and not re.search(r"[A-Za-z一-鿿=+√∫∑^?×÷<>≤≥]",
-                                         _body_after_marker(stmt, kind, key[1], key[2])))
+                       and not re.search(r"[A-Za-z一-鿿=+√∫∑^?×÷<>≤≥]", _mo_body))
+        # 完整原始题面（锚页 + 续页切片）——needs/marker_only 的 question 会被替换成指引句，
+        # 跨页图线索（见下页图 在续页上）要靠它检查
+        _cont_parts = [_problem_statement(pages[k].get("text", ""), kind, key[1], key[2])
+                       or " ".join((pages[k].get("text") or "").split()) for k in prob_idxs if k != i]
+        orig_question = " ".join([stmt] + _cont_parts).strip()
         if needs:
             qts = "page_reference"
             question = ("（%s %d.%d）本题依赖原始讲义 %s 第 %d 页的图/表，须配合所附 asset 作答。"
@@ -425,11 +445,8 @@ def extract_lecture_items(pages):
                         % (label, key[1], key[2], pf, prob_page["page"]))
         else:
             qts = "full"
-            # slice each continued page to THIS problem's portion (cut at the next marker on that page)
-            # so a `Quiz 1.1 Problem (Continued) … Quiz 1.2 Problem …` page doesn't append Quiz 1.2's text.
-            cont_parts = [_problem_statement(pages[k].get("text", ""), kind, key[1], key[2])
-                          or " ".join((pages[k].get("text") or "").split()) for k in prob_idxs if k != i]
-            question = " ".join([stmt] + cont_parts).strip()
+            # continued 切片已在 orig_question 内按题裁好（Quiz 1.1 (Continued) 页不吞 Quiz 1.2）
+            question = orig_question
         item_id = "lecture_%s_%d_%d" % (kind, key[1], key[2])
         if key in ambiguous:   # readable stem + injective index (so a/b.pdf vs a_b.pdf don't collide)
             item_id += "__%s_%d" % (re.sub(r"[^\w]", "_", os.path.splitext(pf)[0]), file_idx[(key, pf)])
@@ -443,6 +460,7 @@ def extract_lecture_items(pages):
             "source_file": pf,
             "source_pages": [p for (f, p) in q_pages],
             "_question_pages": q_pages,                     # stripped from the emitted bank
+            "_prompt_text": orig_question,                  # 原始题面含续页（needs 项 question 被替换成指引句）
             "_render": bool(needs or marker_only),          # render the page for figure- AND image-prompt items
             "requires_assets": bool(needs),
             "question_text_status": qts,
@@ -1274,8 +1292,10 @@ def extract_homework_items(pages, root_name="", exclude=frozenset()):
                     body_txt = (same_line + "\n" + body_txt).strip()
             # 只有正文【没有实质内容】才算 marker-only——"2+2=?"/"求导" 这类短而完整的题面仍是 full；
             # 纯数字正文（如 "Problem 1\n12" 的页脚页码）没有字母/CJK/运算符，是抽取残渣 → 按图片题处理
-            marker_only = (len(re.findall(r"[0-9A-Za-z一-鿿]", body_txt)) == 0
-                           or not re.search(r"[A-Za-z一-鿿+\-*/=^%<>?？()（）]", body_txt))
+            _mo_body = "\n".join(l for l in body_txt.splitlines()
+                                  if not _PAGE_RESIDUE_RE.match(l.strip()))   # 页脚残渣行不算正文
+            marker_only = (len(re.findall(r"[0-9A-Za-z一-鿿]", _mo_body)) == 0
+                           or not re.search(r"[A-Za-z一-鿿+\-*/=^%<>?？()（）]", _mo_body))
             # chapter：只在题文/文件名明说时才标（第N章 / Chapter N / chNN）——作业号 ≠ 章节号，不硬编
             chm = (re.search(r"(?:第\s*(\d+)\s*章|Chapter\s+(\d+))", q_text, re.I)
                    or re.search(r"(?:^|[\/_\-. ])ch\s*0*(\d+)", hf, re.I))
@@ -1390,6 +1410,7 @@ def group_sections(pages, notes=None):
         if pg.get("file") not in sec["files"]:
             sec["files"].append(pg.get("file"))
         sec["pages"].append(pg.get("page"))
+        sec.setdefault("page_keys", []).append((f, pg.get("page")))
         if (pg.get("text") or "").strip():
             sec["text_blocks"].append("<!-- %s p.%d -->\n%s" % (pg.get("file"), pg.get("page"),
                                                                  pg.get("text", "").strip()))
@@ -1927,6 +1948,7 @@ def run(args, backend=None):
     pages = []
     residue_files = {}
     residue_page_keys = set()
+    page_pdf_all_raw = {}
     for tp in texts:
         pages.extend(_read_text_file_pages(tp, _rel(tp, materials), report))
     for pdf in pdfs:
@@ -1935,6 +1957,7 @@ def run(args, backend=None):
             nonblank, no_content, total = 0, [], 0
             for i, txt in enumerate(backend.page_texts(pdf)):
                 pages.append({"file": rel, "page": i + 1, "text": txt, "_pdf": pdf})
+                page_pdf_all_raw[(rel, i + 1)] = pdf
                 total += 1
                 # 残渣感知判定：每页只剩页码「12」的扫描件不能算有文本（审计实测骗过精确空判定）
                 if _page_has_content(txt):
@@ -2079,6 +2102,8 @@ def run(args, backend=None):
     # ---- render assets for figure-dependent items ----
     asset_root = args.asset_root
     page_pdf = {(pg["file"], pg["page"]): pg["_pdf"] for pg in pages if pg.get("_pdf")}
+    page_pdf_all = dict(page_pdf_all_raw)   # 含残渣页——「见下页图」的图页往往正是无文本页
+    page_pdf_all.update(page_pdf)
 
     want_render = args.render_pages in ("auto", "required")
     if want_render and not backend.can_render():
@@ -2110,13 +2135,40 @@ def run(args, backend=None):
         assets = []
         # one asset PER (file, page) — render every question page AND every (continued) answer page,
         # each from its OWN source file.
+        _qtxt = (it.get("_prompt_text") or it.get("question") or "")   # needs 项的 question 是指引句
+        _adj = []
+        if re.search(r"[上下]一?页|(?:next|previous|following|preceding)\s+page", _qtxt, re.I):
+            # 锚定到【含线索的那一页】：多页题在 p1 说「见下页」只该带上 p2，
+            # 不能给每个题面页都 +1 把下一题/答案页(p3)也卷进来
+            for (f, p) in it.get("_question_pages", []):
+                _pt = next((pg.get("text") or "" for pg in pages
+                            if pg["file"] == f and pg["page"] == p), "")
+                if re.search(r"下一?页|(?:next|following)\s+page", _pt, re.I):
+                    _adj.append((f, p + 1))
+                if p > 1 and re.search(r"上一?页|(?:previous|preceding)\s+page", _pt, re.I):
+                    _adj.append((f, p - 1))
+        # 「见下页图」的图在相邻页——一并渲染。查全量页映射（图页常是无文本残渣页）。
+        # 排除：已有题面页、_answer_pages、以及【页面文本带解答标记】的页——_answer_pages
+        # 只在答案依赖图时才设，纯文本答案页得靠内容判；解答页当题面资产就是泄题，宁缺勿泄
+        _ans_keys = set(it.get("_answer_pages", []))
+        _asf = it.get("answer_source_file") or it.get("source_file")
+        _ans_keys |= {(_asf, p0) for p0 in (it.get("answer_source_pages") or [])}
+
+        def _adj_ok(f0, p0):
+            if (f0, p0) in _ans_keys or (f0, p0) in it.get("_question_pages", []):
+                return False
+            _t0 = next((pg.get("text") or "" for pg in pages
+                        if pg["file"] == f0 and pg["page"] == p0), "")
+            return not re.search(r"(?im)^[ \t>*#]*(?:solutions?|answers?|解答|答案)\b", _t0)
+        _adj = [(f, p) for (f, p) in _adj if (f, p) in page_pdf_all and _adj_ok(f, p)]
         plan = ([("question_context", f, p, "") for (f, p) in it.get("_question_pages", [])]
+                + [("question_context", f, p, "_adj") for (f, p) in _adj]
                 + [("answer_context", f, p, "_sol") for (f, p) in it.get("_answer_pages", [])])
         for role, file, page, suffix in plan:
             name = _safe_asset_name(file, page, it["id"], suffix)
             rel_path = "references/assets/" + name
             wrote = False
-            pdf = page_pdf.get((file, page))
+            pdf = page_pdf_all.get((file, page))
             if can_write and pdf is not None:
                 try:
                     png = backend.render_page_png(pdf, page - 1)
@@ -2198,8 +2250,55 @@ def run(args, backend=None):
                           "实为判断/编程/选择题（选项在图里）等，改写 type（合法值 choice/subjective/"
                           "diagram/fill_blank/true_false/code）并补 options；同时抽查已判为 "
                           "choice/fill_blank 的题是否属实。" % _typed["subjective"]})
+    # D5: wiki 配图——含图/表标题（Figure N / Table N / 图N / 表N）的讲义页渲染成 PNG，
+    # 注入章节末尾「本章图示页」区；渲染不可用时警告降级（纯文字 wiki 照常完整）
+    _WIKI_CAP_RE = re.compile(
+        r"(?m)^\s*(?:(?:Figure|Fig\.?|Table)\s*\d+|[图表]\s*[\d一二三四五六七八九十]+)")
+    wiki_fig_assets = {}
+    _cap_pages = [(pg["file"], pg["page"]) for pg in wiki_pages
+                  if pg.get("_pdf") and _WIKI_CAP_RE.search(pg.get("text") or "")]   # cap 只数可渲染页
+    if _cap_pages and can_write:
+        if len(_cap_pages) > 30:
+            report["warnings"].append("wiki_figures_capped: 图示页 %d 张只渲染前 30 张（控制体积）——"
+                                      "未渲染页仍在原 PDF，可让 AI 用多模态直接查看对应页，"
+                                      "或按章节拆分材料分次重建" % len(_cap_pages))
+            _cap_pages = _cap_pages[:30]
+        for _f, _p in _cap_pages:
+            _pdf = page_pdf.get((_f, _p))
+            if _pdf is None:
+                continue
+            try:
+                _png = backend.render_page_png(_pdf, _p - 1)
+            except Exception as e:
+                report["skipped"].append({"file": _f, "why": "wiki 图示页渲染失败 p.%d: %s" % (_p, e)})
+                continue
+            if not _png:
+                continue
+            _name = _safe_asset_name(_f, _p, "wiki%08x" % (zlib.crc32(_f.encode("utf-8")) & 0xffffffff),
+                                      "_fig")   # 源路径 CRC 防 a/b.pdf 与 a_b.pdf 同名互撞
+            _full = os.path.join(asset_root, _name)
+            if not _under(asset_root, _full):
+                report["warnings"].append("unsafe_asset_target_skipped")
+                continue
+            os.makedirs(asset_root, exist_ok=True)
+            with open(_full, "wb") as _fh:
+                _fh.write(_png)
+            rendered += 1
+            wiki_fig_assets[(_f, _p)] = "../assets/" + _name
+        report["pages_rendered"] = rendered
+    elif _cap_pages and want_render:
+        report["warnings"].append(
+            "wiki_figures_skipped: 检测到 %d 个图/表标题页但渲染不可用（缺后端或 --asset-root）——"
+            "wiki 纯文字仍完整；需要配图请补齐后重建" % len(_cap_pages))
+
     _ch_notes = []
     sections = group_sections(wiki_pages, _ch_notes)
+    if wiki_fig_assets:
+        for sec in sections:
+            gal = ["![%s 第 %d 页图示](%s)" % (f0, p0, wiki_fig_assets[(f0, p0)])
+                   for (f0, p0) in sec.get("page_keys", []) if (f0, p0) in wiki_fig_assets]
+            if gal:
+                sec["text_blocks"].append("### 本章图示页（构建时自动渲染）\n\n" + "\n\n".join(gal))
     for _f in _ch_notes:
         report["warnings"].append(
             "chapter_unassigned: %s（无任何章节线索，按上文/第 1 章并入——正确分章请重命名加 chNN "
