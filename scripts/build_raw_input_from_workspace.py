@@ -534,7 +534,7 @@ def _hw_norm(stem):
     return re.sub(r"(?<!\d)0+(\d)", r"\1", s)
 
 
-def classify_homework_files(files, root_name=""):
+def classify_homework_files(files, root_name="", notes=None):
     """Split material files into (homework_files, {solution_file: paired_homework_file|None}).
     Solutions pair by stripped-stem equality or prefix; an unpairable solution file is fail-loud."""
     hw, sols = [], []
@@ -665,13 +665,17 @@ def classify_homework_files(files, root_name=""):
         mirror = {d for (d, _n) in hw_by_key
                   if d != sdir and _mirror_key(d) == _mirror_key(sdir)}
         match = None
+        ambiguous = False
         for tier in ({sdir}, mirror, family, {d for (d, _n) in hw_by_key}):
             got = _lookup(tier)
             if got is _AMBIG:
+                ambiguous = True
                 break
             if got is not None:
                 match = got
                 break
+        if ambiguous and notes is not None:
+            notes.append(("ambiguous", sf))    # 同层多候选，为防配错放弃——必须留痕
         pairing[sf] = match
     for sf in [k for k, v in pairing.items() if v is None]:
         # 配不上且路径/文件名没有任何作业线索（solutions/ch01.pdf 这类通用解答目录装的
@@ -689,6 +693,8 @@ def classify_homework_files(files, root_name=""):
         if not root_is_hw and not sf_exam_ctx and not _HW_FILE_RE.search(sf_rel) \
                 and not _EXAM_FILE_RE.search("/" + sf_stem) \
                 and not _EXAMISH_LOOSE_RE.search("/" + sf_stem):
+            if notes is not None:
+                notes.append(("reassigned", sf))   # 交还讲义管线也要留痕，绝不静默改道
             del pairing[sf]
     return hw, pairing
 
@@ -847,7 +853,8 @@ def extract_homework_items(pages, root_name="", exclude=frozenset()):
     into bank items with source_type='homework'. Returns (items, hw_report)."""
     files = sorted({pg["file"] for pg in pages})
     is_pdf = {f: any(pg.get("_pdf") for pg in pages if pg["file"] == f) for f in files}
-    hw_files, pairing = classify_homework_files(files, root_name)
+    _cls_notes = []
+    hw_files, pairing = classify_homework_files(files, root_name, _cls_notes)
     if exclude:
         # 已归还讲义管线的讲义式试卷文件——这边绝不再当题面册解析（防双吃/答案卷进题面）；
         # 指向它们的配对项一并摘除（解答册自会走 unpaired 警告，不静默）
@@ -855,11 +862,19 @@ def extract_homework_items(pages, root_name="", exclude=frozenset()):
         pairing = {sf: (None if hf in exclude else hf) for sf, hf in pairing.items()
                    if sf not in exclude}
     exam_files = {f for f in hw_files if _is_exam_path(f, root_name)}
+    _note_msgs = []
+    for _kind, _sf in _cls_notes:
+        if _kind == "ambiguous":
+            _note_msgs.append("hw_pairing_ambiguous: %s（同层多个候选作业，为防配错放弃自动配对——"
+                              "请人工指认或重命名后重建）" % _sf)
+        elif _kind == "reassigned":
+            _note_msgs.append("hw_solution_reassigned_to_lecture: %s（配不上作业且无作业/试卷线索——"
+                              "按讲义解答交还讲义配对；若它其实是作业答案册请重命名带 hw/sol 记号）" % _sf)
     report = {"exam_files": sorted(exam_files),
               "homework_files": hw_files,
               "homework_solution_files": sorted(pairing),
               "homework_pairs": sorted([s, h] for s, h in pairing.items() if h),
-              "homework_problems": 0, "homework_answered": 0, "warnings": []}
+              "homework_problems": 0, "homework_answered": 0, "warnings": _note_msgs}
     for sf, h in sorted(pairing.items()):
         if h is not None:
             continue
@@ -1330,22 +1345,32 @@ def extract_homework_items(pages, root_name="", exclude=frozenset()):
     return items, report
 
 
-def group_sections(pages):
+def group_sections(pages, notes=None):
     """Group pages into chapters. A chapter number comes from a lecture marker on the page, else from
     a `ch<NN>` token in the filename, else the chapter CARRIED FORWARD from the previous page of the
     same file (so an unmarked ch-2 prose page after `Example 2.1` stays in ch 2, not ch 1), else 1.
-    Returns ordered list of {chapter, files, pages, text}."""
+    传入 notes 列表时，把【全文件无任何章节线索】（默认并入第 1 章属于猜测）的文件名收集进去，
+    让调用方 fail-loud——绝不静默猜章节。Returns ordered list of {chapter, files, pages, text}."""
     by_ch = {}
     order = []
     last_ch_by_file = {}
+    clue_files, all_files = set(), []
     for pg in pages:
         f = pg.get("file")
+        if f not in all_files:
+            all_files.append(f)
         markers = detect_lecture_markers(pg.get("text", ""))
-        m = re.search(r"ch(?:apter)?[ _-]?0*(\d+)", os.path.basename(f or ""), re.I)
+        # 词元边界：march-2024.pdf 的 "ch" 前面是字母，不是章节记号（审计实测捏造第 2024 章）；
+        # CamelCase（LectureChapter02）单列大小写敏感分支放行
+        _base = os.path.basename(f or "")
+        m = (re.search(r"(?<![A-Za-z])ch(?:apter)?[ _-]?0*(\d+)", _base, re.I)
+             or re.search(r"(?<=[a-z])Ch(?:apter)?[ _-]?0*(\d+)", _base))   # 驼峰缩写 LectureCh02 也放行（大写 C 区分 march）
         if markers:
             ch = markers[0]["chapter"]
+            clue_files.add(f)
         elif m:
             ch = int(m.group(1))
+            clue_files.add(f)
         else:
             ch = last_ch_by_file.get(f, 1)   # carry forward the previous marked page's chapter (same file)
         last_ch_by_file[f] = ch
@@ -1359,6 +1384,8 @@ def group_sections(pages):
         if (pg.get("text") or "").strip():
             sec["text_blocks"].append("<!-- %s p.%d -->\n%s" % (pg.get("file"), pg.get("page"),
                                                                  pg.get("text", "").strip()))
+    if notes is not None:
+        notes.extend(f for f in all_files if f not in clue_files)
     return [by_ch[c] for c in sorted(order)]
 
 
@@ -1973,7 +2000,26 @@ def run(args, backend=None):
     wiki_pages = [pg for pg in pages if pg["file"] not in sol_files
                   and pg["file"] not in sol_dir_files
                   and (pg["file"], pg["page"]) not in residue_page_keys]   # 残渣页不进 wiki
-    raw_input = build_raw_input(course, group_sections(wiki_pages), lecture_items, homework_items)
+    _ch_notes = []
+    sections = group_sections(wiki_pages, _ch_notes)
+    for _f in _ch_notes:
+        report["warnings"].append(
+            "chapter_unassigned: %s（无任何章节线索，按上文/第 1 章并入——正确分章请重命名加 chNN "
+            "或页首加章节标记，或由 AI 核对 wiki 分章）" % _f)
+    if _ch_notes:
+        report["ai_review"].append({
+            "kind": "chapter_unassigned", "file": "；".join(_ch_notes[:20]),
+            "action": "这些文件无章节线索，内容已并入上文/第 1 章（这是猜测）。请 AI 核对生成的 wiki "
+                      "分章是否正确，不对则手工调整或让用户重命名后重建。"})
+    if not sections:
+        report["warnings"].append(
+            "wiki_empty: 讲义类内容为零（材料全是作业/试卷/答案或未能提取）——将生成占位第 1 章，"
+            "复习知识面为空")
+        report["ai_review"].append({
+            "kind": "wiki_empty", "file": "(all)",
+            "action": "没有任何讲义内容进入 wiki。请确认材料里是否本应有讲义；若有，检查它们是否被"
+                      "列入 skipped/接管清单并逐条处理；若确实只有题目材料，请告知学生 wiki 为空。"})
+    raw_input = build_raw_input(course, sections, lecture_items, homework_items)
     return 0, raw_input, report
 
 

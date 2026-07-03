@@ -2431,6 +2431,79 @@ class HomeworkIngest(unittest.TestCase):
         self.assertNotIn("37", hw[0].get("answer", ""))           # 残渣页不卷进答案切片
         self.assertNotIn(2, hw[0].get("answer_source_pages") or [])
 
+    # ---- D3: 警告消费契约 + 绝不猜清理 regression guards ----
+
+    def test_filename_year_not_taken_as_chapter(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {})
+        for rel in ("march-2024.pdf", "lec_ch02.pdf"):
+            with open(os.path.join(tmp, "mat", rel), "wb") as f:
+                f.write(b"%PDF-fake")
+
+        class YrBackend(FakeBackend):
+            def page_texts(self, pdf_path):
+                if "march" in pdf_path:
+                    return ["三月讲义的正文。"]
+                return ["第二章讲义的正文。"]
+        code, payload, report = _run(mat, YrBackend({}))
+        self.assertFalse(any(ph.get("phase_num") == 2024 or "2024" in (ph.get("phase_name") or "")
+                             for ph in payload["phases"]))        # march-2024 不捏造第 2024 章
+        self.assertTrue(any(w.startswith("chapter_unassigned") and "march-2024" in w
+                            for w in report["warnings"]))         # 无线索并入是猜测，必须留痕
+        self.assertFalse(any("lec_ch02" in w for w in report["warnings"]
+                             if w.startswith("chapter_unassigned")))   # 有线索的不误报
+
+    def test_empty_wiki_flagged_loudly(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw1.pdf": ["Problem 1\n只有作业的材料。"]})
+        code, payload, report = _run(mat, be)
+        self.assertTrue(any(w.startswith("wiki_empty") for w in report["warnings"]))
+        self.assertTrue(any(e["kind"] == "wiki_empty" for e in report.get("ai_review", [])))
+
+    def test_ambiguous_pairing_leaves_reasoned_trace(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw1a.pdf": ["Problem 1\n甲卷题面。"],
+                            "hw1b.pdf": ["Problem 1\n乙卷题面。"],
+                            "hw1_sol.pdf": ["Problem 1 Solution\n歧义答案。"]})
+        code, payload, report = _run(mat, be)
+        self.assertTrue(any(w.startswith("hw_pairing_ambiguous") and "hw1_sol" in w
+                            for w in report["warnings"]))         # 歧义放弃必须说明原因
+
+    def test_reassigned_generic_solution_leaves_trace(self):
+        tmp = tempfile.mkdtemp()
+        mat = os.path.join(tmp, "mat")
+        os.makedirs(os.path.join(mat, "solutions"), exist_ok=True)
+        os.makedirs(os.path.join(mat, "lectures"), exist_ok=True)
+        for rel in ("solutions/week1.pdf", "lectures/ch01.pdf"):
+            with open(os.path.join(mat, *rel.split("/")), "wb") as f:
+                f.write(b"%PDF-fake")
+
+        class RaBackend(FakeBackend):
+            def page_texts(self, pdf_path):
+                if "solutions" in pdf_path.replace(chr(92), "/"):
+                    return ["Quiz 1.1 Solution\n讲义解答内容。"]
+                return ["Quiz 1.1 Problem\n讲义题面。"]
+        code, payload, report = _run(mat, RaBackend({}))
+        self.assertTrue(any(w.startswith("hw_solution_reassigned_to_lecture")
+                            for w in report["warnings"]))         # 改道交还讲义也要留痕
+
+    def test_camelcase_chapter_filename_detected(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {})
+        with open(os.path.join(tmp, "mat", "LectureChapter02.pdf"), "wb") as f:
+            f.write(b"%PDF-fake")
+
+        class CcBackend(FakeBackend):
+            def page_texts(self, pdf_path):
+                return ["驼峰命名章节的正文。"]
+        code, payload, report = _run(mat, CcBackend({}))
+        self.assertTrue(any(ph.get("phase_num") == 2 or "第 2 章" in (ph.get("phase_name") or "")
+                            for ph in payload["phases"]))         # CamelCase Chapter02 归第 2 章
+        self.assertTrue(B.re.search(r"(?<=[a-z])Ch(?:apter)?[ _-]?0*(\d+)", "LectureCh02"))
+        self.assertIsNone(B.re.search(r"(?<=[a-z])Ch(?:apter)?[ _-]?0*(\d+)", "march-2024"))
+        self.assertFalse(any(w.startswith("chapter_unassigned")
+                             for w in report["warnings"]))
+
     def test_no_network_or_llm(self):
 
 

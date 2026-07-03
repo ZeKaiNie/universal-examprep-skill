@@ -222,6 +222,9 @@ def main():
             normalized = TRUE_FALSE_NORMALIZE.get(q["answer"].strip().lower(), q["answer"])
             q["answer"] = normalized
     # ────────────────────────────────────────────────────────────────
+    # 补号后重算缺答案清单——validate 阶段无 id 的题记的是「#序号」占位，
+    # 持久化报告必须指向题库里真实存在的 id，后续会话的 AI 才能定位接手
+    missing_answer_ids = [q["id"] for q in quiz_bank if is_blank(q.get("answer"))]
 
     print(f"[+] 识别到科目: {course_name}")
     print(f"[+] 阶段数量: {len(phases)} 个")
@@ -254,6 +257,17 @@ def main():
     with open(quiz_file_path, "w", encoding="utf-8") as qf:
         json.dump(quiz_bank, qf, indent=2, ensure_ascii=False)
     print("[+] 已写入题库文件: references/quiz_bank.json")
+
+    # 导入报告持久化——缺答案清单只留在控制台会随会话丢失，后续会话的 AI 无从接手
+    ingest_report = {
+        "course_name": course_name, "phases": len(phases), "quiz_bank": len(quiz_bank),
+        "missing_answer_ids": missing_answer_ids,
+        "note": "missing_answer_ids 的题没有标准答案：测验前需补全，或由 AI 生成并向学生明确标注"
+                "「⚠️ AI生成答案，非老师/教材提供」。",
+    }
+    with open(os.path.join(output_dir, "ingest_report.json"), "w", encoding="utf-8") as rf:
+        json.dump(ingest_report, rf, ensure_ascii=False, indent=2)
+    print("[+] 已写入导入报告: ingest_report.json")
 
     # 3. 生成 study_plan.md（可重复生成，无用户状态）
     plan_content = render_template(

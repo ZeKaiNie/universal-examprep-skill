@@ -21,6 +21,7 @@
 7. **每个学习/检查点事件后更新进度**：授课完成、答对/答错、归档错题后都要更新进度（有 state 走 `update_progress.py set/set-*-status/set-check`，md 自动重渲染；无 state 才手写 md），并在回复末尾刷新进度面板。
 8. **诚实优先**：资料里没有依据且没把握时，如实说「资料里没有这道题的答案」，不要硬编。
 9. **画图题先跑算法**：二叉树/图遍历/状态机等不要凭记忆手绘，先运行标准算法得到结构再渲染；无 Python 则文字描述并标「未经程序验证」。
+10. **警报必须逐条接手**：构建/导入完成后**必须**完整读取 `parse_report.json` 的 `warnings` 与 `skipped`、`ai_review_manifest.json` 的 `entries`、以及工作区 `ingest_report.json` 的 `missing_answer_ids`，**逐条处理**：能补救的（转存 UTF-8、重命名加 chNN/sol 记号、多模态直读 PDF/图片补录知识点或题目）立即处理；不能补救的必须向学生明确说明**哪些材料未导入、为什么**。严禁静默略过任何一条——程序侧的每一条警报都默认「AI 会接手」，你不接手它就永远丢了。
 
 ## 文件约定
 - `references/wiki/chN_*.md` 唯一知识源 · `references/quiz_bank.json` 唯一答案源（题带 `source`: teacher / ai_generated）
