@@ -109,7 +109,7 @@ def validate(data):
             continue
         qtype = q.get("type")
         if qtype not in VALID_QUIZ_TYPES:
-            errors.append(f"题目 {tag} 的 type 必须是 choice 或 subjective（当前为 {qtype!r}）。")
+            errors.append(f"题目 {tag} 的 type 必须是 {'/'.join(sorted(VALID_QUIZ_TYPES))} 之一（当前为 {qtype!r}）。")
         if not q.get("question"):
             errors.append(f"题目 {tag} 缺少题干 question。")
         if qtype == "choice" and not q.get("options"):

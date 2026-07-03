@@ -2504,6 +2504,328 @@ class HomeworkIngest(unittest.TestCase):
         self.assertFalse(any(w.startswith("chapter_unassigned")
                              for w in report["warnings"]))
 
+    # ---- D4: 题型识别 + 未知题型警报 regression guards ----
+
+    def test_mcq_detected_with_options(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw96.pdf": ["Problem 1\n下列哪个说法正确？\nA. 甲选项\nB. 乙选项\n"
+                                         "C. 丙选项继续\n换行的丙。\nD. 丁选项"],
+                            "hw96_sol.pdf": ["1. B"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(len(hw), 1)
+        self.assertEqual(hw[0]["type"], "choice")                  # 大写连续选项行 → 选择题
+        self.assertEqual(len(hw[0]["options"]), 4)
+        self.assertIn("换行的丙", hw[0]["options"][2])             # 选项续行并入
+        self.assertEqual(hw[0].get("answer"), "B")               # 键前缀剥掉，validator 可过
+
+    def test_lowercase_subparts_not_choice(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw97.pdf": ["Problem 1\n(a) 求导数。\n(b) 求积分。"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "subjective")              # 小写小问不是选项，绝不猜
+
+    def test_blank_prompt_is_fill_blank(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw98.pdf": ["Problem 1\n函数 f(x) 的导数是 ______ 。"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "fill_blank")              # 题面填空线 → 填空题
+
+    def test_lecture_quiz_mcq_detected(self):
+        tmp = tempfile.mkdtemp()
+        mat = os.path.join(tmp, "mat")
+        os.makedirs(mat, exist_ok=True)
+        with open(os.path.join(mat, "lec01.pdf"), "wb") as f:
+            f.write(b"%PDF-fake")
+        be = FakeBackend({"lec01.pdf": ["Quiz 1.1 Problem\n选出正确项：\nA. 对的\nB. 错的\n"
+                                        "Quiz 1.1 Solution\nA"]})
+        code, payload, report = _run(mat, be)
+        lec = [q for q in payload["quiz_bank"] if q["id"].startswith("lecture_quiz")]
+        self.assertTrue(lec)
+        self.assertEqual(lec[0]["type"], "choice")                 # 讲义测验同样识别
+        self.assertEqual(len(lec[0]["options"]), 2)
+        self.assertEqual(lec[0].get("answer"), "A")                # 解答标题剥掉归一成字母
+
+    def test_type_heuristic_warning_and_review_entry(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw99.pdf": ["Problem 1\n普通主观题面。"]})
+        code, payload, report = _run(mat, be)
+        self.assertTrue(any(w.startswith("type_heuristic") for w in report["warnings"]))
+        self.assertTrue(any(e["kind"] == "type_defaulted"
+                            for e in report.get("ai_review", [])))  # 默认定型必须交 AI 复核
+
+    def test_choice_with_unnormalizable_answer_downgrades(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw100.pdf": ["Problem 1\n选出正确项：\nA. 甲\nB. 乙"],
+                            "hw100_sol.pdf": ["1. 因为甲显然不对，所以综合判断选乙（详见教材）。"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "subjective")              # 长解答归一不了→降级不硬标
+        self.assertNotIn("options", hw[0])
+        self.assertIn("选乙", hw[0].get("answer", ""))             # 答案原文保留
+
+    def test_five_option_mcq_detected(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw101.pdf": ["Problem 1\n五选一：\nA. 甲\nB. 乙\nC. 丙\nD. 丁\nE. 戊"],
+                            "hw101_sol.pdf": ["1. E"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "choice")
+        self.assertEqual(len(hw[0]["options"]), 5)                 # E 选项不再被吞进 D
+        self.assertEqual(hw[0].get("answer"), "E")
+
+    def test_response_box_blank_stays_subjective(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw102.pdf": ["Problem 1\n求积分并写出过程。\nAnswer: ________"],
+                            "hw103.pdf": ["Problem 1\n证明不等式。\nShow your work: ________"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(len(hw), 2)
+        for q in hw:
+            self.assertEqual(q["type"], "subjective")              # 答题栏空线不是题面挖空
+
+    def test_six_option_mcq_detected(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw104.pdf": ["Problem 1\n六选一：\nA. 甲\nB. 乙\nC. 丙\nD. 丁\nE. 戊\nF. 己"],
+                            "hw104_sol.pdf": ["1. F"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "choice")
+        self.assertEqual(len(hw[0]["options"]), 6)                 # F 选项不再被吞进 E
+        self.assertEqual(hw[0].get("answer"), "F")
+
+    def test_lettered_subproblem_mcq_key_normalized(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw105.pdf": ["Problem 1a\n小问选择：\nA. 甲\nB. 乙"],
+                            "hw105_sol.pdf": ["Answers\n1a. B"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "choice")                  # 字母小问键前缀可剥
+        self.assertEqual(hw[0].get("answer"), "B")
+
+    def test_trailing_instruction_not_folded_into_option(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw106.pdf": ["Problem 1\n选出正确项：\nA. 甲\nB. 乙\n\nExplain your choice."],
+                            "hw106_sol.pdf": ["1. 乙"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "choice")
+        self.assertEqual(hw[0]["options"][1], "B. 乙")             # 空行后说明不并入选项
+        self.assertEqual(hw[0].get("answer"), "B")                 # 按选项正文归一成字母
+
+    def test_fill_blank_answer_stripped_of_heading(self):
+        tmp = tempfile.mkdtemp()
+        mat = os.path.join(tmp, "mat")
+        os.makedirs(mat, exist_ok=True)
+        with open(os.path.join(mat, "lec01.pdf"), "wb") as f:
+            f.write(b"%PDF-fake")
+        be = FakeBackend({"lec01.pdf": ["Quiz 1.1 Problem\n栈的出入顺序是 ______ 。\n"
+                                        "Quiz 1.1 Solution\nLIFO"]})
+        code, payload, report = _run(mat, be)
+        lec = [q for q in payload["quiz_bank"] if q["id"].startswith("lecture_quiz")]
+        self.assertEqual(lec[0]["type"], "fill_blank")
+        self.assertEqual(lec[0].get("answer"), "LIFO")             # 判分对的是填的值，不是标题
+
+    def test_answer_prefix_stripping_precision(self):
+        self.assertEqual(B._strip_answer_prefix("Answer 1: B"), "B")          # 欠剥修复
+        self.assertEqual(B._strip_answer_prefix("Answer: LIFO"), "LIFO")
+        self.assertEqual(B._strip_answer_prefix("Solution set"), "Solution set")   # 过剥修复
+        self.assertEqual(B._strip_answer_prefix("Quiz 1.1 Solution Solution set"), "Solution set")
+        self.assertEqual(B._strip_answer_prefix("Problem 1 Solution B"), "B")
+        self.assertEqual(B._strip_answer_prefix("1(a). B"), "B")
+        self.assertEqual(B._strip_answer_prefix("Answer: 0.5"), "0.5")        # 小数不是键
+        self.assertEqual(B._strip_answer_prefix("Quiz 1.1 Solution 0.5"), "0.5")
+        self.assertEqual(B._strip_answer_prefix("Answer: 1.5 表示比例"), "1.5 表示比例")
+
+    def test_instruction_after_options_without_blank_line(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw107.pdf": ["Problem 1\n选出正确项：\nA. alpha\nB. beta\nExplain your choice."],
+                            "hw107_sol.pdf": ["1. beta"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "choice")
+        self.assertEqual(hw[0]["options"][1], "B. beta")           # 无空行的指令也不卷进选项
+        self.assertEqual(hw[0].get("answer"), "B")                 # 选项正文归一不受污染
+
+    def test_prompt_mentioning_answer_still_fill_blank(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw108.pdf": ["Problem 1\nAnswer the following: f'(x) = ______ 。"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "fill_blank")              # 提到 answer 的真填空不误伤
+
+    def test_decimal_fill_blank_answer_preserved(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw109.pdf": ["Problem 1\n概率是 ______ 。"],
+                            "hw109_sol.pdf": ["Problem 1 Solution\nAnswer: 0.5"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "fill_blank")
+        self.assertEqual(hw[0].get("answer"), "0.5")               # 金标 0.5 绝不腐蚀成 5
+
+    def test_choice_key_outside_labels_downgrades(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw110.pdf": ["Problem 1\n二选一：\nA. 甲\nB. 乙"],
+                            "hw110_sol.pdf": ["1. C"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "subjective")              # 键在标签外→降级不发坏 choice
+        self.assertNotIn("options", hw[0])
+
+    def test_chinese_instruction_not_folded_into_option(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw111.pdf": ["Problem 1\n选出正确项：\nA. 甲\nB. 乙\n解释你的答案"],
+                            "hw111_sol.pdf": ["1. B"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "choice")
+        self.assertEqual(hw[0]["options"][1], "B. 乙")             # 中文指令行不并入选项
+
+    def test_bare_underline_writing_area_stays_subjective(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw112.pdf": ["Problem 1\nProve the identity.\n__________"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "subjective")              # 书写区不是挖空
+
+    def test_lowercase_choice_key_accepted(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw113.pdf": ["Problem 1\n二选一：\nA. 甲\nB. 乙"],
+                            "hw113_sol.pdf": ["1. b"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "choice")
+        self.assertEqual(hw[0].get("answer"), "B")                 # 小写键归一成大写标签
+
+    def test_fill_in_the_blank_phrase_wins(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw114.pdf": ["Problem 1\nFill in the blank: ______"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "fill_blank")              # 明说填空不被指示语词典抑制
+
+    def test_inline_options_truncated_at_instruction(self):
+        tmp = tempfile.mkdtemp()
+        mat = os.path.join(tmp, "mat")
+        os.makedirs(mat, exist_ok=True)
+        with open(os.path.join(mat, "lec01.pdf"), "wb") as f:
+            f.write(b"%PDF-fake")
+        be = FakeBackend({"lec01.pdf": ["Quiz 1.1 Problem\n选一个：A. foo B. bar Explain your choice.\n"
+                                        "Quiz 1.1 Solution\nbar"]})
+        code, payload, report = _run(mat, be)
+        lec = [q for q in payload["quiz_bank"] if q["id"].startswith("lecture_quiz")]
+        self.assertEqual(lec[0]["type"], "choice")
+        self.assertEqual(lec[0]["options"][1], "B. bar")           # 行内末选项在指令处截尾
+        self.assertEqual(lec[0].get("answer"), "B")                # 按正文 bar 归一
+
+    def test_bare_problem_label_key_normalized(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw115.pdf": ["Problem 1\n二选一：\nA. 甲\nB. 乙"],
+                            "hw115_sol.pdf": ["Question 1: B"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "choice")
+        self.assertEqual(hw[0].get("answer"), "B")                 # 裸题号标签键可剥
+
+    def test_eg_abbreviation_not_an_option(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw116.pdf": ["Problem 1\n四选一：\nA. 甲\nB. 乙\nC. 丙\nD. 丁\n"
+                                          "E.g. circle exactly one answer"],
+                            "hw116_sol.pdf": ["1. D"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "choice")
+        self.assertEqual(len(hw[0]["options"]), 4)                 # E.g. 缩写不是第五个选项
+
+    def test_inline_option_separators_trimmed(self):
+        tmp = tempfile.mkdtemp()
+        mat = os.path.join(tmp, "mat")
+        os.makedirs(mat, exist_ok=True)
+        with open(os.path.join(mat, "lec01.pdf"), "wb") as f:
+            f.write(b"%PDF-fake")
+        be = FakeBackend({"lec01.pdf": ["Quiz 1.1 Problem\n选一个：A. foo, B. bar\n"
+                                        "Quiz 1.1 Solution\nfoo"]})
+        code, payload, report = _run(mat, be)
+        lec = [q for q in payload["quiz_bank"] if q["id"].startswith("lecture_quiz")]
+        self.assertEqual(lec[0]["type"], "choice")
+        self.assertEqual(lec[0]["options"][0], "A. foo")           # 尾随逗号剥掉
+        self.assertEqual(lec[0].get("answer"), "A")                # 正文比对不被分隔符卡住
+
+    def test_note_after_options_not_folded(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw117.pdf": ["Problem 1\n下列哪个正确？\nA. 甲\nB. 丁\n"
+                                          "E.g. circle exactly one answer"],
+                            "hw117_sol.pdf": ["1. 丁"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "choice")
+        self.assertEqual(hw[0]["options"][1], "B. 丁")             # E.g. 注记不卷进末选项
+        self.assertEqual(hw[0].get("answer"), "B")
+
+    def test_uppercase_subparts_without_cue_not_choice(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw118.pdf": ["Problem 1\nA. Find the derivative of f.\n"
+                                          "B. Compute the integral of f."]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "subjective")              # 无选择线索的大写小问不猜
+        self.assertNotIn("options", hw[0])
+
+    def test_scored_writing_area_stays_subjective(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw119.pdf": ["Problem 1\nProve the identity.\n__________ (5 pts)"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "subjective")              # 得分标注不算挖空内容
+
+    def test_answer_the_following_subparts_not_choice(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw120.pdf": ["Problem 1\nAnswer the following questions.\n"
+                                          "A. Find the derivative.\nB. Compute the integral."]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "subjective")              # following 不再当选择线索
+
+    def test_cueless_mcq_promoted_by_letter_key(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw121.pdf": ["Problem 1\nWhat is 2+2?\nA. 3\nB. 4"],
+                            "hw121_sol.pdf": ["1. B"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "choice")                  # 裸字母键触发晋升
+        self.assertEqual(len(hw[0]["options"]), 2)
+        self.assertEqual(hw[0].get("answer"), "B")
+
+    def test_choice_key_with_rationale_kept(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw122.pdf": ["Problem 1\n下列哪个正确？\nA. 甲\nB. 乙"],
+                            "hw122_sol.pdf": ["1. B. Because it is even."]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "choice")                  # 带理由的键不降级
+        self.assertEqual(hw[0].get("answer"), "B")
+
+    def test_cn_delimiter_decimal_key_stripped(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw123.pdf": ["Problem 1\n概率是 ______ 。"],
+                            "hw123_sol.pdf": ["Problem 1 Solution\n1、0.5"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(hw[0]["type"], "fill_blank")
+        self.assertEqual(hw[0].get("answer"), "0.5")               # 顿号键剥掉、小数保全
+
+    def test_score_suffixed_writing_area_stays_subjective(self):
+        tmp = tempfile.mkdtemp()
+        mat, be = _mk(tmp, {"hw124.pdf": ["Problem 1\nProve the identity.\n__________ / 5 points"],
+                            "hw125.pdf": ["Problem 1\n证明恒等式。\n__________ / 10分"]})
+        code, payload, report = _run(mat, be)
+        hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
+        self.assertEqual(len(hw), 2)
+        for q in hw:
+            self.assertEqual(q["type"], "subjective")              # 计分书写行不是挖空
+
     def test_no_network_or_llm(self):
 
 

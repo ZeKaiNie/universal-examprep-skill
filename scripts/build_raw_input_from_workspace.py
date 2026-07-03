@@ -433,10 +433,11 @@ def extract_lecture_items(pages):
         item_id = "lecture_%s_%d_%d" % (kind, key[1], key[2])
         if key in ambiguous:   # readable stem + injective index (so a/b.pdf vs a_b.pdf don't collide)
             item_id += "__%s_%d" % (re.sub(r"[^\w]", "_", os.path.splitext(pf)[0]), file_idx[(key, pf)])
+        _qt, _opts = _classify_question_type(question)
         item = {
             "id": item_id,
             "chapter": key[1],
-            "type": "diagram" if needs else "subjective",
+            "type": "diagram" if needs else _qt,
             "question": question,
             "source": "material",
             "source_file": pf,
@@ -446,6 +447,8 @@ def extract_lecture_items(pages):
             "requires_assets": bool(needs),
             "question_text_status": qts,
         }
+        if not needs and _qt == "choice" and _opts:
+            item["options"] = _opts
         if not needs:
             item["keywords"] = []  # subjective recommended field; left for the tutor/teacher to fill
         if ans_idx:
@@ -462,8 +465,10 @@ def extract_lecture_items(pages):
                                        for j in ans_idx) if t).strip()
             if sol:
                 item["answer"] = sol + ("（解答可能依赖图，须看原页/asset）" if needs else "")
+                _apply_typed_answer(item)
             else:
                 item["answer"] = ref + ("（依赖图，须看原页/asset）" if needs else "")
+                _apply_typed_answer(item)
         else:
             item["answer_status"] = "unknown"   # honest: no solution page detected
         items.append(item)
@@ -1275,18 +1280,22 @@ def extract_homework_items(pages, root_name="", exclude=frozenset()):
             chm = (re.search(r"(?:第\s*(\d+)\s*章|Chapter\s+(\d+))", q_text, re.I)
                    or re.search(r"(?:^|[\/_\-. ])ch\s*0*(\d+)", hf, re.I))
             _src = "exam" if hf in exam_files else "homework"
+            _qt, _opts = _classify_question_type(q_text)
             item = {"id": "%s_%s_%s" % (_src if _src == "exam" else "hw", stem,
                                         str(mk["num"]).replace(".", "_")),   # 1.1 → _1_1，id 保持安全字符
-                    "type": "subjective",
+                    "type": _qt,
                     "question": q_text, "source": "material", "ai_generated": False,   # 不静默截断（长题保完整）
                     "source_type": _src, "homework_number": mk["num"],
                     "question_text_status": "page_reference" if marker_only else "full",
                     "source_file": hf, "source_pages": q_pages or [bounds[0][1] if bounds else 1]}
+            if _qt == "choice" and _opts:
+                item["options"] = _opts
             if chm:
                 item["chapter"] = int(next(g for g in chm.groups() if g))
             if ans:
                 sf, body, apages = ans
                 item["answer"] = body                     # 不静默截断
+                _apply_typed_answer(item)
                 item["answer_source_file"] = sf
                 item["answer_source_pages"] = apages or None
                 if item["answer_source_pages"] is None:
@@ -1606,6 +1615,180 @@ def _fmt_pages(nums):
         out.append(str(nums[i]) if i == j else "%d-%d" % (nums[i], nums[j]))
         i = j + 1
     return ",".join(out)
+
+
+# ---- D4: 保守题型启发——只认高置信形态，判不准保持 subjective（汇总警报交 AI 复核）----
+# 选项行只认【大写】A-D（(a)(b) 小写通常是小问不是选项，绝不猜）
+_OPTION_LINE_RE = re.compile(r"^[ \t]*[（(]?([A-H])[）)．.、:：][ \t]*(?![a-z]\.)(\S.*)$")
+_BLANK_RUN_RE = re.compile(r"[_＿]{3,}")
+
+
+def _strip_answer_prefix(ans_text):
+    """剥解答标题（Quiz X.Y Solution / Answer: / 答案：）与键前缀（1. / 1(a). / 1a.）——
+    choice/fill_blank 的答案归一共用。"""
+    t = " ".join(str(ans_text or "").split())
+    # 带编号的标题形无歧义，可无分隔符剥（Quiz 1.1 Solution … / Problem 1 Solution …）
+    t = re.sub(r"(?i)^(?:quiz|example)\s+\d+(?:\.\d+)*\s*(?:solutions?|answers?)\s*[:：.]?\s*", "", t)
+    t = re.sub(r"(?i)^(?:problem|exercise|question)\s*#?\s*\d+(?:\.\d+)*"
+               r"(?:\s*\([A-Za-z]\)|[A-Za-z])?\s*(?:solutions?|answers?|解答|答案)\s*[:：.]?\s*", "", t)
+    # 裸题号标签键（Question 1: B / Problem 2. / 第1题：）——分隔符必带，防误剥正文
+    t = re.sub(r"(?i)^(?:problem|exercise|question)\s*#?\s*\d+(?:\.\d+)*"
+               r"(?:\s*\([A-Za-z]\)|[A-Za-z])?\s*[:：.]\s*", "", t)
+    t = re.sub(r"^第?\s*\d+\s*题\s*[:：.]\s*", "", t)
+    # 裸解答词必须带编号或分隔符才剥——「Answer 1: B」「Answer: LIFO」剥，
+    # 「Solution set」这类正文短语绝不剥（过剥实测）
+    t = re.sub(r"(?i)^(?:solutions?|answers?|解答|答案)"
+               r"(?:\s*#?\s*\d+(?:\.\d+)*(?:\s*\([A-Za-z]\)|[A-Za-z])?\s*[:：.]?|\s*[:：.])\s*", "", t)
+    # 句点分隔符后紧跟数字的不是键是小数（Answer: 0.5 / 1.5 表示比例）——绝不剥；
+    # )、 不是小数分隔符（1、0.5 / 1)0.5 的键照剥）
+    t = re.sub(r"^\d+(?:\.\d+)*(?:\s*\([A-Za-z]\)|[A-Za-z])?\s*(?:[)、]\s*|\.[ \t]*(?!\d))", "", t)
+    return t.strip()
+
+
+def _normalize_choice_answer(ans_text, options):
+    """把解答切片归一成选项字母（validator 只认 裸标签/选项全文/选项正文）：剥前缀后剩
+    单个 A-H（可带括号/句点）才认；整段恰是某选项全文/正文也认；否则 None。"""
+    t = _strip_answer_prefix(ans_text)
+    m = re.fullmatch(r"[（(]?([A-Ha-h])[）)．.。]?", t)
+    if m:
+        letter = m.group(1).upper()
+        labels = {str(o)[:1].upper() for o in options or []}
+        # 键字母不在已抽选项里（抽取漏了选项/键错位）——不归一，让调用方降级，
+        # 绝不发一个 answer 不在 options 里的 choice
+        return letter if letter in labels else None
+    t_cmp = re.sub(r"[\s,，;；、.。]+$", "", t)
+    for o in options or []:
+        body = re.sub(r"^[A-H][.．、:：)]\s*", "", str(o)).strip()
+        if t == o or t_cmp == re.sub(r"[\s,，;；、.。]+$", "", body):
+            return str(o)[:1]
+    # 头部字母 + 分隔符/理由词（B. Because… / B 因为…）——标签无歧义，理由只是附注
+    m2 = re.match(r"[（(]?([A-Ha-h])(?:[）)．.。:：]|\s+(?:because|since|因为|由于))", t)
+    if m2:
+        letter = m2.group(1).upper()
+        labels = {str(o)[:1].upper() for o in options or []}
+        return letter if letter in labels else None
+    return None
+
+
+def _apply_typed_answer(item):
+    """按启发式题型归一答案：choice 归一成字母（归一不了降级主观——宁少标不发 validator
+    必拒的题）；fill_blank 剥解答标题/键前缀（判分要对的是填的值，不是标题文本）。"""
+    if not item.get("answer"):
+        return
+    if item.get("type") == "choice":
+        na = _normalize_choice_answer(item["answer"], item.get("options"))
+        if na is not None:
+            item["answer"] = na
+        else:
+            item["type"] = "subjective"
+            item.pop("options", None)
+            item.setdefault("keywords", [])
+    elif item.get("type") == "fill_blank":
+        stripped = _strip_answer_prefix(item["answer"])
+        if stripped:
+            item["answer"] = stripped
+    elif item.get("type") == "subjective" and "options" not in item:
+        # 晋升通道：键归一出裸字母（1. B）说明这就是选择题——二次判型越过线索门，
+        # 字母还得落在再抽出的选项标签里才晋升（双保险，绝不硬猜）
+        t = _strip_answer_prefix(item["answer"])
+        m = re.fullmatch(r"[（(]?([A-Ha-h])[）)．.。]?", t)
+        if m:
+            qt2, opts2 = _classify_question_type(item.get("question") or "", assume_choice=True)
+            if qt2 == "choice" and opts2 \
+                    and m.group(1).upper() in {str(o)[:1].upper() for o in opts2}:
+                item["type"] = "choice"
+                item["options"] = opts2
+                item["answer"] = m.group(1).upper()
+                item.pop("keywords", None)
+
+
+# 选择题提示词——题干里得有「选/哪/下列/which/choose…」这类线索，大写小问
+# （A. Find f'(x). B. Compute…）才不会光凭字母序列被误判成选择题
+_CHOICE_CUE_RE = re.compile(
+    r"(?i)which|select|choose|circle|correct|incorrect|true|false|multiple\s*choice"
+    r"|下列|以下|哪|选|正确|错误|属于|符合|判断")
+
+
+def _classify_question_type(q_text, assume_choice=False):
+    """(type, options)。≥2 个从 A 起按序排列的大写选项行 → choice + options（续行并入上一项）；
+    题面带填空线 → fill_blank；其余一律 subjective——启发式判不准绝不硬猜别的型。"""
+    letters, opts, block_open = [], [], False
+    for ln in (q_text or "").splitlines():
+        m = _OPTION_LINE_RE.match(ln)
+        if m:
+            letters.append(m.group(1))
+            opts.append("%s. %s" % (m.group(1), m.group(2).strip()))
+            block_open = True
+        elif not ln.strip():
+            block_open = False                         # 空行结束选项块——其后说明行不并入
+        elif opts and block_open:
+            if re.match(r"(?i)^\s*(?:(?:explain|show|justify|prove|describe|discuss|note|hints?|"
+                        r"circle|select|choose|mark|write)\b|(?:e\.?\s*g|i\.?\s*e|n\.?\s*b)\.?[.:：\s]"
+                        r"|请|说明|解释|证明|注意|提示|选出|圈出|写出)",
+                        ln) or _HW_ANSBOX_INSTR_RE.search(ln):
+                block_open = False                     # 紧随选项的答题指令不是选项续行
+            else:
+                opts[-1] = opts[-1] + " " + ln.strip()     # 选项跨行——续行并入上一项
+    if len(letters) >= 2 and letters == [chr(65 + i) for i in range(len(letters))]:
+        stem_lines = []
+        for ln in (q_text or "").splitlines():
+            if _OPTION_LINE_RE.match(ln):
+                break
+            stem_lines.append(ln)
+        if assume_choice or _CHOICE_CUE_RE.search(" ".join(stem_lines)):
+            return "choice", opts
+        return "subjective", None          # 无选择线索的字母清单是小问列表，不猜
+    # 行内选项：讲义题面常被空白折叠成一行（… A. 对的 B. 错的）——只认 A．/A:/（A）
+    # 这类点号冒号/全角括号形，不认英文半角 (A)（散文引用「见(A)节」会误判）
+    t = q_text or ""
+    # 选项前可以是全角冒号/逗号/顿号（选一个：A. …）——不只空白
+    ms = list(re.finditer(r"(?:^|[\s：:，,。；;、])(?:（([A-H])）|([A-H])[．.、:：])[ \t]*(?![a-z]\.)", t))
+    seq = [(m.group(1) or m.group(2)) for m in ms]
+    if len(seq) >= 2 and seq == [chr(65 + i) for i in range(len(seq))] \
+            and (assume_choice or _CHOICE_CUE_RE.search(t[:ms[0].start()])):
+        opts2 = []
+        for j, m in enumerate(ms):
+            end = ms[j + 1].start() if j + 1 < len(ms) else len(t)
+            body = t[m.end():end].strip()
+            if j == len(ms) - 1 and body:
+                # 折叠成单行的题面里，末选项后常粘答题指令——在「小写/CJK 后接大写指令动词
+                # 或中文指令词」的句界截断；write-back 这类小写正文不受影响
+                cut = re.search(r"(?<=[a-z0-9）)\u4e00-\u9fff])\s+(?=(?:Explain|Show|Justify|"
+                                r"Prove|Describe|Discuss|Note|Hints?|Circle|Select|Choose|Mark|"
+                                r"Write)\b)|(?<=[a-z0-9）)\u4e00-\u9fff])\s*"
+                                r"(?=请|说明|解释|证明|注意|提示|选出|圈出|写出)", body)
+                if cut:
+                    body = body[:cut.start()].strip()
+            body = body.rstrip(",，;；、 ")             # 行内分隔符（A. foo, B. bar）不留在选项体
+            if not body:
+                opts2 = []
+                break
+            opts2.append("%s. %s" % (seq[j], body))
+        if opts2:
+            return "choice", opts2
+    prev = ""
+    for ln in (q_text or "").splitlines():
+        if _BLANK_RUN_RE.search(ln):
+            # 只有【标签形状】才算答题栏：标签紧贴空线（Answer: ____）、整行是指示语、
+            # 或上一行以答案标签结尾——「Answer the following: f(x)= ____」是真填空题
+            label_before = re.search(r"(?i)(?:answers?|solutions?|答案|解答|作答|答题)"
+                                     r"[处栏]?\s*[:：]?\s*[_＿]", ln)
+            label_prev = re.search(r"(?i)(?:answers?|solutions?|答案|解答|作答|答题)"
+                                   r"[处栏]?\s*[:：]?\s*$", prev)
+            residual = _BLANK_RUN_RE.sub("", ln)
+            residual = re.sub(r"[（(][^（）()]{0,24}[)）]", "", residual)          # (5 pts) 类标注不算内容
+            residual = re.sub(r"[/／]?\s*\d+\s*(?:(?:points?|pts?|marks?)\b|分)", "", residual).strip()
+            embedded = bool(re.search(r"[^\W_]", residual))
+            # 「Fill in the blank / 填空」是明说的正面信号——优先于答题栏抑制
+            #（指示语词典的 in the blank 恰好会撞上它）
+            if re.search(r"(?i)fill\s+in\s+the\s+blanks?|填空", ln + " " + prev):
+                return "fill_blank", None
+            # 整行只有下划线（证明题末尾的书写区）不是题面挖空——空线必须嵌在文字里
+            if embedded and not (label_before or label_prev or _HW_ANSBOX_INSTR_RE.search(ln)):
+                return "fill_blank", None
+        if ln.strip():
+            prev = ln
+    return "subjective", None
 
 
 def _rel(path, base):
@@ -2000,6 +2183,21 @@ def run(args, backend=None):
     wiki_pages = [pg for pg in pages if pg["file"] not in sol_files
                   and pg["file"] not in sol_dir_files
                   and (pg["file"], pg["page"]) not in residue_page_keys]   # 残渣页不进 wiki
+    _typed = {}
+    for _it in (lecture_items + homework_items):
+        _typed[_it.get("type", "subjective")] = _typed.get(_it.get("type", "subjective"), 0) + 1
+    if _typed:
+        report["warnings"].append(
+            "type_heuristic: 题型由保守启发式判定——%s；启发式只认选择题/填空题两种形态，"
+            "判断/编程等其他题型会落在主观题里，请 AI 复核 quiz_bank 的 type 字段"
+            % "、".join("%s %d" % (k, v) for k, v in sorted(_typed.items())))
+        if _typed.get("subjective"):
+            report["ai_review"].append({
+                "kind": "type_defaulted", "file": "references/quiz_bank.json",
+                "action": "有 %d 道题按主观题默认定型（启发式判不准绝不硬猜）。请 AI 抽查这些题：若"
+                          "实为判断/编程/选择题（选项在图里）等，改写 type（合法值 choice/subjective/"
+                          "diagram/fill_blank/true_false/code）并补 options；同时抽查已判为 "
+                          "choice/fill_blank 的题是否属实。" % _typed["subjective"]})
     _ch_notes = []
     sections = group_sections(wiki_pages, _ch_notes)
     for _f in _ch_notes:
