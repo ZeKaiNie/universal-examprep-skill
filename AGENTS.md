@@ -15,6 +15,7 @@
 2. **惰性加载**：每次**只**读当前阶段的一个 `references/wiki/chN_*.md`；严禁一次性读全书或塞整库进上下文。
 3. **题只从题库出 + 视觉题先看题面图**：测验只从 `references/quiz_bank.json` 抽题判分；**题库有相关题时绝不自己编题**。带 `requires_assets=true` 或 `maybe_requires_assets=true` 的视觉依赖题，必须先展示所有题面侧图（`question_context`/`figure`/`diagram`/`table`），标「题面图 / question-side asset」，再问题、提示、讲解或给答案；**不得先展示答案侧图**（`answer_context`/`worked_solution`），答案侧图只在解答/复盘阶段、题面图已显示之后展示，并标「答案图 / answer-side asset」。图缺失/不可读/Markdown 不渲染/网页端无法显示则跳过该题，改出全文题；只打印路径或 slash-prefixed Windows drive-letter 伪路径不算显示。`stub`/`page_reference` 同理，先呈现原页/资源否则跳过。详见 [`docs/file-format.md`](docs/file-format.md) §4。
 - 范围过滤契约（A2）：默认混合题池；学生限定范围（如只做作业题）后即为已记录的 scope 过滤器，越范围出题前必须先输出「⚠️ 临时覆盖你的 <范围> 范围偏好」，未标 source_type 的题在限定范围内一律排除并报告数量（官方选题工具 scripts/select_questions.py）。
+- 难度×掌握出题（A7）：针对性/检查点练习用官方选题器 scripts/select_hard_questions.py——按 难度（scripts/score_difficulty.py 的结构启发式下界，非语义）× 错题/疑难/知识点窗口掌握状态 × 学习模式 确定性排序（查缺补漏 weak 先易后难→mastered 先难；零基础全局先易后难）；默认全库，**检查点务必带 --chapter <当前章>**（--from-chapter N 是「≥N 的所有章」，只给「某章起步补弱」用，别拿来做检查点）；A2 范围/越界声明照常生效（--source-type all 可一次性覆盖为混合池，须先声明）。
 - 结构化进度契约（A4）：存在 study_state.json 时它是唯一事实源——一律经 scripts/update_progress.py 更新（set/add-mistake/add-confusion/render），study_progress.md 是生成视图、严禁手改（下次渲染即丢）；状态写入失败必须告知用户，绝不当作已保存继续。state 缺失时先分辨：Python 可用（新建工作区）→ 先 `python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace <ws> init` 建立事实源再更新；真无法运行 Python 才降级手写 md（照常有效）。
 4. **标注来源**（canonical，详见 `docs/language-policy.md`）：🟢 来自资料 / 🟡 AI补充，可能与你老师讲的不完全一致 / ⚠️ AI生成答案，非老师/教材提供。
 5. **不伪装**：**绝不**把 AI 生成/补充的答案伪装成老师提供的标准答案。
