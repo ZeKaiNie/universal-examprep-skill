@@ -1,0 +1,19 @@
+MiniOS Lecture Notes (fictional, self-authored fixture — NOT real course material).
+
+The Gearbox scheduler wakes every twenty milliseconds and selects the runnable process holding the highest priority score. Ties are broken by the earliest arrival time.
+
+A Vellum page is eight kilobytes in size and is the smallest unit that the MiniOS memory manager will allocate to a process.
+
+The Tanager filesystem stores the metadata for every file in a compact record called an inode-plus, which also keeps the last three access timestamps.
+
+A quench is the operation that flushes all dirty cache lines back to persistent storage so that a later crash cannot lose acknowledged writes.
+
+The Beacon transport protocol retransmits a lost packet only after three consecutive missed acknowledgements, which keeps spurious retransmissions rare on a healthy link.
+
+Latching means acquiring a short-lived lock on a single memory page for the duration of one update, and releasing it immediately afterwards.
+
+The Cirrus compiler speeds up tight loops by unrolling each of them up to four times before it emits machine code.
+
+Every Gearbox process is granted a time slice of fifty milliseconds, after which the scheduler preempts it and reconsiders the ready queue.
+
+The Marlin database keeps its write-ahead log in a file named marlin.wal, and replays that log on startup to recover uncommitted transactions.

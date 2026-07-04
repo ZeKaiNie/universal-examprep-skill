@@ -1,0 +1,42 @@
+# spike 本地隔离——即便有人从本目录内跑 git 也生效。fixtures/ 与 tests/ 是提交的（未忽略）。
+
+# 重型可选依赖的虚拟环境
+.venv/
+venv/
+env/
+virtualenv*/
+
+# 持久化的向量索引 / 嵌入（真实产物，非源码）
+index/
+index_store/
+storage/
+*.faiss
+*.index
+chroma*/
+*.db
+**/embeddings*.npy
+*.npz
+*.pkl
+*.bin
+
+# 真跑输出（对齐 benchmark/results 的忽略口径）
+results/
+raw.jsonl
+answers.jsonl
+summary.json
+
+# 材料副本 / 软链（Yale/MIT 转录受版权，已在 benchmark/materials 忽略；绝不在 spike 下再提交）
+materials/
+
+# 真 config（含密钥）——只提交 config.example.json
+config.json
+
+# 下载的模型缓存 / 日志 / 临时
+.cache/
+models/
+*.log
+*.tmp
+
+# 字节码
+__pycache__/
+*.py[cod]
