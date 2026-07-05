@@ -1,0 +1,6 @@
+# OPT-IN 依赖，仅供 --real 真跑用。绝不加入 repo/skill/benchmark 的任何 requirements；--mock 一律不装。
+# 安装：  pip install -r spike/llamaindex_rag/requirements-real.txt
+# 对齐 llama-index 0.14.x（2026-06 校验；需 Python >=3.10,<4.0）。真 embed 首次会下载 BGE 模型(~130MB)。
+llama-index-core>=0.14,<0.15
+llama-index-embeddings-huggingface>=0.6,<0.7
+llama-index-llms-openai-like>=0.5,<0.6
