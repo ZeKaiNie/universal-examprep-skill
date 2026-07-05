@@ -1,0 +1,26 @@
+{
+  "_comment": "run_matrix.py 的真跑配置模板（B4）。复制为你自己的 config.json 后按需改。相对路径按本 config 文件所在目录解析。先用 `python run_matrix.py --mock` 跑自带 fixture 课程验证管线；真跑加 --real（用你已登录的 Claude 订阅，resumable、配额感知）。这里以 gen.py 曾硬编码的 algo/psyc 两门课为例，展示如何改成配置驱动。",
+  "courses": [
+    {
+      "name": "algo",
+      "combined": "materials/algorithms_mit6006/_combined.txt",
+      "items": "items/items_algo_full.jsonl",
+      "skill_ws": "skill_workspace/mit6006_full",
+      "raw_ws": "skill_workspace/rawfiles_algo"
+    },
+    {
+      "name": "psyc",
+      "combined": "materials/psych_yale_psyc110/_combined.txt",
+      "items": "items/items_psyc_full.jsonl",
+      "skill_ws": "skill_workspace/psyc110_full",
+      "raw_ws": "skill_workspace/rawfiles_psyc"
+    }
+  ],
+  "models": ["opus", "sonnet", "haiku"],
+  "arms": ["closedbook", "rawfiles", "skill"],
+  "primary_course": "algo",
+  "secondary_course": "psyc",
+  "results_dir": "results/matrix_run",
+  "judge_model": "haiku",
+  "mock": false
+}

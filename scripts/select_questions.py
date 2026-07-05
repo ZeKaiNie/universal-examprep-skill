@@ -136,19 +136,19 @@ def export_sqlite(bank, path):
 
 
 def run(argv=None):
-    ap = argparse.ArgumentParser(description="按标签筛题（来源/章节/知识点/难度/图依赖），quiz_bank 为唯一事实源。")
+    ap = argparse.ArgumentParser(description="Filter questions by tags (source/chapter/knowledge point/difficulty/figure-dependency); quiz_bank is the single source of truth.")
     ap.add_argument("--workspace", required=True)
     ap.add_argument("--source-type", default=None,
-                    help="逗号分隔的来源过滤（%s）" % "/".join(sorted(SOURCE_TYPES)))
-    ap.add_argument("--chapter", default=None, help="章节/phase")
-    ap.add_argument("--knowledge-point", default=None, help="知识点（子串匹配）")
+                    help="comma-separated source filter (%s)" % "/".join(sorted(SOURCE_TYPES)))
+    ap.add_argument("--chapter", default=None, help="chapter/phase")
+    ap.add_argument("--knowledge-point", default=None, help="knowledge point (substring match)")
     ap.add_argument("--difficulty-min", type=int, default=None)
     ap.add_argument("--difficulty-max", type=int, default=None)
     ap.add_argument("--requires-assets", choices=["any", "yes", "no", "maybe"], default="any")
-    ap.add_argument("--limit", type=int, default=0, help="0=不限")
+    ap.add_argument("--limit", type=int, default=0, help="0 = no limit")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--export-sqlite", default=None,
-                    help="可选：把题库导出为 sqlite 查询缓存（生成物，不进仓库、不被本工具回读）")
+                    help="optional: export the bank as a sqlite query cache (generated artifact; not committed, never read back by this tool)")
     args = ap.parse_args(argv)
 
     if args.source_type is not None:                   # ""（空字符串）也必须走校验，不能静默回混合池

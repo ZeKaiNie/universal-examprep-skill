@@ -263,7 +263,7 @@
       "closedbook": 0.0092,
       "rawfiles": 0.0275,
       "skill": 0.0175,
-      "material": 0.9
+      "material": null
     },
     "courseB": {
       "closedbook": 0.0105,
@@ -324,5 +324,6 @@
       "n_infra_error": 0,
       "cost_usd": 0.032
     }
-  }
+  },
+  "ragged_matrix": true
 }

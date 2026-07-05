@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""一键解析并生成备考 LLM Wiki 目录结构与进度文件。
+"""One-shot parse and generate the cram LLM wiki directory structure and progress files。
 
 依赖：Python 3.7+ 标准库，无需 pip 安装。
 设计原则：发现问题就大声报错并停下，绝不静默产出残缺文件。
@@ -109,7 +109,7 @@ def validate(data):
             continue
         qtype = q.get("type")
         if qtype not in VALID_QUIZ_TYPES:
-            errors.append(f"题目 {tag} 的 type 必须是 choice 或 subjective（当前为 {qtype!r}）。")
+            errors.append(f"题目 {tag} 的 type 必须是 {'/'.join(sorted(VALID_QUIZ_TYPES))} 之一（当前为 {qtype!r}）。")
         if not q.get("question"):
             errors.append(f"题目 {tag} 缺少题干 question。")
         if qtype == "choice" and not q.get("options"):
@@ -167,10 +167,10 @@ def render_template(template_name, replacements, markers):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="一键解析并生成备考 LLM Wiki 目录结构与进度文件")
-    parser.add_argument("--input", "-i", type=str, default="raw_input.json", help="输入的结构化大纲 JSON 文件路径")
-    parser.add_argument("--output-dir", "-o", type=str, default=".", help="输出的目标工作区路径 (默认为当前目录)")
-    parser.add_argument("--force", action="store_true", help="允许覆盖已存在的 study_progress.md（会先自动备份）")
+    parser = argparse.ArgumentParser(description="One-shot parse and generate the cram LLM wiki directory structure and progress files")
+    parser.add_argument("--input", "-i", type=str, default="raw_input.json", help="input structured-outline JSON path")
+    parser.add_argument("--output-dir", "-o", type=str, default=".", help="target workspace path (default: current directory)")
+    parser.add_argument("--force", action="store_true", help="allow overwriting an existing study_progress.md (auto-backup first)")
     args = parser.parse_args()
 
     if not os.path.exists(args.input):
@@ -222,6 +222,9 @@ def main():
             normalized = TRUE_FALSE_NORMALIZE.get(q["answer"].strip().lower(), q["answer"])
             q["answer"] = normalized
     # ────────────────────────────────────────────────────────────────
+    # 补号后重算缺答案清单——validate 阶段无 id 的题记的是「#序号」占位，
+    # 持久化报告必须指向题库里真实存在的 id，后续会话的 AI 才能定位接手
+    missing_answer_ids = [q["id"] for q in quiz_bank if is_blank(q.get("answer"))]
 
     print(f"[+] 识别到科目: {course_name}")
     print(f"[+] 阶段数量: {len(phases)} 个")
@@ -254,6 +257,17 @@ def main():
     with open(quiz_file_path, "w", encoding="utf-8") as qf:
         json.dump(quiz_bank, qf, indent=2, ensure_ascii=False)
     print("[+] 已写入题库文件: references/quiz_bank.json")
+
+    # 导入报告持久化——缺答案清单只留在控制台会随会话丢失，后续会话的 AI 无从接手
+    ingest_report = {
+        "course_name": course_name, "phases": len(phases), "quiz_bank": len(quiz_bank),
+        "missing_answer_ids": missing_answer_ids,
+        "note": "missing_answer_ids 的题没有标准答案：测验前需补全，或由 AI 生成并向学生明确标注"
+                "「⚠️ AI生成答案，非老师/教材提供」。",
+    }
+    with open(os.path.join(output_dir, "ingest_report.json"), "w", encoding="utf-8") as rf:
+        json.dump(ingest_report, rf, ensure_ascii=False, indent=2)
+    print("[+] 已写入导入报告: ingest_report.json")
 
     # 3. 生成 study_plan.md（可重复生成，无用户状态）
     plan_content = render_template(

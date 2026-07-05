@@ -52,7 +52,8 @@ def _pages(file, *texts):
 
 def _materials_with_pdf(basename="ch01.pdf"):
     """A temp materials dir holding one empty .pdf on disk (the fake backend supplies its text)."""
-    d = tempfile.mkdtemp(prefix="mat-")
+    d = os.path.join(tempfile.mkdtemp(prefix="mat-"), "materials")
+    os.makedirs(d)
     with open(os.path.join(d, basename), "wb") as f:
         f.write(b"%PDF-1.4 fake")
     return d
@@ -272,7 +273,8 @@ class CoreExtraction(unittest.TestCase):
 
     # ---- P0D: prune leftover workspace dirs from the materials scan ----
     def test_scan_prunes_leftover_workspace_dirs(self):
-        d = tempfile.mkdtemp(prefix="mat-")
+        d = os.path.join(tempfile.mkdtemp(prefix="mat-"), "materials")
+        os.makedirs(d)
         os.makedirs(os.path.join(d, "references", "wiki"))
         os.makedirs(os.path.join(d, "scratch", "extracted"))
         with open(os.path.join(d, "references", "wiki", "ch01.md"), "w", encoding="utf-8") as f:
@@ -281,7 +283,7 @@ class CoreExtraction(unittest.TestCase):
             f.write("Quiz 9.9 leftover scratch")
         with open(os.path.join(d, "ch01.pdf"), "wb") as f:
             f.write(b"%PDF fake")
-        pdfs, texts, pruned = B._scan_materials(d)
+        pdfs, texts, pruned, _others = B._scan_materials(d)
         self.assertEqual([os.path.basename(p) for p in pdfs], ["ch01.pdf"])  # only the real PDF
         self.assertEqual(texts, [])                                          # leftover .md/.txt skipped
         self.assertIn("references", pruned)
@@ -289,7 +291,8 @@ class CoreExtraction(unittest.TestCase):
 
     def test_leftover_workspace_not_ingested(self):
         # P0D end-to-end: a prior workspace's markers must not enter the bank; the real PDF's do
-        d = tempfile.mkdtemp(prefix="mat-")
+        d = os.path.join(tempfile.mkdtemp(prefix="mat-"), "materials")
+        os.makedirs(d)
         os.makedirs(os.path.join(d, "references", "wiki"))
         with open(os.path.join(d, "references", "wiki", "ch01.md"), "w", encoding="utf-8") as f:
             f.write("## Quiz 9.9 Problem leftover\n## Quiz 9.9 Solution x")
@@ -339,13 +342,14 @@ class CoreExtraction(unittest.TestCase):
 
     def test_legitimate_references_dir_not_pruned(self):
         # a course 'references/' of real PDFs (no wiki/assets signature) must NOT be pruned
-        d = tempfile.mkdtemp(prefix="mat-")
+        d = os.path.join(tempfile.mkdtemp(prefix="mat-"), "materials")
+        os.makedirs(d)
         os.makedirs(os.path.join(d, "references"))
         with open(os.path.join(d, "references", "ch02.pdf"), "wb") as f:
             f.write(b"%PDF fake")
         with open(os.path.join(d, "ch01.pdf"), "wb") as f:
             f.write(b"%PDF fake")
-        pdfs, texts, pruned = B._scan_materials(d)
+        pdfs, texts, pruned, _others = B._scan_materials(d)
         self.assertEqual(sorted(os.path.basename(p) for p in pdfs), ["ch01.pdf", "ch02.pdf"])
         self.assertEqual(pruned, [])
 
@@ -359,21 +363,23 @@ class CoreExtraction(unittest.TestCase):
 
     def test_references_assets_pdfs_not_pruned(self):
         # a course storing PDFs under references/assets/ (no references/wiki) must NOT be pruned
-        d = tempfile.mkdtemp(prefix="mat-")
+        d = os.path.join(tempfile.mkdtemp(prefix="mat-"), "materials")
+        os.makedirs(d)
         os.makedirs(os.path.join(d, "references", "assets"))
         with open(os.path.join(d, "references", "assets", "fig.pdf"), "wb") as f:
             f.write(b"%PDF fake")
-        pdfs, texts, pruned = B._scan_materials(d)
+        pdfs, texts, pruned, _others = B._scan_materials(d)
         self.assertIn("fig.pdf", [os.path.basename(p) for p in pdfs])
         self.assertEqual(pruned, [])
 
     def test_generated_progress_files_skipped(self):
         # study_plan.md / study_progress.md at the materials root are workspace files, not material
-        d = tempfile.mkdtemp(prefix="mat-")
+        d = os.path.join(tempfile.mkdtemp(prefix="mat-"), "materials")
+        os.makedirs(d)
         for fn in ("study_plan.md", "study_progress.md", "lecture_notes.md"):
             with open(os.path.join(d, fn), "w", encoding="utf-8") as f:
                 f.write("Quiz 1.1  x\nQuiz 1.1 Solution  y")
-        pdfs, texts, pruned = B._scan_materials(d)
+        pdfs, texts, pruned, _others = B._scan_materials(d)
         names = sorted(os.path.basename(p) for p in texts)
         self.assertEqual(names, ["lecture_notes.md"])   # real notes kept, generated files skipped
 
@@ -404,13 +410,14 @@ class CoreExtraction(unittest.TestCase):
 
     def test_skip_files_only_at_root(self):
         # study_plan.md skipped at the materials ROOT but KEPT in a subfolder (could be a real file)
-        d = tempfile.mkdtemp(prefix="mat-")
+        d = os.path.join(tempfile.mkdtemp(prefix="mat-"), "materials")
+        os.makedirs(d)
         os.makedirs(os.path.join(d, "lectures"))
         with open(os.path.join(d, "study_plan.md"), "w", encoding="utf-8") as f:
             f.write("x")
         with open(os.path.join(d, "lectures", "study_plan.md"), "w", encoding="utf-8") as f:
             f.write("y")
-        pdfs, texts, pruned = B._scan_materials(d)
+        pdfs, texts, pruned, _others = B._scan_materials(d)
         rels = sorted(os.path.relpath(t, d).replace(os.sep, "/") for t in texts)
         self.assertEqual(rels, ["lectures/study_plan.md"])   # root skipped, subfolder kept
 
@@ -447,7 +454,8 @@ class CoreExtraction(unittest.TestCase):
     def test_nested_workspace_dir_fully_pruned(self):
         # a prior run's output (skill_workspace/ with references/wiki + study_progress.md) nested under
         # --materials must be pruned WHOLE — its study_progress.md must not leak in as a .md material
-        d = tempfile.mkdtemp(prefix="mat-")
+        d = os.path.join(tempfile.mkdtemp(prefix="mat-"), "materials")
+        os.makedirs(d)
         ws = os.path.join(d, "skill_workspace")
         os.makedirs(os.path.join(ws, "references", "wiki"))
         for p in (os.path.join(ws, "study_progress.md"), os.path.join(ws, "references", "wiki", "ch1.md")):
@@ -455,7 +463,7 @@ class CoreExtraction(unittest.TestCase):
                 f.write("Quiz 9.9  leftover")
         with open(os.path.join(d, "ch01.pdf"), "wb") as f:
             f.write(b"%PDF fake")
-        pdfs, texts, pruned = B._scan_materials(d)
+        pdfs, texts, pruned, _others = B._scan_materials(d)
         self.assertEqual(texts, [])                              # nothing from skill_workspace/
         self.assertEqual([os.path.basename(p) for p in pdfs], ["ch01.pdf"])
         self.assertIn("skill_workspace", pruned)
@@ -622,7 +630,8 @@ class CliAndRun(unittest.TestCase):
         self.assertTrue(any("answer_image_unavailable" in w for w in report["warnings"]))
 
     def test_txt_materials_work_without_backend(self):
-        d = tempfile.mkdtemp(prefix="mat-")
+        d = os.path.join(tempfile.mkdtemp(prefix="mat-"), "materials")
+        os.makedirs(d)
         with open(os.path.join(d, "notes.txt"), "w", encoding="utf-8") as f:
             f.write("Example 1.1 Problem  hi\n")
         code, ri, report = B.run(_args(d), backend=B.NoBackend())  # no PDFs -> stdlib path works
@@ -760,7 +769,8 @@ class CliAndRun(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(args.asset_root, os.path.basename(a["path"]))))
 
     def test_answer_spanning_multiple_files_warns(self):
-        d = tempfile.mkdtemp(prefix="mat-")
+        d = os.path.join(tempfile.mkdtemp(prefix="mat-"), "materials")
+        os.makedirs(d)
         for fn in ("a.pdf", "b.pdf"):
             with open(os.path.join(d, fn), "wb") as f:
                 f.write(b"%PDF fake")

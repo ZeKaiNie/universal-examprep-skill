@@ -11,6 +11,13 @@ This skill is **bilingual by design**: an English *control plane* for precision 
 The bilingual split lands in two steps and is now realized:
 1. **Policy + provenance** — establish the language policy and mirror the canonical provenance labels into every entrypoint.
 2. **Control-plane conversion** — the modular `skills/exam-*` files use **English control sections** (Purpose / Activation / Inputs / Workflow / Output Contract / Boundaries) while keeping **Simplified-Chinese student-facing examples** under `Student-facing Output`.
+   (A8a) This is now **lint-enforced zero-CJK**: `tests/test_control_plane_language.py` scans every
+   non-exempt `## ` section of `skills/*/SKILL.md`, the whole `AGENTS.md`, and every script's argparse
+   `description`/`epilog`/`help` contract. Chinese may appear in control text only via three structural
+   escapes: 「…」 (verbatim student-visible phrasing), `…` (code spans / persisted values), or the
+   canonical-token allowlist (`ALLOWED_TOKENS`). Exempt zones stay Chinese by design: YAML frontmatter
+   (trigger surface), `## Student-facing Output` bodies, CJK-headed template sections, the root
+   `SKILL.md`, and `prompts/web_prompt.md`.
 
 Root `SKILL.md` stays **Chinese-first** as the compatibility entrypoint, and `prompts/web_prompt.md` stays Chinese-first — neither is rewritten wholesale.
 
@@ -18,6 +25,51 @@ Root `SKILL.md` stays **Chinese-first** as the compatibility entrypoint, and `pr
 - 根目录 `SKILL.md` / `prompts/web_prompt.md`：维持**中文优先**，不整体改写。
 
 ---
+
+## Language state & dispatch（A8b：回复语言）
+
+- 持久化：`study_state.json.language`，canonical `中文` / `English` / `双语`（别名经 `update_progress.py`
+  `--language` 归一；未知值保留 + 告警）。缺省/为空 = `中文`（所有旧工作区行为逐字节不变）。
+- 首问：并入 A6 的**一次合并首问**（模式 × 时间宽裕度 × 语言，语言行三语呈现）；紧迫开场按学生开场语言
+  静默推断，**绝不推断 `双语`**。会话中途 `set --language <值>` 随时切换，下一条回复生效。
+- `双语` 是**组合规则**而非第三套模板：逐块 zh 在前、`> EN:` 镜像随后；锚点只出现一次（token+gloss 形态）。
+
+### ANCHOR-INVARIANCE PRINCIPLE（锚点不变性，MUST）
+
+以下十类 canonical 字面在**任何语言模式下逐字节原样输出**（英文/双语模式在 token **之后或下一行**加
+英文 gloss，绝不改写 token 内部——它们被 behavior_smoke / drift 从 transcript 解析、被测试钉死、
+或持久化在学生工作区里）：
+
+1. 三个来源标注 canonical 标签（🟢/🟡/⚠️ 全文）
+2. 范围覆盖声明 「⚠️ 临时覆盖你的 <scope> 范围偏好」
+3. 七步模板块标（圈号 + canonical 中文名：① 题面图 … ⑦ 知识点溯源）
+4. 来源块行 `题目来源：…｜答案来源：…` 与 来源未知/来源页未知
+5. 收尾块名 易错点 / 3分钟速记 / 现在轮到你
+6. 错题本/错题档案 与回执 已记录到错题本 / 已记录到疑难点
+7. 阶段引用 `阶段 N`
+8. 窗口复核提示语（还记得 / 复述 / 做题实测 类）
+9. 双语资产标签 题面图 / question-side asset、答案图 / answer-side asset
+10. 弃答 canonical 资料里没有这道题的答案（及其变体）
+
+持久化文件与脚本输出在所有模式下保持中文 canonical；向非中文学生转述脚本回执/失败时，引用中文原文
+并附英文复述——**绝不在翻译中丢失 fail-loud 内容**。
+
+### A8c：英文入口面 / English entry surfaces（derived renderings）
+
+- `SKILL.en.md` 与 `prompts/web_prompt.en.md` 是**派生英文渲染（derived renderings）**：行为的
+  **source of truth 是对应的中文文件**（根 `SKILL.md` / `prompts/web_prompt.md`）。两者不一致时
+  **以中文文件为准**；改行为先改 zh，en 随后同步（PR 内同改或紧随其后）。
+- en 面契约（由 `tests/test_language_policy.py` 的 `A8cEnEntrypoints` 钉死）：
+  - **无 YAML frontmatter**——en 文件不是可触发的 skill 入口，是英文操作手册 / 可复制 prompt；
+  - **锚点不变性十类照常适用**：canonical token 逐字节中文，英文 gloss 只在 token 之后/下一行；
+  - **en 面纯度**：除 canonical 锚点白名单、「…」引用与代码 span 外**零 CJK**（不许烂成中英混杂）；
+  - 🟢/🟡/⚠️ 作标签出现的行**同行携带中文 canonical**（防英文竞争标注）；
+  - 视觉资产门禁用 en 渲染 "Before asking, explaining, hinting, or solving"（与 zh 门禁同义同强度）。
+- 这**不是** `locales/` 拆分、也不引入第二套行为——同一仓库、同一安装、同一控制层与状态词汇
+  （持久化 vocab 仍为中文 canonical）。见 [`localization.md`](localization.md) 的 A8c 附记。
+- **唯一例外面**：`prompts/web_prompt.en.md` 因 web 端无持久化 `language`，自声明**默认回复语言为
+  English**（学生可说「中文」/「双语」随时切回）——这是该 en prompt 的既定口径、被测试钉住，
+  不是渲染漂移；学生层「默认简体中文」对本地/有状态形态依旧无条件成立。
 
 ## English control plane（控制层 = 英文优先）
 

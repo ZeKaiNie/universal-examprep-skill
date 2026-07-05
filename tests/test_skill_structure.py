@@ -21,7 +21,7 @@ SKILL_DIRS = [
 
 # core anti-hallucination rules the compact fallback must carry (invariants, see docs/skill-architecture.md)
 AGENTS_INVARIANTS = ["study_progress.md", "references/wiki/", "quiz_bank.json",
-                     "惰性", "AI 生成", "skills/exam-cram/SKILL.md"]
+                     "Lazy-load", "AI-generated", "skills/exam-cram/SKILL.md"]
 
 
 def read(*parts):

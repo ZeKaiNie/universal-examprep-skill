@@ -27,6 +27,7 @@
     "provenance_fidelity_min": 0.8,
     "progress_rows_lost_max": 0,
     "wiki_unique_files_max": 2,
-    "overread_max": 0
+    "overread_max": 0,
+    "md_write_after_state_max": 0
   }
 }

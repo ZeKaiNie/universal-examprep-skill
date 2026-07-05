@@ -492,13 +492,13 @@ def apply_suspects(ws, materials, bank, suspects, backend, asset_root, warnings)
 
 
 def run(argv=None, backend=None):
-    ap = argparse.ArgumentParser(description="构建通用视觉双索引（召回优先；纯标准库 + 可选 PDF 后端；无 LLM/网络）。")
-    ap.add_argument("--workspace", required=True, help="备考工作区（含 references/quiz_bank.json）")
-    ap.add_argument("--materials", default=None, help="课程材料文件夹（扫描 PDF 建 figure_page_index）")
-    ap.add_argument("--out-dir", default=None, help="索引输出目录（默认 <workspace>/references/）")
+    ap = argparse.ArgumentParser(description="Build the generic dual visual index (recall-first; pure stdlib + optional PDF backend; no LLM/network).")
+    ap.add_argument("--workspace", required=True, help="cram workspace (contains references/quiz_bank.json)")
+    ap.add_argument("--materials", default=None, help="course materials folder (scan PDFs to build figure_page_index)")
+    ap.add_argument("--out-dir", default=None, help="index output dir (default <workspace>/references/)")
     ap.add_argument("--apply", action="store_true",
-                    help="把疑漏题渲染原页挂为题面 asset 并标 maybe_requires_assets=true（默认只报告不改）")
-    ap.add_argument("--asset-root", default=None, help="--apply 的截图目录（默认 <workspace>/references/assets）")
+                    help="attach rendered original pages as question-side assets for suspects and mark maybe_requires_assets=true (default: report only)")
+    ap.add_argument("--asset-root", default=None, help="screenshot dir for --apply (default <workspace>/references/assets)")
     args = ap.parse_args(argv)
 
     ws = args.workspace

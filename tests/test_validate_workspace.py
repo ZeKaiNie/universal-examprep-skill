@@ -332,7 +332,7 @@ class TestValidateWorkspace(unittest.TestCase):
     def test_current_phase_not_in_plan_warns(self):
         d = self.make_ws([{"id": "x", "chapter": 1, "type": "choice", "question": "q",
                            "options": ["A. a"], "answer": "A", "source": "teacher"}],
-                         prog="## 当前复习断点\n阶段 99\n\n## 💡 概念疑难点记录\n", plan="阶段 1\n")
+                         prog="## 当前复习断点\n阶段 99\n\n## 💡 概念疑难点记录\n", plan="## 阶段 1：栈\n")
         _, warnings, _ = V.validate(d)
         self.assertTrue(any("当前阶段 99" in w["msg"] for w in warnings))
 

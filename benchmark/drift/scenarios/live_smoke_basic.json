@@ -10,6 +10,7 @@
     "untagged_questions_max": 0,
     "wrong_phase_quiz_max": 0,
     "checkpoint_reset_max": 0,
-    "provenance_fidelity_min": 0.8
+    "provenance_fidelity_min": 0.8,
+    "md_write_after_state_max": 0
   }
 }

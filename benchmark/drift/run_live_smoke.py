@@ -306,6 +306,10 @@ def main(argv=None):
     ap.add_argument("--max-output-chars", type=int, default=4000)
     ap.add_argument("--max-prompt-chars", type=int, default=12000)
     ap.add_argument("--turn-timeout", type=int, default=120)
+    ap.add_argument("--ledger", default=None,
+                    help="运行账本路径（默认 benchmark/runs/ledger.jsonl）")
+    ap.add_argument("--no-ledger", action="store_true", help="本次不记账")
+    ap.add_argument("--model", default=None, help="仅用于账本标注（agent-cmd 背后的模型名）")
     args = ap.parse_args(argv)
 
     for name in ("max_turns", "max_output_chars", "max_prompt_chars", "turn_timeout"):
@@ -370,59 +374,118 @@ def main(argv=None):
     import re as _re
     m = _re.search(r"当前阶段：(\d+)", progress)
     cur_phase = int(m.group(1)) if m else 1
+    _ledger, ws_hash0 = None, None
+    if not args.no_ledger:            # B7: 指纹必须在回合循环改写 study_progress.md 之前取——
+        sys.path.insert(0, os.path.join(ROOT, "benchmark", "runs"))   # 账本行代表运行的「输入」，
+        try:                          # 事后按原始 fixture 重算才能对上
+            import ledger as _ledger
+            ws_hash0 = _ledger.workspace_hash(sandbox)
+        except Exception as e:        # 记账绝不影响运行结果
+            print("[!] ledger 不可用：%s" % e)
+            _ledger = None
+    sent_prompts = []                     # 实际发出的每条完整 prompt（含逐轮对话历史）——审计哈希以此为准
+
+    def _ledger_row(exit_code, transcript, summary, note):
+        """B7: one auditable row per REAL run — success AND abort paths both come through here."""
+        if _ledger is None:
+            return
+        try:
+            _e, _warn = _ledger.try_record({
+                "kind": "live_smoke", "model": args.model,
+                # 多轮 prompt 含前轮回复：只哈希静态脚本会让不同实际输入拿到相同 prompt_hash，
+                # 审计字段就失去「跑的到底是什么」的意义——哈希实际发送串
+                "prompt_hash": _ledger.hash_text(chr(0).join(sent_prompts)),
+                "workspace_hash": ws_hash0,
+                "transcript_path": transcript, "summary_path": summary,
+                "exit_code": exit_code, "notes": note,
+            }, args.ledger)
+            if _warn:
+                print("[!] " + _warn)
+            elif _e:
+                print("[+] 账本 run_id=%s" % _e["run_id"])
+        except Exception as e:                       # 记账绝不影响运行结果
+            print("[!] ledger 不可用：%s" % e)
+
     history, exchanges, oracle_failures = [], [], []
-    for i, turn in enumerate(turns, 1):
-        prompt = build_prompt(sandbox, digest, history, turn["user"], args.max_prompt_chars, progress)
-        reply = call_agent(args.agent_cmd, prompt, args.turn_timeout, args.max_output_chars, cwd=sandbox)
-        history += [("user", turn["user"]), ("assistant", reply)]
-        for f in check_oracle(turn, reply):
-            oracle_failures.append("turn %d: %s" % (i, f))
-        if turn.get("kind") == "quiz":                 # a quiz prompt must not LEAK the standard answer
-            rnorm = re.sub(r"\s+", "", reply)
-            for qid in re.findall(r"\[#([^\]\s]+)\]", reply):
-                for key in bank_answers.get(qid, []):
-                    # 单字符答案（如 "0"）任意出现会误报——要求出现在「答案」语境附近才算泄露
-                    hit = (key in rnorm) if len(key) >= 2 else bool(re.search("答案.{0,6}" + re.escape(key), rnorm))
-                    if hit:
-                        oracle_failures.append("turn %d: quiz 泄露标准答案（[#%s] 含 %r）" % (i, qid, key))
-                        break
-        snapshot = None
-        tp = turn.get("phase_context")
-        if isinstance(tp, str) and tp.strip().isdigit():
-            tp = int(tp.strip())                       # T4/adapter 都接受数字字符串，这里同口径
-        if isinstance(tp, int) and not isinstance(tp, bool) and tp != cur_phase:    # the script advanced the phase — the harness (as
-            cur_phase = tp                             # the 'environment') persists the checkpoint the
-            progress = _progress_with_phase(progress, cur_phase)   # agent reads on later turns
-            with open(canonical, "w", encoding="utf-8", newline="\n") as f:
-                f.write(progress)                       # disk copy stays in sync with the prompt state
-            snapshot = progress
-        exchanges.append((turn, reply, snapshot))
-        print("[+] turn %d/%d 完成（回复 %d 字）" % (i, len(turns), len(reply)))
+    log_path = jsonl_path = None
+    try:
+        for i, turn in enumerate(turns, 1):
+            prompt = build_prompt(sandbox, digest, history, turn["user"], args.max_prompt_chars, progress)
+            sent_prompts.append(prompt)
+            reply = call_agent(args.agent_cmd, prompt, args.turn_timeout, args.max_output_chars, cwd=sandbox)
+            history += [("user", turn["user"]), ("assistant", reply)]
+            for f in check_oracle(turn, reply):
+                oracle_failures.append("turn %d: %s" % (i, f))
+            if turn.get("kind") == "quiz":             # a quiz prompt must not LEAK the standard answer
+                rnorm = re.sub(r"\s+", "", reply)
+                for qid in re.findall(r"\[#([^\]\s]+)\]", reply):
+                    for key in bank_answers.get(qid, []):
+                        # 单字符答案（如 "0"）任意出现会误报——要求出现在「答案」语境附近才算泄露
+                        hit = (key in rnorm) if len(key) >= 2 else bool(re.search("答案.{0,6}" + re.escape(key), rnorm))
+                        if hit:
+                            oracle_failures.append("turn %d: quiz 泄露标准答案（[#%s] 含 %r）" % (i, qid, key))
+                            break
+            snapshot = None
+            tp = turn.get("phase_context")
+            if isinstance(tp, str) and tp.strip().isdigit():
+                tp = int(tp.strip())                   # T4/adapter 都接受数字字符串，这里同口径
+            if isinstance(tp, int) and not isinstance(tp, bool) and tp != cur_phase:    # the script advanced the phase — the harness (as
+                cur_phase = tp                         # the 'environment') persists the checkpoint the
+                progress = _progress_with_phase(progress, cur_phase)   # agent reads on later turns
+                with open(canonical, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(progress)                   # disk copy stays in sync with the prompt state
+                snapshot = progress
+            exchanges.append((turn, reply, snapshot))
+            print("[+] turn %d/%d 完成（回复 %d 字）" % (i, len(turns), len(reply)))
 
-    log_path = os.path.join(args.out_dir, "live_session.md")
-    with open(log_path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(render_log(spec, exchanges))
-    jsonl_path = os.path.join(args.out_dir, "live_session.jsonl")
-    conv = subprocess.run([sys.executable, os.path.join(HERE, "convert_session_log.py"),
-                           "--in", log_path, "--out", jsonl_path],
-                          capture_output=True, text=True, encoding="utf-8")
-    if conv.returncode != 0:
-        _die("T5b 转换失败（exit %d）：%s" % (conv.returncode, (conv.stderr or "")[:400]), 3)
+        md_candidate = os.path.join(args.out_dir, "live_session.md")
+        with open(md_candidate, "w", encoding="utf-8", newline="\n") as f:
+            f.write(render_log(spec, exchanges))
+        log_path = md_candidate                      # 写成功后才发布——账本路径必须指向真实产物
+        # 转换成功前不发布 jsonl 路径：转换失败中止时，账本 transcript_path 必须是 null
+        # 而不是一个不存在的文件（否则账本没法核查失败运行）
+        jsonl_candidate = os.path.join(args.out_dir, "live_session.jsonl")
+        conv = subprocess.run([sys.executable, os.path.join(HERE, "convert_session_log.py"),
+                               "--in", log_path, "--out", jsonl_candidate],
+                              capture_output=True, text=True, encoding="utf-8")
+        if conv.returncode != 0:
+            _die("T5b 转换失败（exit %d）：%s" % (conv.returncode, (conv.stderr or "")[:400]), 3)
+        jsonl_path = jsonl_candidate
 
-    score = subprocess.run([sys.executable, os.path.join(HERE, "run_drift.py"),
-                            "--scenario", scenario, "--transcript", jsonl_path],
-                           capture_output=True, text=True, encoding="utf-8")
-    sys.stdout.write(score.stdout)
-    sys.stderr.write(score.stderr)
-    print("[+] session log: %s\n[+] jsonl: %s" % (log_path, jsonl_path))
-    if score.returncode not in (0, 1):
-        _die("T4 判分器异常退出（%d）——不产生任何通过结论" % score.returncode, 3)
+        score = subprocess.run([sys.executable, os.path.join(HERE, "run_drift.py"),
+                                "--scenario", scenario, "--transcript", jsonl_path],
+                               capture_output=True, text=True, encoding="utf-8")
+        sys.stdout.write(score.stdout)
+        sys.stderr.write(score.stderr)
+        print("[+] session log: %s\n[+] jsonl: %s" % (log_path, jsonl_path))
+        if score.returncode not in (0, 1):
+            _die("T4 判分器异常退出（%d）——不产生任何通过结论" % score.returncode, 3)
+    except SystemExit as e:
+        # 付费回合已经烧掉——中途 _die（agent 非零退出/超时/预算超限/转换判分失败）也必须留审计行
+        code = e.code if isinstance(e.code, int) else 3
+        if exchanges and log_path is None:
+            # 已完成的回合不能无痕蒸发：把部分会话写成 T5b 日志，账本行才有可核查的 artifact
+            try:
+                log_path = os.path.join(args.out_dir, "live_session.partial.md")
+                with open(log_path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(render_log(spec, exchanges))
+                print("[+] 已保存部分会话记录（%d 回合）: %s" % (len(exchanges), log_path))
+            except Exception as pe:                  # 保存失败绝不掩盖原始中止原因
+                print("[!] 部分会话记录保存失败：%s" % pe)
+                log_path = None
+        _ledger_row(code, jsonl_path, log_path,
+                    "aborted mid-run: turns_done=%d/%d oracle_failures=%d"
+                    % (len(exchanges), len(turns), len(oracle_failures)))
+        raise
+    # oracle 门槛是最终判定的一部分——账本必须记「真实」退出码，否则被 oracle 拦下的失败在账本里成了通过
+    final_rc = 1 if oracle_failures else score.returncode
+    _ledger_row(final_rc, jsonl_path, log_path,
+                "turns=%d oracle_failures=%d" % (len(turns), len(oracle_failures)))
     if oracle_failures:                          # per-turn oracles gate the verdict alongside T4 metrics —
         for f in oracle_failures:                # a probe answered wrongly must not PASS on metrics alone
             print("[oracle-fail] " + f)
         print("[!] %d 个回合级 oracle 未通过（探针答复不符合脚本期望）" % len(oracle_failures))
-        return 1
-    return score.returncode                      # 0 = 达标；1 = 检出漂移（判分真实跑过才可能返回 0）
+    return final_rc                              # 0 = 达标；1 = 检出漂移/oracle 未过（判分真实跑过才可能返回 0）
 
 
 if __name__ == "__main__":

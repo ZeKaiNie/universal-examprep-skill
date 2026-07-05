@@ -1,0 +1,6 @@
+# 运行产物（answers/scores/summary/cache）不入库——fixture 只提交输入
+results/
+*.jsonl.tmp
+__pycache__/
+# 反例外：benchmark/.gitignore 有个全局 `config.json`，会误伤这份 fixture 输入配置——放行它
+!config.json

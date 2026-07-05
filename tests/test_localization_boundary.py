@@ -11,7 +11,12 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 REQUIRED_LABELS = [
-    "当前阶段", "这题考什么", "标准答题步骤", "易错点", "3分钟速记",
+    "当前阶段", "易错点", "3分钟速记",
+    # A5 七步讲解模板块标题（exam-tutor）+ 每题来源块
+    "题面图", "这题在问什么", "图里要读的量", "核心公式", "逐步演算", "答案自检", "知识点溯源",
+    "题目来源", "答案来源",
+    # exam-quiz 判分反馈仍用旧措辞
+    "这题考什么", "标准答题步骤",
     "现在轮到你", "已记录到错题本", "资料里没有明确答案",
     # AI-supplement reminder uses the canonical marker (single source: docs/language-policy.md)
     "AI补充，可能与你老师讲的不完全一致",
@@ -55,10 +60,11 @@ class LocalizationBoundaryTest(unittest.TestCase):
 
     def test_existing_student_labels_remain_in_skill_files(self):
         tutor = read("skills", "exam-tutor", "SKILL.md")
-        for label in ("当前阶段", "这题考什么", "标准答题步骤"):
+        for label in ("当前阶段", "这题在问什么", "逐步演算", "知识点溯源", "题目来源"):
             self.assertIn(label, tutor, f"exam-tutor 丢失学生侧标签: {label}")
-        self.assertIn("已记录到错题本", read("skills", "exam-quiz", "SKILL.md"),
-                      "exam-quiz 丢失「已记录到错题本」")
+        quiz = read("skills", "exam-quiz", "SKILL.md")
+        for label in ("已记录到错题本", "这题考什么", "标准答题步骤", "题目来源"):
+            self.assertIn(label, quiz, f"exam-quiz 丢失学生侧标签: {label}")
         cheat = read("skills", "exam-cheatsheet", "SKILL.md")
         for label in ("必背", "老师强调"):
             self.assertIn(label, cheat, f"exam-cheatsheet 丢失小抄栏目: {label}")

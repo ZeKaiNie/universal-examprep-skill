@@ -53,9 +53,9 @@ def plan_wiki_map(text):
 
 
 def run(argv=None):
-    ap = argparse.ArgumentParser(description="从题库 knowledge_points + study_plan 构建知识点索引。")
+    ap = argparse.ArgumentParser(description="Build the knowledge-point index from quiz_bank knowledge_points + study_plan.")
     ap.add_argument("--workspace", required=True)
-    ap.add_argument("--out", default=None, help="默认 <workspace>/references/knowledge_index.json")
+    ap.add_argument("--out", default=None, help="default <workspace>/references/knowledge_index.json")
     args = ap.parse_args(argv)
 
     bank_path = os.path.join(args.workspace, "references", "quiz_bank.json")

@@ -29,11 +29,11 @@ def _die(msg):
 
 
 def run(argv=None):
-    ap = argparse.ArgumentParser(description="按章列出图依赖题（总数×requires×maybe×疑漏）。")
+    ap = argparse.ArgumentParser(description="List figure-dependent items by chapter (total x requires x maybe x suspects).")
     ap.add_argument("--workspace", required=True)
-    ap.add_argument("--chapter", default=None, help="只看这一章")
-    ap.add_argument("--list", action="store_true", help="逐题列出（id + 标记 + 资产）")
-    ap.add_argument("--json", action="store_true", help="输出 JSON 而非表格")
+    ap.add_argument("--chapter", default=None, help="only this chapter")
+    ap.add_argument("--list", action="store_true", help="list per item (id + flags + assets)")
+    ap.add_argument("--json", action="store_true", help="output JSON instead of a table")
     args = ap.parse_args(argv)
 
     bank_path = os.path.join(args.workspace, "references", "quiz_bank.json")

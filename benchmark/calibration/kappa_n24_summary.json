@@ -1,0 +1,37 @@
+{
+ "what": "24 题四层分层盲测人工校准（human vs Sonnet 裁判）——脱敏摘要，不含任何课程内容/题面/答案文本",
+ "date": "2026-07-04",
+ "method": {
+  "tool": "calibrate_matrix.py 同款四层分层（可答判对/可答判错/越界弃答/越界未弃答 = 8/8/4/4，判对:判错各半、可答:越界≈2:1）",
+  "blind": "裁判判定与 model/arm 对标注者隐藏（藏 .calibration_key.jsonl）",
+  "pool": "真实 PSYC 110 / MIT 6.006 结果（Sonnet 权威判定）；先剔除 29 条配额错误答案（infra 残留非模型作答）；可答的数值题/词法快路按 B5 政策排除",
+  "annotator": "Siyun Chen（人工逐条盲判）"
+ },
+ "n": 24,
+ "agreement": 0.9167,
+ "cohen_kappa": 0.8333,
+ "strata": {
+  "answerable_judge_correct": 8,
+  "answerable_judge_wrong": 8,
+  "oos_judge_abstained": 4,
+  "oos_judge_not_abstained": 4
+ },
+ "oos_agreement": "8/8",
+ "disagreements": [
+  {
+   "item_id": "psyc_27",
+   "model": "sonnet",
+   "arm": "closedbook",
+   "direction": "human=对 / judge=错（判分偏严）"
+  },
+  {
+   "item_id": "psyc_27",
+   "model": "opus",
+   "arm": "closedbook",
+   "direction": "human=对 / judge=错（判分偏严）"
+  }
+ ],
+ "caveat": "分歧方向（全部判分偏严）是抽样迹象、非对全部判分的证明；判分与被测同属 Claude 家族是已知局限。",
+ "corroborates": "早先 16 题抽查 kappa=0.875（README『判分如何保证可信』）",
+ "raw_artifacts": "盲表/隐藏key/人工判定 属真实数据不入库（本目录 gitignored），此摘要为唯一入库件"
+}

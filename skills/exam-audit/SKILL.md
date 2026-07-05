@@ -7,7 +7,7 @@ description: >
 license: MIT
 ---
 
-# exam-audit — 工作区体检（只读）
+# exam-audit — workspace health check (read-only)
 
 ## Purpose
 Inspect a prep workspace built by `exam-ingest` and report health issues. This is a read-only inspector. Do NOT fix anything by default; only fix after the user explicitly grants permission. Emit a concrete issue report; never silently modify or delete files.
@@ -31,13 +31,13 @@ Inspect read-only. Open and parse files; never write, rename, or delete. Check e
 5. **Path safety.** Flag suspicious writes outside `references/wiki/` and any residual `../` or absolute paths.
 
 ## Output Contract
-Emit a single issue list. Each entry contains: 【级别(阻断/警告/提示)】 (severity: blocker / warning / notice) + 【位置文件】 (file path) + 【现象】 (concrete symptom) + 【建议修法】 (suggested fix). End with an overall verdict: 可用 (usable) or 需修 (needs repair).
+Emit a single issue list. Each entry contains: `【级别(阻断/警告/提示)】` (severity: blocker / warning / notice) + `【位置文件】` (file path) + `【现象】` (concrete symptom) + `【建议修法】` (suggested fix). End with an overall verdict: `可用` (usable) or `需修` (needs repair).
 
 Do NOT auto-fix. After reporting, fix item-by-item only if the user grants permission, or hand the workspace back to `exam-ingest` for rebuild.
 
 Preserve these provenance labels VERBATIM when quoting them in findings: 🟢 来自资料 / 🟡 AI补充，可能与你老师讲的不完全一致 / ⚠️ AI生成答案，非老师/教材提供.
 
-Student-facing output defaults to Simplified Chinese unless the user asks otherwise.
+Student-facing output defaults to Simplified Chinese; a persisted `study_state.json` `language` (`English`/`双语`) switches it per exam-cram's dispatch rule (canonical tokens verbatim).
 
 ## Boundaries
 - Zero modifications and zero deletions by default — this is an inspection, not construction.

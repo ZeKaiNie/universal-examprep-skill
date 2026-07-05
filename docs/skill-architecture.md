@@ -3,6 +3,8 @@
 本文档解释这套备考技能从「单体 SKILL.md」走向「可移植技能集合」后的结构，以及各项防幻觉能力落在哪里。
 **本次重构只加结构、文档与测试，不改 `scripts/ingest.py` 逻辑，不改变任何既有行为。**
 
+> A8b: student-facing rendering is dispatched by `study_state.json.language` (`中文` default / `English` / `双语`); canonical tokens are language-invariant (see docs/language-policy.md).
+
 ## 1. 兼容入口（不破坏现有用法）
 - 根目录 **`SKILL.md`** 保持为**默认 / 兼容入口**，仍承载完整防编题与来源标注规则。已经按旧方式安装本技能的 host 不受影响。
 - 新支持技能集合的 host 可改用 **`skills/exam-cram/SKILL.md`** 作主入口——它与根 `SKILL.md` 描述同一行为。
@@ -38,7 +40,7 @@ skills/
 
 ## 4. 当前能力落点
 - **知识来源透明化（provenance）**：贯穿全部子技能——🟢 来自资料 / 🟡 AI补充，可能与你老师讲的不完全一致 / ⚠️ AI生成答案，非老师/教材提供（canonical 见 `docs/language-policy.md`）；契约写在 `exam-cram` 的 *Knowledge provenance* 与 `AGENTS.md` 规则 4–5、8。
-- **零基础「重点题精讲」模式**：`exam-cram` 的 `panic` 模式 + `exam-tutor` 的对应工作流。
+- **3 学习模式 × 4 时间宽裕度**（A6）：`exam-cram` 的 *Modes* 段（零基础从头讲 / 某章起步补弱 / 查缺补漏，叠加 ≤1天/1-3天/3-7天/>7天）——首次对话问清、存 `study_state.json` 的 `mode`/`time_budget`；3-7天/>7天档的知识点窗口存 `knowledge_window`（`update_progress.py window-add/window-set-status`）。零基础「重点题精讲」= `零基础从头讲` 模式 + `exam-tutor` 的七步模板工作流（旧 `panic` 已迁移至此）。
 - **画图题确定性处理（`type: "diagram"`）**：`exam-tutor`（讲）与 `exam-quiz`（判）的「先跑算法再画图」流程。
 - **6 大题型**（`choice / subjective / diagram / fill_blank / true_false / code`）：`exam-quiz`，与 `scripts/ingest.py` 的 `VALID_QUIZ_TYPES` 一致。
 - **confusion-tracker**：位于 `skills/confusion-tracker/` 的子技能（与其他子技能同级），由 `exam-tutor` 在教学时记录概念疑难点、`exam-review` 在复盘阶段调起。

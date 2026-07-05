@@ -1,0 +1,18 @@
+{
+  "courses": [
+    {
+      "name": "minios",
+      "combined": "materials/_combined.txt",
+      "items": "items.jsonl",
+      "skill_ws": "skill_ws",
+      "raw_ws": "raw_ws"
+    }
+  ],
+  "models": ["opus", "haiku"],
+  "arms": ["closedbook", "rawfiles", "skill"],
+  "primary_course": "minios",
+  "secondary_course": null,
+  "results_dir": "results",
+  "judge_model": "mock",
+  "mock": true
+}

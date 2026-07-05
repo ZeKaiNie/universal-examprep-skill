@@ -1,0 +1,23 @@
+{
+  "name": "mode_urgent_no_questions",
+  "fixture": "benchmark/drift/fixtures/mini_course_long_state",
+  "transcript": "benchmark/drift/transcripts/good_session_urgent_1day.jsonl",
+  "requires_state": true,
+  "time_budget": "≤1天",
+  "goal_markers": [
+    "期末",
+    "复习",
+    "备考",
+    "考试",
+    "exam"
+  ],
+  "thresholds": {
+    "goal_retention_min": 0.9,
+    "plan_mutations_max": 0,
+    "untagged_questions_max": 0,
+    "checkpoint_reset_max": 0,
+    "urgent_mode_questions_max": 0,
+    "urgent_mode_persisted_min": 1
+  },
+  "notes": "A6 模式漂移（≤1天档）：时间宽裕度=≤1天时，任何向学生抛出的澄清/偏好问句都算漂移（浪费复习时间）。urgent_mode_questions_max=0 在这里被真实施加——好例全程零提问；配套坏例 bad_urgent_1day_questions.jsonl 每轮都在问学生偏好，会把该指标顶到 3。 另加 urgent_mode_persisted_min=1：好转写 turn 1 必须把推断出的 零基础从头讲+≤1天 写进 study_state.json 快照，只喊不落盘会红。"
+}

@@ -30,7 +30,8 @@
       "progress_after": "mock/sample_outputs/progress_after_mistake.md",
       "progress_detector": "progress_has_mistake_archive",
       "expect_archive": "mc_q2",
-      "best_effort": false
+      "best_effort": false,
+      "state_after": "mock/state_after_mistake.json"
     },
     {
       "name": "confusion_tracking",
@@ -39,7 +40,8 @@
       "detector": "progress_has_confusion_row",
       "mock_output": "mock/sample_outputs/progress_after_confusion.md",
       "expect_confusion": "为什么栈",
-      "best_effort": false
+      "best_effort": false,
+      "state_after": "mock/state_after_confusion.json"
     },
     {
       "name": "checkpoint_recovery",
@@ -55,15 +57,54 @@
       "claim": "无 Python 时手动写盘，产出的工作区仍是完整、可校验的（用预建的手写工作区模拟，不真禁用 Python）",
       "prompt": "（模拟：本机没有安装 Python，无法运行 ingest.py）",
       "detector": "validate_fixture_workspace",
-      "fallback_workspace": "fixtures/mini_course",
+      "fallback_workspace": "fixtures/mini_course_nostate",
       "best_effort": false
     },
     {
       "name": "zero_basic_key_question",
-      "claim": "0 基础重点题精讲包含 考点拆解 / 标准答题步骤 / 易错点 / 3分钟速记",
+      "claim": "0 基础/panic 模式对每道重点题都走 A5 七步模板（①-⑦ + 每题来源块）；旧版只给 考点拆解+标准答题步骤 两段式（无 ①-⑦）现在判不合格",
       "prompt": "我 0 基础，请把这道重点题彻底讲透。",
-      "detector": "has_zero_basic_sections",
+      "detector": "teaching_template_ok + question_source_block_ok + has_zero_basic_sections",
       "mock_output": "mock/sample_outputs/zero_basic_explain.txt",
+      "mock_negative_legacy": "mock/sample_outputs/zero_basic_legacy_only.txt",
+      "best_effort": false
+    },
+    {
+      "name": "time_budget_no_questions",
+      "claim": "≤1天时间宽裕度下严禁向学生提任何澄清/偏好问句（任何问题都在浪费复习时间）——纯讲解直出",
+      "prompt": "我明天就考了（≤1天），别问我问题，直接讲重点。",
+      "detector": "urgent_no_student_questions_ok",
+      "mock_output": "mock/sample_outputs/time_budget_1day_good.txt",
+      "mock_negative": "mock/sample_outputs/time_budget_1day_bad.txt",
+      "best_effort": false
+    },
+    {
+      "name": "knowledge_window_recheck",
+      "claim": "窗口外知识点必须真复核：3-7天回问或出题实测均可，>7天必须用对应难题实测（只口头问不算），都不能默认还会",
+      "prompt": "（3-7天档）接着讲要用到之前学过、已在窗口外的知识点。",
+      "detector": "window_out_rechecked",
+      "mock_output": "mock/sample_outputs/window_recheck_good.txt",
+      "mock_negative": "mock/sample_outputs/window_recheck_bad.txt",
+      "mock_test": "mock/sample_outputs/window_recheck_test_good.txt",
+      "mock_negative_recall_only": "mock/sample_outputs/window_recheck_recall_only_bad.txt",
+      "best_effort": false
+    },
+    {
+      "name": "teaching_template",
+      "claim": "重点题精讲走固定七步模板（①题面图→②这题在问什么→③图里要读的量→④核心公式→⑤逐步演算→⑥答案自检→⑦知识点溯源，②必须在④前）且每题带一行来源块 题目来源｜答案来源｜canonical 标签，默认输出到来源块为止（易错点/3分钟速记/现在轮到你 仅学生要求才输出）；AI 生成答案时 ⚠️ 必须同时出现在来源行与答案块标题",
+      "prompt": "请精讲这道重点题（走七步讲解模板，标清来源）。",
+      "detector": "teaching_template_ok + question_source_block_ok",
+      "mock_output": "mock/sample_outputs/teaching_template_good.txt",
+      "mock_liberal": "mock/sample_outputs/teaching_template_liberal_good.txt",
+      "mock_ai_answer": "mock/sample_outputs/teaching_template_ai_answer_good.txt",
+      "mock_negative_skip_ask": "mock/sample_outputs/teaching_template_skip_ask.txt",
+      "mock_negative_formula_first": "mock/sample_outputs/teaching_template_formula_first.txt",
+      "mock_negative_no_source": "mock/sample_outputs/teaching_template_no_source.txt",
+      "mock_negative_unlabeled_source": "mock/sample_outputs/teaching_template_unlabeled_source.txt",
+      "mock_negative_missing_warn": "mock/sample_outputs/teaching_template_missing_warn.txt",
+      "mock_negative_warn_title": "mock/sample_outputs/teaching_template_warn_title.txt",
+      "mock_negative_unsolicited_closers": "mock/sample_outputs/teaching_template_unsolicited_closers.txt",
+      "mock_optin_closers": "mock/sample_outputs/teaching_template_optin_closers.txt",
       "best_effort": false
     },
     {
@@ -98,6 +139,25 @@
       "prompt": "（前情：学生已说只做作业题）给我找几道 lecture 里的图片题。",
       "mock_output": "mock/sample_outputs/scope_override_good.txt",
       "mock_negative": "mock/sample_outputs/scope_override_missing.txt"
+    },
+    {
+      "name": "language_first_ask",
+      "claim": "首问回合=完整合并首问（三模式+四档全 gloss+三语语言行）；答复后一条 set 三旗标全 canonical（乱序合法）；紧迫开场静默三旗标（默认 零基础从头讲/≤1天、语言=开场语言、静默推断 双语 被抓、开场显式要双语则放行）且零问句",
+      "prompt": "我下周有期末考，帮我复习《数据结构》。",
+      "detector": "language_first_ask_ok",
+      "mock_output": "mock/sample_outputs/language_ask_good.txt",
+      "mock_negative": "mock/sample_outputs/language_ask_missing_line.txt",
+      "mock_urgent": "mock/sample_outputs/language_urgent_silent.txt",
+      "mock_urgent_negative": "mock/sample_outputs/language_urgent_question.txt",
+      "best_effort": false,
+      "mock_persist": "mock/sample_outputs/language_persist_good.txt",
+      "mock_persist_negative": "mock/sample_outputs/language_persist_noncanonical.txt",
+      "mock_urgent_bilingual": "mock/sample_outputs/language_urgent_bilingual.txt",
+      "mock_urgent_wrong_language": "mock/sample_outputs/language_urgent_wrong_language.txt",
+      "urgent_expected_language": "中文",
+      "mock_negative_unglossed": "mock/sample_outputs/language_ask_unglossed.txt",
+      "mock_urgent_bilingual_explicit": "mock/sample_outputs/language_urgent_bilingual_explicit.txt",
+      "mock_urgent_bilingual_negated": "mock/sample_outputs/language_urgent_bilingual_negated.txt"
     }
   ]
 }

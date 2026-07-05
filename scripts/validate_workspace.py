@@ -58,6 +58,24 @@ def _read(path):
         return f.read()
 
 
+def _plan_phase_nums(text):
+    """Phase numbers in a study_plan.md, as strings — matches ALL supported word orders
+    （「阶段N」「第N阶段」「Phase N」，与更新器/T4 解析器同款），否则合法计划会被当成
+    没有阶段列表而跳过校验。"""
+    nums = set()
+    for ln in (text or "").splitlines():
+        h = ln.lstrip()
+        # 与更新器/T4 同口径：只认结构行、阶段号 ≥1
+        if not (h.startswith("#") or h.startswith("|") or re.match(r"[-*]\s", h)
+                or re.match(r"\d+\s*[.)、）]", h)):     # 有序列表（1. 阶段…）也是计划条目
+            continue
+        for m in re.finditer(r"阶段\s*(\d+)|第\s*(\d+)\s*阶段|[Pp]hase\s*(\d+)", ln):
+            g = next(x for x in m.groups() if x)
+            if int(g) >= 1:
+                nums.add(str(int(g)))      # 规范十进制——「阶段01」要能配上 current_phase=1
+    return nums
+
+
 def _reject_const(c):
     # json.loads accepts NaN/Infinity/-Infinity by default; reject them so quiz_bank.json is strict JSON.
     raise ValueError(f"非标准 JSON 常量 {c}（NaN/Infinity 不允许）")
@@ -106,7 +124,7 @@ def validate(ws):
         warnings.append({"level": "warning", "msg": msg})
 
     if not os.path.isdir(ws):
-        err(f"工作区目录不存在或不可读: {ws}", level="fatal")
+        err(f"workspace directory不存在或不可读: {ws}", level="fatal")
         return errors, warnings, stats
 
     # ---- structure ----
@@ -398,12 +416,94 @@ def validate(ws):
             plan_path = os.path.join(ws, "study_plan.md")
             m_cur = re.search(r"当前[^#]*?阶段\s*(\d+)", prog, re.S)
             if m_cur and os.path.isfile(plan_path):
-                plan_phases = set(re.findall(r"阶段\s*(\d+)", _read(plan_path)))
+                plan_phases = _plan_phase_nums(_read(plan_path))
                 if plan_phases and m_cur.group(1) not in plan_phases:
                     warn(f"study_progress.md 当前阶段 {m_cur.group(1)} 不在 study_plan.md 的阶段列表 "
                          f"{sorted(int(x) for x in plan_phases)} 中（断点可能无法正确恢复）")
         except OSError:
             pass
+
+    # ---- A4: structured state (study_state.json = source of truth when present) ----
+    state_path = os.path.join(ws, "study_state.json")
+    # 悬空符号链接 isfile 为 False——不先查 islink 会整段跳过校验、放行一个更新器拒跑的工作区
+    if _is_symlink(state_path) or (os.path.isfile(state_path)
+                                   and not os.path.realpath(state_path).startswith(
+                                       os.path.realpath(ws) + os.sep)):
+        err("study_state.json 是符号链接/经符号链接逃出工作区（技能会读/写这个事实源）")
+    elif os.path.lexists(state_path) and not os.path.isfile(state_path):
+        err("study_state.json 存在但不是常规文件（目录/特殊文件）——官方更新器无法持久化 state")
+    elif os.path.isfile(state_path):
+        try:
+            st = json.loads(_read(state_path))
+        except OSError as e:
+            # isfile 通过后仍可能读失败（权限变更/竞态删除）——Tier-1 要给结构化报错，不许崩栈
+            err(f"study_state.json 存在但无法读取（{e}）——请检查文件权限")
+            st = None
+        except UnicodeDecodeError:
+            err("study_state.json 不是 UTF-8——状态文件损坏（应由 update_progress.py 以 UTF-8 原子写入）")
+            st = None
+        except ValueError as e:
+            err(f"study_state.json 不是合法 JSON: {e}")
+            st = None
+        if isinstance(st, dict):
+            cp = st.get("current_phase")
+            if not (isinstance(cp, int) and not isinstance(cp, bool) and cp >= 1):
+                err(f"study_state.json 的 current_phase 必须是 ≥1 的整数，当前 {cp!r}")
+            else:
+                # state 是断点事实源——阶段号必须真实存在于 study_plan.md，否则下次会话会恢复进
+                # 不存在的阶段/wiki（不能只靠生成视图 md 的那条 warning 兜底）
+                plan_path_a4 = os.path.join(ws, "study_plan.md")
+                if os.path.isfile(plan_path_a4):
+                    try:
+                        plan_phases_a4 = _plan_phase_nums(_read(plan_path_a4))
+                        if plan_phases_a4 and str(cp) not in plan_phases_a4:
+                            err(f"study_state.json 的 current_phase={cp} 不在 study_plan.md 的阶段列表 "
+                                f"{sorted(int(x) for x in plan_phases_a4)} 中（事实源指向不存在的阶段，"
+                                "断点无法恢复）")
+                    except OSError:
+                        pass
+            for field in ("mistake_archive", "confusion_log", "knowledge_window"):
+                v = st.get(field)
+                if v is not None and not (isinstance(v, list)
+                                          and all(isinstance(x, dict) for x in v)):
+                    err(f"study_state.json 的 {field} 必须是对象数组，当前 {type(v).__name__}")
+                    continue                          # 标量/坏形态不再往下迭代（1 会 TypeError 崩栈）
+                if field == "knowledge_window":
+                    continue    # 与更新器同 schema：knowledge_window 只要求对象数组——
+                                # 行内元数据不强求 note，validator 不能拒收官方更新器可用的 state
+                for x in (v or []):
+                    if not isinstance(x, dict):
+                        continue
+                    if not (isinstance(x.get("note"), str) and x["note"].strip()):
+                        err(f"study_state.json 的 {field} 行缺非空 note 字段: {x!r}")
+                    # 与 update_progress 的行 schema 对齐——validator 放行的 state 官方更新器必须能用
+                    for k in ("id", "status"):
+                        if x.get(k) is not None and not isinstance(x[k], str):
+                            err(f"study_state.json 的 {field} 行 {k} 必须是字符串或省略: {x!r}")
+            pc = st.get("phase_checklist")
+            if pc is not None and not (isinstance(pc, list) and all(isinstance(x, dict) for x in pc)):
+                err(f"study_state.json 的 phase_checklist 必须是对象数组，当前 {type(pc).__name__}")
+            else:
+                for x in (pc or []):
+                    if not (isinstance(x.get("text"), str) and x["text"].strip()):
+                        err(f"study_state.json 的 phase_checklist 行缺非空 text 字段: {x!r}")
+                    if x.get("done") is not None and not isinstance(x["done"], bool):
+                        err(f"study_state.json 的 phase_checklist 行 done 必须是布尔: {x!r}")
+            prefs = st.get("preferences")
+            if prefs is not None and not isinstance(prefs, dict):
+                err(f"study_state.json 的 preferences 必须是对象，当前 {type(prefs).__name__}")
+            # md is a GENERATED view — a phase mismatch means someone hand-patched it（下次渲染会丢）
+            prog_path2 = os.path.join(ws, "study_progress.md")
+            if isinstance(cp, int) and os.path.isfile(prog_path2):
+                try:
+                    m2 = re.search(r"(?:当前进行阶段|当前阶段)\D*?(\d+)", _read(prog_path2))
+                    if m2 and int(m2.group(1)) != cp:
+                        warn(f"study_progress.md 的阶段（{m2.group(1)}）与 study_state.json（{cp}）不一致——"
+                             "md 是生成视图，请用 update_progress.py render 重建，不要手改 md")
+                except OSError:
+                    pass
+        elif st is not None:
+            err("study_state.json 顶层必须是 JSON 对象")
 
     return errors, warnings, stats
 
@@ -415,9 +515,9 @@ def _exit_code(errors):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="校验一个备考工作区是否符合 docs/file-format.md")
-    ap.add_argument("workspace", help="工作区目录")
-    ap.add_argument("--json", action="store_true", help="以 JSON 输出 errors/warnings/stats")
+    ap = argparse.ArgumentParser(description="Validate a cram workspace against docs/file-format.md")
+    ap.add_argument("workspace", help="workspace directory")
+    ap.add_argument("--json", action="store_true", help="output errors/warnings/stats as JSON")
     args = ap.parse_args(argv)
     try:
         sys.stdout.reconfigure(encoding="utf-8")

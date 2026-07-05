@@ -56,8 +56,57 @@ class AggregateMatrix(unittest.TestCase):
         s = self._aggregate()
         self.assertAlmostEqual(s["total_cost_usd"], 2.14, places=4)
         self.assertAlmostEqual(s["cost_per_q"]["courseA"]["closedbook"], 0.0092, places=4)
-        self.assertAlmostEqual(s["cost_per_q"]["courseA"]["material"], 0.9, places=4)
+        # material 臂全是 infra_error（没有一条模型答案）→ 每题成本 None（不是 0.9 的假均值）；
+        # 真实花费仍在 total_cost_usd 与 cell 的 cost_usd 总额里，不丢账
+        self.assertIsNone(s["cost_per_q"]["courseA"]["material"])
         self.assertAlmostEqual(s["matrix"]["opus|material"]["cost_usd"], 1.8, places=4)
+
+    def test_cost_per_q_excludes_infra_rows(self):
+        # infra_error 行不进每题成本的分母——0 成本失败行摊薄「每题成本」就是虚标
+        d = tempfile.mkdtemp()
+        ans = os.path.join(d, "a.jsonl")
+        sco = os.path.join(d, "s.jsonl")
+        with open(ans, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"course": "c", "model": "opus", "arm": "skill", "item_id": "q1",
+                                "answerable": True, "status": "ok", "cost_usd": 0.8}) + "\n")
+            f.write(json.dumps({"course": "c", "model": "opus", "arm": "skill", "item_id": "q2",
+                                "answerable": True, "status": "infra_error", "cost_usd": 0.0}) + "\n")
+            f.write(json.dumps({"course": "c", "model": "opus", "arm": "skill", "item_id": "q3",
+                                "answerable": True, "status": "infra_error", "cost_usd": 0.0}) + "\n")
+        with open(sco, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"course": "c", "model": "opus", "arm": "skill", "item_id": "q1",
+                                "correct": True, "judge_error": 0}) + "\n")
+        out = os.path.join(d, "o.json")
+        A.main(["--answers", ans, "--scores", sco, "--primary-course", "c", "--out", out])
+        with open(out, encoding="utf-8") as f:
+            s = json.load(f)
+        self.assertAlmostEqual(s["cost_per_q"]["c"]["skill"], 0.8, places=4)   # 0.8/1，不是 0.8/3≈0.27
+
+    def test_ragged_matrix_flagged(self):
+        # 主课程各格答题集不齐平 → summary 有 ragged_matrix 标记 + stderr 警告（不硬拦：续跑中途合法）
+        s = self._aggregate()
+        self.assertTrue(s["ragged_matrix"])              # fixture 的 material 格只有 2 题，齐不平
+        r = _run_agg(["--answers", ANS, "--scores", SCO, "--primary-course", "courseA",
+                      "--secondary-course", "courseB", "--judge-model", "fixture-judge",
+                      "--out", os.path.join(tempfile.mkdtemp(), "s.json")])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("不齐平", r.stderr)
+
+    def test_flat_matrix_not_flagged(self):
+        d = tempfile.mkdtemp()
+        ans = os.path.join(d, "a.jsonl")
+        sco = os.path.join(d, "s.jsonl")
+        with open(ans, "w", encoding="utf-8") as f, open(sco, "w", encoding="utf-8") as g:
+            for arm in ("closedbook", "skill"):
+                for iid in ("q1", "q2"):
+                    f.write(json.dumps({"course": "c", "model": "opus", "arm": arm, "item_id": iid,
+                                        "answerable": True, "status": "ok", "cost_usd": 0.1}) + "\n")
+                    g.write(json.dumps({"course": "c", "model": "opus", "arm": arm, "item_id": iid,
+                                        "correct": True, "judge_error": 0}) + "\n")
+        out = os.path.join(d, "o.json")
+        A.main(["--answers", ans, "--scores", sco, "--primary-course", "c", "--out", out])
+        with open(out, encoding="utf-8") as f:
+            self.assertFalse(json.load(f)["ragged_matrix"])
 
     def test_failed_cells_surfaced_not_correct(self):
         # the all-infra material cell honestly shows null rates + n_infra_error, never silently 'correct'
@@ -538,6 +587,15 @@ class ReportMatrixExplicitSummary(unittest.TestCase):
         self.assertIn("material", html)            # the summary's OWN material arm rendered
         self.assertNotIn("98%", html)              # no hard-coded published PSYC conclusion
         self.assertNotIn("kappa", html.lower())    # no published narrative leaks into a custom render
+
+    def test_all_infra_cost_renders_na_not_none(self):
+        # 全 infra 臂的 cost_per_q 是 null → 报告渲染 N/A，绝不出现 "$None"
+        d = tempfile.mkdtemp()
+        self._render(d)
+        with open(os.path.join(d, "report.html"), encoding="utf-8") as f:
+            page = f.read()
+        self.assertNotIn("$None", page)
+        self.assertIn("material=N/A", page)
 
     def test_custom_summary_to_default_outdir_refuses(self):
         # rendering a CUSTOM --summary with no --out-dir would overwrite the committed published

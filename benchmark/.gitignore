@@ -32,3 +32,5 @@ skill_workspace/*
 # 人工校准标注（可能含答案细节）
 calibration/*
 !calibration/README.md
+!calibration/kappa_n24_summary.json
+runs/ledger.jsonl

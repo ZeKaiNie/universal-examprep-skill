@@ -1,0 +1,2 @@
+好的，已记录：
+python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace ws set --mode 查缺补漏 --time-budget 1-3天 --language Klingon

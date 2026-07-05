@@ -24,7 +24,7 @@ BANNED = [
 
 
 def runtime_files():
-    rels = ["README.md", "SKILL.md", "AGENTS.md"]
+    rels = ["README.md", "SKILL.md", "SKILL.en.md", "AGENTS.md"]
     for pat in ("docs/*.md", "prompts/*.md", "skills/**/*.md", "templates/*.md"):
         for p in glob.glob(os.path.join(ROOT, pat), recursive=True):
             rels.append(os.path.relpath(p, ROOT).replace("\\", "/"))

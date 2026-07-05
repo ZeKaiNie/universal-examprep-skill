@@ -335,6 +335,22 @@ def main():
         print(f"{label:22}{p(o):>11}{p(s['correct']):>11}{p(s['faithfulness']):>8}{p(s['hallucination']):>8}{p(s['abstention_oos']):>9}")
     print(f"\n[+] -> {MATRIX}/summary_corrected.json（未覆盖 summary.json）")
 
+    if scores_out or answers_out:
+        # B7: 账本行是【最后一步】——旧 summary.json 读取/对比打印等任何后续工作失败都会非零退出，
+        # 成功行必须等全部工作真正完成才落盘（失败仅提示，不影响运行结果）
+        try:
+            sys.path.insert(0, os.path.join(HERE, "runs"))
+            import ledger as _ledger
+            _e2, _warn2 = _ledger.try_record({
+                "kind": "rejudge_export", "model": args.judge_model if args.llm else None,
+                # scores 与 answers 是成对导出（aggregate_matrix.py 两个都要）——账本记全才可复现
+                "transcript_path": args.scores_out, "summary_path": args.answers_out,
+                "exit_code": 0,
+                "notes": "rows=%d llm=%s" % (n_exported[0], bool(args.llm))})
+            print(("[!] " + _warn2) if _warn2 else ("[+] 账本 run_id=%s" % _e2["run_id"]))
+        except Exception as e:
+            print("[!] ledger 不可用：%s" % e)
+
 
 if __name__ == "__main__":
     main()

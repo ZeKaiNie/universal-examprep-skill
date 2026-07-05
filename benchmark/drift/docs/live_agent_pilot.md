@@ -105,11 +105,12 @@ Supported event types are deliberately narrow: `read_file` and `write_file`. Typ
 malformed and the converter exits with code `2`.
 
 Tracked writes must include snapshots in the same turn. If `### Events` records `- write_file:
-study_progress.md` or `- write_file: study_plan.md`, include the matching `### Files After:
-study_progress.md` or `### Files After: study_plan.md` block. Without that snapshot, T4 cannot score
-progress-row persistence or plan drift accurately, so the converter rejects the log.
-For these tracked files, `./` prefixes and Windows-style backslashes are normalized to the canonical
-`study_progress.md` / `study_plan.md` keys before JSONL is emitted.
+study_progress.md`, `- write_file: study_plan.md`, or `- write_file: study_state.json`（A4 结构化
+状态，`update_progress.py` 的官方写入）, include the matching `### Files After: <该文件>` block.
+Without that snapshot, T4 cannot score progress-row persistence, plan drift, or the A4 checkpoint
+accurately, so the converter rejects the log. For these tracked files, `./` prefixes and
+Windows-style backslashes are normalized to the canonical `study_progress.md` / `study_plan.md` /
+`study_state.json` keys before JSONL is emitted.
 
 ## Convert To T4 JSONL
 

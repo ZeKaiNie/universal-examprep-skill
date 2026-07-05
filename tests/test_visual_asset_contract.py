@@ -13,6 +13,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUNTIME_CONTRACT_FILES = [
     "SKILL.md",
     "AGENTS.md",
+    "SKILL.en.md",
+    "prompts/web_prompt.en.md",
     "prompts/web_prompt.md",
     "skills/exam-cram/SKILL.md",
     "skills/exam-quiz/SKILL.md",
@@ -75,7 +77,7 @@ class VisualAssetContractTest(unittest.TestCase):
         bad = "/" + "D:/"
         hits = []
         roots = [os.path.join(ROOT, d) for d in SCAN_TEXT_DIRS]
-        roots.extend(os.path.join(ROOT, f) for f in ("SKILL.md", "AGENTS.md"))
+        roots.extend(os.path.join(ROOT, f) for f in ("SKILL.md", "SKILL.en.md", "AGENTS.md"))
         for root in roots:
             if os.path.isfile(root):
                 candidates = [root]

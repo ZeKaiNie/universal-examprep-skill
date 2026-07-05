@@ -28,6 +28,10 @@ def _run(args, env_extra=None):
     env.pop("FAKE_DRIFT", None)
     env.pop("FAKE_LEAK", None)
     env.update(env_extra or {})
+    if "--ledger" not in args and "--no-ledger" not in args:
+        # 离线冒烟绝不写默认账本——benchmark/runs/ledger.jsonl 是「一行=一次真实运行」的审计日志，
+        # 跑测试套件不能往里塞假 agent 行（要测记账的用例自带 --ledger 临时路径）
+        args = list(args) + ["--no-ledger"]
     return subprocess.run([sys.executable, RUNNER] + args,
                           capture_output=True, text=True, encoding="utf-8", env=env)
 

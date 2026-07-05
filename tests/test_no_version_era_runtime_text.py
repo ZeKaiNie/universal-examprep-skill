@@ -23,7 +23,7 @@ FORBIDDEN = ["V2.0", "V2.1", "v2.0", "v2.1", "New in V2", "重大更新特性", 
 
 
 def runtime_files():
-    rels = ["README.md", "SKILL.md", "AGENTS.md"]
+    rels = ["README.md", "SKILL.md", "SKILL.en.md", "AGENTS.md"]
     for pat in ("docs/*.md", "prompts/*.md", "skills/**/*.md", "templates/*.md"):
         for p in glob.glob(os.path.join(ROOT, pat), recursive=True):
             rels.append(os.path.relpath(p, ROOT).replace("\\", "/"))

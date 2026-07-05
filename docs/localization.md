@@ -30,6 +30,18 @@
 
 ---
 
+A8b 补充：第二语言层目前以 **en 平行块**形式内联在各子技能的 `## Student-facing Output`
+（`skills/exam-tutor` / `exam-quiz` 的 English rendering 块 + 其余子技能的 dispatch 指针）；
+回复语言由 `study_state.json.language` 派发（`中文`/`English`/`双语`，见
+[`language-policy.md`](language-policy.md) 的 Language state & dispatch 与锚点不变性原则）。
+拆分 `locales/` 目录仍**暂不**做。
+
+A8c 附记（**撤回旧口径**）：A8c 已落地为**同仓同装的英文入口面**——`SKILL.en.md` +
+`prompts/web_prompt.en.md`，均为**锚点保持的派生渲染**（source of truth 仍是对应中文文件，
+见 [`language-policy.md`](language-policy.md) 的 A8c 小节）。它**不是**第二个打包 locale、
+**不**触发 `locales/` 拆分；拆分留待真正的**第二**种打包语言（完整 anchor-free 第二语言层）
+出现时再做，届时内联 en 块与 en 入口面即拆分素材源。
+
 ## 3. 将来的 locale 拆分规则 / Future locale split rule
 
 **仅当**某个未来 PR 真正加入第二种语言时，才引入：
@@ -72,11 +84,10 @@ locales/
 下列是当前学生侧的 **canonical 中文词汇**——部分嵌在 `## Student-facing Output` 模板里（如 `当前阶段`），部分是判分反馈 / 诚实弃答 / 来源标注时的固定说法（如 `资料里没有明确答案`、来源标注）。它们必须保留在打包的 `zh-CN` 学生侧；将来拆 locale 时原样带到 `zh-CN` 文件。来源标注用词以 [`language-policy.md`](language-policy.md) 为准（canonical 单一来源）。
 
 - `当前阶段`
-- `这题考什么`
-- `标准答题步骤`
-- `易错点`
-- `3分钟速记`
-- `现在轮到你`
+- `题面图`、`这题在问什么`、`图里要读的量`、`核心公式`、`逐步演算`、`答案自检`、`知识点溯源`（A5 七步讲解模板的七个块标题，exam-tutor）
+- `题目来源`、`答案来源`（A5 每题固定来源块，exam-tutor 与 exam-quiz 判分反馈）
+- `这题考什么`、`标准答题步骤`（exam-quiz 判分反馈用语）
+- `易错点`、`3分钟速记`、`现在轮到你`（讲解收尾块——**默认不输出**，仅学生要求或存有偏好时按需给；输出时用这三个 canonical 措辞。`易错点` 另用于 exam-quiz 判分反馈与小抄栏目）
 - `已记录到错题本`
 - `资料里没有明确答案`（诚实弃答）
 - `🟡 AI补充，可能与你老师讲的不完全一致`（AI 补充提醒，canonical 见 `language-policy.md`）

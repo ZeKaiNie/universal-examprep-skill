@@ -1,0 +1,35 @@
+{
+  "name": "long_session_state",
+  "fixture": "benchmark/drift/fixtures/mini_course_long_state",
+  "transcript": "benchmark/drift/transcripts/good_session_state.jsonl",
+  "requires_state": true,
+  "goal_markers": [
+    "期末",
+    "复习",
+    "备考",
+    "考试",
+    "exam"
+  ],
+  "unrelated_goal_phrases": [
+    "switch course",
+    "换一门课",
+    "换个科目",
+    "与考试无关",
+    "放弃这次考试",
+    "咱们聊点别的"
+  ],
+  "thresholds": {
+    "goal_retention_min": 0.9,
+    "plan_mutations_max": 0,
+    "quiz_invention_rate_max": 0.0,
+    "untagged_questions_max": 0,
+    "wrong_phase_quiz_max": 0,
+    "checkpoint_reset_max": 0,
+    "provenance_fidelity_min": 0.8,
+    "progress_rows_lost_max": 0,
+    "wiki_unique_files_max": 2,
+    "overread_max": 0,
+    "md_write_after_state_max": 0
+  },
+  "notes": "A4 state-backed replay: every progress write goes through study_state.json (+ regenerated md); md_write_after_state_max=0 is exercised for real here"
+}

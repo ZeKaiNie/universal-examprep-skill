@@ -28,11 +28,11 @@ def _die(msg):
 
 
 def run(argv=None):
-    ap = argparse.ArgumentParser(description="列出讲义/材料里的视觉页（按文件汇总，可按类型过滤）。")
+    ap = argparse.ArgumentParser(description="List visual pages in lectures/materials (grouped by file; filterable by type).")
     ap.add_argument("--workspace", required=True)
-    ap.add_argument("--index", default=None, help="figure_page_index.json 路径（默认在 references/ 下）")
-    ap.add_argument("--file", default=None, help="只看路径含此子串的文件")
-    ap.add_argument("--kind", default=None, help="只看含此视觉类型的页（figure/table/circuit/…）")
+    ap.add_argument("--index", default=None, help="figure_page_index.json path (default under references/)")
+    ap.add_argument("--file", default=None, help="only files whose path contains this substring")
+    ap.add_argument("--kind", default=None, help="only pages with this visual type (figure/table/circuit/...)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 

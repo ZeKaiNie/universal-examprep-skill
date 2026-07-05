@@ -122,10 +122,13 @@ RUN_SKILL_DRIFT_LLM=1 python benchmark/drift/run_live_smoke.py   --agent-cmd "cl
 ## 边界与限制（诚实）
 
 - **确定性 replay ≠ 真 agent 行为**：探测器只对脚本化 transcript 成立；真实模型是否这样表现**未被验证**。
-- **真 LLM 长会话仍未实现**：`--llm` 是 opt-in **skeleton**（需 `RUN_SKILL_DRIFT_LLM=1`），**绝不返回成功**
-  （无 env → exit 2；设了 env → 打印「未实现」exit 3）；它不接入模型、不读 key、不联网。
-- **不进 CI 的付费部分**：本 harness 的确定性层零成本、进根级测试；完整长程 LLM benchmark（以天计额度）
-  仍为**未来工作**、手动触发、绝不进 CI。
+- **真 LLM 长会话已转正为 opt-in（B3）**：`run_drift.py --llm` 不再是 skeleton——委托给 `run_live_smoke.py`
+  的真管线（驱动真 agent 逐回合 → 录 T5b 日志 → 转 JSONL → **同一套** `compute_metrics`/阈值判分 → 记账），
+  token 上限 / 失败中止 / fixture 沙箱都在 live runner 里。需 `RUN_SKILL_DRIFT_LLM=1`（无 env → exit 2；
+  设了 env 但没给 `--agent-cmd`/`--turns` → 委托的 live runner 因缺必需参数而非零退出，**绝不无 agent 就报成功**）。
+  用法：`RUN_SKILL_DRIFT_LLM=1 python run_drift.py --llm --agent-cmd "claude -p {prompt}" --out-dir <dir> --turns <spec>`。
+- **不进 CI 的付费部分**：本 harness 的确定性层零成本、进根级测试；真 agent 的 `--llm` 路径会产生真实调用成本
+  （以天计额度），**手动触发、绝不进 CI**。
 
 ### 指标是 smoke 启发式，不是语义评分器——已知固有限制
 

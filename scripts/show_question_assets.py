@@ -44,10 +44,10 @@ def _usable(ws, a):
 
 
 def run(argv=None):
-    ap = argparse.ArgumentParser(description="输出某题应先展示的题面图 Markdown（fail-closed）。")
+    ap = argparse.ArgumentParser(description="Print the question-side asset Markdown that must be shown first for an item (fail-closed).")
     ap.add_argument("--workspace", required=True)
-    ap.add_argument("--id", required=True, help="题目 id")
-    ap.add_argument("--with-answer", action="store_true", help="随后追加答案侧 asset（默认不展示）")
+    ap.add_argument("--id", required=True, help="question id")
+    ap.add_argument("--with-answer", action="store_true", help="append answer-side assets afterwards (hidden by default)")
     args = ap.parse_args(argv)
 
     bank_path = os.path.join(args.workspace, "references", "quiz_bank.json")

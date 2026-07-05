@@ -29,7 +29,7 @@ FLOAT_FIELDS = {"cost_usd"}
 MESSAGE_SECTIONS = {"user", "assistant"}
 EVENT_SECTIONS = {"events"}
 EVENT_TYPES = {"read_file", "write_file"}
-TRACKED_WRITE_SNAPSHOTS = {"study_plan.md", "study_progress.md"}
+TRACKED_WRITE_SNAPSHOTS = {"study_plan.md", "study_progress.md", "study_state.json"}   # A4: T4 优先读 state 快照
 
 
 class SessionLogError(Exception):

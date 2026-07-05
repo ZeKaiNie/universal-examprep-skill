@@ -1,0 +1,7 @@
+# 自撰金标 fixture（benchmark schema）——覆盖 numeric/definition/factual + 1 道 answerable=false 越界探针。
+# 供 run_matrix.py --mock 端到端干跑；不含任何受版权课程文本。
+{"id": "mx_num_page", "question": "How large is a Vellum page in kilobytes?", "gold_answer": "8", "supporting_span": "A Vellum page is eight kilobytes", "source_file": "materials/_combined.txt", "answer_type": "numeric", "answerable": true, "tolerance": 0}
+{"id": "mx_num_slice", "question": "How many milliseconds is a Gearbox time slice?", "gold_answer": "50", "supporting_span": "time slice of fifty milliseconds", "source_file": "materials/_combined.txt", "answer_type": "numeric", "answerable": true, "tolerance": 0}
+{"id": "mx_def_quench", "question": "What does a quench operation do?", "gold_answer": "flushes all dirty cache lines back to persistent storage", "supporting_span": "A quench flushes all dirty cache lines back to persistent storage", "source_file": "materials/_combined.txt", "answer_type": "definition", "answerable": true, "tolerance": 0}
+{"id": "mx_fact_wal", "question": "What file does the Marlin database keep its write-ahead log in?", "gold_answer": "marlin.wal", "supporting_span": "write-ahead log in a file named marlin.wal", "source_file": "materials/_combined.txt", "answer_type": "factual", "answerable": true, "tolerance": 0}
+{"id": "mx_probe_oos", "question": "What is the average rainfall in the Amazon basin during April?", "gold_answer": "", "supporting_span": "", "source_file": "materials/_combined.txt", "answer_type": "factual", "answerable": false, "tolerance": 0}

@@ -173,3 +173,5 @@ For any item with `requires_assets=true` or `maybe_requires_assets=true`:
 越范围出题前必须先输出「⚠️ 临时覆盖你的 <范围> 范围偏好」；未标 `source_type` 的题在限定范围内一律排除并报告数量。
 官方工具：`scripts/select_questions.py`（组合筛选 + 可选 `--export-sqlite` 生成查询缓存，缓存是生成物不进仓库）、
 `scripts/build_knowledge_index.py`（知识点 ↔ 章节/wiki/题目 索引，页码级引用留待 A5）。
+
+**生产者**：`scripts/build_raw_input_from_workspace.py` 自 A3 起自动产出 `source_type="homework"` 的作业题（题答分离 PDF 配对 / inline Solution / 中英标记），页码出处齐全；其余 source_type 值可手工标注或由后续 ingest 增强补齐。

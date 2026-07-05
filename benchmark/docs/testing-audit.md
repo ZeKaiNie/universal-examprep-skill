@@ -45,7 +45,17 @@
 - 概念疑难点追踪（疑难行写入进度）
 - study_progress 断点恢复（读出当前阶段）
 - 无 Python 环境降级写盘（手写工作区过校验）
-- 0 基础重点题精讲（四小节齐全）
+- 0 基础重点题精讲（已升级为 A5 七步模板）
+
+A 线各阶段又新增 **5 个 Tier 2 确定性行为场景**（`behavior_smoke/scenarios.json`，B1 收尾登记进 [`coverage-matrix.md`](coverage-matrix.md)）：
+
+- 视觉题 题面图门禁（`visual_first_assets`，P0-V1/A1）
+- 范围过滤 + 越界覆盖声明（`scope_override`，A2）
+- 七步讲解模板 + 每题来源块（`teaching_template`，A5）
+- ≤1天档严禁向学生提问（`time_budget_no_questions`，A6）
+- 窗口外知识点须真复核（`knowledge_window_recheck`，A6；>7天须出题实测）
+
+另有 **1 个 Tier 4 长会话 replay 场景**（`benchmark/drift/scenarios/mode_urgent_no_questions.json`，**不是** Tier 2 smoke）：模式漂移——≤1天零提问 `urgent_mode_questions` + 紧迫开场推断并落盘 `urgent_mode_persisted`。
 
 **仍诚实**：确定性层只证明探测器对**预期产物**成立，**不证明真 LLM agent 一定产出这些行为**。**真 LLM 行为验证仍 opt-in、不进 CI、尚未实现**（`--llm` 仅 skeleton，需 `RUN_SKILL_BEHAVIOR_LLM=1`）；**LLM Wiki 惰性加载**与**画图先跑算法再画**仍为 best-effort / 未覆盖。详见 [`../behavior_smoke/README.md`](../behavior_smoke/README.md) 与 [`coverage-matrix.md`](coverage-matrix.md)。
 

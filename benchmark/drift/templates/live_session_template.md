@@ -5,6 +5,9 @@ fixture: benchmark/drift/fixtures/mini_course_long
 agent: codex
 date: YYYY-MM-DD
 notes: self-authored fixture only; no private or copyrighted material
+tracked-writes: study_progress.md / study_plan.md / study_state.json 的 write_file 事件都必须带
+  同回合的「### Files After: <该文件>」快照（A4 工作区经 update_progress.py 更新时记 study_state.json），
+  否则转换器拒绝该日志
 
 ## Turn 1
 kind: resume

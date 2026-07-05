@@ -314,7 +314,7 @@ class KnowledgeIndex(unittest.TestCase):
 
 
 class ScopeContract(unittest.TestCase):
-    ENTRY_POINTS = ["SKILL.md", "AGENTS.md", "prompts/web_prompt.md", "skills/exam-quiz/SKILL.md", "skills/exam-cram/SKILL.md",
+    ENTRY_POINTS = ["SKILL.md", "SKILL.en.md", "AGENTS.md", "prompts/web_prompt.md", "prompts/web_prompt.en.md", "skills/exam-quiz/SKILL.md", "skills/exam-cram/SKILL.md",
                     "skills/exam-tutor/SKILL.md", "skills/exam-review/SKILL.md"]
 
     def test_all_entry_points_carry_override_marker(self):

@@ -233,14 +233,30 @@ def build_summary(merged, primary_course, secondary_course=None, judge_model="un
         course_matrix.setdefault(course, {})["%s|%s" % (model, arm)] = _cell(items)
 
     # cost_per_q: course → arm → mean per-item cost (across models)
+    # infra_error 行**不进均值分母**（与正确率同一条诚实规则：它们不是模型答案）——否则一堆 0 成本的
+    # 失败行会把「每题成本」摊薄成漂亮数字，报告照登就是虚标。真实总花费仍在 total_cost_usd 里。
     cost_per_q = {}
     cost_acc = {}
     for m in merged:
-        ca = cost_acc.setdefault((m["course"], m["arm"]), [0.0, 0])
+        ca = cost_acc.setdefault((m["course"], m["arm"]), [0.0, 0])   # 臂键保留（全失败 → None 而非消失）
+        if m["infra_error"]:
+            continue
         ca[0] += (m.get("cost_usd") or 0)
         ca[1] += 1
     for (course, arm), (tot, n) in cost_acc.items():
         cost_per_q.setdefault(course, {})[arm] = round(tot / n, 4) if n else None
+
+    # 齐平性：主课程各 (model,arm) 格的答题集应一致（「同题跨臂比较」的前提）。不齐平不硬拦
+    # （续跑中途单独聚合是合法状态），但要**响亮标出**——headline n_items 是并集，各格分母是自己的子集。
+    prim_sets = {}
+    for m in merged:
+        if m["course"] == primary_course:
+            prim_sets.setdefault((m["model"], m["arm"]), set()).add(m["item_id"])
+    ragged = len({frozenset(v) for v in prim_sets.values()}) > 1
+    if ragged:
+        sys.stderr.write("aggregate_matrix: ⚠️ 主课程各格答题集不齐平（%s）——跨臂/跨模型对比要小心，"
+                         "n_items 是并集而非公共集\n"
+                         % ", ".join("%s|%s=%d" % (k[0], k[1], len(v)) for k, v in sorted(prim_sets.items())))
 
     n_items = len({m["item_id"] for m in merged if m["course"] == primary_course})
     summary = {
@@ -253,6 +269,7 @@ def build_summary(merged, primary_course, secondary_course=None, judge_model="un
         "matrix": course_matrix[primary_course],          # report_matrix.py reads this
         "course_matrix": course_matrix,                    # generic, every course
         "cost_per_q": cost_per_q,
+        "ragged_matrix": ragged,                           # 主课程各格答题集不齐平（对比要小心）
         "aggregated_by": "aggregate_matrix.py",            # provenance: NOT the published rejudge output
     }
     if secondary_course is not None:

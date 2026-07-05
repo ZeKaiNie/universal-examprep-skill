@@ -34,8 +34,13 @@ RUN_SKILL_BEHAVIOR_LLM=1 python benchmark/behavior_smoke/run_behavior_smoke.py -
 | `confusion_tracking` | 「为什么」类疑问写入进度 | mock 进度的疑难点区新增一行 |
 | `checkpoint_recovery` | 从当前阶段续而非重启 | 从进度读出当前阶段 = 2，且续跑消息指向阶段 2 |
 | `no_python_fallback` | 无 Python 手写产出仍完整 | 手写工作区通过 Tier-1 校验 |
-| `zero_basic_key_question` | 0 基础精讲含 4 个小节 | mock 输出含 考点拆解 / 标准答题步骤 / 易错点 / 3分钟速记 |
+| `zero_basic_key_question` | 0 基础精讲含结构化小节 | mock 输出含 考点拆解（或 这题在问什么）+ 标准答题步骤（或 逐步演算）；易错点/3分钟速记 为可选收尾块不再要求 |
+| `teaching_template` | A5 七步讲解模板 + 每题来源块 | ①-⑦ 齐全按序（②在④前）、⑦ 落到章节/wiki；来源行 题目来源｜答案来源｜canonical 标签；AI 答案 ⚠️ 进来源行与答案块标题；默认到来源块为止、未经要求的收尾块被抓（学生要求了则豁免）；7 个反例全被抓 |
 | `visual_first_assets` | 视觉题先展示题面侧 asset | mock 输出必须先出现带 `题面图 / question-side asset` 标签的真实 fixture 本地图片；反例（答案图先出现 / 题目前泄露答案图或正文 / 未标注答案图 / 图片前正文 / 题后插图 / `问题：` 后迟到图片 / 不安全或缺失路径 / 只打印路径）必须不合格 |
+| `scope_override` | 越范围出题须先声明（A2） | mock 输出在第一道题**之前**出现 verbatim「⚠️ 临时覆盖你的 <范围> 范围偏好」；反例（题后才声明 / 不声明）必须不合格 |
+| `language_first_ask` | 首问一次合并 模式×时间×语言（A6/A8b），语言行三语呈现；紧迫开场静默推断 | mock 好例=三语语言行+一条三旗标 set；反例漏语言行被抓；紧迫变体=零问句+`--language` ∈ canonical，紧迫反例收尾提问被抓 |
+| `time_budget_no_questions` | ≤1天档严禁向学生提问（A6） | mock 好例纯讲解、无面向学生的问句；反例（问「你想先复习哪一章？」「还有问题吗？」「Should I…」等收尾/通用问句）必须不合格；自答式反问不误伤 |
+| `knowledge_window_recheck` | 窗口外知识点须真复核（A6） | 3-7天好例回问/实测均可、反例默认还会被抓；>7天（`require_test`）只认出题实测——只口头「还记得吗」的坏例被抓；否定式（不问/不实测/我就当你会了）不算复核、否定式安全声明（不会默认你会）不误伤 |
 | `lazy_load_best_effort` | 只读当前章节 | **best-effort**：确定性模式跳过；需 transcript/LLM 才能真验 |
 
 ## 什么是 best-effort / 没覆盖

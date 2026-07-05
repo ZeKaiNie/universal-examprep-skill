@@ -1,0 +1,20 @@
+{
+  "name": "window_persist",
+  "fixture": "benchmark/drift/fixtures/mini_course_long_state",
+  "transcript": "benchmark/drift/transcripts/window_persist_session.jsonl",
+  "requires_state": true,
+  "time_budget": "3-7天",
+  "goal_markers": ["期末", "复习", "备考", "考试", "exam"],
+  "thresholds": {
+    "goal_retention_min": 0.9,
+    "plan_mutations_max": 0,
+    "untagged_questions_max": 0,
+    "provenance_fidelity_min": 0.8,
+    "progress_rows_lost_max": 0,
+    "window_rows_added_min": 2,
+    "window_rows_lost_max": 0,
+    "window_status_migrations_min": 2,
+    "md_write_after_state_max": 0
+  },
+  "notes": "A6 知识点窗口长会话持久化（填 B1 评审标注的 Tier4 ❌）：一段查缺补漏会话里窗口条目随讲解登记（栈的LIFO/队列FIFO 各一条 → window_rows_added≥2），窗口进出用状态迁移（在窗口→窗口外→已实测）而非删行，所以 window_rows_lost 必须为 0——静默丢掉窗口条目会红。每回合双写 study_state.json + study_progress.md 快照（md_write_after_state=0）。"
+}
