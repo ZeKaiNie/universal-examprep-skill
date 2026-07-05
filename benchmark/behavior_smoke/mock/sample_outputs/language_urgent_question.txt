@@ -1,0 +1,3 @@
+明天就考？好的。先确认一下：
+python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace ws set --mode 零基础从头讲 --time-budget ≤1天 --language 中文
+你想用中文还是英文复习呢？

@@ -30,6 +30,13 @@
 
 ---
 
+A8b 补充：第二语言层目前以 **en 平行块**形式内联在各子技能的 `## Student-facing Output`
+（`skills/exam-tutor` / `exam-quiz` 的 English rendering 块 + 其余子技能的 dispatch 指针）；
+回复语言由 `study_state.json.language` 派发（`中文`/`English`/`双语`，见
+[`language-policy.md`](language-policy.md) 的 Language state & dispatch 与锚点不变性原则）。
+拆分 `locales/` 目录仍**暂不**做——留待**第二**个打包发布形态（A8c 英文版 skill）或第三语言时，
+届时内联 en 块即拆分素材源。
+
 ## 3. 将来的 locale 拆分规则 / Future locale split rule
 
 **仅当**某个未来 PR 真正加入第二种语言时，才引入：

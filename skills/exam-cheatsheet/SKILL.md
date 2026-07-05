@@ -33,7 +33,7 @@ Trigger when all study phases are basically cleared and review is wrapping up, O
 - Write `walkthrough.md`: per-chapter quick recall + key-item answer templates + weak-spot list, with a refreshed progress panel at the end.
 - Every line carries one provenance label: 🟢 来自资料 / 🟡 AI补充，可能与你老师讲的不完全一致 / ⚠️ AI生成答案，非老师/教材提供.
 - Keep it to one or two printable, hand-copyable pages.
-- Student-facing output defaults to Simplified Chinese unless the user asks otherwise. (See [`docs/language-policy.md`](../../docs/language-policy.md).)
+- Student-facing output defaults to Simplified Chinese; a persisted `study_state.json` `language` (`English`/`双语`) switches it per exam-cram's dispatch rule (canonical tokens verbatim). (See [`docs/language-policy.md`](../../docs/language-policy.md).)
 
 ## Student-facing Output
 考前最后一小时速记小抄，按这几栏压缩（每条一行、能照写，标清来源）：
@@ -55,6 +55,9 @@ Trigger when all study phases are basically cleared and review is wrapping up, O
 【还没拿下（考前再看一眼）】
 - 错题：……　疑难点：……
 ```
+
+
+Render per the persisted `study_state.json` `language` (`中文` default / `English` / `双语`); canonical tokens stay verbatim with a trailing gloss — see [`exam-cram`](../exam-cram/SKILL.md) Output Contract for the dispatch and composition rules.
 
 ## Boundaries
 - Do not put content into the cram sheet that the materials do not cover unless it is tagged 🟡 or ⚠️.

@@ -3,6 +3,8 @@
 本文档解释这套备考技能从「单体 SKILL.md」走向「可移植技能集合」后的结构，以及各项防幻觉能力落在哪里。
 **本次重构只加结构、文档与测试，不改 `scripts/ingest.py` 逻辑，不改变任何既有行为。**
 
+> A8b: student-facing rendering is dispatched by `study_state.json.language` (`中文` default / `English` / `双语`); canonical tokens are language-invariant (see docs/language-policy.md).
+
 ## 1. 兼容入口（不破坏现有用法）
 - 根目录 **`SKILL.md`** 保持为**默认 / 兼容入口**，仍承载完整防编题与来源标注规则。已经按旧方式安装本技能的 host 不受影响。
 - 新支持技能集合的 host 可改用 **`skills/exam-cram/SKILL.md`** 作主入口——它与根 `SKILL.md` 描述同一行为。

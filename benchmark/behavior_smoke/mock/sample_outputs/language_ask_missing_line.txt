@@ -1,0 +1,5 @@
+开始前问两件事：
+1) 学习模式：零基础从头讲 / 某章起步补弱 / 查缺补漏
+2) 时间宽裕度：≤1天 / 1-3天 / 3-7天 / >7天
+
+python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace ws set --mode 查缺补漏 --time-budget 1-3天

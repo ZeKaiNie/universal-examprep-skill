@@ -49,7 +49,7 @@ Pull chapter/phase-scoped items from `references/quiz_bank.json`, present one it
 - Present one item at a time; grade as pass/not-pass plus key-point feedback; refresh the progress panel at the end.
 - Each graded item's feedback ends with the one-line source block `题目来源：…｜答案来源：…｜<🟢/🟡/⚠️>` (Workflow step 5); an AI-supplied answer carries ⚠️ in both the `解析/参考答案` block title and the source label.
 - Update the check-in log and wrong-item archive — via `update_progress.py` (add-mistake / set-check) when `study_state.json` exists, else in `study_progress.md` — then hand control back to `exam-cram`.
-- Student-facing output defaults to Simplified Chinese unless the user asks otherwise. (See [`docs/language-policy.md`](../../docs/language-policy.md).)
+- Student-facing output defaults to Simplified Chinese; a persisted `study_state.json` `language` (`English`/`双语`) switches it per exam-cram's dispatch rule (canonical tokens verbatim). (See [`docs/language-policy.md`](../../docs/language-policy.md).)
 - Provenance labels in feedback are verbatim student-facing markers: 🟢 来自资料 / 🟡 AI补充，可能与你老师讲的不完全一致 / ⚠️ AI生成答案，非老师/教材提供.
 
 ## Student-facing Output
@@ -61,6 +61,16 @@ Pull chapter/phase-scoped items from `references/quiz_bank.json`, present one it
 - **答错**：❌ 这里错了：……（指出逻辑漏洞）。标准答题步骤：1.… 2.…。再看一眼原题解析。
 - **连错两次**：要不要 ① 查看提示　② 跳过并归档错题　③ 再想想？选 ② 我就「已记录到错题本」，考前再扫雷。
 - **题/答为 AI 生成**：⚠️ AI生成答案，非老师/教材提供，仅供参考，请和老师/教材核对。
+
+### English rendering (`language=English`)
+
+Grade in English around the LANGUAGE-INVARIANT anchors: the receipt keeps its canonical form with a
+trailing gloss — 已记录到错题本 (recorded to the mistake archive)；the escape-hatch option ② keeps the
+错题本/归档 tokens (e.g. "② skip & archive to 错题本"); the scope-override marker is emitted verbatim
+BEFORE any out-of-scope item, gloss after: 「⚠️ 临时覆盖你的 <scope> 范围偏好」 (temporarily overriding
+your <scope> scope preference); the per-item source block line stays 100% verbatim Chinese with its
+`> EN:` gloss on the following line. ✅/🟡/❌ feedback prose is English. For `language=双语`, apply
+[`exam-cram`](../exam-cram/SKILL.md)'s composition rule (zh unit first, `> EN:` mirror, anchors once).
 
 ## Boundaries
 - **Structured progress state (A4)**: when `study_state.json` exists it is the SINGLE SOURCE OF TRUTH — update it via `python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace <ws> set/add-mistake/add-confusion/render` (script path resolves from the skill package root); `study_progress.md` is a GENERATED view (hand edits are lost on the next render — never hand-patch it). If a state write fails, TELL the user; never continue as if it saved. Without `study_state.json` (no-Python fallback), a hand-maintained md stays valid.

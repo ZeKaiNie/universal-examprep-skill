@@ -1,0 +1,4 @@
+明天就考，直接开讲。已静默设定：
+python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace ws set --mode 零基础从头讲 --time-budget ≤1天 --language 双语
+
+第 1 章第一个知识点：栈……（继续讲解，不提问）

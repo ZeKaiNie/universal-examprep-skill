@@ -1,0 +1,6 @@
+「明天就考，直接双语讲」——好的，双语模式直接开讲（显式选择，非推断）。已设定：
+python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace ws set --mode 零基础从头讲 --time-budget ≤1天 --language 双语
+
+第 1 章第一个知识点：栈。
+> EN: Chapter 1, first point: the stack.
+（继续讲解，不提问）

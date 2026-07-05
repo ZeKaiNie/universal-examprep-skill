@@ -26,6 +26,34 @@ Root `SKILL.md` stays **Chinese-first** as the compatibility entrypoint, and `pr
 
 ---
 
+## Language state & dispatch（A8b：回复语言）
+
+- 持久化：`study_state.json.language`，canonical `中文` / `English` / `双语`（别名经 `update_progress.py`
+  `--language` 归一；未知值保留 + 告警）。缺省/为空 = `中文`（所有旧工作区行为逐字节不变）。
+- 首问：并入 A6 的**一次合并首问**（模式 × 时间宽裕度 × 语言，语言行三语呈现）；紧迫开场按学生开场语言
+  静默推断，**绝不推断 `双语`**。会话中途 `set --language <值>` 随时切换，下一条回复生效。
+- `双语` 是**组合规则**而非第三套模板：逐块 zh 在前、`> EN:` 镜像随后；锚点只出现一次（token+gloss 形态）。
+
+### ANCHOR-INVARIANCE PRINCIPLE（锚点不变性，MUST）
+
+以下十类 canonical 字面在**任何语言模式下逐字节原样输出**（英文/双语模式在 token **之后或下一行**加
+英文 gloss，绝不改写 token 内部——它们被 behavior_smoke / drift 从 transcript 解析、被测试钉死、
+或持久化在学生工作区里）：
+
+1. 三个来源标注 canonical 标签（🟢/🟡/⚠️ 全文）
+2. 范围覆盖声明 「⚠️ 临时覆盖你的 <scope> 范围偏好」
+3. 七步模板块标（圈号 + canonical 中文名：① 题面图 … ⑦ 知识点溯源）
+4. 来源块行 `题目来源：…｜答案来源：…` 与 来源未知/来源页未知
+5. 收尾块名 易错点 / 3分钟速记 / 现在轮到你
+6. 错题本/错题档案 与回执 已记录到错题本 / 已记录到疑难点
+7. 阶段引用 `阶段 N`
+8. 窗口复核提示语（还记得 / 复述 / 做题实测 类）
+9. 双语资产标签 题面图 / question-side asset、答案图 / answer-side asset
+10. 弃答 canonical 资料里没有这道题的答案（及其变体）
+
+持久化文件与脚本输出在所有模式下保持中文 canonical；向非中文学生转述脚本回执/失败时，引用中文原文
+并附英文复述——**绝不在翻译中丢失 fail-loud 内容**。
+
 ## English control plane（控制层 = 英文优先）
 
 These instructions are read by the agent (Claude / Codex), **not** the student. Prefer English, and keep them **precise, imperative, and testable**:

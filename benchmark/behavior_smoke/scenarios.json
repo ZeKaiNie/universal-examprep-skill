@@ -139,6 +139,25 @@
       "prompt": "（前情：学生已说只做作业题）给我找几道 lecture 里的图片题。",
       "mock_output": "mock/sample_outputs/scope_override_good.txt",
       "mock_negative": "mock/sample_outputs/scope_override_missing.txt"
+    },
+    {
+      "name": "language_first_ask",
+      "claim": "首问回合=完整合并首问（三模式+四档全 gloss+三语语言行）；答复后一条 set 三旗标全 canonical（乱序合法）；紧迫开场静默三旗标（默认 零基础从头讲/≤1天、语言=开场语言、静默推断 双语 被抓、开场显式要双语则放行）且零问句",
+      "prompt": "我下周有期末考，帮我复习《数据结构》。",
+      "detector": "language_first_ask_ok",
+      "mock_output": "mock/sample_outputs/language_ask_good.txt",
+      "mock_negative": "mock/sample_outputs/language_ask_missing_line.txt",
+      "mock_urgent": "mock/sample_outputs/language_urgent_silent.txt",
+      "mock_urgent_negative": "mock/sample_outputs/language_urgent_question.txt",
+      "best_effort": false,
+      "mock_persist": "mock/sample_outputs/language_persist_good.txt",
+      "mock_persist_negative": "mock/sample_outputs/language_persist_noncanonical.txt",
+      "mock_urgent_bilingual": "mock/sample_outputs/language_urgent_bilingual.txt",
+      "mock_urgent_wrong_language": "mock/sample_outputs/language_urgent_wrong_language.txt",
+      "urgent_expected_language": "中文",
+      "mock_negative_unglossed": "mock/sample_outputs/language_ask_unglossed.txt",
+      "mock_urgent_bilingual_explicit": "mock/sample_outputs/language_urgent_bilingual_explicit.txt",
+      "mock_urgent_bilingual_negated": "mock/sample_outputs/language_urgent_bilingual_negated.txt"
     }
   ]
 }

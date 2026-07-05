@@ -1,0 +1,4 @@
+开始前一次问清三件事（回答后立刻开讲 / three quick choices, then we start）：
+1) 学习模式 / Mode：零基础从头讲 (from scratch) / 某章起步补弱 (patch weak spots from a chapter) / 查缺补漏 (gap-filling)
+2) 时间宽裕度 / Time budget：≤1天 (≤1 day) / 1-3天 (1-3 days) / 3-7天 (3-7 days) / >7天 (>7 days)
+3) 语言 / Language：中文 / English / 双语 (bilingual — 题目与讲解并排双语 / side-by-side)

@@ -37,7 +37,7 @@ Do NOT auto-fix. After reporting, fix item-by-item only if the user grants permi
 
 Preserve these provenance labels VERBATIM when quoting them in findings: 🟢 来自资料 / 🟡 AI补充，可能与你老师讲的不完全一致 / ⚠️ AI生成答案，非老师/教材提供.
 
-Student-facing output defaults to Simplified Chinese unless the user asks otherwise.
+Student-facing output defaults to Simplified Chinese; a persisted `study_state.json` `language` (`English`/`双语`) switches it per exam-cram's dispatch rule (canonical tokens verbatim).
 
 ## Boundaries
 - Zero modifications and zero deletions by default — this is an inspection, not construction.

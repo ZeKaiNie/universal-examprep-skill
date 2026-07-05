@@ -424,6 +424,75 @@ def asks_student_question(text):
     return False
 
 
+# ---- A8b：语言并入合并首问（模式 × 时间 × 语言，一次问、一条 set 立三样） ----
+_LANG_ASK_RE = re.compile(r"语言\s*/\s*Language：中文\s*/\s*English\s*/\s*双语")
+_SET_LINE_RE = re.compile(r"update_progress\.py[^\n]*\bset\b[^\n]*")
+
+
+def _set_flags(text):
+    """最后一条 set 行的 --mode/--time-budget/--language 旗标值（**顺序无关**）。"""
+    flags = {}
+    for m in _SET_LINE_RE.finditer(text or ""):
+        cur = {}
+        for fm in re.finditer(r"--(mode|time-budget|language)[=\s]\s*\"?([^\s\"]+)", m.group(0)):
+            cur[fm.group(1)] = fm.group(2)
+        if cur:
+            flags = cur
+    return flags
+
+
+def language_first_ask_ok(text):
+    """首问回合契约：**完整**合并首问——三语语言行 + 三个模式选项 + 四个时间档选项都在场
+    （set 发生在学生答复之后——由 language_persist_ok 另测）。"""
+    t = text or ""
+    if not _LANG_ASK_RE.search(t):
+        return False
+    # 每个模式选项须带英文 gloss（同行括注、以拉丁字母开头）——语言未定前英文学生也能读懂
+    for m in ("零基础从头讲", "某章起步补弱", "查缺补漏"):
+        if not re.search(re.escape(m) + r"[^\n]{0,8}[（(]\s*[A-Za-z]", t):
+            return False
+    # 四个时间档同样各须 gloss（只 gloss 一个档骗不过）
+    for x in ("≤1天", "1-3天", "3-7天", ">7天"):
+        if not re.search(re.escape(x) + r"[^\n]{0,6}[（(]\s*[<≤>A-Za-z0-9]", t):
+            return False
+    return True
+
+
+def language_persist_ok(text, urgent=False, expected_lang=None):
+    """持久化契约：一条 set 同时带全三旗标（顺序无关）且 --language ∈ canonical。
+    urgent=紧迫开场变体：另须 零问句 + 默认 零基础从头讲/≤1天 + 语言 ∈ {中文, English}
+    （双语只能显式选择，**绝不静默推断**）；expected_lang=按开场语言的推断期望——
+    中文开场静默持久化 English 也算违约（契约：推断学生开场所用语言）。"""
+    f = _set_flags(text)
+    if not all(k in f for k in ("mode", "time-budget", "language")):
+        return False
+    if f["mode"] not in ("零基础从头讲", "某章起步补弱", "查缺补漏"):
+        return False                                    # mode 也须 canonical（随便讲讲 骗不过）
+    if f["time-budget"] not in ("≤1天", "1-3天", "3-7天", ">7天"):
+        return False                                    # tier 同理（someday 骗不过）
+    if urgent:
+        if not urgent_no_student_questions_ok(text):
+            return False
+        if not (f["mode"] == "零基础从头讲" and f["time-budget"] == "≤1天"):
+            return False
+        # 显式双语开场 = 显式选择而非推断 → 放行；但必须是**肯定式**请求——
+        # 「不要双语，直接中文讲」里的 双语 是否定式提及，不算同意（否定词贴邻前缀即拒）
+        first_set = _SET_LINE_RE.search(text or "")
+        pre = (text or "")[:first_set.start()] if first_set else ""
+        explicit_bi = False
+        for bm in re.finditer("双语", pre):
+            ctx = pre[max(0, bm.start() - 4):bm.start()]
+            if not any(neg in ctx for neg in ("不要", "别", "不用", "无需", "非")):
+                explicit_bi = True
+                break
+        if f["language"] == "双语":
+            return explicit_bi
+        if f["language"] not in ("中文", "English"):
+            return False
+        return expected_lang is None or f["language"] == expected_lang
+    return f["language"] in ("中文", "English", "双语")
+
+
 def urgent_no_student_questions_ok(text):
     """≤1天档：严禁向用户提问（任何问题都在浪费复习时间）——纯讲解陈述句，没有面向学生的问句。"""
     return not asks_student_question(text)
@@ -862,6 +931,36 @@ def check_scenario_mock(name, sc, fixture_path=FIXTURE):
                 and has_zero_basic_sections(good_txt))
         legacy_bad = teaching_template_ok(_read(_p(sc["mock_negative_legacy"])))
         return (good and not legacy_bad), f"seven_step_good={good} legacy_two_section_caught={not legacy_bad}"
+    if name == "language_first_ask":
+        # 首问回合：好例=三语语言行；反例漏语言行 → 被抓（首问回合不要求 set——还没等到学生答复）。
+        # 持久化回合：好例=一条 set 三旗标（**乱序**也认）；反例 --language 非 canonical → 被抓。
+        # 紧迫变体：静默三旗标 + 默认 零基础从头讲/≤1天 + 语言 ∈ {中文,English}；
+        # 反例①静默推断 双语 → 被抓；反例②收尾仍提问 → 被抓。
+        ask = language_first_ask_ok(_read(_p(sc["mock_output"])))
+        ask_bad = language_first_ask_ok(_read(_p(sc["mock_negative"])))
+        ask_unglossed = language_first_ask_ok(_read(_p(sc["mock_negative_unglossed"])))
+        persist = language_persist_ok(_read(_p(sc["mock_persist"])))
+        persist_bad = language_persist_ok(_read(_p(sc["mock_persist_negative"])))
+        exp = sc.get("urgent_expected_language")
+        urgent = language_persist_ok(_read(_p(sc["mock_urgent"])), urgent=True, expected_lang=exp)
+        urgent_bi = language_persist_ok(_read(_p(sc["mock_urgent_bilingual"])), urgent=True, expected_lang=exp)
+        urgent_bi_explicit = language_persist_ok(_read(_p(sc["mock_urgent_bilingual_explicit"])),
+                                                 urgent=True, expected_lang=exp)
+        urgent_bi_negated = language_persist_ok(_read(_p(sc["mock_urgent_bilingual_negated"])),
+                                                urgent=True, expected_lang=exp)
+        urgent_mm = language_persist_ok(_read(_p(sc["mock_urgent_wrong_language"])), urgent=True,
+                                        expected_lang=exp)
+        urgent_q = language_persist_ok(_read(_p(sc["mock_urgent_negative"])), urgent=True, expected_lang=exp)
+        return (ask and not ask_bad and not ask_unglossed and persist and not persist_bad
+                and urgent and not urgent_bi and urgent_bi_explicit and not urgent_bi_negated
+                and not urgent_mm and not urgent_q), (
+            f"ask_good={ask} missing_language_line_caught={not ask_bad} "
+            f"unglossed_options_caught={not ask_unglossed} "
+            f"persist_orderfree={persist} noncanonical_caught={not persist_bad} "
+            f"urgent_defaults_ok={urgent} inferred_bilingual_caught={not urgent_bi} "
+            f"explicit_bilingual_allowed={urgent_bi_explicit} "
+            f"negated_bilingual_caught={not urgent_bi_negated} "
+            f"opening_language_mismatch_caught={not urgent_mm} urgent_question_caught={not urgent_q}")
     if name == "time_budget_no_questions":
         # ≤1天档：好例纯讲解无学生问句；反例向学生抛澄清/偏好问句 → 被抓
         good = urgent_no_student_questions_ok(_read(_p(sc["mock_output"])))

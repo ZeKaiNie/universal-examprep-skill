@@ -146,5 +146,41 @@ class LanguagePolicyTest(unittest.TestCase):
         self.assertIn("备考", web)
 
 
+
+class A8bLanguageDispatch(unittest.TestCase):
+    """A8b：合并首问（模式×时间×语言）、派发规则、en 平行块与锚点存活。"""
+
+    def _read(self, *parts):
+        import os
+        with open(os.path.join(ROOT, *parts), encoding="utf-8") as f:
+            return f.read()
+
+    def test_cram_combined_ask_and_dispatch(self):
+        t = self._read("skills", "exam-cram", "SKILL.md")
+        self.assertIn("ask ONE combined question", t)             # 语言并入 A6 首问，不新增阻塞问题
+        self.assertIn("语言 / Language：中文 / English / 双语", t)  # 三语语言行
+        self.assertIn("--language <语言>", t)                      # 一次 set 立三样
+        self.assertIn("NEVER infer `双语`", t)                     # 双语只显式选择
+        self.assertIn("LANGUAGE-INVARIANT", t)                     # 派发规则 + 锚点不变性
+        self.assertIn("Simplified Chinese", t)                     # 既有钉字存活
+
+    def test_tutor_en_block_keeps_anchors(self):
+        t = self._read("skills", "exam-tutor", "SKILL.md")
+        self.assertIn("### English rendering", t)
+        self.assertIn("① 题面图 (Question figure)", t)             # token+gloss 形态
+        self.assertIn("题目来源：lec", t.replace("lecture03", "lec"))  # 来源块行原样（示例）
+        self.assertIn("> EN:", t)                                  # 双语镜像行形态
+
+    def test_quiz_en_block_keeps_receipt(self):
+        t = self._read("skills", "exam-quiz", "SKILL.md")
+        self.assertIn("已记录到错题本 (recorded to the mistake archive)", t)
+        self.assertIn("### English rendering", t)
+
+    def test_policy_carries_anchor_invariance(self):
+        t = self._read("docs", "language-policy.md")
+        self.assertIn("ANCHOR-INVARIANCE PRINCIPLE", t)
+        self.assertIn("Language state & dispatch", t)
+
+
 if __name__ == "__main__":
     unittest.main()
