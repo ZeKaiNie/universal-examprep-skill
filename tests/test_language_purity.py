@@ -192,10 +192,10 @@ SCRIPT_CMD_RE = re.compile(r"^\s*(?:\$ ?)?python(?:3)?\b")
 # End state: both .en entry files. RED until C2b rewrites them; if this module
 # must land green at C2a ahead of C2b, the landing PR may stage this tuple —
 # C2b MUST restore both entries in the same PR that rewrites the files.
-# C2a 分期（STAGED）：清单暂空——今天两个 .en 文件仍带 ~50 行 CJK prose（C0 审计 §1）。
-# C2b 重写 SKILL.en.md / prompts/web_prompt.en.md 为零 CJK 时，必须在同一 commit 恢复：
-#   EN_SURFACE_FILES = ("SKILL.en.md", "prompts/web_prompt.en.md")
-EN_SURFACE_FILES = ()
+EN_SURFACE_FILES = (
+    "SKILL.en.md",
+    "prompts/web_prompt.en.md",
+)
 
 
 def en_purity_offenses(text):
@@ -260,6 +260,8 @@ def is_pure_en(output_text):
 # ("file" = whole file minus YAML frontmatter; "sfo" = the file's
 #  '## Student-facing Output' section only. exam-audit has no SFO section.)
 ZH_OUTPUT_PURITY_TARGETS = [
+    ("SKILL.md", "file"),                    # C2b
+    ("prompts/web_prompt.md", "file"),       # C2b
 ]
 
 # English-prose detector: any run of >=2 latin letters left after stripping.

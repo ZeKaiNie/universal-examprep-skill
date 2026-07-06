@@ -113,10 +113,10 @@ For any item with `requires_assets=true` or `maybe_requires_assets=true`:
 
 1. **Before asking, explaining, hinting, or solving**, display every question-side asset first.
 2. Use only question-side assets at first (`question_context` / `figure` / `diagram` / `table`).
-3. Label each displayed prompt image as `题面图 / question-side asset` and include its role/caption when available.
+3. Label each displayed prompt image PER THE REPLY-LANGUAGE MODE, and include its role/caption when available: `中文`/`双语` sessions use `题面图` for both the image ALT text and the visible label; `English` sessions use `Question-side asset` for both. Behavior probes accept the zh form as well as the legacy bilingual composite `题面图 / question-side asset` (probes only run on zh-mode transcripts). See docs/language-policy.md.
 4. Do not show answer-side assets (`answer_context` / `worked_solution`) before all question-side assets have already been shown.
 5. If the asset file is missing/unreadable, the UI cannot render it, or the runtime can only print an unrenderable path, **skip the item or stop with a clear explanation**. Do not proceed as if the image was shown.
-6. Show answer-side assets only during solution/review, after the question-side asset display has happened, and label them `答案图 / answer-side asset`.
+6. Show answer-side assets only during solution/review, after the question-side asset display has happened, and label them per the reply-language mode: `中文`/`双语` → `答案图`, `English` → `Answer-side asset` (probes also accept the legacy `答案图 / answer-side asset` composite).
 
 `stub` / `page_reference` items follow the same principle: the visible prompt context must appear before teaching, quizzing, hinting, or solving. If the original page/resource is not renderable in the current UI, the item is not safe to ask or explain as a complete prompt.
 

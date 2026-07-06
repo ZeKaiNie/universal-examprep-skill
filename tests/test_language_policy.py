@@ -22,8 +22,6 @@ CANON_GREEN = "来自资料"
 CANONICAL_FILES = [
     ("docs", "language-policy.md"),
     ("SKILL.md",),
-    ("SKILL.en.md",),
-    ("prompts", "web_prompt.en.md"),
     ("AGENTS.md",),
     ("prompts", "web_prompt.md"),
     ("skills", "exam-help", "SKILL.md"),
@@ -188,31 +186,15 @@ class A8bLanguageDispatch(unittest.TestCase):
         self.assertIn("EN CANONICAL VOCABULARY", p, "缺 EN canonical 词表")
         self.assertNotIn("### ANCHOR-INVARIANCE PRINCIPLE", p, "旧锚点不变性小节不应复活")
 class A8cEnEntrypoints(unittest.TestCase):
-    """A8c：英文发布形态的两个派生入口（SKILL.en.md / prompts/web_prompt.en.md）。
-    zh 为行为事实源，en 为派生渲染；十类锚点逐字节中文 + gloss；en 面须真英文（另有纯度测试）。"""
+    """A8c/C2b：两个派生英文入口（SKILL.en.md / prompts/web_prompt.en.md）。
+    阶段 6 反转：en 面**零 CJK**（钉在 tests/test_language_purity.py T1），本类钉
+    EN canonical 词表在场 + 结构契约；zh 为行为事实源。"""
 
     EN_FILES = (("SKILL.en.md",), ("prompts", "web_prompt.en.md"))
 
-    # en 面纯度测试的转义（**独立于** test_control_plane_language.ALLOWED_TOKENS——那边的
-    # 死 token 卫生只扫 skills/*+AGENTS+argparse，这里的 token 在那边会被误判为死）
-    EN_SURFACE_TOKENS = (
-        "🟢 来自资料", "🟡 AI补充，可能与你老师讲的不完全一致", "⚠️ AI生成答案，非老师/教材提供",
-        "来自资料", "AI补充，可能与你老师讲的不完全一致", "AI生成答案，非老师/教材提供",
-        "临时覆盖你的", "范围偏好",
-        "① 题面图", "② 这题在问什么", "③ 图里要读的量", "④ 核心公式",
-        "⑤ 逐步演算", "⑥ 答案自检", "⑦ 知识点溯源",
-        "题目来源", "答案来源", "来源未知", "来源页未知",
-        "易错点", "3分钟速记", "现在轮到你",
-        "错题本", "错题档案", "已记录到错题本", "已记录到疑难点", "概念疑难点记录",
-        "阶段", "还记得", "复述", "做题实测",
-        "题面图 / question-side asset", "答案图 / answer-side asset", "题面图", "答案图",
-        "资料里没有这道题的答案",
-        "零基础从头讲", "某章起步补弱", "查缺补漏", "≤1天", "1-3天", "3-7天", ">7天",
-        "在窗口", "窗口外", "已实测", "待复盘", "已订正", "已回顾", "已解决", "已复盘",
-        "备战计划", "实时进度", "进度打卡面板", "备考科目", "当前复习", "进度打卡",
-        "错题累积", "第 X/N 阶段已通关", "第 X 阶段",
-        "中文", "双语", "讲解模板", "混合题池", "语言",
-    )
+    EN_LABELS = ("🟢 From your materials",
+                 "🟡 AI-supplemented — may differ from what your teacher taught",
+                 "⚠️ AI-generated answer — not from your teacher or textbook")
 
     def _read(self, parts):
         with open(os.path.join(ROOT, *parts), encoding="utf-8") as f:
@@ -221,56 +203,45 @@ class A8cEnEntrypoints(unittest.TestCase):
     def test_files_exist_no_frontmatter(self):
         for parts in self.EN_FILES:
             t = self._read(parts)
-            self.assertFalse(t.startswith("---"), parts)          # 无 YAML 前言（不是可触发 skill 文件）
-            self.assertIn("source of truth", t, parts)            # 派生渲染声明（zh 为事实源）
+            self.assertFalse(t.startswith("---"), parts)          # 非可触发入口
+            self.assertIn("source of truth", t, parts)            # zh 为事实源声明
 
-    def test_ten_anchor_classes_present(self):
-        # 只要求 zh 源文件里确实存在的锚点（en 是派生渲染，不得要求 zh 没有的内容）
-        need = ("🟢 来自资料", "🟡 AI补充，可能与你老师讲的不完全一致", "⚠️ AI生成答案，非老师/教材提供",
-                "临时覆盖你的", "范围偏好", "① 题面图", "⑦ 知识点溯源", "题目来源", "答案来源",
-                "易错点", "阶段", "现在轮到你", "题面图 / question-side asset",
-                "答案图 / answer-side asset", "资料里没有这道题的答案")
+    def test_en_canonical_vocabulary_present(self):
+        need = self.EN_LABELS + (
+            "⚠️ Temporarily overriding your",
+            "scope preference",
+            "The materials do not contain an answer to this question.",
+            "Question-side asset", "Answer-side asset",
+            "① Question figure", "⑦ Source trace",
+            "Question source:", "Answer source:")
         for parts in self.EN_FILES:
             t = self._read(parts)
             for tok in need:
                 self.assertIn(tok, t, (parts, tok))
 
-    def test_en_surface_is_actually_english(self):
-        # 纯度：剥 「…」/反引号/EN_SURFACE_TOKENS 后零 CJK——旗舰英文形态不许烂成中英混杂
+    def test_label_lines_carry_en_canonical(self):
+        # 同行守卫（反转版）：🟢/🟡 作标签的行必须同行带完整 EN canonical 句；⚠️ 行须带
+        # AI-generated / Temporarily overriding / 视觉门禁等已知用途之一。集合引用先剥。
         import re as _re
-        cjk = _re.compile(u"[㐀-䶿一-鿿]")
-        for parts in self.EN_FILES:
-            t = self._read(parts)
-            t = _re.sub(u"「[^」]*」", "", t)
-            t = _re.sub(r"`[^`\n]*`", "", t)
-            for tok in sorted(self.EN_SURFACE_TOKENS, key=len, reverse=True):
-                t = t.replace(tok, "")
-            bad = [ln.strip()[:80] for ln in t.splitlines() if cjk.search(ln)]
-            self.assertFalse(bad, (parts, bad[:6]))
-
-    def test_label_lines_carry_chinese_canonical(self):
-        # 同行守卫：🟢/🟡 只作来源标注用、⚠️ 另用于范围覆盖——**任何**含它们的行必须同行带
-        # 对应中文 canonical（防英文竞争标注）。「🟢/🟡/⚠️」「🟢🟡」这类对标签集合的紧凑
-        # 引用先剥掉（是集合引用、不是标注本身）。mutation 验证：把任一标签行换成
-        # 「🟢 From the materials」必须失败。
-        import re as _re
-        setref = _re.compile(r"🟢[/／\s]*🟡[/／\s]*(?:⚠️)?")
-        req = (("🟢", ("来自资料",)), ("🟡", ("AI补充",)),
-               ("⚠️", ("AI生成答案", "临时覆盖你的")))
+        setref = _re.compile(r"🟢[/\s]*🟡[/\s]*(?:⚠️)?")
+        codespan = _re.compile(r"`[^`\n]*`")   # 代码 span 里提及的 zh canonical 形不算标签用法
+        req = (("🟢", ("From your materials",)),
+               ("🟡", ("AI-supplemented",)),
+               ("⚠️", ("AI-generated answer", "Temporarily overriding")))
         for parts in self.EN_FILES:
             for ln in self._read(parts).splitlines():
-                s = setref.sub("", ln)
-                for emoji, zhs in req:
+                s = setref.sub("", codespan.sub("", ln))
+                for emoji, needles in req:
                     if emoji in s:
-                        self.assertTrue(any(z in s for z in zhs), (parts, ln[:100]))
+                        self.assertTrue(any(x in s for x in needles), (parts, ln[:100]))
 
     def test_web_prompt_en_specific_pins(self):
         t = self._read(("prompts", "web_prompt.en.md"))
         self.assertIn("NEVER claim you have written or updated `study_state.json`", t)
-        self.assertIn("read-only fact source", t)                 # 粘贴 state = 只读恢复（对齐 zh 只读事实源）
-        self.assertIn('question_text_status="stub"', t)           # stub 门禁与 zh 同钉
+        self.assertIn("read-only fact source", t)
+        self.assertIn('question_text_status="stub"', t)
         self.assertIn('"page_reference"', t)
-        self.assertIn("3分钟速记", t)                              # zh web 专有锚（root 无此节）
+        self.assertIn("3-minute mnemonic", t)                     # 收尾块 EN 名（默认不输出规则随文）
         self.assertIn("default reply language", t.lower())        # web 无 state 的英文默认自声明
 
     def test_root_en_specific_pins(self):
@@ -280,14 +251,6 @@ class A8cEnEntrypoints(unittest.TestCase):
         self.assertIn("Before asking, explaining, hinting, or solving", t)
         self.assertIn("SKILL.md", t)                              # 指回 zh 事实源
 
-    def test_en_surfaces_are_discoverable(self):
-        # A8c-2：英文用户必须能从 README/兼容矩阵/portability/AGENTS 找到 en 入口面
-        readme = self._read(("README.md",))
-        self.assertIn("SKILL.en.md", readme)
-        self.assertIn("prompts/web_prompt.en.md", readme)
-        self.assertIn("web_prompt.en.md", self._read(("docs", "agent-portability.md")))
-        self.assertIn("web_prompt.en.md", self._read(("AGENTS.md",)))
-
     def test_machine_token_parity_with_zh_root(self):
         zh = self._read(("SKILL.md",))
         en = self._read(("SKILL.en.md",))
@@ -296,6 +259,15 @@ class A8cEnEntrypoints(unittest.TestCase):
                     "select_questions.py", "select_hard_questions.py"):
             self.assertIn(tok, zh, tok)
             self.assertIn(tok, en, tok)
+
+    def test_en_surfaces_are_discoverable(self):
+        # A8c-2：英文用户必须能从 README/兼容矩阵/portability/AGENTS 找到 en 入口面
+        #（C2b 保留此契约——文件名不变、发现路径不能丢）
+        readme = self._read(("README.md",))
+        self.assertIn("SKILL.en.md", readme)
+        self.assertIn("prompts/web_prompt.en.md", readme)
+        self.assertIn("web_prompt.en.md", self._read(("docs", "agent-portability.md")))
+        self.assertIn("web_prompt.en.md", self._read(("AGENTS.md",)))
 
 
 if __name__ == "__main__":

@@ -192,7 +192,7 @@ python scripts/validate_workspace.py path/to/workspace
   * 📄 `localization.md`：本地化边界——当前学生侧中文模板与控制逻辑同文件、暂不拆 `locales/`，及将来加第二语言时的拆分规则。
 * 📂 **`prompts/`**：存放提示词。
   * 📄 `web_prompt.md`：**【网页端一键平替提示词】** —— 专为不支持本地写盘的网页版 AI（ChatGPT / DeepSeek 网页端 / 豆包）准备，复制直接用。
-  * 📄 `web_prompt.en.md`：**【英文版网页提示词（派生渲染）】** —— 上者的英文版，默认英文回复（可说「中文」/「双语」切换），锚点与防编题规则同款。
+  * 📄 `web_prompt.en.md`：**【英文版网页提示词（派生渲染）】** —— 上者的英文版，默认英文回复（可说「中文」/「双语」切换），防编题规则同款、输出为纯英文（零中文字符）。
 * 📂 **`templates/`**：备考基准模板文件。
   * 📄 `study_plan_template.md`：复习计划表模板。
   * 📄 `study_progress_template.md`：进度追踪与错题打卡表模板。

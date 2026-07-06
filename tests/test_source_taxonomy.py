@@ -320,8 +320,12 @@ class ScopeContract(unittest.TestCase):
     def test_all_entry_points_carry_override_marker(self):
         for p in self.ENTRY_POINTS:
             txt = open(os.path.join(ROOT, p), encoding="utf-8").read()
-            self.assertIn("临时覆盖", txt, p)
-            self.assertIn("范围偏好", txt, p)
+            if p.endswith(".en.md"):
+                self.assertIn("Temporarily overriding", txt, p)   # C2b：en 面英文声明
+                self.assertIn("scope preference", txt, p)
+            else:
+                self.assertIn("临时覆盖", txt, p)
+                self.assertIn("范围偏好", txt, p)
 
     def test_smoke_detector_positive_negative(self):
         sys.path.insert(0, os.path.join(ROOT, "benchmark", "behavior_smoke"))

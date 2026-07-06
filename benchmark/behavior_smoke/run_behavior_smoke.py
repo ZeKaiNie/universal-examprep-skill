@@ -610,10 +610,11 @@ def visual_first_asset_display_ok(text, fixture_path=FIXTURE):
     answer_side_label = "\u7b54\u6848\u56fe / answer-side asset"
 
     def prompt_alt_ok(alt):
+        # C2b：zh 纯形「题面图」与旧双语复合形都算合格题面侧 ALT（单语言纯净后 zh 输出用纯形）
         alt = alt or ""
         lower_alt = alt.lower()
         return (
-            question_side_label in alt
+            ("题面图" in alt or "question-side asset" in lower_alt)
             and answer_side_label not in alt
             and "answer-side asset" not in lower_alt
             and "worked solution" not in lower_alt
@@ -624,9 +625,10 @@ def visual_first_asset_display_ok(text, fixture_path=FIXTURE):
         alt = alt or ""
         lower_alt = alt.lower()
         return (
-            question_side_label not in alt
+            "题面图" not in alt
+            and "question-side asset" not in lower_alt
             and (
-                answer_side_label in alt
+                "答案图" in alt
                 or "answer-side asset" in lower_alt
                 or "worked solution" in lower_alt
             )

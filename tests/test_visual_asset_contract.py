@@ -48,8 +48,12 @@ class VisualAssetContractTest(unittest.TestCase):
             txt = read(rel)
             self.assertIn("requires_assets=true", txt, rel)
             self.assertIn("maybe_requires_assets=true", txt, rel)
-            self.assertIn("题面图 / question-side asset", txt, rel)
-            self.assertIn("answer-side", txt, rel)
+            if rel.endswith(".en.md"):
+                self.assertIn("Question-side asset", txt, rel)    # C2b：en 面英文标签
+                self.assertIn("Answer-side asset", txt, rel)
+            else:
+                self.assertIn("题面图", txt, rel)                  # zh 面中文标签（子技能双语形含之）
+                self.assertTrue(("answer-side" in txt) or ("答案图" in txt), rel)
             self.assertTrue(
                 ("fail-closed" in txt) or ("跳过" in txt) or ("skip" in txt) or ("绝不出" in txt),
                 rel,
