@@ -16,6 +16,7 @@ behavior_smoke/results/
 
 # 个人配置
 config.json
+config_*.json
 
 # 真实金标集：放行「仅题面」题集(_q)做公开可见的测试集；含答案 key 的完整金标本地保留（可能逐字引用讲义）
 items/items.jsonl
