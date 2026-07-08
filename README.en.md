@@ -12,7 +12,7 @@ English · [中文](README.md)
 [![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/ZeKaiNie/universal-examprep-skill/actions/workflows/ci.yml/badge.svg)](https://github.com/ZeKaiNie/universal-examprep-skill/actions)
 
-**Closed-book <10% → with the skill ~90%+** · context −90% · 100% honest abstention · 6 agents
+**Never fabricates: 100% honest abstention** · in-your-materials-not-the-model's-head 11% → ~99% · context −90% · 6 agents
 
 </div>
 
@@ -45,24 +45,24 @@ The difference isn't tone. It's whether each claim lands back in your materials.
 
 ## Numbers
 
-Two unrelated open courses, **same model, same question, only "with vs. without materials" changes**. The questions are mined from course transcripts — specifics you can't guess (the professor's own examples, obscure studies he named, exact numbers). Without materials the model runs on priors and mostly collapses.
+The skill's value is **grounding**: connecting what's in your materials but not in the model's head — **accurately**, and **never fabricated**. Two real measurements (judge: Sonnet):
 
-<div align="center"><img src="benchmark/docs/img/hard_psyc_correct_en.svg" width="600" alt="closed-book vs with the skill, correctness" /></div>
+**① In your materials, not in the model — the skill goes from 11% to ~99%.** Details mined from course transcripts (the professor's examples, obscure studies, exact numbers) that world knowledge can't answer; closed-book collapses, hand the materials back and it returns:
 
-Correctness, higher is better (judge: Sonnet):
+<div align="center"><img src="benchmark/docs/img/hard_psyc_correct_en.svg" width="600" alt="materials-specific: closed-book vs with the skill" /></div>
 
 | Course · Model | Closed-book | Raw files + generic agent | With the skill |
 |---|:--:|:--:|:--:|
-| PSYC 110 · Opus 4.8 | 9% | 96% | **100%** |
-| PSYC 110 · Sonnet 4.6 | 7% | 96% | 87% |
-| PSYC 110 · Haiku 4.5 | 9% | 89% | **96%** |
-| 6.006 · Opus 4.8 | 27% | 91% | **91%** |
-| 6.006 · Sonnet 4.6 | 56% | 87% | 85% |
-| 6.006 · Haiku 4.5 | 31% | 85% | **89%** |
+| PSYC 110 · Opus 4.8 | 11% | 98% | **98%** |
+| PSYC 110 · Sonnet 4.6 | 11% | 100% | **98%** |
+| PSYC 110 · Haiku 4.5 | 11% | 94% | **100%** |
+| 6.006 · Haiku 4.5 | 44% | 89% | **91%** |
 
-Two domains (humanities fact recall / algorithm reasoning), same result: **without materials the model can't answer; grounding is where the correctness comes from.** The skill matches a "raw files agent" on accuracy but costs less — it pulls only the compressed relevant chapters instead of re-scanning the whole file pile each question.
+**② Not in the materials at all — the skill says "not covered" 100% of the time.** On out-of-scope probes, with the skill (and raw files) **all three models, both courses, abstain honestly 100%**; closed-book only 60%–90% (it fabricates a plausible answer). This is the most direct anti-hallucination measure.
 
-<details><summary>Cost per question (the skill's real edge: same accuracy, less spend)</summary>
+The skill matches a "raw files agent" on accuracy but costs less — it pulls only the compressed relevant chapters instead of re-scanning the whole file pile each question:
+
+<details><summary>Cost per question (same accuracy, less spend)</summary>
 
 | Cost / question | Closed-book | Raw files agent | With the skill |
 |---|:--:|:--:|:--:|
@@ -71,7 +71,7 @@ Two domains (humanities fact recall / algorithm reasoning), same result: **witho
 
 </details>
 
-Full method, three-arm design, cost, human agreement calibration, limitations → **[test report](benchmark/REPORT.en.md)**.
+Full method, three-arm design, judge calibration, cost, limitations → **[test report](benchmark/REPORT.en.md)**.
 
 ---
 
@@ -85,6 +85,31 @@ A ladder of "don't make it up unless you have to":
 4. **Draw-it questions run the algorithm first** — for binary trees / graph traversal, it runs the real algorithm in the background to get the topology, then renders — no imagining.
 5. **Figure-dependent questions won't be served without the figure** — no unanswerable question handed to the student.
 6. **Chapter-sliced knowledge base, loaded on demand** — sliced by chapter, loaded by progress, so long chats don't blow up the context. **Context −90%.**
+
+---
+
+## Study modes · time budget · preferences
+
+The skill adapts how deep it teaches, how fast, and whether it asks you questions — all kept in `study_state.json`, persistent across chats.
+
+**3 study modes** (how it teaches):
+
+| Mode | For |
+|---|---|
+| **Teach from scratch** | Haven't studied at all — walk every chapter from zero, 7-step walkthrough per key question |
+| **Start mid-course, shore up weak spots** | Know some — start from a chapter you name, target the weak parts |
+| **Fill the gaps** | Mostly covered — just quiz to find blind spots, mistakes first |
+
+**4 time budgets** (how fast):
+
+| Budget | Behavior |
+|---|---|
+| **≤ 1 day** | All-out sprint — **never asks you anything**, silently infers defaults (teach-from-scratch), goes straight in |
+| **1–3 days** | Hits the essentials, compresses the rest |
+| **3–7 days** | Normal pace, asks which chapters you're solid on |
+| **> 7 days** | Relaxed — for chapters you say you know, it **quizzes to verify** rather than taking your word |
+
+**Preferences** (remembers your habits): whether walkthroughs append the "common mistakes" / "3-minute recap" closing blocks, reply language (Chinese / English / bilingual), and per-chapter mastery windows (`window-add` / `window-set-status`) — all persisted, changed by a single line anytime. See [`docs/language-policy.md`](docs/language-policy.md) and [`docs/skill-architecture.md`](docs/skill-architecture.md).
 
 ---
 

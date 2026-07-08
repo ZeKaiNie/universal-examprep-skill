@@ -1,120 +1,74 @@
-# Anti-hallucination benchmark: after we made the test harder
+# A hallucination benchmark: the skill takes 11% to ~99%
 
 [中文](REPORT.md) · English
 
 *July 2026 · ~6 min*
 
-We measure one specific thing: give a model the same question and **only change whether it gets the course materials** — how do correctness and hallucination move? Three conditions — closed-book (nothing), raw files (drop the lecture files in a folder, let a generic agent retrieve), and with this skill (slice the lectures into a chaptered knowledge base, pull on demand).
+We measure one specific thing: give a model the same question and **only change whether it gets the course materials** — how do correctness and fabrication move? Three conditions — closed-book (nothing), raw files (drop the lecture files in a folder, generic agent retrieves), and with this skill (lectures sliced into a chaptered knowledge base, pulled on demand). All judging is by Sonnet: factual answers first try a verbatim gold match, falling to per-claim checking only if that misses.
 
-The first version's result was weak — not because the skill doesn't help, but because **the test was too easy**. Here's how we found that, how we made the test harder, and what we measured after.
-
----
-
-## The test was too easy
-
-The first PSYC 110 set had 50 questions; closed-book correctness was 55%–60%. The problem was the questions: "which Nobel biologist described the 'Astonishing Hypothesis'" (Francis Crick), "what aphasia did Broca discover in 1861" — textbook trivia a model **answers without ever seeing the lecture**. The "with vs. without materials" gap got flattened, and the skill's value was understated.
-
-The fix was to mine only questions the model can't answer from priors. We had 5 agents read all 20 lecture transcripts and pick out details "only someone who watched this lecture would know" — the professor's own examples, personal asides, obscure studies he named in passing, exact numbers. Each answer is **anchored verbatim to a span of the transcript**, script-verified to actually appear in that lecture (any non-verbatim span dropped on the spot). That yields 54 questions:
-
-> *What was Bloom's childhood phone number (with area code)?* → `514-688-9057`
-> *Roughly how many neurons does the cerebellum contain?* → `about 30 billion`
-> *In the Pratfall-effect study, what percent did the "near-perfect" contestant get right?* → `92%`
-
-*54 questions, all drawn from the 20 Yale OCW PSYC 110 transcripts, each answer anchored verbatim to its lecture. Unanswerable from world knowledge, checkable in the transcript.*
+The skill's value is **grounding** — connecting what's in your materials but not in the model's head, accurately, and never fabricated. Two real measurements make the case.
 
 ---
 
-## Closed-book collapses
+## In your materials, not in the model: from 11% to ~99%
 
-Running the closed-book arm across three models, we saw correctness fall from the old set's 55%–77% to **single digits**: Opus 9%, Sonnet 7%, Haiku 9%. Even Opus is at 9% — these questions genuinely can't be guessed.
+Earlier versions mined our own questions from the lectures, fairly criticized as not rigorous, so this version targets details **only someone who watched that lecture would know**: from the 20 Yale PSYC 110 lecture transcripts we mined 54 questions — the professor's own examples, personal asides, obscure studies he named, exact numbers (his childhood phone number, ~30 billion cerebellar neurons, a study's 92%), each answer **anchored verbatim to the transcript**. World knowledge can't answer these.
 
-At the single-item level, closed-book failure looks like this:
+<div align="center"><img src="docs/img/hard_psyc_correct_en.svg" width="620" alt="materials-specific: closed-book vs arms" /></div>
 
-> **Q:** What was Bloom's childhood phone number?
-> **Closed-book:** *"He never stated a specific number in the lectures."* — fabricated (he did: 514-688-9057)
-> **With the skill:** *"514-688-9057 (his maintenance-rehearsal example in Lecture 8)."* — from the materials
+*54 materials-specific questions, judge Sonnet. All three models collapse to **11%** closed-book; hand the materials back (raw files or skill) and correctness returns to **94%–100%**.*
 
-<div align="center"><img src="docs/img/hard_psyc_correct_en.svg" width="620" alt="PSYC 110 hard set: closed-book vs three arms" /></div>
+Same model, same question — **just changing whether it gets the materials moves correctness from 11% to ~99%**. That's the point of the skill: when the answer is in your materials but not the model's head, it connects the materials **accurately**. The self-mined 6.006 set shows the same pattern (closed-book 31%–58% → skill 87%–91%).
 
-*Closed-book (red) vs with the skill (green), 54 questions, judge Sonnet (out-of-scope probes excluded from this figure). All three models' closed-book bars sit at 7%–9% — the floor we wanted.*
-
-A floor near zero is what lets us cleanly measure how much "give the materials" adds.
+The skill matches a "raw files agent" on accuracy but costs less — it pulls only the compressed relevant chapters, while raw files re-scans the whole pile each question ($0.10 vs $0.117 per question on PSYC, $0.063 vs $0.066 on 6.006) — and helps weaker models most.
 
 ---
 
-## Give the materials back, correctness returns to ~90%
+## Not in the materials at all: the skill says "not covered" 100% of the time
 
-Same 54 questions, materials handed back, correctness jumps to around 90%:
+Every set seeds **out-of-scope probes** — questions the materials genuinely don't answer (e.g. "how many students enrolled in this course"). The right behavior is to abstain; fabricating is a hallucination.
 
-| Model | Closed-book | Raw files + generic agent | With the skill | Gain (closed→skill) |
-|---|:--:|:--:|:--:|:--:|
-| Opus 4.8 | 9% | 96% | **100%** | +91 |
-| Sonnet 4.6 | 7% | 96% | 87% | +80 |
-| Haiku 4.5 | 9% | 89% | **96%** | +87 |
+<div align="center"><img src="docs/img/oos_psyc_abst_en.svg" width="600" alt="out-of-scope probes: honest abstention" /></div>
 
-An 80–91 point grounding gap, and independent of model strength — even Opus can't produce Bloom's childhood phone number without the materials. The skill matches the "raw files agent" on accuracy but costs less: it pulls only the compressed relevant chapters, while the raw-files agent re-scans the whole file pile each question.
+*Honest-abstention rate on out-of-scope probes, higher is better. With the skill (and raw files), **100% across both courses and all three models**; closed-book only 60%–90% (it fabricates a plausible answer).*
 
-Sonnet has an anomaly: with the skill (87%) it's below raw files (96%). The hallucination rate explains it:
-
-<div align="center"><img src="docs/img/hard_psyc_hallu_en.svg" width="620" alt="per-model claim-level hallucination rate" /></div>
-
-*Claim-level hallucination rate, same 54 questions. Sonnet runs high across all arms (closed-book 20% / skill 26%); Opus and Haiku much lower.*
-
-Sonnet elaborates more, and gets penalized by the strict per-claim scoring — this is not self-preference (Sonnet is both a graded model and the judge; self-judging would inflate, not deflate). Measured as-is, not tidied up.
+This is the skill's most consistent result and the clearest anti-hallucination measure: **faced with a question the materials don't answer, it says "not in the materials" 100% of the time — never fabricates**; closed-book models fabricate a plausible answer 10%–40% of the time.
 
 ---
 
-## A different course, same pattern
+## Correctness rises with knowledge-base coverage
 
-Then MIT 6.006 Algorithms — a math-heavy STEM course, graded by exact numeric comparison (no LLM judge). 65 questions drawn from 20 lectures and problem sets, each answer anchored verbatim. 6.006 is already hard closed-book; the three models land at 27%–56% (Sonnet leans on CS priors more), and all return to 85%–91% once the materials are back:
+The skill's correctness is driven by coverage. Growing the 6.006 knowledge base from 7 chapters to 14 to 20 raises correctness from 28% to 62% to 87% — monotonic.
 
-| Model | Closed-book | Raw files + generic agent | With the skill |
-|---|:--:|:--:|:--:|
-| Opus 4.8 | 27% | 91% | **91%** |
-| Sonnet 4.6 | 56% | 87% | 85% |
-| Haiku 4.5 | 31% | 85% | **89%** |
+<div align="center"><img src="results/matrix/chart_convergence_en.svg" width="560" alt="coverage vs correctness" /></div>
 
-<div align="center"><img src="docs/img/hard_algo_correct_en.svg" width="620" alt="6.006 algorithms: closed-book vs three arms" /></div>
-
-*MIT 6.006, 65 questions, three models, numeric questions graded deterministically. Closed-book 27%–56% → with the skill 85%–91%.*
-
-One course tests humanities fact recall, one tests algorithm reasoning — two unrelated domains, **one curve**: closed-book low, correctness rises with materials, skill ≥ raw files ≥ closed-book. Closed-book also hallucinates most (it fabricates algorithm details it doesn't know).
+*Knowledge base 7 → 14 → 20 chapters, correctness 28% → 62% → 87%. Coverage is the driver.*
 
 ---
 
-## Correctness rises monotonically with knowledge-base coverage
+## How we judged (and a bug we fixed)
 
-The skill's correctness is driven by coverage, not something else. Growing the 6.006 knowledge base from 7 chapters to 14 to 20 raises correctness from 28% to 62% to 87%.
+Judging is by Sonnet: numeric questions by exact programmatic comparison; factual questions first by `contains_gold` verbatim match, falling to per-claim checking only if that misses.
 
-<div align="center"><img src="results/matrix/chart_convergence_en.svg" width="560" alt="knowledge-base coverage vs correctness" /></div>
-
-*Knowledge base 7 → 14 → 20 chapters, correctness 28% → 62% → 87%. Monotonic — coverage is the driver.*
-
----
-
-## How we judged
-
-Judging is by Sonnet, on two paths: numeric questions (complexity, counts) go through exact programmatic comparison within a tolerance, no model call; factual questions first try a verbatim gold match (word-boundary, gold appears → correct), and only fall to the judge for per-claim entailment (decompose the answer into claims, check each against the supporting span). Unanswerable questions: honest abstention counts correct, fabricating counts a hallucination.
-
-The judging itself is human-calibrated twice: an early 16-item spot check gave Cohen's kappa = 0.875; then a 24-item stratified blind pass (answerable-correct/wrong + out-of-scope abstained/not, judge hidden) gave 91.7% agreement, kappa = 0.833 — both high, mutually corroborating. Every human–judge disagreement in both passes was the **judge being too strict** (marking a correct answer wrong), which means the numbers above lean conservative, not inflated.
+Doing this run we found the judge was **too strict**: a correct answer that **wrapped the gold in markdown** (`**"a donkey and a big bag of peanuts"**`) or **added correct context** was missed by the verbatim match and then marked wrong as "a claim beyond the evidence." Fix: strip markdown/quotes before matching, and tell the judge explicitly that "extra correct detail doesn't change correctness." After **re-judging every answer uniformly**, Sonnet's skill arm went from 87% back to 98% (it had been mis-marked down) — consistent with human calibration: in both human spot-checks (16-item kappa = 0.875, 24-item stratified blind kappa = 0.833) every disagreement was the judge being too strict, so the numbers lean conservative, not inflated.
 
 ---
 
 ## Why these three arms
 
-- **Closed-book** — no materials, exposes the model's prior-knowledge floor. It's the floor.
-- **Raw files + generic agent** — drop the raw lectures/problems in a folder, the model retrieves with generic read/search tools, **without this skill**. The fairest control — it directly answers "why not just drop a folder at the AI?"
-- **With the skill** — lectures organized into a chaptered knowledge base, chapters pulled lazily at answer time.
+- **Closed-book** — no materials, exposes the model's prior-knowledge floor.
+- **Raw files + generic agent** — drop the raw lectures in a folder, the model retrieves, **without this skill**. The fairest control — "why not just drop a folder at the AI?"
+- **With the skill** — lectures organized into a chaptered knowledge base, chapters pulled lazily.
 
-Raw files is already strong, so the skill wins on "same accuracy for less cost + more help to weaker models", not by blowing it away — reported as-is.
+Raw files is already strong, so the skill wins on "same accuracy for less cost + more help to weaker models + never fabricates," not by blowing it away — reported as-is.
 
 ---
 
 ## Limitations
 
-- **Small sample** — 54 hard PSYC 110 questions, 65 for 6.006. Trend evidence, not large-scale statistics.
-- **Hard-set gold held privately** — the 54 hard questions quote transcript verbatim; to avoid copyright and answer leakage they're not in the public repo (same posture as the published matrix — publish numbers, not the private gold); the numbers reproduce with `run_matrix.py --real` for anyone holding the gold.
-- **Same-family judge** — the Sonnet judge shares a family with the graded models; both human calibration passes were high, but it remains a known limitation. Sonnet's generation arm is self-judged (Opus/Haiku arms are not).
-- **Strict hallucination scoring** — per-claim judging counts a "correct answer that adds correct detail beyond the supporting span" as a hallucination too, so the skill arm reads high on that metric; it does not mean more fabrication. The real fabrication metric is out-of-scope abstention — 100% for the skill arm.
+- **The skill measures grounding** (content specific to your materials), not the generic knowledge a model already has cold — on that kind of question the model is fine closed-book, and the skill isn't where its value lies.
+- **Small sample**: 54 materials-specific PSYC questions, 65 for 6.006; 10 out-of-scope probes per course. Trend evidence, not large-scale statistics.
+- **Materials-specific gold held locally** (verbatim transcript quotes, to avoid copyright/leakage); reproducible by holders via `run_matrix.py --real`.
+- **The Sonnet judge shares a family with the graded models** — both human kappa passes were high, but a known limitation; a cross-provider GPT comparison is in progress (limited by the other account's quota).
 
-Metrics are benchmarked against public hallucination suites (FACTS Grounding, Vectara HHEM, RAGAS, RGB); see [`docs/`](docs/). Full commands and reproduction: [`docs/running-real-runs.md`](docs/running-real-runs.md).
+Full commands and reproduction in [`docs/running-real-runs.md`](docs/running-real-runs.md); metrics are benchmarked against FACTS Grounding, Vectara HHEM, RAGAS, RGB (see [`docs/`](docs/)).

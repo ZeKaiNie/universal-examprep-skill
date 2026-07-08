@@ -9,26 +9,26 @@
 <text x="42" y="92" font-size="11" fill="#888" text-anchor="end">75%</text>
 <line x1="48" y1="30" x2="666" y2="30" stroke="#eee"/>
 <text x="42" y="34" font-size="11" fill="#888" text-anchor="end">100%</text>
-<rect x="89" y="192" width="41" height="72" fill="#d93025" rx="2"/>
-<text x="110" y="188" font-size="10" fill="#444" text-anchor="middle">31</text>
-<rect x="141" y="51" width="41" height="213" fill="#f9ab00" rx="2"/>
-<text x="161" y="47" font-size="10" fill="#444" text-anchor="middle">91</text>
-<rect x="192" y="51" width="41" height="213" fill="#1a7f64" rx="2"/>
-<text x="213" y="47" font-size="10" fill="#444" text-anchor="middle">91</text>
+<rect x="89" y="44" width="41" height="220" fill="#d93025" rx="2"/>
+<text x="110" y="40" font-size="10" fill="#444" text-anchor="middle">94</text>
+<rect x="141" y="108" width="41" height="156" fill="#f9ab00" rx="2"/>
+<text x="161" y="104" font-size="10" fill="#444" text-anchor="middle">67</text>
+<rect x="192" y="99" width="41" height="165" fill="#1a7f64" rx="2"/>
+<text x="213" y="95" font-size="10" fill="#444" text-anchor="middle">71</text>
 <text x="151" y="282" font-size="12" fill="#333" text-anchor="middle">Opus 4.8</text>
-<rect x="295" y="128" width="41" height="136" fill="#d93025" rx="2"/>
-<text x="316" y="124" font-size="10" fill="#444" text-anchor="middle">58</text>
-<rect x="347" y="51" width="41" height="213" fill="#f9ab00" rx="2"/>
-<text x="367" y="47" font-size="10" fill="#444" text-anchor="middle">91</text>
-<rect x="398" y="60" width="41" height="204" fill="#1a7f64" rx="2"/>
-<text x="419" y="56" font-size="10" fill="#444" text-anchor="middle">87</text>
+<rect x="295" y="62" width="41" height="202" fill="#d93025" rx="2"/>
+<text x="316" y="58" font-size="10" fill="#444" text-anchor="middle">86</text>
+<rect x="347" y="113" width="41" height="151" fill="#f9ab00" rx="2"/>
+<text x="367" y="109" font-size="10" fill="#444" text-anchor="middle">65</text>
+<rect x="398" y="108" width="41" height="156" fill="#1a7f64" rx="2"/>
+<text x="419" y="104" font-size="10" fill="#444" text-anchor="middle">67</text>
 <text x="357" y="282" font-size="12" fill="#333" text-anchor="middle">Sonnet 4.6</text>
-<rect x="501" y="162" width="41" height="102" fill="#d93025" rx="2"/>
-<text x="522" y="158" font-size="10" fill="#444" text-anchor="middle">44</text>
-<rect x="553" y="56" width="41" height="208" fill="#f9ab00" rx="2"/>
-<text x="573" y="52" font-size="10" fill="#444" text-anchor="middle">89</text>
-<rect x="604" y="51" width="41" height="213" fill="#1a7f64" rx="2"/>
-<text x="625" y="47" font-size="10" fill="#444" text-anchor="middle">91</text>
+<rect x="501" y="48" width="41" height="216" fill="#d93025" rx="2"/>
+<text x="522" y="44" font-size="10" fill="#444" text-anchor="middle">92</text>
+<rect x="553" y="108" width="41" height="156" fill="#f9ab00" rx="2"/>
+<text x="573" y="104" font-size="10" fill="#444" text-anchor="middle">67</text>
+<rect x="604" y="117" width="41" height="147" fill="#1a7f64" rx="2"/>
+<text x="625" y="113" font-size="10" fill="#444" text-anchor="middle">63</text>
 <text x="563" y="282" font-size="12" fill="#333" text-anchor="middle">Haiku 4.5</text>
 <rect x="48" y="302" width="11" height="11" fill="#d93025"/>
 <text x="63" y="312" font-size="11" fill="#444">Closed-book</text>
