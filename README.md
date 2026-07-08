@@ -47,16 +47,16 @@ The difference isn't tone. It's whether each claim lands back in your materials.
 
 The skill's value is **grounding**: connecting what's in your materials but not in the model's head — **accurately**, and **never fabricated**. Two real measurements (judge: Sonnet):
 
-**① In your materials, not in the model — the skill goes from 11% to ~99%.** Details mined from course transcripts (the professor's examples, obscure studies, exact numbers) that world knowledge can't answer; closed-book collapses, hand the materials back and it returns:
+**① In your materials, not in the model — the skill goes from 11% up to 100%.** Details mined from course transcripts (the professor's examples, obscure studies, exact numbers) that world knowledge can't answer; closed-book collapses, hand the materials back and it returns:
 
 <div align="center"><img src="benchmark/docs/img/hard_psyc_correct_en.svg" width="600" alt="materials-specific: closed-book vs with the skill" /></div>
 
 | Course · Model | Closed-book | Raw files + generic agent | With the skill |
 |---|:--:|:--:|:--:|
-| PSYC 110 · Opus 4.8 | 11% | 98% | **98%** |
-| PSYC 110 · Sonnet 4.6 | 11% | 100% | **98%** |
-| PSYC 110 · Haiku 4.5 | 11% | 94% | **100%** |
-| 6.006 · Haiku 4.5 | 44% | 89% | **91%** |
+| PSYC 110 · Opus 4.8 | 11% | 98% | **100%** |
+| PSYC 110 · Sonnet 4.6 | 13% | 100% | **100%** |
+| PSYC 110 · Haiku 4.5 | 11% | 98% | **100%** |
+| 6.006 · Haiku 4.5 | 45% | 89% | **91%** |
 
 **② Not in the materials at all — the skill says "not covered" 100% of the time.** On out-of-scope probes, with the skill (and raw files) **all three models, both courses, abstain honestly 100%**; closed-book only 60%–90% (it fabricates a plausible answer). This is the most direct anti-hallucination measure.
 

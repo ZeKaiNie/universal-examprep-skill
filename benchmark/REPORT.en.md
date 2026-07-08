@@ -16,13 +16,13 @@ Earlier versions mined our own questions from the lectures, fairly criticized as
 
 <div align="center"><img src="docs/img/hard_psyc_correct_en.svg" width="620" alt="materials-specific: closed-book vs arms" /></div>
 
-*54 materials-specific questions, judge Sonnet. All three models collapse to **11%** closed-book; hand the materials back (raw files or skill) and correctness returns to **94%–100%**.*
+*54 materials-specific questions, judge Sonnet. All three models collapse to **11%–13%** closed-book; hand the materials back (raw files or skill) and correctness returns to **98%–100%** — every model reaches **100% with the skill**.*
 
 Same model, same question — **just changing whether it gets the materials moves correctness from 11% to ~99%**. That's the point of the skill: when the answer is in your materials but not the model's head, it connects the materials **accurately**. A STEM course (6.006 Algorithms, 65 questions) shows the same pattern:
 
 <div align="center"><img src="docs/img/hard_algo_correct_en.svg" width="620" alt="6.006 materials-specific: closed-book vs arms" /></div>
 
-*6.006, 65 questions. Closed-book 31%–58% → with the skill 87%–91%. One humanities-recall course, one algorithm-reasoning course, one curve.*
+*6.006, 65 questions. Closed-book 31%–58% → with the skill 91% (all three models). One humanities-recall course, one algorithm-reasoning course, one curve.*
 
 The skill matches a "raw files agent" on accuracy but costs less — it pulls only the compressed relevant chapters, while raw files re-scans the whole pile each question ($0.10 vs $0.117 per question on PSYC, $0.063 vs $0.066 on 6.006) — and helps weaker models most.
 
@@ -57,7 +57,11 @@ The skill's correctness is driven by coverage. Growing the 6.006 knowledge base 
 
 Judging is by Sonnet: numeric questions by exact programmatic comparison; factual questions first by `contains_gold` verbatim match, falling to per-claim checking only if that misses.
 
-Doing this run we found the judge was **too strict**: a correct answer that **wrapped the gold in markdown** (`**"a donkey and a big bag of peanuts"**`) or **added correct context** was missed by the verbatim match and then marked wrong as "a claim beyond the evidence." Fix: strip markdown/quotes before matching, and tell the judge explicitly that "extra correct detail doesn't change correctness." After **re-judging every answer uniformly**, Sonnet's skill arm went from 87% back to 98% (it had been mis-marked down) — consistent with human calibration: in both human spot-checks (16-item kappa = 0.875, 24-item stratified blind kappa = 0.833) every disagreement was the judge being too strict, so the numbers lean conservative, not inflated.
+Doing this run we found the judge was **too strict** in two ways. **First**, a correct answer that **wrapped the gold in markdown** (`**"a donkey and a big bag of peanuts"**`) or **added correct context** was missed by the verbatim match and then marked wrong as "a claim beyond the evidence." Fix: strip markdown/quotes before matching, and tell the judge explicitly that "extra correct detail doesn't change correctness."
+
+**Second**, on 14 items the judge call itself **crashed and returned no verdict** — which the aggregator counts as wrong by default, penalizing whichever arm they happened to land in. We re-adjudicated all 14 with **three independent judges each, majority vote** (containment / abstention-skeptic / domain-fact lenses; every verdict was unanimous). Eight were genuinely correct answers the crash had hidden — e.g. an answer quoting *"they built my minivan"* against the gold *"they built his minivan,"* or one quoting the LIS subproblem verbatim; the other six were genuine abstentions ("not sure") or wrong commitments ("12" against the gold "ten"), which stay not-correct. After both fixes, **all three models reach 100% with the skill on PSYC**.
+
+Both corrections point the same way as human calibration: in both human spot-checks (16-item kappa = 0.875, 24-item stratified blind kappa = 0.833) every human–judge disagreement was the judge being too strict, so the numbers lean conservative, not inflated.
 
 ---
 
