@@ -1,0 +1,20 @@
+{
+  "items_path": "fixtures/mini_items.jsonl",
+  "materials_text": "fixtures/mini_materials.txt",
+  "skill_workspace": "",
+  "results_dir": "results",
+  "generator_cmd": "",
+  "generator_model": "deepseek-chat",
+  "judge_cmd": "",
+  "judge_model": "",
+  "mock": true,
+  "backend": null,
+  "openai_api_key": "",
+  "openai_api_base": "https://api.deepseek.com/v1",
+  "top_k": 4,
+  "min_score": 0.25,
+  "chunk_size": 512,
+  "chunk_overlap": 64,
+  "context_window": 32768,
+  "embed_model": "BAAI/bge-small-en-v1.5"
+}
