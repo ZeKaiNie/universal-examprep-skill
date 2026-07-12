@@ -1,0 +1,7 @@
+学生：这是我的《数据结构》课件文件夹 D:\Downloads\ds_course，帮我建一个复习库。
+辅导：好的。建库前先确认工作区落点：建议把复习工作区建在 D:\Study\ds_final_prep（和课件分开、跨会话不丢）。就建在这里可以吗？还是你想换个位置？
+学生：可以，就建在 D:\Study\ds_final_prep。
+辅导：收到，目标路径已确认，现在注册并建库：
+`python scripts/update_progress.py --workspace D:\Study\ds_final_prep workspace-register --course 数据结构 --materials D:\Downloads\ds_course`
+`python scripts/ingest.py --input D:\Downloads\ds_course --output-dir D:\Study\ds_final_prep`
+工作区已建在 D:\Study\ds_final_prep（以后每次开场的进度面板都会带这行绝对路径，防迷路）。

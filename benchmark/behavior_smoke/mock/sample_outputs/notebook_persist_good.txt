@@ -1,0 +1,9 @@
+[#mc_q4] 顺序表与链表的随机访问——结论速览（完整七步精讲已先落盘，聊天里只留摘要）：
+- 顺序表随机访问 O(1)：地址 = 基地址 + i × 元素大小，一次乘加直接定位。
+- 链表随机访问 O(n)：找第 i 个结点要从头结点跳 i 次 next。
+- 记忆钩子：数组「跳格子」一步到位，链表「数格子」逐个数。
+
+落盘命令（幂等：同 --id 重讲会原位覆盖并刷新时间戳，目录 index.md 已确定性重建）：
+`python scripts/notebook.py --workspace . add-entry --chapter 2 --type walkthrough --id mc_q4 --title "顺序表与链表的随机访问"`（正文经 STDIN 写入）
+
+完整解答：notebook/ch02.md#mc_q4 ｜ 目录：notebook/index.md

@@ -1,0 +1,147 @@
+# -*- coding: utf-8 -*-
+"""v4-P5 — scripts/cheatsheet_render.py: md-subset rendering, print-CSS invariants
+(margin floor / columns / font), page-fit math monotonicity, PDF page-count parser,
+and the no-browser degradation contract. No real browser is launched in CI
+(EXAMPREP_NO_BROWSER=1)."""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPTS = os.path.join(ROOT, "scripts")
+sys.path.insert(0, SCRIPTS)
+import cheatsheet_render as cr  # noqa: E402
+
+PY = sys.executable
+
+MD = "\n".join([
+    "# 《数据结构》考前小抄",
+    "## 必背结论",
+    "- 链表访问 **O(n)**，顺序表随机访问 `O(1)`",
+    "- 归并排序稳定，*快排*不稳定",
+    "| 结构 | 查找 | 插入 |",
+    "|---|---|---|",
+    "| 链表 | O(n) | O(1) |",
+    "1. 第一步",
+    "2. 第二步",
+    "---",
+    "见 [ch02 笔记](notebook/ch02.md#q13)。",
+])
+
+
+class MdSubset(unittest.TestCase):
+    def test_blocks_render(self):
+        h = cr.md_to_html_body(MD)
+        for frag in ("<h1>", "<h2>", "<ul>", "<li>", "<strong>O(n)</strong>", "<em>快排</em>",
+                     "<code>O(1)</code>", "<table>", "<th>结构</th>", "<td>O(n)</td>",
+                     "<ol>", "<hr/>"):
+            self.assertIn(frag, h)
+
+    def test_links_flattened_for_print(self):
+        h = cr.md_to_html_body(MD)
+        self.assertNotIn("<a ", h, "打印面不留活链接")
+        self.assertIn('<span class="lnk">ch02 笔记</span>', h)
+
+    def test_html_escaped(self):
+        h = cr.md_to_html_body("危险 <script>alert(1)</script> 内容")
+        self.assertNotIn("<script>", h)
+
+
+class LayoutMath(unittest.TestCase):
+    def test_margin_floor_enforced(self):
+        html = cr.render_html(MD, 9.0, 2, margin_mm=5)
+        self.assertIn("margin: %dmm" % cr.MIN_MARGIN_MM, html,
+                      "低于 12mm 的边距必须被抬回下限（打印机吞边）")
+
+    def test_font_and_columns_in_css(self):
+        html = cr.render_html(MD, 7.0, 3)
+        self.assertIn("font: 7.0pt", html)
+        self.assertIn("column-count: 3", html)
+
+    def test_pick_font_monotonic(self):
+        f1, _ = cr.pick_font(3000, 2)
+        f2, _ = cr.pick_font(30000, 2)
+        self.assertGreaterEqual(f1, f2, "内容越多字号只能更小")
+        self.assertGreaterEqual(f1, cr.FONT_MIN)
+        self.assertLessEqual(f1, cr.FONT_MAX)
+
+    def test_pick_font_prefers_largest_fitting(self):
+        font, cols = cr.pick_font(100, 2)
+        self.assertEqual(font, cr.FONT_MAX, "内容极少时应取最大字号（可读优先）")
+        self.assertEqual(cols, 2)
+
+    def test_dense_content_switches_three_columns(self):
+        font, cols = cr.pick_font(10 ** 6, 1)
+        self.assertEqual(font, cr.FONT_MIN)
+        self.assertEqual(cols, 3)
+
+
+class PdfPageCount(unittest.TestCase):
+    def test_counts_page_objects_not_pages_node(self):
+        blob = (b"%PDF-1.7\n1 0 obj</Type /Pages /Kids [2 0 R 3 0 R]>\n"
+                b"2 0 obj</Type /Page /Parent 1 0 R>\n3 0 obj</Type /Page /Parent 1 0 R>\n")
+        p = tempfile.mktemp(suffix=".pdf")
+        with open(p, "wb") as f:
+            f.write(blob)
+        try:
+            self.assertEqual(cr.pdf_page_count(p), 2, "/Type /Pages 树节点不算页")
+        finally:
+            os.unlink(p)
+
+
+class CliContract(unittest.TestCase):
+    def _ws(self):
+        ws = tempfile.mkdtemp(prefix="cs_")
+        with open(os.path.join(ws, "cheatsheet.md"), "w", encoding="utf-8") as f:
+            f.write(MD)
+        return ws
+
+    def _run(self, *extra):
+        env = dict(os.environ, EXAMPREP_NO_BROWSER="1")
+        return subprocess.run([PY, os.path.join(SCRIPTS, "cheatsheet_render.py")] + list(extra),
+                              capture_output=True, text=True, encoding="utf-8", env=env)
+
+    def test_html_only_exit_0(self):
+        ws = self._ws()
+        try:
+            r = self._run("--workspace", ws, "--pages", "2", "--html-only")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(os.path.isfile(os.path.join(ws, "cheatsheet.html")))
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_no_browser_degrades_exit_3_with_html(self):
+        ws = self._ws()
+        try:
+            r = self._run("--workspace", ws, "--pages", "1")
+            self.assertEqual(r.returncode, 3, "无浏览器必须走降级码并保留 HTML 产物")
+            self.assertIn("no_browser", r.stderr)
+            self.assertTrue(os.path.isfile(os.path.join(ws, "cheatsheet.html")))
+            self.assertFalse(os.path.isfile(os.path.join(ws, "cheatsheet.pdf")))
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_missing_md_dies(self):
+        ws = tempfile.mkdtemp(prefix="cs_")
+        try:
+            r = self._run("--workspace", ws, "--pages", "1")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("cheatsheet.md", r.stderr)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_bad_usage(self):
+        ws = self._ws()
+        try:
+            self.assertEqual(self._run("--workspace", ws, "--pages", "0").returncode, 2)
+            self.assertEqual(self._run("--workspace", ws, "--pages", "1",
+                                       "--font-size", "20").returncode, 2)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

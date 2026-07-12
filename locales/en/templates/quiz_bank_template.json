@@ -1,0 +1,47 @@
+[
+  {
+    "id": "q1",
+    "chapter": 1,
+    "type": "choice",
+    "question": "This is a sample multiple-choice question. What does the question describe?",
+    "options": [
+      "A. Content of option A",
+      "B. Content of option B",
+      "C. Content of option C",
+      "D. Content of option D"
+    ],
+    "answer": "A",
+    "explanation": "This is the explanation for the multiple-choice question, used by the AI to correct the student after a wrong answer.",
+    "source": "teacher"
+  },
+  {
+    "id": "q2",
+    "chapter": 2,
+    "type": "subjective",
+    "question": "This is a sample subjective/calculation question. What does it ask?",
+    "answer": "The standard solution steps and the final numeric answer go here.",
+    "keywords": ["keyword 1", "keyword 2", "formula A"],
+    "explanation": "This is the detailed step-by-step solution for the subjective/calculation question.",
+    "source": "teacher"
+  },
+  {
+    "id": "q3",
+    "chapter": 3,
+    "type": "diagram",
+    "question": "Sample diagram question: draw the rotation process and the final shape of an AVL tree after inserting [3,2,1] in order.",
+    "answer": "A balanced tree with root 2, left child 1, right child 3 (right-rotate first).",
+    "diagram_type": "avl_tree",
+    "render_hint": "Actually run the AVL insertion algorithm with graphviz/matplotlib before rendering; remind the student that the teacher's drawing conventions (e.g. whether NIL nodes are drawn) take priority.",
+    "explanation": "Diagram questions must never be hand-drawn from memory; run the standard algorithm to obtain the structure first, then draw.",
+    "source": "teacher"
+  },
+  {
+    "id": "q4",
+    "chapter": 1,
+    "type": "fill_blank",
+    "question": "Sample fill-in-the-blank question: a stack is ____ (last-in-first-out / first-in-first-out).",
+    "answer": "Last-in, first-out (LIFO)",
+    "explanation": "The standard answer and explanation for the fill-in-the-blank question.",
+    "source": "ai_generated"
+  }
+]

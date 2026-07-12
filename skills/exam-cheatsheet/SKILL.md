@@ -1,21 +1,24 @@
 ---
 name: exam-cheatsheet
 description: >
-  全员通关后生成考前极简速记小抄（Cheat Sheet）与总复习走查 walkthrough.md：按「必背结论/公式 →
-  有难度例题（必要时含题面图）→ 例题解答（代入公式、保留基础过程）→ 要点解释（同类题怎么办）」
-  四段压缩成考场能默写的一两页。当复习收尾、用户要「考前小抄/速记/总结」时使用。
+  全员通关后把 错题本+笔记本+知识点窗口+wiki 编译成考前速记小抄 cheatsheet.md（每条要点带可溯源
+  锚点），并按用户指定页数渲染成打印级 PDF：按「必背结论/公式 → 有难度例题（必要时含题面图）→
+  例题解答（代入公式、保留基础过程）→ 要点解释（同类题怎么办）」四段组织。当复习收尾、用户要
+  「考前小抄/速记/总结/打印版」时使用。
 license: MIT
 ---
 
-# exam-cheatsheet — pre-exam cheatsheet
+# exam-cheatsheet — pre-exam cheatsheet compiler
 
 ## Purpose
-Compress everything already mastered into a one-to-two-page, printable, copy-by-hand cram sheet, written to `walkthrough.md` in the workspace. Summarize only mastered content. Do not teach new material and do not invent new questions.
+COMPILE (not free-generate) everything already mastered into a dense, printable cram sheet: `cheatsheet.md` at the workspace root, where **every top-level bullet carries a resolvable source link** into `notebook/`, `mistakes/`, or `references/wiki/` — then render it to a **PDF at the student's requested page count** via the official renderer. Summarize only mastered content. Do not teach new material and do not invent new questions. (`walkthrough.md` is the retired v3 output name: never write it; leave an existing one untouched.)
 
 ## Activation
 Trigger when all study phases are basically cleared and review is wrapping up, OR when the user asks for 「给我一份考前小抄 / 速记 / 总复习」 (a pre-exam cheat sheet, quick-recall sheet, or final review).
 
 ## Inputs
+- `mistakes/` + `notebook/` — the HIGHEST-priority compile sources: full mistake entries and persisted walkthroughs/feedback are already student-verified content with ready-made anchors (`notebook/chNN.md#<anchor>`). Read `mistakes/index.md` / `notebook/index.md` first when they exist.
+- `study_state.json` `knowledge_window` — points with status `out_window` outrank `in_window`/`verified` ones (the student is actively losing those points, and they are exactly what the sheet exists for; status codes per `scripts/i18n.py`).
 - `references/wiki/` — core conclusions/formulas per chapter. Iterate through **all mastered chapters** — from `study_state.json`'s `current_phase`/`phase_checklist` when it exists (the structured-state source of truth), else `study_progress.md`, against `study_plan.md` — reading each chapter slice one at a time (never dump the whole wiki into context at once) so the sheet covers every mastered chapter.
 - `references/quiz_bank.json` — teacher-flagged key items and their answer frameworks.
 - `python "${CLAUDE_SKILL_DIR}/scripts/select_hard_questions.py"` — ranks example candidates. Resolve it from the skill package root, NOT the workspace (a student workspace has no `scripts/`). Its output is a FLAT difficulty/mastery-ordered list — grouping by knowledge point is the agent's job (Workflow 3).
@@ -28,38 +31,24 @@ Trigger when all study phases are basically cleared and review is wrapping up, O
 4. **Worked solution (「例题解答」).** Substitute the formula with the item's actual values: intermediate arithmetic MAY be skipped, but the base process MUST stay — which formula, what gets substituted, what comes out. When the materials provide no answer, the solution carries ⚠️ AI生成答案，非老师/教材提供.
 5. **Takeaway (「要点解释」).** For each example: how to handle same-type / similar-stem questions — the recognition cue first, then which answer framework to apply.
 6. **Provenance stays honest, off the layout.** Unlabeled lines mean material-sourced — that default applies ONLY to content actually taken from the wiki/materials. Any AI-supplemented line carries 🟡 AI补充，可能与你老师讲的不完全一致 inline; any AI-generated answer carries ⚠️ AI生成答案，非老师/教材提供 inline; a solution whose answer provenance is missing or unknown in `quiz_bank.json` carries 「来源未知」 explicitly — never let the unlabeled default absorb uncertain provenance (canonical wording in [`docs/language-policy.md`](../../docs/language-policy.md)). Per-line 🟢 tagging is no longer required.
-7. **Write output.** Write `walkthrough.md` to the workspace with the four fixed sections per mastered chapter; refresh the progress panel at the end.
-8. Never invent teacher emphasis that is not in the materials. If the materials do not flag a point, do not present it as a teacher-flagged item.
+7. **Traceability is mandatory (lint-enforced).** Every top-level `- ` bullet in `cheatsheet.md` MUST end with a source link of the shape `[→](notebook/chNN.md#<anchor>)`, `[→](mistakes/chNN.md#<anchor>)`, or `[→](references/wiki/<file>.md)` — prefer the notebook/mistake entry the content was compiled from, falling back to the wiki chapter file. `python "${CLAUDE_SKILL_DIR}/scripts/validate_workspace.py" <ws>` REDS on any untraced bullet or dead link; run it after writing and fix before showing the student.
+8. **Write output.** Write `cheatsheet.md` to the workspace root with the four fixed sections per mastered chapter; refresh the progress panel at the end.
+9. **Render the PDF (page count is the student's call).** Ask for the target page count if not stated (default 2). Run `python "${CLAUDE_SKILL_DIR}/scripts/cheatsheet_render.py" --workspace <ws> --pages <N>`: exit 0 → `cheatsheet.pdf` produced at exactly N pages with print-safe ≥12 mm margins (never lower them — printers eat edges); exit 3 → no local browser: hand the student `cheatsheet.html` plus the one-line print instruction the tool emits. Then do a **visual pass** when the client can view files: open the PDF/HTML — if content overflows the page target or the last page trails more than ~15% blank, nudge `--font-size` down/up and re-render until the sheet fills exactly N pages as densely as possible.
+10. Never invent teacher emphasis that is not in the materials. If the materials do not flag a point, do not present it as a teacher-flagged item.
 
 ## Output Contract
-- Write `walkthrough.md`: the four fixed sections per mastered chapter, headings in the active reply language — `中文` 「必背结论/公式」→「例题」→「例题解答」→「要点解释」, `English` Must-memorize conclusions & formulas → Worked example → Worked solution → Takeaway — with a refreshed progress panel at the end.
+- Write `cheatsheet.md`: the four fixed sections per mastered chapter, headings in the active reply language — `中文` 「必背结论/公式」→「例题」→「例题解答」→「要点解释」, `English` Must-memorize conclusions & formulas → Worked example → Worked solution → Takeaway — with a refreshed progress panel at the end. Never write `walkthrough.md` (retired v3 name).
+- Every top-level bullet carries its `[→](…)` source link (notebook / mistakes / wiki); `validate_workspace.py` must pass on the written sheet before it is shown.
+- Deliver the printable artifact: `cheatsheet.pdf` at the student's requested page count (default 2) via `scripts/cheatsheet_render.py`, or `cheatsheet.html` + print instruction on the no-browser degradation path. Margins stay ≥12 mm; density is tuned with `--font-size`, never by shrinking margins.
 - Provenance is inline and honest: AI-supplemented lines carry 🟡 AI补充，可能与你老师讲的不完全一致; AI-generated answers carry ⚠️ AI生成答案，非老师/教材提供; unlabeled lines are material-sourced (per-line 🟢 tagging not required).
-- Keep it to one or two printable, hand-copyable pages.
 - Student-facing output defaults to English (Simplified Chinese if the student opened in Chinese); a persisted `study_state.json` `language` (`中文`/`English`/`双语`) switches it per exam-cram's dispatch rule with single-language purity. (See [`docs/language-policy.md`](../../docs/language-policy.md).)
 
-## Student-facing Output
-考前最后一小时速记小抄，固定四段、每章循环（简洁实用，AI 补充/生成的行就地标注）：
-
-```text
-【必背结论/公式】
-- ……
-- ……（🟡 AI补充，可能与你老师讲的不完全一致——只有资料没讲、AI 补的行才标）
-
-【例题】（每个重点知识点配一道有难度的例题；依赖图的题必须先真实展示题面图，展示不了就换题面自足的题）
-- 例：……
-  ![题面图](references/assets/chNN_pXX_fig.png)
-
-【例题解答】（把公式代入计算：可省略中间计算步骤，但必须保留基础过程——用哪条公式、代什么数、得出什么）
-- ……（老师/资料没给答案时标 ⚠️ AI生成答案，非老师/教材提供）
-
-【要点解释】（遇到同类型或类似题干的题怎么办：先认出特征，再套对应的答题框架）
-- ……
-```
-
-上面代码块只是**版式示例**——写入真实 `walkthrough.md` 时，图片行必须是真正的 Markdown 图片（workspace 相对路径，学生打开 md 即见图）；只写路径文字不算展示，嵌不了图就换题面自足的题。
-
-
-Render per the persisted `study_state.json` `language` (`中文` default / `English` / `双语`) with single-language purity — `中文` output stays pure Chinese, `English` output uses the EN canonical vocabulary, `双语` composes the zh unit first + a `> EN:` mirror per block; see [`exam-cram`](../exam-cram/SKILL.md) Output Contract and [`docs/language-policy.md`](../../docs/language-policy.md).
+## Language packs
+Student-visible wording for this skill lives in per-language packs — load the one matching `study_state.json.language` BEFORE emitting any student-visible output:
+- `zh` → [`../../locales/zh/skills/exam-cheatsheet.md`](../../locales/zh/skills/exam-cheatsheet.md)
+- `en` → [`../../locales/en/skills/exam-cheatsheet.md`](../../locales/en/skills/exam-cheatsheet.md)
+- `bilingual` → compose from the zh pack with a `> EN:` mirror line per block (rules in [`../../docs/language-policy.md`](../../docs/language-policy.md))
+Unset language → this is the first conversation: the merged first-ask (mode × time budget × language) decides it; default en unless the student opened in Chinese.
 
 ## Boundaries
 - Do not put content into the cram sheet that the materials do not cover unless it is tagged 🟡 or ⚠️.

@@ -24,8 +24,10 @@ BANNED = [
 
 
 def runtime_files():
-    rels = ["README.md", "SKILL.md", "SKILL.en.md", "AGENTS.md"]
-    for pat in ("docs/*.md", "prompts/*.md", "skills/**/*.md", "templates/*.md"):
+    # v4-P2: SKILL.en.md → locales/en/SKILL.md; templates/ moved under locales/.
+    # The locales/**/*.md glob keeps every language pack + template covered.
+    rels = ["README.md", "SKILL.md", "AGENTS.md"]
+    for pat in ("docs/*.md", "prompts/*.md", "skills/**/*.md", "locales/**/*.md"):
         for p in glob.glob(os.path.join(ROOT, pat), recursive=True):
             rels.append(os.path.relpath(p, ROOT).replace("\\", "/"))
     return sorted(set(rels))

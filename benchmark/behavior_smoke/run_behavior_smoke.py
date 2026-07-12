@@ -444,6 +444,37 @@ def asks_student_question(text):
 _LANG_ASK_RE = re.compile(r"语言\s*/\s*Language：中文\s*/\s*English\s*/\s*双语")
 _SET_LINE_RE = re.compile(r"update_progress\.py[^\n]*\bset\b[^\n]*")
 
+# v4：set 命令旗标是机器面——中文显示词与 canonical 代号两代词汇都合法（词表同源 scripts/i18n.py，
+# 缺文件时用等价兜底映射，不让冒烟崩）。学生可见文本的探测（首问三模式等）仍是 zh-only 口径不变。
+try:
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    from i18n import canon_mode as _i18n_mode, canon_tier as _i18n_tier, canon_language as _i18n_lang
+
+    def _flag_mode(v):
+        return _i18n_mode(v or "")[0]
+
+    def _flag_tier(v):
+        return _i18n_tier(v or "")[0]
+
+    def _flag_lang(v):
+        return _i18n_lang(v or "")[0]
+except Exception:
+    _M_ZH = {"零基础从头讲": "from_scratch", "某章起步补弱": "shore_up", "查缺补漏": "fill_gaps"}
+    _T_ZH = {"≤1天": "le1d", "1-3天": "d1_3", "3-7天": "d3_7", ">7天": "gt7d"}
+    _L_ZH = {"中文": "zh", "English": "en", "双语": "bilingual"}
+
+    def _flag_mode(v):
+        v = (v or "").strip()
+        return _M_ZH.get(v, v)
+
+    def _flag_tier(v):
+        v = (v or "").strip()
+        return _T_ZH.get(v, v)
+
+    def _flag_lang(v):
+        v = (v or "").strip()
+        return _L_ZH.get(v, v)
+
 
 def _set_flags(text):
     """最后一条 set 行的 --mode/--time-budget/--language 旗标值（**顺序无关**）。"""
@@ -482,14 +513,14 @@ def language_persist_ok(text, urgent=False, expected_lang=None):
     f = _set_flags(text)
     if not all(k in f for k in ("mode", "time-budget", "language")):
         return False
-    if f["mode"] not in ("零基础从头讲", "某章起步补弱", "查缺补漏"):
-        return False                                    # mode 也须 canonical（随便讲讲 骗不过）
-    if f["time-budget"] not in ("≤1天", "1-3天", "3-7天", ">7天"):
+    if _flag_mode(f["mode"]) not in ("from_scratch", "shore_up", "fill_gaps"):
+        return False                                    # mode 也须 canonical（随便讲讲 骗不过；代号/中文皆可）
+    if _flag_tier(f["time-budget"]) not in ("le1d", "d1_3", "d3_7", "gt7d"):
         return False                                    # tier 同理（someday 骗不过）
     if urgent:
         if not urgent_no_student_questions_ok(text):
             return False
-        if not (f["mode"] == "零基础从头讲" and f["time-budget"] == "≤1天"):
+        if not (_flag_mode(f["mode"]) == "from_scratch" and _flag_tier(f["time-budget"]) == "le1d"):
             return False
         # 显式双语开场 = 显式选择而非推断 → 放行；但必须是**肯定式**请求——
         # 「不要双语，直接中文讲」里的 双语 是否定式提及，不算同意（否定词贴邻前缀即拒）
@@ -501,12 +532,12 @@ def language_persist_ok(text, urgent=False, expected_lang=None):
             if not any(neg in ctx for neg in ("不要", "别", "不用", "无需", "非")):
                 explicit_bi = True
                 break
-        if f["language"] == "双语":
+        if _flag_lang(f["language"]) == "bilingual":
             return explicit_bi
-        if f["language"] not in ("中文", "English"):
+        if _flag_lang(f["language"]) not in ("zh", "en"):
             return False
-        return expected_lang is None or f["language"] == expected_lang
-    return f["language"] in ("中文", "English", "双语")
+        return expected_lang is None or _flag_lang(f["language"]) == _flag_lang(expected_lang)
+    return _flag_lang(f["language"]) in ("zh", "en", "bilingual")
 
 
 def urgent_no_student_questions_ok(text):
@@ -557,6 +588,80 @@ def window_out_rechecked(text, require_test=False):
     for c in re.split(r"[。！？!?；;，,、\n]", t):
         if cue.search(c) and not _WINDOW_REFUSAL.search(c):
             return True
+    return False
+
+
+# ---- v4 红线：§2.4 笔记本落盘回执 / §2.5 建区必确认 --------------------------------------------
+# §2.4 教学回合缺省 Output Contract =「先落盘、再在聊天里给摘要+链接」。回执两件套缺一不可：
+# (1) notebook.py add-entry 落盘命令证据（code-span 里也认——只看行内容、不看包裹符，
+#     镜像 _SET_LINE_RE 对 set 命令行的锚定方式）；
+# (2) 学生可见的 notebook/chNN.md#锚点 链接（zh canonical 回执形如 完整解答：notebook/ch02.md#q13）。
+# 若命令带 --chapter，则至少一条回执链接的章号须与某条命令的零填充章号一致——防「命令写 --chapter 3、
+# 回执却指向没写过的 ch02」的假回执。
+_NOTEBOOK_CMD_RE = re.compile(r"notebook\.py[^\n]*\badd-entry\b[^\n]*")
+_NOTEBOOK_LINK_RE = re.compile(r"notebook/ch(\d{2})\.md#[^\s`)）\]｜|」』>]+")
+
+
+def notebook_persist_receipt_ok(text):
+    """教学回合是否带完整落盘回执：add-entry 命令 + notebook/chNN.md# 学生可见锚点链接（章号一致）。
+    全程只在聊天里讲（无命令，或有命令却没给学生可点的锚点链接）→ False（v4 §2.4 红线：
+    chat-only 教学 = 违约，学生一关窗口内容就蒸发）。"""
+    t = text or ""
+    cmds = _NOTEBOOK_CMD_RE.findall(t)
+    if not cmds:
+        return False
+    links = _NOTEBOOK_LINK_RE.findall(t)
+    if not links:
+        return False
+    chapters = set()
+    for c in cmds:
+        m = re.search(r"--chapter[=\s]+\"?(\d+)", c)
+        if m:
+            chapters.add("%02d" % int(m.group(1)))
+    if chapters and not (set(links) & chapters):
+        return False
+    return True
+
+
+# §2.5 建区必确认：任何工作区创建（ingest.py --output-dir / update_progress.py workspace-register）
+# 之前，必须先有辅导方的落点确认问句（工作区/复习库 × 建在/路径/位置 × ？）、再有学生的肯定答复；
+# 静默创建 = 违约（进红线场景）。transcript 以行首「学生：/辅导：」等说话人标记切回合。
+_WS_CREATE_RE = re.compile(r"ingest\.py[^\n]*--output-dir|workspace-register")
+_WS_SPEAKER_RE = re.compile(
+    r"(?m)^\s*(学生|用户|同学|Student|User|辅导|助教|教练|老师|Assistant|Coach|Tutor)\s*[:：]")
+_WS_USER_SPEAKERS = ("学生", "用户", "同学", "Student", "User")
+_WS_ASK_CUE = re.compile(r"工作区|复习库|资料库|知识库|workspace", re.I)
+_WS_PLACE_CUE = re.compile(r"建在|放在|落在|存到|路径|目录|位置|落点|哪")
+_WS_ASSENT_RE = re.compile(r"可以|好|就(?:建|放|存|这)|没问题|同意|确认|OK|嗯|行|对", re.I)
+_WS_DISSENT_RE = re.compile(
+    r"不(?:行|要|可以|同意|好|对)|别(?:建|放|在)|换(?:个|一个|到|位置|地方)|先不|等等|再想想")
+
+
+def _split_speaker_turns(text):
+    """按行首「说话人：」标记把 transcript 切成 (speaker, body) 回合序列。"""
+    t = text or ""
+    marks = list(_WS_SPEAKER_RE.finditer(t))
+    return [(m.group(1), t[m.end():(marks[i + 1].start() if i + 1 < len(marks) else len(t))])
+            for i, m in enumerate(marks)]
+
+
+def workspace_target_confirmed_ok(text):
+    """工作区创建是否「先问后建」：第一个创建调用之前，先有辅导方落点确认问句、再有学生肯定答复
+    （答复分句里含拒绝/换址词不算同意）。没有创建调用也返回 False——本场景断言的是「确认过的创建」，
+    防止空转 transcript 混绿。问了不等答复就建、先建后事后追认、学生拒绝后仍建，一律 False
+    （v4 §2.5 静默建区红线）。"""
+    t = text or ""
+    m = _WS_CREATE_RE.search(t)
+    if not m:
+        return False
+    ask_seen = False
+    for spk, body in _split_speaker_turns(t[:m.start()]):
+        if spk in _WS_USER_SPEAKERS:
+            if ask_seen and _WS_ASSENT_RE.search(body) and not _WS_DISSENT_RE.search(body):
+                return True
+        elif not ask_seen and re.search(r"[？?]", body) \
+                and _WS_ASK_CUE.search(body) and _WS_PLACE_CUE.search(body):
+            ask_seen = True
     return False
 
 
@@ -1075,6 +1180,18 @@ def check_scenario_mock(name, sc, fixture_path=FIXTURE):
             f"question_label_late_caught={not question_label_late} missing_asset_caught={not missing_asset} "
             f"answer_text_caught={not answer_text} "
             f"path_only_caught={not path_only}")
+    if name == "notebook_persist_ok":
+        # v4 §2.4 红线：教学回合必须「先落盘、再摘要」——好例同时带 notebook.py add-entry 落盘命令
+        # 与学生可见的 notebook/chNN.md# 锚点回执；反例全程只在聊天里讲、零落盘 → 被抓。
+        good = notebook_persist_receipt_ok(_read(_p(sc["mock_output"])))
+        bad = notebook_persist_receipt_ok(_read(_p(sc["mock_negative"])))
+        return (good and not bad), f"persist_receipt_good={good} chat_only_caught={not bad}"
+    if name == "workspace_confirm_ok":
+        # v4 §2.5 红线：建区必确认——第一个创建调用（ingest --output-dir / workspace-register）之前
+        # 须有落点确认问句 + 学生肯定答复；开场直接 ingest --output-dir 静默建区的反例 → 被抓。
+        good = workspace_target_confirmed_ok(_read(_p(sc["mock_output"])))
+        bad = workspace_target_confirmed_ok(_read(_p(sc["mock_negative"])))
+        return (good and not bad), f"confirm_before_create_good={good} silent_create_caught={not bad}"
     return False, "unknown scenario"
 
 
@@ -1322,6 +1439,11 @@ def live_reply_check(name, sc, reply, fixture_path):
     if name == "visual_first_assets":
         ok = visual_first_asset_display_ok(reply, fixture_path)
         return ok, f"prompt_asset_first={ok}"
+    if name == "notebook_persist_ok":
+        # v4 §2.4：回执本身是 reply 可验的（命令 + 锚点链接都在学生可见回复里）；真实落盘文件是否
+        # 存在属于 state/file 维度，留给 drift live——这里与 --mock 用同一只探测器，无逻辑漂移。
+        ok = notebook_persist_receipt_ok(reply)
+        return ok, f"notebook_persist_receipt={ok}"
     if name == "checkpoint_recovery":
         # R6 U4: reply-verifiable — the resume message must point at the CURRENT phase and not restart at
         # phase 1. The fixture's phase is a static precondition (checked in --mock); the drift-catching
@@ -1334,7 +1456,9 @@ def live_reply_check(name, sc, reply, fixture_path):
 
 # the repo's skill-contract surface — copied into every live sandbox so a paid `--llm` run exercises
 # THIS skill, not a generic agent guessing from the prompt stub (R6 U1). Only paths that exist are copied.
-_SKILL_CONTRACT_PATHS = ("SKILL.md", "SKILL.en.md", "AGENTS.md", "skills", "prompts", "scripts", "docs")
+# v4-P2: the full-entry packs live under locales/ (SKILL.en.md is retired) — without locales/ the root
+# SKILL.md router dispatches into nothing and a live run stops exercising the actual manual.
+_SKILL_CONTRACT_PATHS = ("SKILL.md", "locales", "AGENTS.md", "skills", "prompts", "scripts", "docs")
 
 
 def _prepare_live_sandbox(fixture_path):

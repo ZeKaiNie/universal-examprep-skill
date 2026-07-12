@@ -314,13 +314,22 @@ class KnowledgeIndex(unittest.TestCase):
 
 
 class ScopeContract(unittest.TestCase):
-    ENTRY_POINTS = ["SKILL.md", "SKILL.en.md", "AGENTS.md", "prompts/web_prompt.md", "prompts/web_prompt.en.md", "skills/exam-quiz/SKILL.md", "skills/exam-cram/SKILL.md",
+    # v4-P2: the root zh manual lives at locales/zh/SKILL.md, the en manual at
+    # locales/en/SKILL.md (SKILL.en.md retired); the control-layer skills files
+    # still carry the override marker in both languages (zh form inside 「…」).
+    ENTRY_POINTS = ["locales/zh/SKILL.md", "locales/en/SKILL.md", "AGENTS.md",
+                    "prompts/web_prompt.md", "prompts/web_prompt.en.md",
+                    "skills/exam-quiz/SKILL.md", "skills/exam-cram/SKILL.md",
                     "skills/exam-tutor/SKILL.md", "skills/exam-review/SKILL.md"]
+
+    @staticmethod
+    def _is_en_surface(p):
+        return p.endswith(".en.md") or p.replace("\\", "/").startswith("locales/en/")
 
     def test_all_entry_points_carry_override_marker(self):
         for p in self.ENTRY_POINTS:
             txt = open(os.path.join(ROOT, p), encoding="utf-8").read()
-            if p.endswith(".en.md"):
+            if self._is_en_surface(p):
                 self.assertIn("Temporarily overriding", txt, p)   # C2b：en 面英文声明
                 self.assertIn("scope preference", txt, p)
             else:

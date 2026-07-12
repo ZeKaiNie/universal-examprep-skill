@@ -39,6 +39,16 @@ def _silent(fn, *a, **k):
 
 
 class BehaviorSmokeTest(unittest.TestCase):
+    # 0 — Codex 评审回归：live 沙箱契约面必须带 locales/（v4-P2 全量入口语言包），
+    # 且不再引用已退役的 SKILL.en.md（复制循环会静默跳过不存在的路径 = 沙箱悄悄缺契约）
+    def test_skill_contract_paths_ship_locales_not_retired_files(self):
+        self.assertIn("locales", H._SKILL_CONTRACT_PATHS)
+        self.assertNotIn("SKILL.en.md", H._SKILL_CONTRACT_PATHS)
+        missing = [rel for rel in H._SKILL_CONTRACT_PATHS
+                   if not os.path.exists(os.path.join(ROOT, rel))]
+        self.assertEqual(missing, [],
+                         f"_SKILL_CONTRACT_PATHS 引用了仓库里不存在的路径（复制时会被静默跳过）: {missing}")
+
     # 1
     def test_fixture_passes_validate_workspace(self):
         ok, errors, warnings, _ = H.validate_fixture_workspace(H.FIXTURE)
@@ -746,6 +756,82 @@ class BehaviorSmokeTest(unittest.TestCase):
                                                require_test=True))
         self.assertFalse(H.window_out_rechecked(_read("mock/sample_outputs/window_recheck_recall_only_bad.txt"),
                                                 require_test=True), ">7天只口头回问的坏例必须被抓")
+
+    def test_notebook_persist_receipt_detector(self):
+        # v4 §2.4 红线：教学回合必须「先落盘、再摘要」——回执 = add-entry 命令 + notebook/chNN.md# 链接
+        good = _read("mock/sample_outputs/notebook_persist_good.txt")
+        self.assertTrue(H.notebook_persist_receipt_ok(good), "落盘命令 + 学生可见锚点回执的好例应通过")
+        self.assertFalse(H.notebook_persist_receipt_ok(_read("mock/sample_outputs/notebook_persist_chat_only.txt")),
+                         "全程只在聊天里讲、零落盘回执必须被抓（v4 §2.4 红线）")
+        # 只贴回执链接、没有 add-entry 命令证据 → 没真落盘，不算
+        self.assertFalse(H.notebook_persist_receipt_ok(
+            "讲解……\n完整解答：notebook/ch02.md#q13 ｜ 目录：notebook/index.md"),
+            "只有链接、无 add-entry 命令证据不应判通过")
+        # 只有命令、学生可见回复里没有 notebook/chNN.md# 锚点链接 → 学生找不到入口，不算
+        self.assertFalse(H.notebook_persist_receipt_ok(
+            "`python scripts/notebook.py --workspace . add-entry --chapter 2 --type walkthrough --id q13`\n讲完了。"),
+            "只有命令、无学生可见锚点链接不应判通过")
+        # 章号不一致：命令写 --chapter 3、回执却指向没写过的 ch02 → 假回执，必须被抓
+        self.assertFalse(H.notebook_persist_receipt_ok(
+            "`python scripts/notebook.py --workspace . add-entry --chapter 3 --type walkthrough --id q13`\n"
+            "完整解答：notebook/ch02.md#q13 ｜ 目录：notebook/index.md"),
+            "命令章号与回执链接章号不一致必须被抓")
+        # zh canonical 回执 + code-span 命令两种证据形态都认；--chapter 2 → ch02 零填充一致
+        self.assertTrue(H.notebook_persist_receipt_ok(
+            "`python scripts/notebook.py --workspace . add-entry --chapter 2 --type feedback --id mc_q2 --mistake`\n"
+            "完整解答：notebook/ch02.md#mc_q2 ｜ 目录：notebook/index.md"),
+            "feedback + --mistake 形态的合规回执也应判通过")
+        # 命令行提到 notebook.py 但不是 add-entry（如 rebuild/list）不算落盘证据
+        self.assertFalse(H.notebook_persist_receipt_ok(
+            "`python scripts/notebook.py --workspace . rebuild`\n完整解答：notebook/ch02.md#q13"),
+            "rebuild/list 等非 add-entry 命令不算落盘证据")
+
+    def test_workspace_confirm_detector(self):
+        # v4 §2.5 红线：建区必确认——先问落点、学生肯定答复之后才允许创建调用
+        good = _read("mock/sample_outputs/workspace_confirm_good.txt")
+        self.assertTrue(H.workspace_target_confirmed_ok(good), "先问路径→学生确认→再建区的好例应通过")
+        self.assertFalse(H.workspace_target_confirmed_ok(_read("mock/sample_outputs/workspace_confirm_silent.txt")),
+                         "开场直接 ingest.py --output-dir 静默建区必须被抓（v4 §2.5 红线）")
+        # 问了但不等学生答复、同一回合直接创建 → 不算确认
+        self.assertFalse(H.workspace_target_confirmed_ok(
+            "学生：帮我建复习库。\n辅导：工作区建在 D:\\Study\\ds 可以吗？我先建上了：\n"
+            "`python scripts/ingest.py --input x --output-dir D:\\Study\\ds`"),
+            "问了不等答复直接建，不算确认")
+        # 学生明确拒绝/要求换位置后仍按原路径创建 → 不算确认
+        self.assertFalse(H.workspace_target_confirmed_ok(
+            "学生：帮我建复习库。\n辅导：工作区建在 D:\\Study\\ds 可以吗？\n学生：不要，换个位置。\n"
+            "辅导：`python scripts/ingest.py --input x --output-dir D:\\Study\\ds`"),
+            "学生拒绝后仍建区，不算确认")
+        # 先建后问（事后追认）→ 不算：确认必须发生在创建之前
+        self.assertFalse(H.workspace_target_confirmed_ok(
+            "学生：帮我建复习库。\n辅导：`python scripts/ingest.py --input x --output-dir D:\\Study\\ds`\n"
+            "已建好。这个工作区位置可以吗？\n学生：可以。"),
+            "先建后追认不算确认（问句必须先于创建调用）")
+        # 没有任何创建调用 → 本场景断言「确认过的创建」，空转 transcript 不得混绿
+        self.assertFalse(H.workspace_target_confirmed_ok("学生：帮我建复习库。\n辅导：工作区想建在哪个目录？"),
+                         "只问不建的空转 transcript 不应判通过（防 vacuous pass）")
+        # workspace-register 也是创建事件——未确认就 register 同样是静默建区
+        self.assertFalse(H.workspace_target_confirmed_ok(
+            "学生：帮我建复习库。\n辅导：`python scripts/update_progress.py --workspace D:\\S "
+            "workspace-register --course 数据结构`"),
+            "未确认就 workspace-register 也必须被抓")
+        # 学生先拒绝、辅导改址再问、学生同意 → 合规（拒绝不永久封死）
+        self.assertTrue(H.workspace_target_confirmed_ok(
+            "学生：帮我建复习库。\n辅导：工作区建在 D:\\Study\\ds 可以吗？\n学生：不要，换个位置。\n"
+            "辅导：那换成 E:\\Study\\ds 这个位置，可以吗？\n学生：可以。\n"
+            "辅导：`python scripts/ingest.py --input x --output-dir E:\\Study\\ds`"),
+            "拒绝→改址→再次确认→建区 的流程应判通过")
+
+    def test_v4_redline_scenarios_wired_into_registry(self):
+        # 两个 v4 红线场景须以确定性断言（非 best_effort）注册进 scenarios.json，且 --mock 判定通过
+        spec = H.load_scenarios()
+        by_name = {s["name"]: s for s in spec["scenarios"]}
+        for nm in ("notebook_persist_ok", "workspace_confirm_ok"):
+            self.assertIn(nm, by_name, "scenarios.json 应注册 v4 红线场景 %s" % nm)
+            sc = by_name[nm]
+            self.assertFalse(sc.get("best_effort"), "%s 是确定性断言场景，不应标 best_effort" % nm)
+            ok, detail = H.check_scenario_mock(nm, sc, H.FIXTURE)
+            self.assertTrue(ok, "%s 场景在 --mock 下应通过（好例过、反例被抓）：%s" % (nm, detail))
 
     def test_run_mock_exits_zero(self):
         self.assertEqual(_silent(H.main, ["--mock"]), 0)

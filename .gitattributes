@@ -1,0 +1,10 @@
+# Slim source archives: GitHub's auto-generated release zip/tarball ("Source code" links)
+# excludes dev-only trees via export-ignore, so a student who downloads the archive gets the
+# runtime surface (~16% of the repo) instead of the full dev monorepo. Cloning is unaffected.
+benchmark/      export-ignore
+tests/          export-ignore
+spike/          export-ignore
+assets/         export-ignore
+.github/        export-ignore
+.gitattributes  export-ignore
+.gitignore      export-ignore

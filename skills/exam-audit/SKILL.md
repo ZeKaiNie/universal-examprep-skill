@@ -40,6 +40,13 @@ Preserve these provenance labels VERBATIM when quoting them in findings: 🟢 �
 
 Student-facing output defaults to English (Simplified Chinese if the student opened in Chinese); a persisted `study_state.json` `language` (`中文`/`English`/`双语`) switches it per exam-cram's dispatch rule with single-language purity.
 
+## Language packs
+This skill produces no student-facing template; its report is agent-composed in the student's language. There are no `locales/zh/skills/exam-audit.md` or `locales/en/skills/exam-audit.md` pack files — compose the issue report directly in the language given by `study_state.json.language`:
+- `zh` → Simplified Chinese, using the zh canonical wording in [`../../docs/language-policy.md`](../../docs/language-policy.md)
+- `en` → English, using the EN canonical vocabulary in [`../../docs/language-policy.md`](../../docs/language-policy.md)
+- `bilingual` → compose zh-first with a `> EN:` mirror line per block (rules in [`../../docs/language-policy.md`](../../docs/language-policy.md))
+Unset language → this is the first conversation: the merged first-ask (mode × time budget × language) decides it; default en unless the student opened in Chinese.
+
 ## Boundaries
 - Zero modifications and zero deletions by default — this is an inspection, not construction.
 - Do not infer the teacher's intent; report only objective inconsistencies and leave the judgment to the student.

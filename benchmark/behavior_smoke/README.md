@@ -41,6 +41,8 @@ RUN_SKILL_BEHAVIOR_LLM=1 python benchmark/behavior_smoke/run_behavior_smoke.py -
 | `language_first_ask` | 首问一次合并 模式×时间×语言（A6/A8b），语言行三语呈现；紧迫开场静默推断 | mock 好例=三语语言行+一条三旗标 set；反例漏语言行被抓；紧迫变体=零问句+`--language` ∈ canonical，紧迫反例收尾提问被抓 |
 | `time_budget_no_questions` | ≤1天档严禁向学生提问（A6） | mock 好例纯讲解、无面向学生的问句；反例（问「你想先复习哪一章？」「还有问题吗？」「Should I…」等收尾/通用问句）必须不合格；自答式反问不误伤 |
 | `knowledge_window_recheck` | 窗口外知识点须真复核（A6） | 3-7天好例回问/实测均可、反例默认还会被抓；>7天（`require_test`）只认出题实测——只口头「还记得吗」的坏例被抓；否定式（不问/不实测/我就当你会了）不算复核、否定式安全声明（不会默认你会）不误伤 |
+| `notebook_persist_ok` | 教学回合「先落盘、再摘要」（v4 §2.4 红线） | mock 好例同时含 `notebook.py … add-entry` 落盘命令（code-span 里也认）与学生可见 `notebook/chNN.md#锚点` 回执（zh canonical 形如 `完整解答：notebook/ch02.md#q13`，回执章号须与命令 `--chapter` 零填充一致）；反例全程只在聊天里讲、零落盘回执必须不合格 |
+| `workspace_confirm_ok` | 建区必确认——静默创建工作区 = 违约（v4 §2.5 红线） | mock 好例在第一个创建调用（`ingest.py --output-dir` / `workspace-register`）**之前**有辅导方落点确认问句 + 学生对目标路径的肯定答复；反例开场直接 `ingest.py --output-dir` 静默建区必须不合格；问了不等答复、先建后追认、学生拒绝后仍建同样不合格 |
 | `lazy_load_best_effort` | 只读当前章节 | **best-effort**：确定性模式跳过；需 transcript/LLM 才能真验 |
 
 ## 什么是 best-effort / 没覆盖

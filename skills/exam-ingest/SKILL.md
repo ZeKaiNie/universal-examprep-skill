@@ -20,6 +20,7 @@ Activate when the workspace is missing — that is, any of `references/wiki/`, `
 - Target workspace directory (default: current workspace root).
 
 ## Workflow
+0. **Dependency preflight (BEFORE touching the materials — never let a student discover a missing library as a mid-ingest crash).** Run `python "${CLAUDE_SKILL_DIR}/scripts/check_deps.py" --materials <dir>`: it is the single manifest of every optional dependency (PDF text backends / PyMuPDF page rendering / local browser for the cheatsheet PDF), probes what is installed, and prints the exact `pip install …` command for anything the student's materials actually NEED (exit 5 = a needed backend is missing). When something needed is missing, ask the student ONCE with the one-line consent phrasing from the language pack, install on yes, then re-run the preflight; on no, proceed only for the non-PDF part of the materials and say plainly what will be skipped. Never install silently, and never skip the preflight when the materials folder contains PDFs.
 1. Parse the materials. Extract knowledge points, core formulas, high-frequency question types, and term definitions. Group them by chapter or phase.
 2. Build `raw_input.json` in the background so it matches `scripts/ingest.py`. Auto-construct an object with `course_name`, `phases[]`, and `quiz_bank[]`, and write it to a temp directory. Never ask the user to write or edit this JSON.
    - Every quiz item MUST carry `chapter` (or `phase`); without it, chapter review cannot retrieve the item. Every item MUST carry `source`: `teacher` (from the teacher/past exams) or `ai_generated` (added by AI).
@@ -28,7 +29,7 @@ Activate when the workspace is missing — that is, any of `references/wiki/`, `
    - **Homework auto-ingest**: the official builder also recognizes homework / solution PDFs (filename patterns like `hw1.pdf`+`hw1_sol.pdf`, `作业3.pdf`+`作业3答案.pdf`), pairs separate question/solution files automatically (inline `Solution` blocks too), and emits bank items tagged `source_type="homework"` with page provenance — so homework-only scope has real inventory. Unpaired solutions / unanswered problems are fail-loud warnings in parse_report.json.
 3. Run the package-root `scripts/ingest.py`: `python <package-root>/scripts/ingest.py --input <temp-json>`. When the full package is installed in Claude Code, `${CLAUDE_SKILL_DIR}` points at the package root — use `python "${CLAUDE_SKILL_DIR}/scripts/ingest.py" --input <…>`.
    - **Recall cross-check AFTER ingest has created the workspace** (`references/quiz_bank.json` must exist — this step reads it): run `python <package-root>/scripts/build_visual_index.py --workspace <workspace> --materials <dir>` to build the dual visual indices (`image_question_index.json` + `figure_page_index.json`) and get the **suspected-missed visual question report** (source pages that ARE visual but whose items carry no visual flag/asset). If suspects are found, rerun with `--apply` (needs a render backend) to attach the original-page screenshot and set `maybe_requires_assets=true` — never leave a figure-dependent item silently unlabeled. (In the no-Python fallback of step 4 this cross-check is unavailable — say so instead of skipping silently.)
-4. No-Python fallback. If the script fails (e.g. `python is not recognized`), switch immediately and silently: use file-write tools to build, from `templates/`, the files `references/wiki/chN_*.md`, `references/quiz_bank.json`, `study_plan.md`, and `study_progress.md`.
+4. No-Python fallback. If the script fails (e.g. `python is not recognized`), switch immediately and silently: use file-write tools to build, from `locales/<lang>/templates/` (pick the pack matching `study_state.json.language`; default zh, and fall back to the zh pack when an en template file is missing), the files `references/wiki/chN_*.md`, `references/quiz_bank.json`, `study_plan.md`, and `study_progress.md`.
 5. Label provenance (canonical labels in [`docs/language-policy.md`](../../docs/language-policy.md)). In wiki paragraphs, distinguish 🟢 来自资料 from 🟡 AI补充，可能与你老师讲的不完全一致. For a question the teacher gave no answer to and AI answers instead, mark the answer ⚠️ AI生成答案，非老师/教材提供.
 
 ## Output Contract
@@ -37,16 +38,15 @@ Activate when the workspace is missing — that is, any of `references/wiki/`, `
 - Emit one setup-receipt line, then hand control back to `exam-cram` for step two (teaching).
 - Student-facing output defaults to English (Simplified Chinese if the student opened in Chinese); a persisted `study_state.json` `language` (`中文`/`English`/`双语`) switches it per exam-cram's dispatch rule with single-language purity. The cold-start receipt follows the same dispatch; see [`docs/language-policy.md`](../../docs/language-policy.md).
 
-## Student-facing Output
-一句话回执（默认简体中文），例：
-  `已初始化备考空间：3 章 wiki + 18 道题（含 2 道 ⚠️ AI生成答案，非老师/教材提供），进度已建。下一步开讲第 1 章。`
-  然后交回 `exam-cram` 进入第二步授课。
-
-
-Render per the persisted `study_state.json` `language` (`中文` default / `English` / `双语`) with single-language purity — `中文` output stays pure Chinese, `English` output uses the EN canonical vocabulary, `双语` composes the zh unit first + a `> EN:` mirror per block; see [`exam-cram`](../exam-cram/SKILL.md) Output Contract and [`docs/language-policy.md`](../../docs/language-policy.md).
+## Language packs
+Student-visible wording for this skill lives in per-language packs — load the one matching `study_state.json.language` BEFORE emitting any student-visible output:
+- `zh` → [`../../locales/zh/skills/exam-ingest.md`](../../locales/zh/skills/exam-ingest.md)
+- `en` → [`../../locales/en/skills/exam-ingest.md`](../../locales/en/skills/exam-ingest.md)
+- `bilingual` → compose from the zh pack with a `> EN:` mirror line per block (rules in [`../../docs/language-policy.md`](../../docs/language-policy.md))
+Unset language → this is the first conversation: the merged first-ask (mode × time budget × language) decides it; default en unless the student opened in Chinese.
 
 ## Boundaries
-- `scripts/ingest.py` and `templates/` live at the package root, not inside `skills/exam-ingest/`. If this subskill is installed alone (`CLAUDE_SKILL_DIR` points only at `skills/exam-ingest/`), the script and templates are unavailable — install the whole package (including root `scripts/` and `templates/`), or use the step-4 no-Python fallback to build the workspace by hand.
+- `scripts/ingest.py` and `locales/<lang>/templates/` live at the package root, not inside `skills/exam-ingest/`. If this subskill is installed alone (`CLAUDE_SKILL_DIR` points only at `skills/exam-ingest/`), the script and templates are unavailable — install the whole package (including root `scripts/` and `locales/`), or use the step-4 no-Python fallback to build the workspace by hand.
 - Do not modify the logic of `scripts/ingest.py`; only call it.
 - Use only safe filenames under `references/wiki/`. The script rejects `../`, absolute paths, and duplicate names.
 - Do not fabricate a "standard answer" the teacher did not provide without the ⚠️ label. When materials are insufficient, state the gap honestly.

@@ -42,23 +42,40 @@ ROOT = os.path.dirname(os.path.dirname(HERE))                      # repo root (
 # （否则「明天考/考前一天/今天」这些被 update_progress 认作 ≤1天 的别名会在 drift 侧被漏判为非紧迫）。
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 try:
-    from update_progress import (_normalize_tier as _canon_tier, LEARNING_MODES as _LEARN_MODES,
+    from update_progress import (_normalize_tier as _canon_tier, _normalize_mode as _canon_mode,
+                                 LEARNING_MODES as _LEARN_MODES,
                                  _WINDOW_STATUSES as _WIN_STATUSES, _md_cell as _md_cell)
+    from i18n import canon_window_status as _canon_win           # v4：状态词归代号（zh 显示词/代号都收）
 except Exception:                                                 # 缺文件时退化为内置常量，不让 drift 崩
     _canon_tier = None
-    _LEARN_MODES = ("零基础从头讲", "某章起步补弱", "查缺补漏")
-    _WIN_STATUSES = ("在窗口", "窗口外", "已实测")
+    _canon_mode = None
+    _LEARN_MODES = ("from_scratch", "shore_up", "fill_gaps")
+    _WIN_STATUSES = ("in_window", "out_window", "verified")
+    _WIN_ZH = {"在窗口": "in_window", "窗口外": "out_window", "已实测": "verified"}
+
+    def _canon_win(v):                                           # 等价兜底：zh 显示词→代号，未知透传
+        return _WIN_ZH.get((v or "").strip(), (v or "").strip())
 
     def _md_cell(v, default="-"):                                # 缺 update_progress 时的等价兜底
         s = str(v) if v not in (None, "") else default
         return re.sub(r"\s*[\r\n]+\s*", " ", s).replace("|", "/").strip()
 
+_WIN_DEFAULT = _WIN_STATUSES[0]                                  # 省略 status 的归一落点（in_window）
+
 
 def _tier_is_urgent(time_budget):
     tb = str(time_budget or "")
     if _canon_tier is not None:
-        tb = _canon_tier(tb)[0]                                   # → canonical 档（≤1天/1-3天/…）
-    return tb in ("≤1天", "<=1天", "1天", "当天")
+        tb = _canon_tier(tb)[0]                                   # → canonical 代号（le1d/d1_3/…）
+    # v4 代号 + 旧显示词/别名都算紧迫——state 三代词汇（代号/中文档名/宽松别名）一视同仁
+    return tb in ("le1d", "≤1天", "<=1天", "1天", "当天")
+
+
+def _canon_mode_code(v):
+    """mode 三代词汇 → 代号（缺 update_progress 时原样透传）。"""
+    if _canon_mode is not None:
+        return _canon_mode(str(v or ""))[0]
+    return (v or "").strip()
 
 # canonical provenance labels — mirror T2 / docs/language-policy.md (single source of truth)
 CANON_LABELS = ["🟢 来自资料", "🟡 AI补充，可能与你老师讲的不完全一致", "⚠️ AI生成答案，非老师/教材提供"]
@@ -409,11 +426,12 @@ def _window_state_map(snap):
     """有序的 [(point@chapter, status, note)] 列表 —— 用于跨源比对 state 与生成视图 md 的窗口面板是否一致。
     用**保留重数**的排序列表而非 dict：md 里同一窗口行出现两次（陈旧/手改）不能被 dict 折叠掉而漏判
     （OSTZO）。带上 note：只改 note 的 state 更新若 md 面板没跟上（备注列陈旧）也要抓（OSZRm）。
-    省略 status 归一到渲染默认 在窗口。"""
+    省略 status 归一到渲染默认（in_window）；两侧词汇（state 代号 / md 中文显示词）都先归代号再比。"""
     keys = snap.get("window_rows", []) or []
     sts = snap.get("window_status", []) or []
     nts = snap.get("window_note", []) or []
-    return sorted((k, (sts[i] if i < len(sts) and sts[i] else "在窗口"), (nts[i] if i < len(nts) else ""))
+    return sorted((k, (_canon_win(sts[i]) if i < len(sts) and sts[i] else _WIN_DEFAULT),
+                   (nts[i] if i < len(nts) else ""))
                   for i, k in enumerate(keys))
 
 
@@ -538,17 +556,19 @@ def parse_state_json(text, plan_phases=None):
         if ch is not None and not isinstance(ch, (str, int)) or isinstance(ch, bool):
             raise DriftError("study_state.json 快照的 knowledge_window 行 chapter 必须是字符串/整数或省略: %r" % r)
         stt = r.get("status")
-        if stt is not None and stt not in _WIN_STATUSES:
-            # update_progress 只接受 在窗口/窗口外/已实测——非 canonical（typo/任意串）是坏写入，
-            # 静默收下会让「状态迁移」指标把乱码变化也当成真窗口进出（Codex R_Xd）
-            raise DriftError("study_state.json 快照的 knowledge_window 行 status 必须是 %s 或省略: %r"
-                             % ("/".join(_WIN_STATUSES), r))
+        if stt is not None and _canon_win(stt) not in _WIN_STATUSES:
+            # update_progress 只接受 canonical 状态（代号或中文显示词，归一后须在词表内）——
+            # 非 canonical（typo/任意串）是坏写入，静默收下会让「状态迁移」指标把乱码变化
+            # 也当成真窗口进出（Codex R_Xd）
+            raise DriftError("study_state.json 快照的 knowledge_window 行 status 必须是 %s（或对应中文"
+                             "显示词）或省略: %r" % ("/".join(_WIN_STATUSES), r))
         # 键按 _md_cell 归一（| → /、换行折叠），与 render_md 写进生成视图的单元格一致——否则含 | 的
         # point 名（DFS|BFS → DFS/BFS）会让正确重渲染的 md 被误判为陈旧面板（Codex OSTZP）
         window_rows.append("%s@%s" % (_md_cell(r["point"]), "" if ch in (None, "") else _md_cell(ch)))
-        # 省略 status 归一到渲染默认「在窗口」——update_progress.render_md 也把缺省 status 渲成 在窗口，
-        # 否则 {point,chapter} 无 status 的合法行会让 state 图（None）与 md 图（在窗口）误判不一致（SGGn）
-        window_status.append(stt if isinstance(stt, str) else "在窗口")
+        # 省略 status 归一到渲染默认（in_window）——update_progress.render_md 也把缺省 status 渲成
+        # 在窗口（对应代号 in_window），否则 {point,chapter} 无 status 的合法行会让 state 图（None）
+        # 与 md 图误判不一致（SGGn）。存入前统一归代号：state 侧三代词汇与 md 侧显示词收敛到同一词表
+        window_status.append(_canon_win(stt) if isinstance(stt, str) else _WIN_DEFAULT)
         # 备注也按 _md_cell 归一（与 render_md 的备注列一致），省略 → ""，用于生成视图一致性比对（OSZRm）
         wn = r.get("note")
         window_note.append(_md_cell(wn, default="") if wn not in (None, "") else "")
@@ -917,7 +937,7 @@ def compute_metrics(scenario, fixture_dir, turns):
                 except ValueError:
                     last_state = None
         urgent_mode_persisted = int(
-            isinstance(last_state, dict) and last_state.get("mode") in _LEARN_MODES
+            isinstance(last_state, dict) and _canon_mode_code(last_state.get("mode")) in _LEARN_MODES
             and _tier_is_urgent(last_state.get("time_budget")))
 
     # 2) plan adherence — walk study_plan.md snapshots; a phase delete/add/reorder is a mutation UNLESS

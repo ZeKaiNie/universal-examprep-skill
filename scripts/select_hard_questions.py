@@ -41,13 +41,15 @@ for _s in ("stdout", "stderr"):
         pass
 
 STATE_NAME = "study_state.json"
-LEARNING_MODES = ("零基础从头讲", "某章起步补弱", "查缺补漏")
+# v4：词表唯一定义点在 i18n.py——本文件不再私藏枚举副本（正是这里的硬编码曾开始漂移）
+import i18n                                                # noqa: E402  同目录
+LEARNING_MODES = i18n.MODES
 _MIXED_SCOPES = {None, "", "混合题池", "mixed", "混合"}   # 非限制性范围——不过滤
 _MIXED_OVERRIDE = {"all", "mixed", "*", "混合", "全部"}   # --source-type 传这些 = 一次性覆盖为混合池
-# 已订正/已解决的错题、已回顾/已解决的疑难不再算薄弱——否则查缺补漏会把「已经拿下的」永远顶在最前，
-# 挤掉仍待复盘的真薄弱点（错题走 待复盘→已订正/已复盘/已解决；疑难走 待回顾→已回顾，也可 已解决）。
-_MISTAKE_RESOLVED = {"已订正", "已复盘", "已解决"}
-_CONFUSION_RESOLVED = {"已回顾", "已解决"}
+# 已解决的错题/疑难不再算薄弱——状态经 canon_row_status 归代号后比对（旧 zh 词/新代号都命中），
+# 否则查缺补漏会把「已经拿下的」永远顶在最前，挤掉仍待复盘的真薄弱点。
+_MISTAKE_RESOLVED = i18n.MISTAKE_RESOLVED
+_CONFUSION_RESOLVED = i18n.CONFUSION_RESOLVED
 
 
 def _die(msg, code=2):
@@ -168,14 +170,14 @@ def build_mastery(state):
     if not state:
         return idx
     for m in state.get("mistake_archive") or []:
-        if isinstance(m, dict) and m.get("status") not in _MISTAKE_RESOLVED:   # 已订正的错题不再算薄弱
+        if isinstance(m, dict) and i18n.canon_row_status(m.get("status") or "") not in _MISTAKE_RESOLVED:   # 已订正的错题不再算薄弱
             if m.get("id"):
                 idx["mistake_ids"].add(str(m["id"]))
             if m.get("chapter") is not None:
                 idx["trouble_ch"].add(str(m["chapter"]))
     for c in state.get("confusion_log") or []:
         if (isinstance(c, dict) and c.get("chapter") is not None
-                and c.get("status") not in _CONFUSION_RESOLVED):              # 已回顾/已解决的疑难不再算薄弱
+                and i18n.canon_row_status(c.get("status") or "") not in _CONFUSION_RESOLVED):   # 已回顾/已解决的疑难不再算薄弱
             idx["trouble_ch"].add(str(c["chapter"]))
     for w in state.get("knowledge_window") or []:
         if not isinstance(w, dict):
@@ -183,10 +185,13 @@ def build_mastery(state):
         pt = str(w["point"]).strip() if w.get("point") else None
         if not pt:                                     # 窗口条目按点匹配；无 point 无法定位到题，跳过
             continue
-        status = w.get("status") or "在窗口"
-        if status == "窗口外":
+        # v4 state 存代号（in_window/out_window/verified），旧 state/手写 md 是中文显示词——
+        # 经 canon_window_status 归一后按代号比对，两代输入都命中（未知自由词/坏类型照旧不进任何一侧）
+        raw = w.get("status") or "in_window"
+        status = i18n.canon_window_status(raw) if isinstance(raw, str) else raw
+        if status == "out_window":
             idx["weak_pt"].add(pt)
-        elif status in ("在窗口", "已实测"):
+        elif status in ("in_window", "verified"):
             idx["strong_pt"].add(pt)
     return idx
 
@@ -228,7 +233,7 @@ def order_items(scored, mode):
     """scored: list of dict(id, difficulty, cls, trigger, chapter, orig_idx). 返回排序后的新列表。"""
     def key(it):
         rank = _CLASS_RANK[it["cls"]]
-        if mode == "零基础从头讲":
+        if mode == "from_scratch":
             # 新手：难度优先（全局先易后难），掌握类别仅作同难度内的次序 tiebreak——
             # 绝不让一道 weak 的难题排到简单题前面（那正是本模式要避免的 hard-first）。
             return (it["difficulty"], rank, it["orig_idx"])
@@ -242,8 +247,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Select questions by difficulty x mastery x A6 mode (A7)")
     ap.add_argument("--workspace", required=True)
     ap.add_argument("-n", "--num", type=int, default=10, help="number of questions (default 10)")
-    ap.add_argument("--mode", choices=LEARNING_MODES, default=None,
-                    help="A6 learning mode; defaults to study_state.mode, else 查缺补漏")
+    ap.add_argument("--mode", default=None,
+                    help="learning mode: from_scratch/shore_up/fill_gaps (zh display words and legacy "
+                         "normal/sprint/panic/mock also accepted); defaults to study_state.mode, else fill_gaps")
     ap.add_argument("--chapter", default=None, help="only this chapter (exact chapter-or-phase match)")
     ap.add_argument("--from-chapter", type=int, default=None,
                     help="only numeric chapter numbers >= N (for 某章起步补弱); never guessed from current_phase - unset means no such filter")
@@ -257,9 +263,9 @@ def main(argv=None):
     items = [q for q in bank if isinstance(q, dict) and q.get("id") is not None]
     state = load_state(args.workspace)
     raw_mode = args.mode or (state or {}).get("mode")
-    mode = _normalize_mode(raw_mode)[0] if raw_mode else "查缺补漏"   # panic→零基础 等旧模式迁移，与 A6 同口径
+    mode = _normalize_mode(raw_mode)[0] if raw_mode else "fill_gaps"   # 旧四模式/中文词→代号，词表同源 i18n
     if mode not in LEARNING_MODES:
-        mode = "查缺补漏"                                # 仍非标准（未知串）→ 回落默认，不炸
+        mode = "fill_gaps"                               # 仍非标准（未知串）→ 回落默认，不炸
     idx = build_mastery(state)
     late = sd._late_chapter_cutoff(items)
     notes = []
@@ -285,7 +291,7 @@ def main(argv=None):
     # 某章起步补弱：需要一个**显式**章范围——--chapter（精确章）或 --from-chapter（该章及之后）任一即可。
     # 都没有才 fail-loud；绝不从 current_phase 猜（阶段号未必等于章号，study_plan 可把 阶段1 映到 ch03）。
     from_chapter = args.from_chapter
-    if mode == "某章起步补弱" and from_chapter is None and args.chapter is None:
+    if mode == "shore_up" and from_chapter is None and args.chapter is None:
         _die("某章起步补弱 需要显式章范围：传 --chapter <N> 或 --from-chapter <N>。不从 current_phase 猜——"
              "阶段号未必等于章号（study_plan 可把阶段映到别的章），猜会漏选/错选章节")
 
@@ -330,7 +336,8 @@ def main(argv=None):
                          ensure_ascii=False, indent=2))
     else:
         print("[A7] 模式=%s｜%s｜选出 %d 题（难度×掌握状态启发式排序，非 LLM）"
-              % (mode, "已读 study_state" if state is not None else "无 state（全按常规）", len(payload)))
+              % (i18n.display("mode", mode), "已读 study_state" if state is not None else "无 state（全按常规）",
+                 len(payload)))
         for note in notes:
             print("    · " + note)
         for it in payload:

@@ -21,9 +21,12 @@ for _stream in ("stdout", "stderr"):
     except Exception:
         pass  # 老版本解释器或非常规环境则保持默认
 
+import i18n
+
 SUBJECT_TOKEN = "《科目名称》"               # 模板中待替换的科目占位符
 PHASE_TABLE_MARKER = "<!-- PHASE_TABLE -->"        # study_plan 模板里表格插入点
 PHASE_CHECKLIST_MARKER = "<!-- PHASE_CHECKLIST -->"  # study_progress 模板里打卡列表插入点
+LANGUAGE_MARKER = "<!-- LANGUAGE -->"              # 显式 --lang 时替换为语言代号，否则整行移除
 SAFE_FILENAME = re.compile(r"^[\w.\-]+\.md$")      # 仅允许不含路径的 *.md 文件名
 VALID_QUIZ_TYPES = {"choice", "subjective", "diagram", "fill_blank", "true_false", "code"}
 
@@ -32,11 +35,15 @@ def is_blank(value):
     return value is None or (isinstance(value, str) and not value.strip())
 
 
-def get_template_path(template_name):
-    # 脚本位于 <skill>/scripts/，模板位于 <skill>/templates/
+def get_template_path(template_name, lang="zh"):
+    # 脚本位于 <package>/scripts/，模板位于 <package>/locales/<lang>/templates/（v4 P2 语言包分离）。
+    # 请求语言的模板缺失时回落 zh 包（历史 canonical，覆盖最全），两者都缺才返回 None。
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    template_path = os.path.join(script_dir, "..", "templates", template_name)
-    return template_path if os.path.exists(template_path) else None
+    for lg in dict.fromkeys((lang, "zh")):
+        template_path = os.path.join(script_dir, "..", "locales", lg, "templates", template_name)
+        if os.path.exists(template_path):
+            return template_path
+    return None
 
 
 def fail(messages):
@@ -78,6 +85,19 @@ def validate(data):
             val = p.get(key)
             if val is None or (isinstance(val, str) and not val.strip()):
                 errors.append(f"第 {idx} 个阶段缺少字段「{key}」。")
+        # phase_num 在校验期就规范化成正整数（手写/LLM 生成的 JSON 常给 "1" 字符串）——
+        # 否则要到写盘中途的 chunk id 格式化才 TypeError，留下残缺工作区（Codex r2）。
+        pn = p.get("phase_num")
+        if pn is not None:
+            if isinstance(pn, bool) or not isinstance(pn, (int, str)):
+                errors.append(f"第 {idx} 个阶段的 phase_num 必须是正整数（当前 {pn!r}）。")
+            elif isinstance(pn, str):
+                if pn.strip().isdigit() and int(pn.strip()) >= 1:
+                    p["phase_num"] = int(pn.strip())
+                else:
+                    errors.append(f"第 {idx} 个阶段的 phase_num 必须是正整数（当前 {pn!r}）。")
+            elif pn < 1:
+                errors.append(f"第 {idx} 个阶段的 phase_num 必须 ≥1（当前 {pn}）。")
         # 文件名安全 + 去重（防止 ../ 越界写盘或互相覆盖）
         fn = p.get("wiki_filename")
         if isinstance(fn, str) and fn.strip():
@@ -123,7 +143,21 @@ def validate(data):
     return course_name, phases, quiz_bank, missing_answer_ids
 
 
-def build_phase_table(phases):
+def build_phase_table(phases, lang="zh"):
+    # 插入行必须跟模板同语言（单语言纯净）：en 模板里混入 阶段/未开始 会产出混语工作区；
+    # 读侧（update_progress._plan_phases / validate_workspace._plan_phase_nums /
+    # build_knowledge_index._PHASE_RE）本就同时认 「阶段N」 与 「Phase N」。
+    if lang == "en":
+        lines = [
+            "| Phase | Core task | Linked wiki chapter file | Status |",
+            "| :--- | :--- | :--- | :--- |",
+        ]
+        for p in phases:
+            fn = os.path.basename(p["wiki_filename"].strip())
+            lines.append(f"| **Phase {p['phase_num']}** | {p['phase_name']} | `references/wiki/{fn}` | Not started |")
+        lines.append("| **Mock test** | Final mixed self-test | `references/quiz_bank.json` | Not started |")
+        lines.append("| **Pitfall sweep** | Mistake-archive revisit & cheat sheet | `study_progress.md` mistake archive | Not started |")
+        return "\n".join(lines)
     lines = [
         "| 阶段 | 核心任务 | 关联 Wiki 章节文件 | 状态 |",
         "| :--- | :--- | :--- | :--- |",
@@ -136,7 +170,15 @@ def build_phase_table(phases):
     return "\n".join(lines)
 
 
-def build_phase_checklist(phases):
+def build_phase_checklist(phases, lang="zh"):
+    if lang == "en":
+        lines = []
+        for p in phases:
+            fn = os.path.basename(p["wiki_filename"].strip())
+            lines.append(f"- [ ] **Phase {p['phase_num']}**: {p['phase_name']} (see `references/wiki/{fn}`)")
+        lines.append("- [ ] **Mock test**: Final mixed self-test (see `references/quiz_bank.json`)")
+        lines.append("- [ ] **Pitfall sweep**: mistake self-test")
+        return "\n".join(lines)
     lines = []
     for p in phases:
         fn = os.path.basename(p["wiki_filename"].strip())
@@ -146,13 +188,13 @@ def build_phase_checklist(phases):
     return "\n".join(lines)
 
 
-def render_template(template_name, replacements, markers):
+def render_template(template_name, replacements, markers, lang="zh"):
     """读取模板并按固定锚点 / 占位符渲染。
 
     用不显眼的注释锚点（如 <!-- PHASE_TABLE -->）替代以往“按 emoji 标题切割”的脆弱做法：
     可见标题被改动也不影响渲染。若锚点缺失或重复则报错，绝不静默输出错误内容。
     """
-    path = get_template_path(template_name)
+    path = get_template_path(template_name, lang)
     if not path:
         fail([f"未找到模板 {template_name}，无法生成。"])
     with open(path, "r", encoding="utf-8") as f:
@@ -171,7 +213,18 @@ def main():
     parser.add_argument("--input", "-i", type=str, default="raw_input.json", help="input structured-outline JSON path")
     parser.add_argument("--output-dir", "-o", type=str, default=".", help="target workspace path (default: current directory)")
     parser.add_argument("--force", action="store_true", help="allow overwriting an existing study_progress.md (auto-backup first)")
+    parser.add_argument("--lang", type=str, default=None,
+                        help="language pack for generated plan/progress files: zh or en "
+                             "(aliases accepted via i18n.canon_language; default zh; "
+                             "missing en template files fall back to the zh pack). When given "
+                             "EXPLICITLY it is also seeded into the progress file so "
+                             "update_progress init migrates it into study_state.language")
     args = parser.parse_args()
+
+    lang_explicit = args.lang is not None
+    lang, lang_warn = i18n.canon_language(args.lang or "zh")
+    if lang not in ("zh", "en"):
+        fail([lang_warn or f"--lang 仅支持 zh / en（当前为 {args.lang!r}）。"])
 
     if not os.path.exists(args.input):
         print(f"[-] 错误: 输入文件 '{args.input}' 不存在。")
@@ -252,6 +305,39 @@ def main():
             wf.write(p["wiki_content"])
         print(f"[+] 已写入 Wiki 文件: references/wiki/{filename}")
 
+    # 1b. v4-P3：小节级切块（仅索引粒度——章文件仍逐字写盘，现有契约零破坏）→ BM25 检索索引。
+    #     检索时 retrieve.py 返回 文件+标题+词窗摘要，弃答门限先于任何生成（spike 契约）。
+    import hashlib
+    import chunk as _chunk
+    import retrieve as _retrieve
+    all_chunks, wiki_meta = [], {}
+    for p in phases:
+        filename = os.path.basename(p["wiki_filename"].strip())
+        _, chs = _chunk.chunk_text(p["wiki_content"])
+        ch_id = "ch%02d" % p["phase_num"]
+        for k, c in enumerate(chs, 1):
+            all_chunks.append({"id": "%s#s%02d" % (ch_id, k),
+                               "file": "references/wiki/" + filename,
+                               "chapter": str(p["phase_num"]),
+                               "title": c["title"], "text": c["text"]})
+        wiki_meta[filename] = {
+            "chapter": p["phase_num"], "n_chunks": len(chs),
+            "sha256": hashlib.sha256(p["wiki_content"].encode("utf-8")).hexdigest()}
+    if all_chunks:
+        index = _retrieve.build_index(all_chunks)
+        with open(os.path.join(output_dir, "references", "retrieval_index.json"),
+                  "w", encoding="utf-8") as xf:
+            json.dump(index, xf, ensure_ascii=False)
+        print(f"[+] 已建检索索引: references/retrieval_index.json（{len(all_chunks)} 块 / {len(phases)} 章）")
+    with open(os.path.join(output_dir, "references", "wiki_meta.json"), "w", encoding="utf-8") as mf:
+        json.dump(wiki_meta, mf, ensure_ascii=False, indent=2)
+    # 术语对照（跨语言检索桥）：raw_input.json 可带顶层 "terms"（AI 建库时产出、可人工校对）
+    terms = data.get("terms")
+    if isinstance(terms, dict) and terms:
+        with open(os.path.join(output_dir, "references", "terms.json"), "w", encoding="utf-8") as tf:
+            json.dump(terms, tf, ensure_ascii=False, indent=2)
+        print(f"[+] 已写入术语对照: references/terms.json（{len(terms)} 组）")
+
     # 2. 写入题库 JSON
     quiz_file_path = os.path.join(output_dir, "references", "quiz_bank.json")
     with open(quiz_file_path, "w", encoding="utf-8") as qf:
@@ -272,8 +358,9 @@ def main():
     # 3. 生成 study_plan.md（可重复生成，无用户状态）
     plan_content = render_template(
         "study_plan_template.md",
-        {SUBJECT_TOKEN: f"《{course_name}》", PHASE_TABLE_MARKER: build_phase_table(phases)},
+        {SUBJECT_TOKEN: f"《{course_name}》", PHASE_TABLE_MARKER: build_phase_table(phases, lang)},
         markers=[PHASE_TABLE_MARKER],
+        lang=lang,
     )
     plan_out_path = os.path.join(output_dir, "study_plan.md")
     with open(plan_out_path, "w", encoding="utf-8") as pf:
@@ -290,16 +377,27 @@ def main():
             backup = f"{progress_out_path}.bak-{datetime.now():%Y%m%d-%H%M%S}"
             shutil.copy2(progress_out_path, backup)
             print(f"[+] 已备份旧进度文件: {os.path.basename(backup)}")
-        first_phase = f"阶段 1：{phases[0]['phase_name']}"
+        # 断点种子行同语言：en 进度文件写 「Phase 1: …」（读侧 current phase 解析两种都认）
+        first_phase = (f"Phase 1: {phases[0]['phase_name']}" if lang == "en"
+                       else f"阶段 1：{phases[0]['phase_name']}")
         prog_content = render_template(
             "study_progress_template.md",
             {
                 SUBJECT_TOKEN: f"《{course_name}》",
                 "{CURRENT_PHASE}": first_phase,
-                PHASE_CHECKLIST_MARKER: build_phase_checklist(phases),
+                PHASE_CHECKLIST_MARKER: build_phase_checklist(phases, lang),
             },
             markers=[PHASE_CHECKLIST_MARKER],
+            lang=lang,
         )
+        # 语言持久化闭环（Codex r5）：显式 --lang 时把语言代号种进进度文件，update_progress init
+        # 迁移即得 study_state.language——否则 en 工作区 init 后 language=null，工具全回落 zh。
+        # 未显式给 --lang 则整行删除（不预占语言，留给合并首问决定——缺省英文政策不被预置 zh 顶掉）。
+        if lang_explicit:
+            prog_content = prog_content.replace(LANGUAGE_MARKER, lang)
+        else:
+            prog_content = "\n".join(l for l in prog_content.splitlines()
+                                     if LANGUAGE_MARKER not in l) + "\n"
         with open(progress_out_path, "w", encoding="utf-8") as prf:
             prf.write(prog_content)
         print("[+] 已生成: study_progress.md")

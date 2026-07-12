@@ -103,7 +103,7 @@ class OrderUnit(unittest.TestCase):
     def test_beginner_mode_global_ascending(self):
         items = [self._mk("weak", 4, 0), self._mk("neutral", 2, 1),
                  self._mk("mastered", 5, 2), self._mk("mastered", 1, 3)]
-        out = [it["id"] for it in shq.order_items(items, "零基础从头讲")]
+        out = [it["id"] for it in shq.order_items(items, "from_scratch")]   # v4：内部函数吃 canonical 代号
         # 零基础=难度优先（全局先易后难），掌握类别仅同难度内 tiebreak：
         # d1(i3) → d2(i1) → d4(i0) → d5(i2)。绝不把 weak 难题(i0 d4)排到简单题前。
         self.assertEqual(out, ["i3", "i1", "i0", "i2"])
@@ -111,10 +111,10 @@ class OrderUnit(unittest.TestCase):
     def test_beginner_never_serves_hard_weak_before_easy(self):
         # 回归 finding：weak d5 绝不排在 neutral d1 之前（零基础模式）
         items = [self._mk("weak", 5, 0), self._mk("neutral", 1, 1)]
-        out = [it["id"] for it in shq.order_items(items, "零基础从头讲")]
+        out = [it["id"] for it in shq.order_items(items, "from_scratch")]   # v4：内部函数吃 canonical 代号
         self.assertEqual(out, ["i1", "i0"])
         # 对照：查缺补漏模式下 weak 仍先行（巩固优先）
-        out2 = [it["id"] for it in shq.order_items(items, "查缺补漏")]
+        out2 = [it["id"] for it in shq.order_items(items, "fill_gaps")]
         self.assertEqual(out2, ["i0", "i1"])
 
 
@@ -145,35 +145,35 @@ class CliIO(unittest.TestCase):
         r = self._run()
         self.assertEqual(r.returncode, 0, r.stderr)
         obj = json.loads(r.stdout)
-        self.assertEqual(obj["mode"], "查缺补漏")
+        self.assertEqual(obj["mode"], "fill_gaps")                # v4：--json 载荷携带代号
         self.assertFalse(obj["state_loaded"])
         self.assertEqual({it["id"] for it in obj["items"]}, {"easy", "mid", "hard"})
 
     def test_reads_mode_from_state(self):
-        self._state({"mode": "零基础从头讲"})
+        self._state({"mode": "零基础从头讲"})                     # 旧代 zh 显示词输入仍被接受
         obj = json.loads(self._run().stdout)
-        self.assertEqual(obj["mode"], "零基础从头讲")
+        self.assertEqual(obj["mode"], "from_scratch")             # 归一化后 --json 输出代号
 
     def test_legacy_panic_mode_migrates_to_beginner(self):
         # 旧 panic → 零基础从头讲（与 update_progress 迁移同口径，不再误当查缺补漏）
         self._state({"mode": "panic"})
         obj = json.loads(self._run().stdout)
-        self.assertEqual(obj["mode"], "零基础从头讲")
+        self.assertEqual(obj["mode"], "from_scratch")
 
     def test_legacy_sprint_mode_migrates_to_review(self):
-        self._state({"mode": "sprint"})            # 旧 sprint → 查缺补漏
+        self._state({"mode": "sprint"})            # 旧 sprint → 查缺补漏（代号 fill_gaps）
         obj = json.loads(self._run().stdout)
-        self.assertEqual(obj["mode"], "查缺补漏")
+        self.assertEqual(obj["mode"], "fill_gaps")
 
     def test_truly_unknown_mode_falls_back(self):
         self._state({"mode": "乱写的模式"})        # 非标准串 → 回落默认，不炸
         obj = json.loads(self._run().stdout)
-        self.assertEqual(obj["mode"], "查缺补漏")
+        self.assertEqual(obj["mode"], "fill_gaps")
 
     def test_cli_mode_overrides_state(self):
         self._state({"mode": "查缺补漏"})
-        obj = json.loads(self._run("--mode", "零基础从头讲").stdout)
-        self.assertEqual(obj["mode"], "零基础从头讲")
+        obj = json.loads(self._run("--mode", "零基础从头讲").stdout)   # CLI 仍接受 zh 显示词
+        self.assertEqual(obj["mode"], "from_scratch")
 
     def test_mistake_makes_weak_first(self):
         self._state({"mode": "查缺补漏", "mistake_archive": [{"id": "hard", "chapter": 5}]})

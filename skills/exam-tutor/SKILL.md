@@ -36,6 +36,7 @@ Teach exactly one current wiki chapter. Explain concepts with real-life metaphor
    The explanation ends at the per-question source block below — ①-⑦ plus the source block is the COMPLETE default output. The legacy closers 易错点 / 3分钟速记 / 现在轮到你 are NOT emitted by default: output them only when the student explicitly asks (e.g. 「给我个口诀」「有什么易错点」「考考我」), or when a stored preference requests them (`set --pref 收尾块=易错点+3分钟速记`, any combination the student named). The legacy `【考点拆解】`/`【标准答题模板/步骤】` blocks are subsumed by ② and ④⑤ — do not duplicate them. Aim for an answer framework the student can reproduce from memory in the exam.
    - **Per-question source block (mandatory)** — immediately after ⑦, one single line in the active reply language — `中文` shape `题目来源：<文件名> 第<N>页（<source_type>）｜答案来源：<文件名 第<N>页 / 老师·教材提供 / AI 推导（无教材答案）>｜<canonical 溯源标签>`, `English` shape `Question source: <file> p.<N> (<source_type>) | Answer source: <…> | <label>`, where the trailing label is exactly one of the three canonical provenance sentences in the active reply language (`中文` 🟢 来自资料 / 🟡 AI补充，可能与你老师讲的不完全一致 / ⚠️ AI生成答案，非老师/教材提供 — `English` the three EN sentences, see [`docs/language-policy.md`](../../docs/language-policy.md)). No teacher/textbook answer → the label MUST be the full ⚠️ sentence and ⑤'s title carries it. Missing source metadata → write `中文` 「来源未知」 / `English` `Source unknown`, never fabricate.
    - **Explanation-template preference (`讲解模板` preference)** — on FIRST entering key-question mode in a workspace, ask which template variant the student wants (七步精讲 = STEM default / 文科变体) and persist it: `python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace <ws> set --pref 讲解模板=<七步精讲|文科变体>`. This is a PREFERENCE, separate from `--mode`; the progress panel shows it under the `⚙️ 偏好` block. Honor the stored value in later sessions without re-asking; change it whenever the student asks (same command). Neither variant may drop any of ①-⑦ or the source block. Without `study_state.json` (no-Python fallback), record it in the md `偏好` section.
+   - **Persist-first (notebook CLI)** — after composing the full ①-⑦ walkthrough (source block included), FIRST write it to the workspace notebook, THEN reply: `echo <walkthrough body> | python "${CLAUDE_SKILL_DIR}/scripts/notebook.py" --workspace <ws> add-entry --chapter <N> --type walkthrough --id <qid> --title <question gist>` (body arrives via STDIN, UTF-8; the script resolves from the skill package root). Re-running the same `--id` in the same chapter REPLACES the entry in place, so a re-teach never duplicates it; `notebook/index.md` rebuilds deterministically on every write. The chat reply is then a 3-5 line digest ending with the full-text link line from the active language pack (zh 「完整解答：`notebook/chNN.md#<anchor>`｜目录：`notebook/index.md`」, en `Full walkthrough: notebook/chNN.md#<anchor> | Index: notebook/index.md`). If the notebook write fails, TELL the student and deliver the complete walkthrough in chat instead — never silently drop content. File-less clients (no file I/O) keep the existing chat-only output per `exam-cram`'s capability dispatch.
 4. **Visual-first key questions.** Before explaining, hinting, or solving any stored/key question with `requires_assets=true` or `maybe_requires_assets=true`, apply [`docs/file-format.md`](../../docs/file-format.md) §4: render/show every question-side asset (`question_context` / `figure` / `diagram` / `table`) first, label it per §4 in the active reply language (`中文`/`双语` `题面图`, `English` `Question-side asset`), and use only those prompt assets before the explanation. Do not show `answer_context` / `worked_solution` assets until solution/review, after the prompt image has already been shown, and label them per §4 in the active reply language (`中文`/`双语` `答案图`, `English` `Answer-side asset`). If the file is missing/unreadable, the UI cannot render it, or the output would only print a non-rendering path (including malformed slash-prefixed Windows drive-letter Markdown), do not teach that item as if the prompt were complete; say the prompt asset is unavailable and move on. Prefer the official tool over hand-writing the Markdown: `python <package-root>/scripts/show_question_assets.py --workspace <ws> --id <qid> --lang <zh|en>` (pass the active reply language — `--lang zh` labels 题面图, `--lang en` labels Question-side asset) emits the prompt-side image lines (POSIX relative paths) and exits 1 when the contract can't be met — treat exit 1 as "skip this item".
 5. **Diagram — run the algorithm first.** For binary tree / AVL / red-black tree / B-tree / graph traversal / state machine diagrams, do not freehand from memory. First write and actually run the standard algorithm in Python (`matplotlib`/`graphviz`) to obtain the structure, then render it to an image. Tell the student 「按通用教科书画法，老师有特殊要求以老师为准」 (drawn per standard textbook convention; defer to the teacher for special requirements). If Python is unavailable, describe each step in ASCII/Mermaid and label it 「未经程序验证」 (not program-verified).
 6. **Provenance labels.** Label every segment using the canonical markers (see [`docs/language-policy.md`](../../docs/language-policy.md)): 🟢 来自资料 for material-sourced content / 🟡 AI补充，可能与你老师讲的不完全一致 for AI additions. When the teacher did not provide the answer and the AI supplies it, label it ⚠️ AI生成答案，非老师/教材提供.
@@ -49,91 +50,19 @@ Teach exactly one current wiki chapter. Explain concepts with real-life metaphor
 
 ## Output Contract
 - Output a concise explanation plus the needed metaphor / formula dissection / memory hook, ending with a refreshed progress panel.
+- **Persist-first default**: every seven-step walkthrough is written to `notebook/chNN.md` via the notebook CLI BEFORE the chat reply (Workflow step 3); the reply itself is a 3-5 line digest plus the pack-provided full-text link line — replying with the full walkthrough in chat while skipping the notebook write is a contract violation on file-capable clients. On a failed write, say so and fall back to full-content chat; on file-less clients, chat-only output stands.
 - Every key-question explanation contains all seven template blocks ①-⑦ in order plus the one-line per-question source block in the active reply language (`中文` `题目来源｜答案来源｜<canonical 标签>` / `English` `Question source: … | Answer source: … | <label>`, per Workflow step 3) — and by default NOTHING after the source block. Skipping ② and pasting formulas directly, omitting the source block, presenting an AI-derived answer without ⚠️ in both ⑤'s title and the source label, or appending unsolicited 易错点 / 3分钟速记 / 现在轮到你 closers are contract violations (behavior smoke: `teaching_template`).
 - After each learning or checkpoint event, update the chapter checkpoint status (state-backed: `update_progress.py set`/`set-check`; fallback: `study_progress.md`).
 - Do not quiz or score; for practice questions, delegate to `exam-quiz` (which draws only from `references/quiz_bank.json`).
 - Limit wiki reads to the single current `references/wiki/chN_*.md` chapter (not other chapters, not the whole book); validate that path. Reading and updating `study_progress.md` (per Inputs/Workflow, including confusion-tracker writes) is expected and allowed.
 - Student-facing output defaults to English (Simplified Chinese if the student opened in Chinese); a persisted `study_state.json` `language` (`中文`/`English`/`双语`) switches it per exam-cram's dispatch rule with single-language purity. Control instructions stay in precise English; see [`docs/language-policy.md`](../../docs/language-policy.md).
 
-## Student-facing Output
-讲题用七步模板的紧凑中文格式（具体、应试，别写翻译腔/长篇大论）。①-⑦ 七个编号块一个都不能少、顺序不能乱：
-
-```text
-当前阶段：阶段 2：线性表　｜　讲解模板：七步精讲（存在 ⚙️ 偏好里，随时可改）
-
-① 题面图：
-![题面图](references/assets/ch02_p12_fig.png)
-（无图题这里写：本题无图，直接看题干条件。）
-
-② 这题在问什么：
-给你一个顺序表和一个链表，问哪种结构随机访问第 i 个元素更快、为什么。考点是两种存储方式的定位代价。
-
-③ 图里要读的量：
-表长 n、要访问的下标 i；链表图里数一数从头结点走到第 i 个结点要跳几次。
-
-④ 核心公式：
-顺序表定位：地址 = 基地址 + i × 元素大小 → O(1)；链表定位：从头走 i 步 → O(i)。
-
-⑤ 逐步演算：
-1. 顺序表：一次乘加直接算出地址，1 步到位。
-2. 链表：i=5 时要做 5 次 next 跳转。
-3. 结论：顺序表随机访问 O(1)，链表 O(n)，顺序表快。
-
-⑥ 答案自检：
-拿 i=0 边界代回：顺序表仍 1 步，链表 0 步——大小关系不变，结论靠谱。
-
-⑦ 知识点溯源：
-第 2 章《线性表》 · references/wiki/ch02_linear_list.md · 原文 [lecture03.pdf 第 12 页](../lecture03.pdf#page=12)
-
-题目来源：hw02.pdf 第 3 页（homework）｜答案来源：hw02_sol.pdf 第 1 页｜🟢 来自资料
-```
-
-- **默认输出到来源块为止**。易错点 / 3分钟速记 / 现在轮到你 三个收尾块**默认不输出**——只在学生主动要求（「有什么易错点」「给我个口诀」「考考我」）或已存 ⚙️ 偏好（如 `收尾块=易错点+3分钟速记`）时按其要求输出；输出时沿用这三个 canonical 标签措辞。
-- **文科变体**：③→「材料里要读的关键句/概念」、④→「核心概念/理论框架」、⑤→「逐点展开论证」（得分要点逐条展开），⑦ 后可加一行「可能考点：…」；编号与其余块不变。
-- **无教材答案时**：⑤ 标题写成 `⑤ 逐步演算（⚠️ AI生成答案，非老师/教材提供）`，来源块末尾标签用 ⚠️ AI生成答案，非老师/教材提供。
-- 零基础重点题精讲对每道重点题都走同一份七步模板（旧版「考点拆解/标准答题步骤」已并入 ②/④⑤，不再单列）。
-
-### English rendering (`language=English`)
-
-Same seven blocks, same order — whole-sentence English using the EN canonical vocabulary in
-[`docs/language-policy.md`](../../docs/language-policy.md) verbatim, zero CJK outside code spans
-(persisted zh values, Chinese filenames, and commands stay inside code spans). A concrete
-English-mode sample of the SAME output the Chinese sample above shows:
-
-```text
-Current stage: Stage 2 (Linear Lists) | Template: seven-step walkthrough (stored as a preference — change anytime)
-
-① Question figure:
-![Question-side asset](references/assets/ch02_p12_fig.png)
-(For a no-figure item this block reads: This question has no figure — read the given conditions.)
-
-② What's being asked: one or two plain English sentences — what the question asks and which knowledge point it tests…
-③ What to read off the figure: …
-④ Core formula: …
-⑤ Step-by-step solution: …
-⑥ Answer self-check: …
-⑦ Source trace: Chapter 2 (Linear Lists) · references/wiki/ch02_linear_list.md · original [lecture03.pdf p.12](../lecture03.pdf#page=12)
-
-Question source: lecture03.pdf p.12 (lecture) | Answer source: provided by the teacher/textbook | 🟢 From your materials
-```
-
-- The source-block line uses ASCII `|` separators; the trailing label is the FULL text of one of the
-  three EN provenance sentences — 🟢 From your materials / 🟡 AI-supplemented — may differ from what your
-  teacher taught / ⚠️ AI-generated answer — not from your teacher or textbook — never the emoji alone.
-  Missing source metadata → write Source unknown (file known but page missing → Source page unknown);
-  never invent a filename or page number.
-- No teacher/textbook answer → ⑤'s title carries the label too:
-  `⑤ Step-by-step solution (⚠️ AI-generated answer — not from your teacher or textbook)`.
-- Closers stay OFF by default (same trigger rule as zh); when the student asks or a stored preference
-  (e.g. `收尾块=易错点+3分钟速记`) requests them, name them in English: Common pitfalls / 3-minute
-  mnemonic / Your turn.
-- Stage references render in English (Stage N); a resume opens with: Resuming from Stage 2.
-- Liberal-arts variant (`文科变体`) in English mode: ③ → the key sentences/concepts to read in the
-  material, ④ → the core concept / theoretical framework, ⑤ → expand each scoring point one by one,
-  and an optional line after ⑦: Possible exam focus: …. Numbering and the other blocks are unchanged.
-- For `language=双语`, do not use this template alone — compose per the rule in
-  [`exam-cram`](../exam-cram/SKILL.md): the zh unit first, then a `> EN:` mirror per block, each side
-  single-language pure.
+## Language packs
+Student-visible wording for this skill lives in per-language packs — load the one matching `study_state.json.language` BEFORE emitting any student-visible output:
+- `zh` → [`../../locales/zh/skills/exam-tutor.md`](../../locales/zh/skills/exam-tutor.md)
+- `en` → [`../../locales/en/skills/exam-tutor.md`](../../locales/en/skills/exam-tutor.md)
+- `bilingual` → compose from the zh pack with a `> EN:` mirror line per block (rules in [`../../docs/language-policy.md`](../../docs/language-policy.md))
+Unset language → this is the first conversation: the merged first-ask (mode × time budget × language) decides it; default en unless the student opened in Chinese.
 
 ## Boundaries
 - **Structured progress state**: when `study_state.json` exists it is the SINGLE SOURCE OF TRUTH — update it via `python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace <ws> set/add-mistake/add-confusion/render`; `study_progress.md` is a GENERATED view (hand edits are lost on the next render — never hand-patch it). If a state write fails, TELL the user; never continue as if it saved. Without `study_state.json` but WITH Python (a fresh, uninitialized workspace), run `update_progress.py --workspace <ws> init` to create the source of truth FIRST — do not stop at hand-editing `study_progress.md`; only when Python truly cannot run does a hand-maintained md stay valid.

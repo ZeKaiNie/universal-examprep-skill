@@ -366,6 +366,14 @@ class LiveRoundSixFixes(unittest.TestCase):
         try:
             self.assertTrue(os.path.isfile(os.path.join(cwd, "SKILL.md")), "SKILL.md must be in the sandbox")
             self.assertTrue(os.path.isdir(os.path.join(cwd, "skills")), "skills/ must be in the sandbox")
+            # v4-P2: the root SKILL.md is a router into locales/ — the full-entry packs must ship too,
+            # or the live agent reads a router that dispatches into nothing (SKILL.en.md is retired).
+            self.assertTrue(os.path.isfile(os.path.join(cwd, "locales", "zh", "SKILL.md")),
+                            "locales/zh/SKILL.md (full-entry pack) must be in the sandbox")
+            self.assertTrue(os.path.isfile(os.path.join(cwd, "locales", "en", "SKILL.md")),
+                            "locales/en/SKILL.md (full-entry pack) must be in the sandbox")
+            self.assertFalse(os.path.exists(os.path.join(cwd, "SKILL.en.md")),
+                             "retired SKILL.en.md must not reappear in the sandbox")
             self.assertTrue(os.path.isfile(os.path.join(cwd, "references", "quiz_bank.json")),
                             "the fixture workspace must still be present")
         finally:

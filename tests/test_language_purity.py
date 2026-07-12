@@ -20,7 +20,8 @@ Doctrine (Phase 6 — user override of the old anchor-invariance design):
     transcripts only; nothing in this module touches benchmark/.
 
 Four enforcement blocks:
-  T1  en-surface purity  — SKILL.en.md + prompts/web_prompt.en.md carry ZERO CJK
+  T1  en-surface purity  — locales/en/SKILL.md + prompts/web_prompt.en.md (plus
+      the per-skill en packs, see EN_SURFACE_FILES) carry ZERO CJK
       outside (a) inline code spans and (b) fenced-code-block lines that invoke
       official scripts. A fenced ```markdown block in web_prompt.en.md is PROSE:
       only its script command lines and inline code spans are exempt. NO token
@@ -86,6 +87,7 @@ EXISTING-TEST SURGERY LIST — what C2b/C2c must edit or retire
      doctrine).
 --------------------------------------------------------------------------------
 """
+import glob
 import os
 import re
 import sys
@@ -103,10 +105,10 @@ def _find_root():
     """Repo root. Landed location is tests/test_language_purity.py → parent of tests/.
     EXAMPREP_ROOT overrides for standalone runs from outside the repo (scratchpad)."""
     cand = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if os.path.exists(os.path.join(cand, "SKILL.en.md")):
+    if os.path.exists(os.path.join(cand, "locales", "en", "SKILL.md")):
         return cand
     env = os.environ.get("EXAMPREP_ROOT")
-    if env and os.path.exists(os.path.join(env, "SKILL.en.md")):
+    if env and os.path.exists(os.path.join(env, "locales", "en", "SKILL.md")):
         return env
     return cand
 
@@ -189,12 +191,21 @@ SCRIPT_CMD_RE = re.compile(r"^\s*(?:\$ ?)?python(?:3)?\b")
 # =============================================================================
 # T1 machinery — en-surface purity (NO whitelist)
 # =============================================================================
-# End state: both .en entry files. RED until C2b rewrites them; if this module
-# must land green at C2a ahead of C2b, the landing PR may stage this tuple —
-# C2b MUST restore both entries in the same PR that rewrites the files.
-EN_SURFACE_FILES = (
-    "SKILL.en.md",
-    "prompts/web_prompt.en.md",
+# v4-P2 layout: the en full-entry pack lives at locales/en/SKILL.md (SKILL.en.md
+# retired) and the per-skill en packs live under locales/en/skills/. All of them
+# are strict zero-CJK-outside-code-spans surfaces EXCEPT confusion-tracker.md,
+# whose fenced example deliberately shows the PERSISTED zh-canonical progress
+# table (machine vocabulary that never drifts with the reply language) — that
+# file plus locales/en/templates/*.md (which keep the 《科目名称》 machine anchor)
+# are covered by tests/test_language_packs.py with the persisted-content
+# structural strips instead of joining this strict roster.
+EN_SURFACE_FILES = tuple(
+    ["locales/en/SKILL.md", "prompts/web_prompt.en.md"]
+    + sorted(
+        os.path.relpath(p, ROOT).replace("\\", "/")
+        for p in glob.glob(os.path.join(ROOT, "locales", "en", "skills", "*.md"))
+        if os.path.basename(p) != "confusion-tracker.md"
+    )
 )
 
 
@@ -243,25 +254,27 @@ def is_pure_en(output_text):
 # T2 machinery — zh-output purity
 # =============================================================================
 # ------------------------------------------------------------------ ROSTER --
-# STARTS EMPTY ON PURPOSE (C2a scaffold): today's zh files still carry
-# decorative English titles and token+gloss shapes (C0 audit §2), so pinning
-# them now would be a permanently-red test. C2b/C2c extend this list file by
-# file, in the same commit that cleans each file. End-state roster:
-#   ("SKILL.md",                          "file"),   # C2b
-#   ("prompts/web_prompt.md",             "file"),   # C2b
-#   ("skills/exam-cram/SKILL.md",         "sfo"),    # C2c
-#   ("skills/exam-ingest/SKILL.md",       "sfo"),    # C2c
-#   ("skills/exam-tutor/SKILL.md",        "sfo"),    # C2c
-#   ("skills/exam-quiz/SKILL.md",         "sfo"),    # C2c
-#   ("skills/exam-review/SKILL.md",       "sfo"),    # C2c
-#   ("skills/exam-cheatsheet/SKILL.md",   "sfo"),    # C2c
-#   ("skills/exam-help/SKILL.md",         "sfo"),    # C2c
-#   ("skills/confusion-tracker/SKILL.md", "sfo"),    # C2c
+# v4-P2 layout: the zh full-entry pack (the former root SKILL.md body) lives at
+# locales/zh/SKILL.md; the former '## Student-facing Output' sections of the
+# sub-skills live as zh packs under locales/zh/skills/ (no exam-audit — it has
+# no student-facing surface by design). Packs that keep the
+# '## Student-facing Output' heading register as "sfo" (the section body is the
+# student copy; the preamble note above it is agent-facing meta); the two packs
+# whose whole body is the student copy (exam-cheatsheet / confusion-tracker,
+# no SFO heading) register as "file".
 # ("file" = whole file minus YAML frontmatter; "sfo" = the file's
-#  '## Student-facing Output' section only. exam-audit has no SFO section.)
+#  '## Student-facing Output' section only.)
 ZH_OUTPUT_PURITY_TARGETS = [
-    ("SKILL.md", "file"),                    # C2b
-    ("prompts/web_prompt.md", "file"),       # C2b
+    ("locales/zh/SKILL.md", "file"),
+    ("prompts/web_prompt.md", "file"),
+    ("locales/zh/skills/exam-cram.md", "sfo"),
+    ("locales/zh/skills/exam-help.md", "sfo"),
+    ("locales/zh/skills/exam-ingest.md", "sfo"),
+    ("locales/zh/skills/exam-quiz.md", "sfo"),
+    ("locales/zh/skills/exam-review.md", "sfo"),
+    ("locales/zh/skills/exam-tutor.md", "sfo"),
+    ("locales/zh/skills/exam-cheatsheet.md", "file"),
+    ("locales/zh/skills/confusion-tracker.md", "file"),
 ]
 
 # English-prose detector: any run of >=2 latin letters left after stripping.
@@ -782,10 +795,15 @@ _CODENAME_RE = re.compile(
     r"(?![A-Za-z0-9_])")   # C 系列（C0-C5/C2c…）是阶段6自身的路标，必须钉
 
 _RUNTIME_CODENAME_FILES = (
-    ["SKILL.md", "SKILL.en.md", "AGENTS.md", "prompts/web_prompt.md", "prompts/web_prompt.en.md"]
+    ["SKILL.md", "AGENTS.md", "prompts/web_prompt.md", "prompts/web_prompt.en.md",
+     "locales/zh/SKILL.md", "locales/en/SKILL.md"]
     + ["skills/%s/SKILL.md" % s for s in
        ("exam-cram", "exam-tutor", "exam-quiz", "exam-review", "exam-cheatsheet",
-        "exam-ingest", "exam-audit", "exam-help", "confusion-tracker")])
+        "exam-ingest", "exam-audit", "exam-help", "confusion-tracker")]
+    # the language packs + templates are runtime text too — codename lint covers them all
+    + sorted(os.path.relpath(p, ROOT).replace("\\", "/")
+             for pat in ("locales/*/skills/*.md", "locales/*/templates/*.md")
+             for p in glob.glob(os.path.join(ROOT, *pat.split("/")))))
 
 
 class C3NoStageCodenames(unittest.TestCase):
@@ -813,29 +831,20 @@ class C3NoStageCodenames(unittest.TestCase):
 
 
 class C2cEnRenderingBlocksArePureEnglish(unittest.TestCase):
-    """C2c：exam-tutor / exam-quiz 的 `### English rendering` 子块必须零 CJK（代码 span 除外）——
-    它是 English 模式的学生可见样例，token+gloss 旧形态已废除。"""
+    """C2c/v4-P2：旧 `### English rendering` 子块已拆出为 en 语言包 —— exam-tutor / exam-quiz
+    的英文学生可见样例现在整文件住在 locales/en/skills/ 下，必须零 CJK（代码 span 除外），
+    token+gloss 旧形态已废除。"""
 
-    EN_RENDER_FILES = ("skills/exam-tutor/SKILL.md", "skills/exam-quiz/SKILL.md")
-    _HEAD = re.compile(r"(?m)^### English rendering")
-    _NEXT = re.compile(r"(?m)^## |^### ")
+    EN_RENDER_FILES = ("locales/en/skills/exam-tutor.md", "locales/en/skills/exam-quiz.md")
 
-    def _en_block(self, text):
-        m = self._HEAD.search(text)
-        self.assertTrue(m, u"缺 `### English rendering` 子块")
-        start = m.end()
-        nxt = self._NEXT.search(text, start)
-        return text[start:nxt.start() if nxt else len(text)]
-
-    def test_en_rendering_blocks_zero_cjk(self):
+    def test_en_rendering_packs_zero_cjk(self):
         for rel in self.EN_RENDER_FILES:
-            block = self._en_block(read_rel(rel))
-            off = en_purity_offenses(block)
-            self.assertFalse(off, u"%s 的 English rendering 块残留 CJK（代码 span 外）：%r" % (rel, off[:6]))
+            off = en_purity_offenses(read_rel(rel))
+            self.assertFalse(off, u"%s 的 en 学生侧文案包残留 CJK（代码 span 外）：%r" % (rel, off[:6]))
 
-    def test_en_rendering_blocks_use_en_vocab(self):
+    def test_en_rendering_packs_use_en_vocab(self):
         for rel in self.EN_RENDER_FILES:
-            block = self._en_block(read_rel(rel))
+            block = read_rel(rel)
             # 至少携带来源块行英文形与一个 EN 来源标签句（防退化回中文样例）
             self.assertIn("Question source:", block, rel)
             self.assertTrue(any(lbl in block for _, lbl in EN_CANONICAL_VOCAB

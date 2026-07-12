@@ -15,6 +15,8 @@ view from it. A write failure is FAIL-LOUD (non-zero exit + message) — never s
     python scripts/update_progress.py --workspace <ws> add-confusion --chapter 1 --note "循环队列取模"
     python scripts/update_progress.py --workspace <ws> render               # json → md（修复被手改的 md）
     python scripts/update_progress.py --workspace <ws> show                 # 打印当前状态 JSON
+    python scripts/update_progress.py workspace-register --course 数据结构 --path <dir> [--materials <dir>]
+    python scripts/update_progress.py workspace-list [--json]               # 全局注册表，不吃 --workspace
 
 Backward compatible: a workspace WITHOUT study_state.json keeps working (no-Python fallback:
 hand-written study_progress.md still validates); `init` adopts the existing md losslessly
@@ -34,79 +36,27 @@ for _s in ("stdout", "stderr"):
     except Exception:
         pass
 
+import i18n
+
 STATE_NAME = "study_state.json"
 MD_NAME = "study_progress.md"
 SCHEMA_VERSION = 1
 
-# ---- A6：3 学习模式 × 4 时间宽裕度（canonical 词表 + 旧四模式迁移废弃）----
-# 学习模式（首次对话必须问清，存 state.mode）：
-LEARNING_MODES = ("零基础从头讲", "某章起步补弱", "查缺补漏")
-# 时间宽裕度（叠加在模式上，存 state.time_budget）：
-TIME_TIERS = ("≤1天", "1-3天", "3-7天", ">7天")
-# 旧四模式（normal/sprint/panic/mock）已废弃 → 迁移为 (新模式, 时间宽裕度提示或 None)。
-# 依据计划：panic→零基础+当天、sprint→查缺补漏+短时限、normal/mock→查缺补漏。
-_MODE_MIGRATION = {
-    "panic": ("零基础从头讲", "≤1天"),
-    "sprint": ("查缺补漏", "1-3天"),
-    "normal": ("查缺补漏", None),
-    "mock": ("查缺补漏", None),
-}
-# 时间宽裕度的宽松别名 → canonical 档。
-_TIER_ALIASES = {
-    "≤1天": "≤1天", "<=1天": "≤1天", "1天": "≤1天", "当天": "≤1天", "今天": "≤1天",
-    "一天": "≤1天", "考前一天": "≤1天", "明天考": "≤1天",
-    "1-3天": "1-3天", "1—3天": "1-3天", "1~3天": "1-3天", "2-3天": "1-3天", "几天": "1-3天",
-    "3-7天": "3-7天", "3—7天": "3-7天", "3~7天": "3-7天", "一周": "3-7天", "一周内": "3-7天",
-    ">7天": ">7天", "＞7天": ">7天", "7天以上": ">7天", "一周以上": ">7天", "还早": ">7天",
-    "时间充裕": ">7天",
-}
+# ---- v4：词表唯一定义点在 scripts/i18n.py——本文件只留兼容名 ----
+# 持久化从此只存语言中性 canonical 代号（from_scratch / le1d / zh / in_window / to_review …）；
+# 生成视图仍渲染中文显示词（i18n.display），md 回读经归一化收敛回代号，三代输入全兼容。
+LEARNING_MODES = i18n.MODES
+TIME_TIERS = i18n.TIERS
+LANGUAGES = i18n.LANGS
+
+_normalize_mode = i18n.canon_mode
+_normalize_tier = i18n.canon_tier
+_normalize_language = i18n.canon_language
 
 
-def _normalize_mode(v):
-    """→ (canonical_mode 或原值, migrated_tier 或 None, warning 或 None)。
-    新模式原样；旧四模式迁移 + 警告；未知值保留但警告（AI 侧再决定，不静默改写）。"""
-    v = (v or "").strip()
-    if v in LEARNING_MODES:
-        return v, None, None
-    if v in _MODE_MIGRATION:
-        new_mode, tier = _MODE_MIGRATION[v]
-        return new_mode, tier, ("旧模式「%s」已废弃，迁移为「%s」%s（新模式仅 %s）"
-                                % (v, new_mode, ("＋时间宽裕度「%s」" % tier) if tier else "",
-                                   "/".join(LEARNING_MODES)))
-    return v, None, ("非标准学习模式「%s」——canonical 仅 %s；已按原值保留，请确认是否规范化"
-                     % (v, "/".join(LEARNING_MODES)))
-
-
-def _normalize_tier(v):
-    """→ (canonical_tier 或原值, warning 或 None)。"""
-    v = (v or "").strip()
-    if v in TIME_TIERS:
-        return v, None
-    if v in _TIER_ALIASES:
-        return _TIER_ALIASES[v], None
-    return v, ("非标准时间宽裕度「%s」——canonical 仅 %s；已按原值保留，请确认是否规范化"
-               % (v, "/".join(TIME_TIERS)))
-
-
-# A8b：回复语言偏好（chat 层渲染语言；持久化文件与脚本输出在任何模式下都保持中文 canonical）
-LANGUAGES = ("中文", "English", "双语")
-_LANG_ALIASES = {
-    "zh": "中文", "zh-cn": "中文", "chinese": "中文", "简体中文": "中文", "汉语": "中文", "中": "中文",
-    "en": "English", "english": "English", "英文": "English", "英语": "English",
-    "bilingual": "双语", "bi": "双语", "zh+en": "双语", "中英": "双语", "中英双语": "双语",
-}
-
-
-def _normalize_language(v):
-    """→ (canonical_language 或原值, warning 或 None)。ASCII 别名不区分大小写；未知值原样保留并告警。"""
-    v = (v or "").strip()
-    if v in LANGUAGES:
-        return v, None
-    key = v.lower()
-    if key in _LANG_ALIASES:
-        return _LANG_ALIASES[key], None
-    return v, ("非标准语言偏好「%s」——canonical 仅 %s；已按原值保留，请确认是否规范化"
-               % (v, "/".join(LANGUAGES)))
+def _disp(kind, code):
+    """code → 中文显示词（生成视图/回执用；未知值原样透传）。"""
+    return i18n.display(kind, code, "zh")
 
 
 def _die(msg, code=2):
@@ -124,7 +74,12 @@ def default_state():
 # ---------------- md → state (migration; tolerant of both bullet and table forms) ----------------
 
 _TABLE_SEP = re.compile(r"^\s*\|[\s:\-|]+\|?\s*$")
-_HDR_WORDS = ("错题id", "关联章节", "题目内容", "错误原因", "序号", "疑难点", "解答要点", "状态")
+# 表头词表（匹配前整行 lower()）：zh 词来自历史模板；en 词来自 locales/en/templates/ 的
+# 进度模板表头（多词短语，避免普通数据行里出现 chapter/status 就被误当表头吞掉）。
+# 少了 en 词，`ingest --lang en` 的英文表头行会被当成真实错题行迁进 state（{id:"Mistake ID"}）。
+_HDR_WORDS = ("错题id", "关联章节", "题目内容", "错误原因", "序号", "疑难点", "解答要点", "状态",
+              "mistake id", "question summary", "error analysis", "trouble spot",
+              "answer key points")
 # 旧模板的空档占位既有全角括号形（（暂无））也有裸标签形（暂无错题 / 暂无疑难 / N/A）——
 # 都不是真实条目；真实笔记只是【包含】这些字样（「暂无法求解」）不受影响（fullmatch 才跳过）
 _PLACEHOLDER = re.compile(
@@ -155,23 +110,24 @@ def parse_md(text):
             if pmatch:
                 preferences[pmatch.group(1).strip()] = pmatch.group(2).strip()
     prefs["preferences"] = preferences
-    lm = re.search(r"语言偏好\**\s*：\s*(.+)", t)
+    lm = re.search(r"(?:语言偏好|Language preference)\**\s*[：:]\s*(.+)", t, re.I)
     prefs["language"] = lm.group(1).strip() if lm else None
     mistakes, confusions, checklist, window = [], [], [], []
     cur, in_checklist, in_window, tbl_cols, window_cols = None, False, False, None, None
     for ln in t.splitlines():
         h = ln.strip()
         is_heading = bool(re.match(r"^\s{0,3}(#{1,4}\s|\*\*)", ln))
-        if is_heading and re.search(r"打卡|checklist", h, re.I):
+        if is_heading and re.search(r"打卡|checklist|check-?in", h, re.I):
             cur, in_checklist, in_window, tbl_cols = None, True, False, None   # 📊 知识点打卡状态 区
             continue
         if is_heading and re.search(r"错题|mistake", h, re.I):
             cur, in_checklist, in_window, tbl_cols = mistakes, False, False, None
             continue
-        if is_heading and re.search(r"疑难|困惑|confusion", h, re.I):
+        # en 模板的疑难区标题是 "Concept trouble-spot log"（不含 confusion）——一并识别
+        if is_heading and re.search(r"疑难|困惑|confusion|trouble[ -]?spot", h, re.I):
             cur, in_checklist, in_window, tbl_cols = confusions, False, False, None
             continue
-        if is_heading and re.search(r"知识点窗口|窗口|🪟", h):
+        if is_heading and re.search(r"知识点窗口|窗口|🪟|window", h, re.I):
             # A6：知识点窗口区——init 恢复路径必须把窗口行迁回 state，否则窗口/已实测追踪不可逆丢
             cur, in_checklist, in_window, window_cols = None, False, True, None
             continue
@@ -191,14 +147,16 @@ def parse_md(text):
                 continue
             cells = [c.strip(" *`") for c in h.strip("|").split("|")]
             low = h.lower()
-            if "知识点" in low and "状态" in low:
+            if ("知识点" in low and "状态" in low) or \
+                    ("knowledge point" in low and "status" in low):   # 手写 en 窗口表同样按表头映射
                 window_cols = []
                 for c in cells:
-                    if "知识点" in c:
+                    cl = c.lower()
+                    if "知识点" in c or "knowledge point" in cl:
                         window_cols.append("point")
-                    elif "章节" in c:
+                    elif "章节" in c or "chapter" in cl:
                         window_cols.append("chapter")
-                    elif "状态" in c:
+                    elif "状态" in c or "status" in cl:
                         window_cols.append("status")
                     else:
                         window_cols.append("note")
@@ -214,12 +172,16 @@ def parse_md(text):
                 elif role not in got:
                     got[role] = c
             if got.get("point"):
+                # md 里的状态是中文显示词（或手写自由词）——回读时归一化成代号，未知词透传
                 window.append({"point": got["point"], "chapter": got.get("chapter"),
-                               "status": got.get("status") or "在窗口", "note": " / ".join(wnotes)})
+                               "status": (i18n.canon_window_status(got["status"])
+                                          if got.get("status") else "in_window"),
+                               "note": " / ".join(wnotes)})
             continue
         if cur is None:
             continue
-        default_status = "待回顾" if cur is confusions else "待复盘"   # 疑难走 待回顾→已回顾 契约
+        # 疑难走 to_revisit→revisited 契约，错题走 to_review→corrected/reviewed（存代号，视图渲染中文）
+        default_status = "to_revisit" if cur is confusions else "to_review"
         if re.match(r"^\s*[-*]\s+\S", ln):
             body = re.sub(r"^\s*[-*]\s+", "", h).strip()
             # 只有整条就是占位符才跳过——真实笔记里出现「（暂无）」字样（如问空集的题）不能被丢
@@ -235,12 +197,13 @@ def parse_md(text):
                 # 纯位置映射会把疑难点当章节、状态当 note，迁移后学生的记录被吞
                 tbl_cols = []
                 for c in (c0.strip(" *`") for c0 in h.strip("|").split("|")):
-                    if "章节" in c:
+                    cl = c.lower()
+                    if "章节" in c or "chapter" in cl:
                         tbl_cols.append("chapter")
-                    elif "状态" in c:
+                    elif "状态" in c or "status" in cl:
                         tbl_cols.append("status")
-                    elif "id" in c.lower() or "序号" in c:
-                        tbl_cols.append("id")
+                    elif "id" in cl or "序号" in c or cl.rstrip(".") == "no":
+                        tbl_cols.append("id")           # en 疑难表的 "No." 序号列
                     else:
                         tbl_cols.append("note")
                 continue
@@ -264,13 +227,15 @@ def parse_md(text):
                 cur.append({"id": ids[0] if ids else got.get("id"),
                             "chapter": got.get("chapter"),
                             "note": " / ".join(notes) or got.get("id") or "",
-                            "status": got.get("status") or default_status})
+                            "status": (i18n.canon_row_status(got["status"])
+                                       if got.get("status") else default_status)})
                 continue
             # 没见到表头或行宽与表头不符——退回位置映射（模板 5 列布局）
             tail = cells[2:]
             # 模板表最后一列是状态——迁移 note 时必须剔除，否则状态在 note 和状态列各出现一次；
             # 只有 3 列（无状态列）时整个尾部都是 note，状态回默认
-            status = tail[-1] if len(tail) >= 2 and tail[-1] else default_status
+            status = (i18n.canon_row_status(tail[-1])
+                      if len(tail) >= 2 and tail[-1] else default_status)
             note_cells = tail[:-1] if len(tail) >= 2 else tail
             first_cell = cells[0] if cells and cells[0] not in ("-", "") else None   # 渲染的 '-' 占位≠id
             cur.append({"id": ids[0] if ids else first_cell, "chapter": cells[1] if len(cells) > 1 else None,
@@ -296,9 +261,11 @@ def render_md(state):
             out.append("| " + " | ".join("（暂无）" if i == 0 else "-" for i in range(len(headers))) + " |")
         for r in rows:
             rid = ("[#%s]" % _md_cell(r["id"])) if r.get("id") else "-"
+            # state 存代号（to_review…）——视图渲染中文显示词；自由词状态原样透传
             out.append("| %s | %s | %s | %s |" % (rid, _md_cell(r.get("chapter")),
                                                   _md_cell(r.get("note"), default=""),
-                                                  _md_cell(r.get("status"), default=default_status)))
+                                                  _md_cell(_disp("row", r.get("status")),
+                                                           default=default_status)))
         return "\n".join(out)
 
     lines = [
@@ -307,13 +274,13 @@ def render_md(state):
         "## ⏱️ 当前复习断点",
         "* **当前进行阶段**：阶段 %d" % state["current_phase"],
         "* **范围/模式**：%s ｜ %s ｜ 时间预算 %s" % (state.get("scope") or "混合题池",
-                                                     state.get("mode") or "未设定",
-                                                     state.get("time_budget") or "未设定"),
+                                                     _disp("mode", state.get("mode")) or "未设定",
+                                                     _disp("tier", state.get("time_budget")) or "未设定"),
         "* **最后更新时间**：%s" % (state.get("last_updated") or "-"),
     ]
     if state.get("language"):
         # 语言偏好也要能从生成视图迁回来——init --force 恢复路径不丢 set --language
-        lines.append("* **语言偏好**：%s" % _md_cell(state["language"], default=""))
+        lines.append("* **语言偏好**：%s" % _md_cell(_disp("lang", state["language"]), default=""))
     lines.append("")
     if state.get("phase_checklist"):
         # 打卡区随 state 一起渲染回来——迁移绝不丢每阶段完成状态；勾选走 set-check 官方路径
@@ -334,7 +301,8 @@ def render_md(state):
         for r in state["knowledge_window"]:
             rows.append("| %s | %s | %s | %s |" % (
                 _md_cell(r.get("point"), default=""), _md_cell(r.get("chapter"), default="-"),
-                _md_cell(r.get("status"), default="在窗口"), _md_cell(r.get("note"), default="")))
+                _md_cell(_disp("window", r.get("status")), default="在窗口"),
+                _md_cell(r.get("note"), default="")))
         lines += ["## 🪟 知识点窗口（近期掌握追踪）", "\n".join(rows), ""]
     if state.get("preferences"):
         lines += ["## ⚙️ 偏好（讲解风格等）",
@@ -475,10 +443,66 @@ def cmd_init(ws, args):
     return 0
 
 
+def _migrate_enums(ws, st):
+    """v4 枚举迁移：state 里的旧中文显示词/旧四模式 → 语言中性代号（原地改，返回是否有变化）。
+    首次发生迁移时把旧 state 备份为 study_state.json.v3bak（已存在则不覆盖）——用户进度永不裸奔。
+    未知自由词一律原样保留（canon_* 的透传语义），绝不静默改写。
+    形态坏掉的字段（非字符串枚举/非列表档案）这里一律跳过——本函数跑在 _require_state 的
+    形态校验【之前】，在坏 state 上迭代/strip 会裸 Traceback，把后面的 fail-loud _die 短路掉。"""
+    changed = False
+    if isinstance(st.get("mode"), str) and st["mode"]:
+        code, mig_tier, _w = i18n.canon_mode(st["mode"])
+        if code != st["mode"]:
+            st["mode"], changed = code, True
+        if mig_tier and not st.get("time_budget"):
+            st["time_budget"], changed = mig_tier, True
+    for field, canon in (("time_budget", lambda v: i18n.canon_tier(v)[0]),
+                         ("language", lambda v: i18n.canon_language(v)[0])):
+        v = st.get(field)
+        if isinstance(v, str) and v:
+            c = canon(v)
+            if c != v:
+                st[field], changed = c, True
+    rows = st.get("knowledge_window")
+    for row in (rows if isinstance(rows, list) else []):
+        if isinstance(row, dict) and isinstance(row.get("status"), str):
+            c = i18n.canon_window_status(row["status"])
+            if c != row["status"]:
+                row["status"], changed = c, True
+    for field in ("mistake_archive", "confusion_log"):
+        rows = st.get(field)
+        for row in (rows if isinstance(rows, list) else []):
+            if isinstance(row, dict) and isinstance(row.get("status"), str):
+                c = i18n.canon_row_status(row["status"])
+                if c != row["status"]:
+                    row["status"], changed = c, True
+    if changed:
+        src = os.path.join(ws, STATE_NAME)
+        bak = src + ".v3bak"
+        # 断链的 .v3bak 符号链接会让 exists() 判 False、随后 open("w") 顺着链接把学生进度
+        # 写到工作区外（Codex r4）——与 save() 的 tmp 同款纪律：islink 先整体拒绝（不写任何
+        # 字节，要求人工清理）；「已备份过」的跳过判断用 lexists（链接也算占位，绝不顺链写）
+        if os.path.islink(bak):
+            _die("检测到符号链接备份文件 %s——可能指向工作区外，拒绝写入（请手动清理后重试）"
+                 % bak, 1)
+        if os.path.isfile(src) and not os.path.lexists(bak):
+            try:
+                with open(src, "r", encoding="utf-8") as f:
+                    old = f.read()
+                with open(bak, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(old)
+                sys.stderr.write("update_progress[migrate]: 检测到旧版词表，已归一为 v4 代号；"
+                                 "原文件备份在 %s\n" % bak)
+            except OSError:
+                pass    # 备份失败不拦截主流程（迁移本身无损：显示词↔代号一一对应）
+    return changed
+
+
 def _require_state(ws, repairing_phase=False):
     st = load_state(ws)
     if st is None:
         _die("尚无 study_state.json——先跑 `update_progress.py --workspace <ws> init` 迁移")
+    _migrate_enums(ws, st)   # v4：旧中文枚举 → canonical 代号（下一次 save 固化）
     # 官方持久化路径必须 fail-loud：半写/手改导致的坏形态要在【变更前】报清楚，不能改到一半 Traceback
     cp = st.get("current_phase")
     if not (isinstance(cp, int) and not isinstance(cp, bool) and cp >= 1):
@@ -575,15 +599,15 @@ def cmd_set(ws, args):
             changed.append("mode=（清除）")
         else:
             cmode, mig_tier, warn = _normalize_mode(args.mode)
-            st["mode"] = cmode
-            changed.append("mode=%s" % cmode)
+            st["mode"] = cmode                                # state 存代号
+            changed.append("mode=%s" % _disp("mode", cmode))  # 回执渲染中文显示词
             if warn:
                 sys.stderr.write("update_progress[warn]: " + warn + "\n")
             # 旧模式迁移带出的时间档：本次未显式 --time-budget 就落它——旧模式名自带紧迫度语义，
             # panic 换到 sprint 必须把 ≤1天 刷成 1-3天，不能留旧迁移值让节奏判定错档（仅显式 --time-budget 才不覆盖）
             if mig_tier and args.time_budget is None:
                 st["time_budget"] = mig_tier
-                changed.append("time_budget=%s（旧模式迁移带出）" % mig_tier)
+                changed.append("time_budget=%s（旧模式迁移带出）" % _disp("tier", mig_tier))
     # A6：time_budget 归一化到 4 个 canonical 档
     if args.time_budget is not None:
         if not args.time_budget:
@@ -592,7 +616,7 @@ def cmd_set(ws, args):
         else:
             ctier, twarn = _normalize_tier(args.time_budget)
             st["time_budget"] = ctier
-            changed.append("time_budget=%s" % ctier)
+            changed.append("time_budget=%s" % _disp("tier", ctier))
             if twarn:
                 sys.stderr.write("update_progress[warn]: " + twarn + "\n")
     if args.scope is not None:
@@ -605,7 +629,7 @@ def cmd_set(ws, args):
         else:
             clang, lwarn = _normalize_language(args.language)
             st["language"] = clang
-            changed.append("language=%s" % clang)
+            changed.append("language=%s" % _disp("lang", clang))
             if lwarn:
                 sys.stderr.write("update_progress[warn]: " + lwarn + "\n")
     for kv in (args.pref or []):
@@ -620,8 +644,13 @@ def cmd_set(ws, args):
     return 0
 
 
-# A6：知识点窗口状态词——窗口内（近期讲过、默认还会）/ 窗口外（需回问或实测）/ 已实测（做题验证过）。
-_WINDOW_STATUSES = ("在窗口", "窗口外", "已实测")
+# 知识点窗口状态代号——in_window（近期讲过、默认还会）/ out_window（需回问或实测）/ verified（做题验证过）。
+# CLI 同时接受代号与中文显示词（在窗口/窗口外/已实测），持久化只存代号。
+_WINDOW_STATUSES = i18n.WINDOW_STATUSES
+
+
+def _window_status_hint():
+    return "/".join("%s（%s）" % (c, _disp("window", c)) for c in _WINDOW_STATUSES)
 
 
 def cmd_window_add(ws, args):
@@ -629,9 +658,9 @@ def cmd_window_add(ws, args):
     point = (args.point or "").strip()
     if not point:
         _die("--point 不能为空")
-    status = (args.status or "在窗口").strip()
+    status = i18n.canon_window_status(args.status or "in_window")
     if status not in _WINDOW_STATUSES:
-        _die("--status 必须是 %s，当前 %r" % ("/".join(_WINDOW_STATUSES), status))
+        _die("--status 必须是 %s，当前 %r" % (_window_status_hint(), (args.status or "").strip()))
     win = st.setdefault("knowledge_window", [])
     # 同名知识点视为同一条：更新其状态/备注，不重复登记——窗口进出是状态迁移不是加行。
     # 章节相容即同一点：任一方未标章节、或两方章节相等 → 命中；先松登记再补章节的常见流程会
@@ -652,18 +681,18 @@ def cmd_window_add(ws, args):
             row["note"] = args.note.strip()
         if ac is not None:                           # 后补的具体章节回填到该点（不新增行）
             row["chapter"] = ac
-        save(ws, st, "window：更新「%s」→%s" % (point, status))
+        save(ws, st, "window：更新「%s」→%s" % (point, _disp("window", status)))
         return 0
     win.append({"point": point, "chapter": ac, "status": status, "note": (args.note or "").strip()})
-    save(ws, st, "window：登记「%s」（%s）" % (point, status))
+    save(ws, st, "window：登记「%s」（%s）" % (point, _disp("window", status)))
     return 0
 
 
 def cmd_window_set_status(ws, args):
     st = _require_state(ws)
-    status = (args.status or "").strip()
+    status = i18n.canon_window_status(args.status or "")
     if status not in _WINDOW_STATUSES:
-        _die("--status 必须是 %s，当前 %r" % ("/".join(_WINDOW_STATUSES), status))
+        _die("--status 必须是 %s，当前 %r" % (_window_status_hint(), (args.status or "").strip()))
     win = st.get("knowledge_window") or []
     hits = []
     if args.index is not None:
@@ -687,7 +716,7 @@ def cmd_window_set_status(ws, args):
         _die("window-set-status 需要 --point 或 --index 定位")
     for r in hits:
         r["status"] = status
-    save(ws, st, "window：%d 条 →%s" % (len(hits), status))
+    save(ws, st, "window：%d 条 →%s" % (len(hits), _disp("window", status)))
     return 0
 
 
@@ -695,9 +724,10 @@ def cmd_add(ws, args, field, label):
     st = _require_state(ws)
     if not (args.note or "").strip():
         _die("--note 不能为空")
-    # 错题走 待复盘→已订正，疑难走 待回顾→已回顾——初始状态必须按目标契约给，复盘流按状态词捞行
+    # 错题走 to_review→corrected/reviewed，疑难走 to_revisit→revisited——初始状态按目标契约给
+    # 代号（复盘流按代号捞行；生成视图渲染回中文显示词）
     row = {"id": args.id, "chapter": args.chapter, "note": args.note.strip(),
-           "status": "待回顾" if field == "confusion_log" else "待复盘"}
+           "status": "to_revisit" if field == "confusion_log" else "to_review"}
     st[field].append(row)
     save(ws, st, "%s +1（共 %d 条）" % (label, len(st[field])))
     return 0
@@ -718,9 +748,10 @@ def cmd_set_status(ws, args, field, label):
         _die("set-status 需要 --id 或 --index 定位行")
     if not hits:
         _die("没找到匹配行（%s id=%r）" % (label, args.id))
+    status = i18n.canon_row_status(args.status)   # 已知词表归代号；未知自由词照旧透传
     for r in hits:
-        r["status"] = args.status
-    save(ws, st, "%s 状态更新 ×%d → %s" % (label, len(hits), args.status))
+        r["status"] = status
+    save(ws, st, "%s 状态更新 ×%d → %s" % (label, len(hits), _disp("row", status)))
     return 0
 
 
@@ -758,9 +789,123 @@ def cmd_show(ws, _args):
     return 0
 
 
+# ---------------- workspace registry（v4 §2.5：课程 → 工作区 跨会话映射；全局、非工作区级） ----------------
+
+REGISTRY_NAME = "workspaces.json"
+REGISTRY_VERSION = 1
+
+
+def _registry_home():
+    # EXAMPREP_HOME 覆盖供部署重定向/测试隔离——默认落用户主目录 ~/.exam-cram（冻结位置）
+    return os.environ.get("EXAMPREP_HOME") or os.path.expanduser("~/.exam-cram")
+
+
+def _registry_path():
+    return os.path.join(_registry_home(), REGISTRY_NAME)
+
+
+def load_registry():
+    """缺文件 = 空注册表（首次引导的正路）；文件损坏 = fail-loud 且点名文件——注册表是学生跨会话
+    找回自己工作区的唯一线索，静默重建等于把所有课程一起弄丢。"""
+    path = _registry_path()
+    if not os.path.isfile(path):
+        return {"version": REGISTRY_VERSION, "workspaces": []}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            reg = json.load(f)
+    except (OSError, UnicodeDecodeError, ValueError) as e:
+        _die("工作区注册表 %s 损坏/无法读取（%s）——不会静默重建；请手工修复或删除该文件后重试"
+             % (path, e), 1)
+    if not isinstance(reg, dict) or not isinstance(reg.get("workspaces"), list) \
+            or any(not isinstance(w, dict) for w in reg["workspaces"]):
+        _die("工作区注册表 %s 结构损坏（应为 {\"version\":1,\"workspaces\":[…]}）——"
+             "不会静默重建；请手工修复或删除该文件后重试" % path, 1)
+    reg.setdefault("version", REGISTRY_VERSION)
+    return reg
+
+
+def save_registry(reg):
+    """Atomic UTF-8 write at the frozen location（temp + os.replace，同 save 的 O_EXCL 反符号链接口径）。"""
+    home = _registry_home()
+    path = os.path.join(home, REGISTRY_NAME)
+    tmp = path + ".tmp"
+    if os.path.islink(tmp):
+        _die("检测到符号链接临时文件 %s——可能指向注册表目录外，拒绝写入（请手动清理后重试）" % tmp, 1)
+    try:
+        os.makedirs(home, exist_ok=True)
+        if os.path.exists(tmp):
+            os.remove(tmp)                      # 上次崩溃残留的普通 tmp——清掉重建
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(reg, ensure_ascii=False, indent=2))
+        os.replace(tmp, path)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        _die("写入工作区注册表失败：%s——注册表未更新，请告知用户（绝不静默继续）" % e, 1)
+
+
+def cmd_workspace_register(args):
+    course = (args.course or "").strip()
+    if not course:
+        _die("--course 不能为空")
+    if not os.path.isdir(args.path):
+        _die("--path 不存在或不是目录: %s——workspace-register 只登记已存在的工作区（建区必确认，"
+             "本命令不代建目录）" % args.path)
+    path = os.path.abspath(args.path)           # 存绝对+归一化路径：换目录/新会话都能找回
+    materials = None
+    if args.materials is not None:
+        if not os.path.isdir(args.materials):
+            _die("--materials 不存在或不是目录: %s" % args.materials)
+        materials = os.path.abspath(args.materials)
+    reg = load_registry()
+    rows = reg["workspaces"]
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    hit = next((w for w in rows if w.get("course") == course), None)
+    if hit is not None:
+        # 同课程重复登记 = 原地更新（换路径/补材料/刷新最近使用），绝不追加重复行；
+        # 未显式给 --materials 时保留旧值——换工作区路径不应顺手抹掉材料线索
+        hit["path"] = path
+        if materials is not None:
+            hit["materials"] = materials
+        hit.setdefault("materials", None)
+        hit["last_used"] = now
+        verb = "更新"
+    else:
+        rows.append({"course": course, "path": path, "materials": materials, "last_used": now})
+        verb = "登记"
+    save_registry(reg)
+    print("[+] workspace-register：%s「%s」→ %s（注册表：%s）" % (verb, course, path, _registry_path()))
+    return 0
+
+
+def cmd_workspace_list(args):
+    reg = load_registry()
+    # 最近使用在前；last_used 为 YYYY-MM-DD HH:MM（字典序即时间序），同分钟并列时后登记的在前
+    ordered = [w for _i, w in sorted(enumerate(reg["workspaces"]),
+                                     key=lambda t: (str(t[1].get("last_used") or ""), t[0]),
+                                     reverse=True)]
+    if args.json:
+        print(json.dumps({"workspaces": ordered}, ensure_ascii=False, indent=2))
+        return 0
+    if not ordered:
+        print("注册表为空——还没有登记过课程工作区；用 workspace-register --course <课程> --path <目录> 登记第一门")
+        return 0
+    for w in ordered:
+        print("- %s ｜ %s ｜ 材料：%s ｜ 最近使用：%s" % (
+            w.get("course") or "-", w.get("path") or "-",
+            w.get("materials") or "-", w.get("last_used") or "-"))
+    return 0
+
+
 def run(argv=None):
     ap = argparse.ArgumentParser(description="Structured study state (study_state.json is the single source of truth; the md is a generated view).")
-    ap.add_argument("--workspace", required=True)
+    # 注册表子命令是全局的（跨课程/跨工作区）不吃 --workspace——因此这里放宽为可选，
+    # 其余子命令在 parse 后补回「必填」检查（同 argparse 原生 required 的 usage+exit 2 行为）
+    ap.add_argument("--workspace", required=False, default=None,
+                    help="workspace dir (required for every subcommand except the global workspace-register/workspace-list)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p_init = sub.add_parser("init")
     p_init.add_argument("--force", action="store_true")
@@ -775,13 +920,15 @@ def run(argv=None):
     p_wa = sub.add_parser("window-add")
     p_wa.add_argument("--point", required=True, help="knowledge-point name")
     p_wa.add_argument("--chapter", default=None)
-    p_wa.add_argument("--status", default="在窗口", help="window status: 在窗口/窗口外/已实测 (default 在窗口)")
+    p_wa.add_argument("--status", default="in_window",
+                      help="window status: in_window/out_window/verified (zh display words `在窗口`/`窗口外`/`已实测` also accepted; default in_window)")
     p_wa.add_argument("--note", default=None)
     p_ws = sub.add_parser("window-set-status")
     p_ws.add_argument("--point", default=None, help="locate by knowledge-point name")
     p_ws.add_argument("--chapter", default=None, help="disambiguate when the same point exists in multiple chapters")
     p_ws.add_argument("--index", type=int, default=None, help="locate by 1-based index")
-    p_ws.add_argument("--status", required=True, help="window status: 在窗口/窗口外/已实测")
+    p_ws.add_argument("--status", required=True,
+                      help="window status: in_window/out_window/verified (zh display words `在窗口`/`窗口外`/`已实测` also accepted)")
     for name in ("add-mistake", "add-confusion"):
         p = sub.add_parser(name)
         p.add_argument("--id", default=None)
@@ -791,14 +938,30 @@ def run(argv=None):
         p = sub.add_parser(name)
         p.add_argument("--id", default=None, help="locate by [#id] (hits all rows with the id)")
         p.add_argument("--index", type=int, default=None, help="locate by 1-based index")
-        p.add_argument("--status", required=True, help="e.g. 已复盘/已解决/待复盘")
+        p.add_argument("--status", required=True,
+                       help="e.g. reviewed/resolved/to_review (zh display words `已复盘`/`已解决`/`待复盘` also accepted; unknown strings kept as-is)")
     p_chk = sub.add_parser("set-check")
     p_chk.add_argument("--index", type=int, default=None, help="locate a check-in item by 1-based index")
     p_chk.add_argument("--match", default=None, help="locate by containing text (must match exactly one)")
     p_chk.add_argument("--undone", action="store_true", help="untick (default is tick-done)")
     sub.add_parser("render")
     sub.add_parser("show")
+    # v4 §2.5：全局工作区注册表（冻结位置 EXAMPREP_HOME|~/.exam-cram 下 workspaces.json）
+    p_wreg = sub.add_parser("workspace-register")
+    p_wreg.add_argument("--course", required=True, help="course name (registry key; re-register updates in place)")
+    p_wreg.add_argument("--path", required=True, help="workspace directory (must already exist)")
+    p_wreg.add_argument("--materials", default=None, help="materials directory (must exist if given)")
+    p_wlist = sub.add_parser("workspace-list")
+    p_wlist.add_argument("--json", action="store_true",
+                         help='machine shape {"workspaces":[...]} (newest first)')
     args = ap.parse_args(argv)
+    if args.cmd == "workspace-register":
+        return cmd_workspace_register(args)
+    if args.cmd == "workspace-list":
+        return cmd_workspace_list(args)
+    if args.workspace is None:
+        # 保持其余子命令的既有契约：--workspace 必填（复刻 argparse required 的报错与 exit 2）
+        ap.error("the following arguments are required: --workspace")
     ws = args.workspace
     if not os.path.isdir(ws):
         _die("workspace 不存在: %s" % ws)

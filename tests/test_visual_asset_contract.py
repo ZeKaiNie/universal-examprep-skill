@@ -10,10 +10,13 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# v4-P2: the root SKILL.md is a language-neutral router; the zh visual-gate
+# wording lives in locales/zh/SKILL.md and the en one in locales/en/SKILL.md
+# (SKILL.en.md retired).
 RUNTIME_CONTRACT_FILES = [
-    "SKILL.md",
+    "locales/zh/SKILL.md",
     "AGENTS.md",
-    "SKILL.en.md",
+    "locales/en/SKILL.md",
     "prompts/web_prompt.en.md",
     "prompts/web_prompt.md",
     "skills/exam-cram/SKILL.md",
@@ -22,7 +25,11 @@ RUNTIME_CONTRACT_FILES = [
     "skills/exam-tutor/SKILL.md",
 ]
 
-SCAN_TEXT_DIRS = ("docs", "prompts", "skills", "tests", "benchmark")
+SCAN_TEXT_DIRS = ("docs", "prompts", "skills", "tests", "benchmark", "locales")
+
+
+def _is_en_surface(rel):
+    return rel.endswith(".en.md") or rel.replace("\\", "/").startswith("locales/en/")
 
 
 def read(rel):
@@ -48,7 +55,7 @@ class VisualAssetContractTest(unittest.TestCase):
             txt = read(rel)
             self.assertIn("requires_assets=true", txt, rel)
             self.assertIn("maybe_requires_assets=true", txt, rel)
-            if rel.endswith(".en.md"):
+            if _is_en_surface(rel):
                 self.assertIn("Question-side asset", txt, rel)    # C2b：en 面英文标签
                 self.assertIn("Answer-side asset", txt, rel)
             else:
@@ -81,7 +88,7 @@ class VisualAssetContractTest(unittest.TestCase):
         bad = "/" + "D:/"
         hits = []
         roots = [os.path.join(ROOT, d) for d in SCAN_TEXT_DIRS]
-        roots.extend(os.path.join(ROOT, f) for f in ("SKILL.md", "SKILL.en.md", "AGENTS.md"))
+        roots.extend(os.path.join(ROOT, f) for f in ("SKILL.md", "AGENTS.md"))
         for root in roots:
             if os.path.isfile(root):
                 candidates = [root]

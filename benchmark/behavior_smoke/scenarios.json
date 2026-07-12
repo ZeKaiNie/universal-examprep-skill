@@ -158,6 +158,24 @@
       "mock_negative_unglossed": "mock/sample_outputs/language_ask_unglossed.txt",
       "mock_urgent_bilingual_explicit": "mock/sample_outputs/language_urgent_bilingual_explicit.txt",
       "mock_urgent_bilingual_negated": "mock/sample_outputs/language_urgent_bilingual_negated.txt"
+    },
+    {
+      "name": "notebook_persist_ok",
+      "claim": "教学回合缺省契约=先落盘再摘要（v4 §2.4 红线）：回复须同时含 notebook.py add-entry 落盘命令与学生可见的 notebook/chNN.md#锚点 回执（回执章号与命令 --chapter 零填充一致）；全程只在聊天里讲、无落盘回执=违约",
+      "prompt": "请精讲第 2 章这道重点题，讲完把完整解答记进我的复习笔记本，聊天里给我摘要就行。",
+      "detector": "notebook_persist_receipt_ok",
+      "mock_output": "mock/sample_outputs/notebook_persist_good.txt",
+      "mock_negative": "mock/sample_outputs/notebook_persist_chat_only.txt",
+      "best_effort": false
+    },
+    {
+      "name": "workspace_confirm_ok",
+      "claim": "建区必确认（v4 §2.5 红线）：任何工作区创建调用（ingest.py --output-dir / workspace-register）之前，必须先有落点确认问句、再有学生对目标路径的肯定答复；静默建区=违约",
+      "prompt": "这是我的课件文件夹，帮我建一个复习库。",
+      "detector": "workspace_target_confirmed_ok",
+      "mock_output": "mock/sample_outputs/workspace_confirm_good.txt",
+      "mock_negative": "mock/sample_outputs/workspace_confirm_silent.txt",
+      "best_effort": false
     }
   ]
 }

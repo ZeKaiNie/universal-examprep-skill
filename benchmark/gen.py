@@ -81,34 +81,92 @@ def classify(text):
     return "ok"
 
 
-def run_claude(prompt, model, cwd=None, skill=False, timeout=900):
+def parse_stream_events(stdout_text):
+    """Parse `--output-format stream-json --verbose` output → (result, cost, files_opened).
+    Pure function (offline-testable). files_opened = every file_path/path/pattern string the
+    agent passed to Read/Glob/Grep tool calls, in call order, deduped — the retrieval trace
+    (v4-P3 缺口8：不记轨迹就永远测不了「到底翻了哪章」)."""
+    result, cost, files, seen = "", None, [], set()
+    for line in (stdout_text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") == "result":
+            result = ev.get("result", "") or result
+            cost = ev.get("total_cost_usd", cost)
+        elif ev.get("type") == "assistant":
+            for block in (ev.get("message") or {}).get("content") or []:
+                if block.get("type") == "tool_use" and block.get("name") in ("Read", "Glob", "Grep"):
+                    inp = block.get("input") or {}
+                    # Grep 的 pattern 是内容搜索正则、不是路径——记进 files_opened 会让
+                    # retrieval_eval 把 "lecture02" 这类搜索词当成「翻开了第 2 章」，虚标
+                    # recall（Codex r2）。Glob 的 pattern 才是路径面；Grep 只记 path 过滤器。
+                    keys = {"Read": ("file_path",), "Glob": ("pattern", "path"),
+                            "Grep": ("path",)}[block["name"]]
+                    for k in keys:
+                        v = inp.get(k)
+                        if isinstance(v, str) and v and v not in seen:
+                            seen.add(v)
+                            files.append(v)
+    return result, cost, files
+
+
+def _run_claude_impl(prompt, model, cwd=None, skill=False, timeout=900, trace=False):
     # Pass the prompt via STDIN, not argv — the material arm dumps a ~100-230K-char course, which
     # blows Windows' ~32K command-line limit (WinError 206) if passed as an argument.
-    args = ["claude", "-p", "--output-format", "json", "--model", model]
+    if trace:
+        args = ["claude", "-p", "--output-format", "stream-json", "--verbose", "--model", model]
+    else:
+        args = ["claude", "-p", "--output-format", "json", "--model", model]
     if skill:
         args += ["--allowedTools", "Read", "Glob", "Grep"]
     try:
         p = subprocess.run(args, cwd=os.path.join(HERE, cwd) if cwd else HERE, input=prompt,
                            capture_output=True, text=True, encoding="utf-8", timeout=timeout)
+        if trace:
+            result, cost, files = parse_stream_events(p.stdout)
+            if result:
+                return result, cost, files
+            return (p.stdout or p.stderr or "").strip()[:2000], None, files
         try:
             data = json.loads(p.stdout)
-            return data.get("result", "") or "", data.get("total_cost_usd")
+            return data.get("result", "") or "", data.get("total_cost_usd"), None
         except json.JSONDecodeError:
-            return (p.stdout or p.stderr or "").strip(), None
+            return (p.stdout or p.stderr or "").strip(), None, None
     except subprocess.TimeoutExpired:
-        return "TIMEOUT", None
+        return "TIMEOUT", None, None
     except Exception as e:                             # never let one bad call kill the whole pass
-        return f"API Error: {e}", None
+        return f"API Error: {e}", None, None
+
+
+def run_claude(prompt, model, cwd=None, skill=False, timeout=900):
+    """(out, cost) — the stable 2-tuple every existing caller (run_matrix judge path 等) unpacks.
+    轨迹要走 run_claude_traced；本函数**永不**因环境变量改变返回形状（Codex r1）。"""
+    out, cost, _files = _run_claude_impl(prompt, model, cwd, skill, timeout, trace=False)
+    return out, cost
+
+
+def run_claude_traced(prompt, model, cwd=None, skill=False, timeout=900):
+    """(out, cost, files_opened) — stream-json 工具轨迹版（检索评测 recall@k 的数据源）。"""
+    return _run_claude_impl(prompt, model, cwd, skill, timeout, trace=True)
 
 
 def generate_one(course, model, arm, qid, q, combined):
+    """(out, cost, files_opened|None)。EXAMPREP_TRACE=1 只在**作答生成**路径开启轨迹——
+    判分等其它 run_claude 调用点不受影响（返回形状恒定）。"""
+    trace = os.environ.get("EXAMPREP_TRACE") == "1"
+    call = run_claude_traced if trace else (lambda *a, **k: run_claude(*a, **k) + (None,))
     if arm == "closedbook":
-        return run_claude(CLOSEDBOOK.format(q=q), model)
+        return call(CLOSEDBOOK.format(q=q), model)
     if arm == "material":
-        return run_claude(MATERIAL.format(material=combined, q=q), model)
+        return call(MATERIAL.format(material=combined, q=q), model)
     if arm == "rawfiles":
-        return run_claude(RAWFILES.format(q=q), model, cwd=COURSES[course]["raw_ws"], skill=True)
-    return run_claude(SKILL.format(q=q), model, cwd=COURSES[course]["skill_ws"], skill=True)
+        return call(RAWFILES.format(q=q), model, cwd=COURSES[course]["raw_ws"], skill=True)
+    return call(SKILL.format(q=q), model, cwd=COURSES[course]["skill_ws"], skill=True)
 
 
 def build_tasks():
@@ -169,9 +227,9 @@ def main():
     print(f"[gen] 任务 {len(tasks)}，已完成 {len(tasks)-len(todo)}，本次待跑 {len(todo)}")
     for i, (course, model, arm, qid) in enumerate(todo, 1):
         q = qcache[course].get(qid, "")
-        ans, cost = "", None
+        ans, cost, files = "", None, None
         for attempt in range(3):                      # retry transient errors with backoff
-            ans, cost = generate_one(course, model, arm, qid, q, combined[course])
+            ans, cost, files = generate_one(course, model, arm, qid, q, combined[course])
             kind = classify(ans)
             if kind == "ok":
                 break
@@ -182,8 +240,11 @@ def main():
         if kind == "ok" and ans.strip():
             key = [course, model, arm, qid]
             cf.write(json.dumps({"key": key}, ensure_ascii=False) + "\n"); cf.flush()
-            af.write(json.dumps({"course": course, "model": model, "arm": arm, "id": qid,
-                                 "answer": ans, "cost": cost}, ensure_ascii=False) + "\n"); af.flush()
+            row = {"course": course, "model": model, "arm": arm, "id": qid,
+                   "answer": ans, "cost": cost}
+            if files:                                 # 轨迹开着才有——检索评测的数据源
+                row["files_opened"] = files
+            af.write(json.dumps(row, ensure_ascii=False) + "\n"); af.flush()
             n_ok += 1; hard_streak = 0
         else:
             n_fail += 1

@@ -77,7 +77,8 @@ ALLOWED_TOKENS = (
     # scope / pools (persisted + A2 contract)
     "混合题池", "混合",
     # receipts + source block shape (student-visible canon quoted in control text)
-    "已记录到错题本", "已记录到疑难点", "题目来源", "答案来源", "来源未知", "来源页未知",
+    # (v4-P2: 已记录到错题本 moved entirely into the language packs — dead here)
+    "已记录到疑难点", "题目来源", "答案来源", "来源未知", "来源页未知",
     # ordering names (select_hard_questions ORDER_LABEL data values)
     "先易后难", "先难挑战",
     # generated-md section names (persisted view blocks)
@@ -185,8 +186,9 @@ class ControlPlaneLanguageTest(unittest.TestCase):
             self.assertIn(label, t, f"exam-tutor 丢失中文教学模板标签: {label}")
 
     def test_quiz_chinese_feedback_preserved(self):
-        self.assertIn("已记录到错题本", read("skills", "exam-quiz", "SKILL.md"),
-                      "exam-quiz 丢失中文判分反馈措辞")
+        # v4-P2: the zh student wording lives in the zh language pack
+        self.assertIn("已记录到错题本", read("locales", "zh", "skills", "exam-quiz.md"),
+                      "exam-quiz zh 包丢失中文判分反馈措辞")
 
     def test_cheatsheet_chinese_sections_preserved(self):
         c = read("skills", "exam-cheatsheet", "SKILL.md")

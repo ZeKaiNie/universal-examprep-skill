@@ -23,8 +23,9 @@
 | ChatGPT / Claude Web | `prompts/web_prompt.md`（English: `prompts/web_prompt.en.md`） | 无本地写盘；该提示词已含来源标注/防编题规则。用文本「进度 Summary」做断点，手动挂载题库后只从中出题 |
 | Generic agents | `AGENTS.md` | 一屏浓缩兜底契约 |
 
-> 兼容性：根目录 `SKILL.md` 仍是默认/兼容入口（承载完整防编题与来源标注规则）。支持技能集合的 host 可改用
-> `skills/exam-cram/SKILL.md` 作主入口；二者描述同一行为。
+> 兼容性：根目录 `SKILL.md` 仍是默认/兼容触发入口（现为语言中性路由器，按 `study_state.json` 的 `language`
+> 分发到全量入口文案包 `locales/zh/SKILL.md` / `locales/en/SKILL.md`，完整防编题与来源标注规则承载在语言包与
+> `skills/` 控制层）。支持技能集合的 host 可改用 `skills/exam-cram/SKILL.md` 作主入口；二者描述同一行为。
 
 ## 未来适配（本 PR 不实现）
 - `.cursor/rules/*.mdc`、`.windsurf/rules/*.md` 等 host 专用规则副本，连同一个「副本与 `AGENTS.md` 对齐」的检查脚本（见 `docs/skill-architecture.md` 的 Future work）。

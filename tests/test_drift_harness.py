@@ -201,11 +201,17 @@ class DriftHarness(unittest.TestCase):
         self.assertEqual(D._window_diff(["栈@1"], ["栈@1"]), (0, 0))                # 状态迁移不改键
 
     def test_b3_omitted_window_status_defaults_in_window(self):
-        # Codex SGGn：省略 status 的合法窗口行归一到渲染默认「在窗口」，不误触 md/state 不一致
+        # Codex SGGn：省略 status 的合法窗口行归一到渲染默认（v4 代号 in_window——state 侧三代词汇
+        # 与 md 侧显示词都经 canon 收敛到代号后再比对），不误触 md/state 不一致
         snap = D.parse_state_json(json.dumps(
             {"current_phase": 1, "mistake_archive": [], "confusion_log": [],
              "knowledge_window": [{"point": "栈", "chapter": "1"}]}), [1])
-        self.assertEqual(snap["window_status"], ["在窗口"])
+        self.assertEqual(snap["window_status"], ["in_window"])
+        # 中文显示词照样被收敛到同一代号（旧 state 快照兼容）
+        snap_zh = D.parse_state_json(json.dumps(
+            {"current_phase": 1, "mistake_archive": [], "confusion_log": [],
+             "knowledge_window": [{"point": "栈", "chapter": "1", "status": "在窗口"}]}), [1])
+        self.assertEqual(snap_zh["window_status"], ["in_window"])
 
     def test_b3_non_canonical_window_status_fails_loud(self):
         # Codex R_Xd：非 canonical 窗口状态（typo/任意串）是坏写入 → 畸形输入 exit 2，不让乱码状态骗过迁移门槛

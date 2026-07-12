@@ -55,11 +55,12 @@ def run(argv=None):
                          "Question-side/Answer-side asset). The `双语` caller emits the zh labels and "
                          "adds its own `> EN:` mirror.")
     args = ap.parse_args(argv)
-    _LANG = {"zh": "zh", "en": "en", "中文": "zh", "english": "en", "双语": "zh"}
-    _key = str(args.lang).strip()
-    lang = _LANG.get(_key) or _LANG.get(_key.lower())
-    if lang is None:
-        _die("--lang 只接受 zh/en 或持久化值 中文/English/双语，收到: %r" % args.lang)
+    # v4：语言词表同源 i18n（不再私藏映射副本）；bilingual 的调用方发 zh 标签 + 自己补 `> EN:` 镜像
+    import i18n                                  # 同目录
+    code, _w = i18n.canon_language(str(args.lang))
+    if code not in i18n.LANGS:
+        _die("--lang 只接受 zh/en/bilingual 或持久化值 中文/English/双语，收到: %r" % args.lang)
+    lang = "en" if code == "en" else "zh"
     q_label = "题面图" if lang == "zh" else "Question-side asset"
     a_label = "答案图" if lang == "zh" else "Answer-side asset"
 

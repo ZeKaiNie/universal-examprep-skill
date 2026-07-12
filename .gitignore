@@ -9,3 +9,6 @@ ai_review_manifest.json
 
 # local RAG experiment scratch (not shippable)
 spike/
+
+# v4-P6: built runtime bundles (attached to releases, never committed)
+dist/

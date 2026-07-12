@@ -119,11 +119,17 @@ git clone https://github.com/ZeKaiNie/universal-examprep-skill .claude/skills/un
 
 ### Claude Code
 
+**推荐——运行时精简包**（约 230 KB 的 zip，只含技能本体，不带开发用的 benchmark/测试）：
+
+到[最新 release](https://github.com/ZeKaiNie/universal-examprep-skill/releases/latest) 下载 `universal-exam-cram-coach.zip`，解压到 `.claude/skills/universal-exam-cram-coach/`（项目内或全局 `~/.claude/skills/` 均可）。
+
+无需预装任何依赖——核心是纯标准库。材料里有 PDF 时，智能体会在建库**之前**运行自带的依赖预检（`scripts/check_deps.py`），把需要的安装命令一次性问清装好，绝不中途报错。
+
+**或克隆整仓**（开发者路径，约 3.4 MB）：
+
 ```bash
 git clone https://github.com/ZeKaiNie/universal-examprep-skill .claude/skills/universal-exam-cram-coach
 ```
-
-项目内 `.claude/skills/` 或全局 `~/.claude/skills/` 均可。
 
 ### Codex / Cursor / Windsurf / Antigravity
 
@@ -133,7 +139,7 @@ git clone https://github.com/ZeKaiNie/universal-examprep-skill .claude/skills/un
 
 无法写本地文件，改用一键平替提示词：复制 [`prompts/web_prompt.md`](prompts/web_prompt.md)（英文版 [`web_prompt.en.md`](prompts/web_prompt.en.md)）发给它，再贴上材料。
 
-> 完整加载矩阵（各智能体支持程度、入口文件）见 [`docs/agent-portability.md`](docs/agent-portability.md)。英文用户另有派生英文面 [`SKILL.en.md`](SKILL.en.md)。
+> 完整加载矩阵（各智能体支持程度、入口文件）见 [`docs/agent-portability.md`](docs/agent-portability.md)。英文用户另有派生英文面 [`locales/en/SKILL.md`](locales/en/SKILL.md)。
 
 ---
 

@@ -1,0 +1,5 @@
+学生：这是我的《数据结构》课件文件夹 D:\Downloads\ds_course，帮我建一个复习库。
+辅导：收到，马上开建：
+`python scripts/ingest.py --input D:\Downloads\ds_course --output-dir ./ds_workspace`
+`python scripts/update_progress.py --workspace ./ds_workspace workspace-register --course 数据结构 --materials D:\Downloads\ds_course`
+建好了，工作区在当前目录下的 ds_workspace，我们直接开始复习。

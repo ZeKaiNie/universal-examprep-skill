@@ -80,7 +80,7 @@ class Migration(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         row = _state(ws)["confusion_log"][0]
         self.assertIn("短表疑难点内容", row["note"])              # 无章节列时疑难点不再被当成章节
-        self.assertEqual(row["status"], "待回顾")
+        self.assertEqual(row["status"], "to_revisit")             # v4：state 存代号（视图仍渲染 待回顾）
         self.assertIsNone(row["chapter"])
 
     def test_prose_phase_mention_not_a_plan_entry(self):
@@ -195,7 +195,7 @@ class Migration(unittest.TestCase):
         _up(ws, ["init"])
         row = _state(ws)["mistake_archive"][0]
         self.assertEqual(row["note"], "只有笔记没有状态列")         # 无状态列时整个尾部是 note
-        self.assertEqual(row["status"], "待复盘")
+        self.assertEqual(row["status"], "to_review")              # v4：state 存代号（视图仍渲染 待复盘）
 
     def test_migration_preserves_phase_checklist(self):
         md = LEGACY_MD + ("\n## 📊 知识点打卡状态\n- [x] **阶段 1**：栈与队列 (关联 `references/wiki/ch1.md`)\n"
@@ -264,27 +264,27 @@ class Mutations(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("已废弃", r.stderr)                          # fail-loud 警告，不静默改写
         st = _state(ws)
-        self.assertEqual(st["mode"], "零基础从头讲")
-        self.assertEqual(st["time_budget"], "≤1天")               # panic 迁移带出当天档
+        self.assertEqual(st["mode"], "from_scratch")              # v4：state 存代号
+        self.assertEqual(st["time_budget"], "le1d")               # panic 迁移带出当天档
         # sprint → 查缺补漏 + 1-3天：换旧模式必须把上一次迁移带出的 ≤1天 刷成 1-3天（Codex R1-XN），
         # 否则节奏判定会卡在错误的紧迫档
         _up(ws, ["set", "--mode", "sprint"])
         st2 = _state(ws)
-        self.assertEqual(st2["mode"], "查缺补漏")
-        self.assertEqual(st2["time_budget"], "1-3天")
+        self.assertEqual(st2["mode"], "fill_gaps")
+        self.assertEqual(st2["time_budget"], "d1_3")
 
     def test_a6_migration_does_not_override_explicit_time_budget(self):
         ws = self._ready()
         r = _up(ws, ["set", "--mode", "panic", "--time-budget", "3-7天"])
         self.assertEqual(r.returncode, 0, r.stderr)
         st = _state(ws)
-        self.assertEqual(st["mode"], "零基础从头讲")
-        self.assertEqual(st["time_budget"], "3-7天")              # 显式 --time-budget 不被迁移带出值覆盖
+        self.assertEqual(st["mode"], "from_scratch")
+        self.assertEqual(st["time_budget"], "d3_7")               # 显式 --time-budget 不被迁移带出值覆盖
 
     def test_a6_time_budget_alias_normalized(self):
         ws = self._ready()
         _up(ws, ["set", "--mode", "查缺补漏", "--time-budget", "一周内"])
-        self.assertEqual(_state(ws)["time_budget"], "3-7天")      # 宽松别名归一到 canonical 档
+        self.assertEqual(_state(ws)["time_budget"], "d3_7")       # 宽松别名归一到 canonical 代号档
 
     def test_a6_unknown_mode_kept_with_warning(self):
         ws = self._ready()
@@ -304,11 +304,11 @@ class Mutations(unittest.TestCase):
         win = _state(ws)["knowledge_window"]
         self.assertEqual(len(win), 2)
         by = {w["point"]: w["status"] for w in win}
-        self.assertEqual(by["栈的LIFO"], "已实测")
-        self.assertEqual(by["队列FIFO"], "窗口外")
+        self.assertEqual(by["栈的LIFO"], "verified")              # v4：state 存代号（视图渲染 已实测）
+        self.assertEqual(by["队列FIFO"], "out_window")
         # set-status 按名定位
         _up(ws, ["window-set-status", "--point", "队列FIFO", "--status", "在窗口"])
-        self.assertEqual({w["point"]: w["status"] for w in _state(ws)["knowledge_window"]}["队列FIFO"], "在窗口")
+        self.assertEqual({w["point"]: w["status"] for w in _state(ws)["knowledge_window"]}["队列FIFO"], "in_window")
         # 进度面板渲染出窗口区
         md = open(os.path.join(ws, "study_progress.md"), encoding="utf-8").read()
         self.assertIn("知识点窗口", md)
@@ -332,12 +332,12 @@ class Mutations(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("多个章节", r.stderr)
         # 状态没被偷偷改
-        self.assertTrue(all(w["status"] == "在窗口" for w in _state(ws)["knowledge_window"] if w["point"] == "模板"))
+        self.assertTrue(all(w["status"] == "in_window" for w in _state(ws)["knowledge_window"] if w["point"] == "模板"))
         # 带 --chapter 只改该章
         r2 = _up(ws, ["window-add", "--point", "模板", "--chapter", "2", "--status", "已实测"])
         self.assertEqual(r2.returncode, 0, r2.stderr)
         by = {str(w["chapter"]): w["status"] for w in _state(ws)["knowledge_window"] if w["point"] == "模板"}
-        self.assertEqual((by["2"], by["5"]), ("已实测", "在窗口"))
+        self.assertEqual((by["2"], by["5"]), ("verified", "in_window"))
 
     def test_a6_window_set_status_ambiguous_multichapter_fail_loud(self):
         # 同名点分布在多章：不带 --chapter 会一次改错所有章 → 必须 fail-loud 要求精确定位（Codex R1-XU）
@@ -351,8 +351,8 @@ class Mutations(unittest.TestCase):
         r2 = _up(ws, ["window-set-status", "--point", "模板", "--chapter", "2", "--status", "已实测"])
         self.assertEqual(r2.returncode, 0, r2.stderr)
         by = {str(w["chapter"]): w["status"] for w in _state(ws)["knowledge_window"] if w["point"] == "模板"}
-        self.assertEqual(by["2"], "已实测")
-        self.assertEqual(by["5"], "在窗口")                        # 第5章的同名点不受影响
+        self.assertEqual(by["2"], "verified")
+        self.assertEqual(by["5"], "in_window")                     # 第5章的同名点不受影响
 
     def test_a6_window_survives_init_force_roundtrip(self):
         # init --force 从 md 重新迁移时，知识点窗口必须无损带回——否则窗口/已实测追踪被静默丢
@@ -389,8 +389,8 @@ class Mutations(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("已废弃", r.stderr)                          # panic 迁移警告在 init 也冒出来
         st = _state(ws)
-        self.assertEqual(st["mode"], "零基础从头讲")
-        self.assertEqual(st["time_budget"], "≤1天")
+        self.assertEqual(st["mode"], "from_scratch")
+        self.assertEqual(st["time_budget"], "le1d")
 
     def test_missing_optional_fields_tolerated(self):
         ws = self._ready()
@@ -409,13 +409,13 @@ class Mutations(unittest.TestCase):
         _up(ws, ["add-confusion", "--note", "取模没搞懂"])
         _up(ws, ["add-mistake", "--note", "Venn 判断错"])
         st = _state(ws)
-        self.assertEqual(st["confusion_log"][-1]["status"], "待回顾")   # 疑难走 待回顾→已回顾 契约
-        self.assertEqual(st["mistake_archive"][-1]["status"], "待复盘")
+        self.assertEqual(st["confusion_log"][-1]["status"], "to_revisit")   # 疑难走 待回顾→已回顾 契约（存代号）
+        self.assertEqual(st["mistake_archive"][-1]["status"], "to_review")
 
     def test_migrated_confusion_bullet_gets_review_status(self):
         ws = _mk_ws(tempfile.mkdtemp())
         _up(ws, ["init"])
-        self.assertEqual(_state(ws)["confusion_log"][0]["status"], "待回顾")
+        self.assertEqual(_state(ws)["confusion_log"][0]["status"], "to_revisit")
 
     def test_render_rejects_non_string_note(self):
         ws = self._ready()
@@ -480,8 +480,8 @@ class Mutations(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         st = _state(ws)
         self.assertEqual(st["scope"], "homework-only")            # A2 范围偏好不因迁移被静默放宽
-        self.assertEqual(st["mode"], "查缺补漏")
-        self.assertEqual(st["time_budget"], "3天")
+        self.assertEqual(st["mode"], "fill_gaps")                 # v4：state 存代号
+        self.assertEqual(st["time_budget"], "3天")                # 非标准串原样保留（透传语义）
         ws2 = _mk_ws(tempfile.mkdtemp())                          # 默认「混合题池｜未设定」→ 保持 None
         _up(ws2, ["init"])
         self.assertIsNone(_state(ws2).get("scope"))
@@ -590,10 +590,10 @@ class Mutations(unittest.TestCase):
     # ---- regression guards for Codex round-10 (5 findings) ----
 
     def test_language_aliases_normalize(self):
-        # A8b：--language 别名归一到 canonical（中文/English/双语）；ASCII 不区分大小写
+        # A8b：--language 别名归一到 canonical 代号（zh/en/bilingual）；ASCII 不区分大小写
         ws = self._ready()
-        for alias, canon in (("zh", "中文"), ("EN", "English"), ("english", "English"),
-                             ("bilingual", "双语"), ("中英", "双语"), ("简体中文", "中文")):
+        for alias, canon in (("zh", "zh"), ("EN", "en"), ("english", "en"),
+                             ("bilingual", "bilingual"), ("中英", "bilingual"), ("简体中文", "zh")):
             r = _up(ws, ["set", "--language", alias])
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(_state(ws)["language"], canon, alias)
@@ -613,7 +613,7 @@ class Mutations(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         st = _state(ws)
         self.assertEqual((st["mode"], st["time_budget"], st["language"]),
-                         ("查缺补漏", "1-3天", "English"))
+                         ("fill_gaps", "d1_3", "en"))             # v4：state 存代号（视图仍渲染显示词）
         md = open(os.path.join(ws, "study_progress.md"), encoding="utf-8").read()
         self.assertIn("语言偏好", md)
         self.assertIn("English", md)
@@ -632,14 +632,14 @@ class Mutations(unittest.TestCase):
             f.write(md.replace("**语言偏好**：English", "**语言偏好**：zh-CN"))
         r = _up(ws, ["init", "--force"])
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(_state(ws)["language"], "中文")          # zh-CN → canonical 中文
+        self.assertEqual(_state(ws)["language"], "zh")            # zh-CN → canonical 代号 zh
 
     def test_language_survives_forced_rebuild(self):
         ws = self._ready()
         _up(ws, ["set", "--language", "English"])
         r = _up(ws, ["init", "--force"])
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(_state(ws)["language"], "English")       # 语言偏好经生成视图迁回
+        self.assertEqual(_state(ws)["language"], "en")            # 语言偏好经生成视图迁回（存代号）
 
     def test_forced_rebuild_keeps_idless_rows_idless(self):
         ws = self._ready()
@@ -759,12 +759,12 @@ class Mutations(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         st = _state(ws)
         row = next(x for x in st["mistake_archive"] if x.get("id") == "q9")
-        self.assertEqual(row["status"], "已复盘")                  # P1：官方状态更新路径
+        self.assertEqual(row["status"], "reviewed")                # P1：官方状态更新路径（state 存代号）
         md = open(os.path.join(ws, "study_progress.md"), encoding="utf-8").read()
-        self.assertIn("已复盘", md)
+        self.assertIn("已复盘", md)                                # 生成视图仍渲染中文显示词
         r2 = _up(ws, ["set-confusion-status", "--index", "1", "--status", "已解决"])
         self.assertEqual(r2.returncode, 0, r2.stderr)
-        self.assertEqual(_state(ws)["confusion_log"][0]["status"], "已解决")
+        self.assertEqual(_state(ws)["confusion_log"][0]["status"], "resolved")
 
     def test_set_status_missing_target_fails(self):
         ws = self._ready()
@@ -1295,7 +1295,10 @@ class DriftJsonSnapshots(unittest.TestCase):
 
 
 class Contract(unittest.TestCase):
-    ENTRY_POINTS = ["SKILL.md", "SKILL.en.md", "AGENTS.md", "prompts/web_prompt.md",
+    # v4-P2: the root SKILL.md is a language-neutral router (still carries the
+    # state-contract essentials); the zh/en full-entry manuals live under locales/.
+    ENTRY_POINTS = ["SKILL.md", "locales/zh/SKILL.md", "locales/en/SKILL.md", "AGENTS.md",
+                    "prompts/web_prompt.md",
                     "prompts/web_prompt.en.md", "skills/exam-cram/SKILL.md",
                     "skills/exam-quiz/SKILL.md", "skills/exam-tutor/SKILL.md", "skills/exam-review/SKILL.md",
                     "skills/confusion-tracker/SKILL.md"]
@@ -1307,8 +1310,9 @@ class Contract(unittest.TestCase):
             self.assertIn("update_progress.py", txt, p)
 
     def test_root_skill_lock_prefers_state(self):
-        txt = open(os.path.join(ROOT, "SKILL.md"), encoding="utf-8").read()
-        self.assertIn("断点状态锁定 (`study_state.json`", txt)     # 根入口的状态锁对齐事实源
+        # v4-P2: the zh workflow wording lives in the zh full-entry pack
+        txt = open(os.path.join(ROOT, "locales", "zh", "SKILL.md"), encoding="utf-8").read()
+        self.assertIn("断点状态锁定 (`study_state.json`", txt)     # zh 全量入口的状态锁对齐事实源
         self.assertIn("set-check", txt)
 
     def test_web_prompt_never_claims_local_writes(self):
@@ -1318,8 +1322,8 @@ class Contract(unittest.TestCase):
         self.assertIn("只读事实源", txt)                          # 粘贴的 state 只读恢复
 
     def test_root_skill_final_review_reads_state(self):
-        txt = open(os.path.join(ROOT, "SKILL.md"), encoding="utf-8").read()
-        self.assertIn("从其 `mistake_archive`", txt)              # 根入口错题重温读事实源
+        txt = open(os.path.join(ROOT, "locales", "zh", "SKILL.md"), encoding="utf-8").read()
+        self.assertIn("从其 `mistake_archive`", txt)              # zh 全量入口错题重温读事实源
 
     def test_state_scenario_exercises_md_gate(self):
         # 新 state-backed 场景真正武装 md_write_after_state 阈值（basic 场景对该阈值先天空转）
@@ -1353,7 +1357,7 @@ class Contract(unittest.TestCase):
         self.assertIn('init' + chr(96) + ' to establish the source of truth', txt)   # 通用代理契约也先建 state
 
     def test_root_skill_bootstraps_state_when_python_available(self):
-        txt = open(os.path.join(ROOT, "SKILL.md"), encoding="utf-8").read()
+        txt = open(os.path.join(ROOT, "locales", "zh", "SKILL.md"), encoding="utf-8").read()
         self.assertIn("先跑 `python " + chr(34) + chr(36) + "{CLAUDE_SKILL_DIR}/scripts/update_progress.py" + chr(34), txt)
 
     def test_agents_md_prefers_state(self):
@@ -1406,6 +1410,235 @@ class Contract(unittest.TestCase):
         src = open(os.path.join(SCRIPTS, "update_progress.py"), encoding="utf-8").read()
         for banned in ("import requests", "urllib.request", "import anthropic", "import socket"):
             self.assertNotIn(banned, src)
+
+
+class WorkspaceRegistry(unittest.TestCase):
+    """v4-P4 §2.5：全局工作区注册表（workspace-register / workspace-list）——
+    冻结位置 EXAMPREP_HOME|~/.exam-cram 下 workspaces.json；测试一律经 EXAMPREP_HOME 隔离，
+    绝不碰真实主目录。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.home = os.path.join(self.tmp, "examprep_home")   # 不预建：save 应自建目录
+
+    def _run(self, args, home=None):
+        env = dict(os.environ)
+        env["EXAMPREP_HOME"] = home or self.home
+        return subprocess.run([sys.executable, os.path.join(SCRIPTS, "update_progress.py")] + args,
+                              capture_output=True, text=True, encoding="utf-8", env=env)
+
+    def _registry_file(self, home=None):
+        return os.path.join(home or self.home, "workspaces.json")
+
+    def _mk_dir(self, name):
+        d = os.path.join(self.tmp, name)
+        os.makedirs(d)
+        return d
+
+    def test_register_list_roundtrip(self):
+        ws = self._mk_dir("ws_ds")
+        mats = self._mk_dir("materials_ds")
+        r = self._run(["workspace-register", "--course", "数据结构", "--path", ws,
+                       "--materials", mats])
+        self.assertEqual(r.returncode, 0, r.stderr)              # 注册表全局：不需要 --workspace
+        reg = json.load(open(self._registry_file(), encoding="utf-8"))
+        self.assertEqual(reg["version"], 1)                      # 冻结 schema：version + workspaces
+        self.assertEqual(len(reg["workspaces"]), 1)
+        row = reg["workspaces"][0]
+        self.assertEqual(row["course"], "数据结构")
+        self.assertEqual(row["path"], os.path.abspath(ws))       # 存绝对归一化路径
+        self.assertEqual(row["materials"], os.path.abspath(mats))
+        self.assertRegex(row["last_used"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+        rj = self._run(["workspace-list", "--json"])
+        self.assertEqual(rj.returncode, 0, rj.stderr)
+        listed = json.loads(rj.stdout)                           # 机器口径 {"workspaces":[...]}
+        self.assertEqual(listed["workspaces"], [row])
+        rh = self._run(["workspace-list"])
+        self.assertEqual(rh.returncode, 0, rh.stderr)
+        self.assertIn("数据结构", rh.stdout)                     # 人读口径带课程与路径
+        self.assertIn(os.path.abspath(ws), rh.stdout)
+
+    def test_reregister_updates_in_place_no_duplicate(self):
+        ws1, ws2 = self._mk_dir("ws_v1"), self._mk_dir("ws_v2")
+        mats = self._mk_dir("mats_v1")
+        self._run(["workspace-register", "--course", "EEC160", "--path", ws1,
+                   "--materials", mats])
+        r = self._run(["workspace-register", "--course", "EEC160", "--path", ws2])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        reg = json.load(open(self._registry_file(), encoding="utf-8"))
+        self.assertEqual(len(reg["workspaces"]), 1)              # 同课程重复登记不追加重复行
+        row = reg["workspaces"][0]
+        self.assertEqual(row["path"], os.path.abspath(ws2))      # 路径已更新
+        self.assertEqual(row["materials"], os.path.abspath(mats))  # 未显式给 --materials 时保留旧值
+        # 两门课都在，且 workspace-list 最近使用在前（同分钟并列时后登记的在前）
+        wsb = self._mk_dir("ws_b")
+        self._run(["workspace-register", "--course", "线性代数", "--path", wsb])
+        rj = self._run(["workspace-list", "--json"])
+        courses = [w["course"] for w in json.loads(rj.stdout)["workspaces"]]
+        self.assertEqual(sorted(courses), ["EEC160", "线性代数"])
+        self.assertEqual(courses[0], "线性代数")
+
+    def test_list_orders_newest_first_by_last_used(self):
+        os.makedirs(self.home)
+        with open(self._registry_file(), "w", encoding="utf-8", newline=chr(10)) as f:
+            json.dump({"version": 1, "workspaces": [
+                {"course": "旧课", "path": self.tmp, "materials": None,
+                 "last_used": "2026-01-01 08:00"},
+                {"course": "新课", "path": self.tmp, "materials": None,
+                 "last_used": "2026-07-01 09:30"},
+            ]}, f, ensure_ascii=False)
+        rj = self._run(["workspace-list", "--json"])
+        self.assertEqual(rj.returncode, 0, rj.stderr)
+        courses = [w["course"] for w in json.loads(rj.stdout)["workspaces"]]
+        self.assertEqual(courses, ["新课", "旧课"])              # 最近使用在前
+
+    def test_register_missing_path_dies(self):
+        missing = os.path.join(self.tmp, "no_such_dir")
+        r = self._run(["workspace-register", "--course", "幽灵课", "--path", missing])
+        self.assertNotEqual(r.returncode, 0)                     # 不存在的路径必须拒绝
+        self.assertIn("不存在", r.stderr)
+        self.assertFalse(os.path.exists(self._registry_file()))  # 拒绝时不落任何注册表
+        ws = self._mk_dir("ws_ok")
+        r2 = self._run(["workspace-register", "--course", "幽灵课", "--path", ws,
+                        "--materials", missing])
+        self.assertNotEqual(r2.returncode, 0)                    # --materials 同样必须真实存在
+        self.assertFalse(os.path.exists(self._registry_file()))
+
+    def test_corrupt_registry_fails_loud_never_recreated(self):
+        os.makedirs(self.home)
+        with open(self._registry_file(), "w", encoding="utf-8") as f:
+            f.write("{corrupt json!!")
+        ws = self._mk_dir("ws_c")
+        for cmd in (["workspace-list"], ["workspace-list", "--json"],
+                    ["workspace-register", "--course", "任意课", "--path", ws]):
+            r = self._run(cmd)
+            self.assertNotEqual(r.returncode, 0, "corrupt registry must fail: %s" % cmd)
+            self.assertIn("workspaces.json", r.stderr)           # zh 报错点名注册表文件
+            self.assertIn("不会静默重建", r.stderr)
+        raw = open(self._registry_file(), encoding="utf-8").read()
+        self.assertEqual(raw, "{corrupt json!!")                 # 损坏文件原样保留，绝不静默重建
+
+    def test_examprep_home_isolation(self):
+        home2 = os.path.join(self.tmp, "examprep_home_2")
+        ws = self._mk_dir("ws_iso")
+        r = self._run(["workspace-register", "--course", "心理学导论", "--path", ws])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.isfile(self._registry_file()))   # 落在 EXAMPREP_HOME 冻结位置
+        self.assertFalse(os.path.exists(self._registry_file(home2)))
+        r2 = self._run(["workspace-list"], home=home2)
+        self.assertEqual(r2.returncode, 0, r2.stderr)            # 空注册表是正常态：exit 0
+        self.assertIn("注册表为空", r2.stdout)                   # 且给中文友好提示
+        self.assertNotIn("心理学导论", r2.stdout)                # 两个 HOME 互不可见
+        rj = self._run(["workspace-list", "--json"], home=home2)
+        self.assertEqual(json.loads(rj.stdout), {"workspaces": []})
+
+    def test_workspace_flag_still_required_elsewhere(self):
+        # 放宽 --workspace 只豁免注册表子命令——其余子命令保持 argparse required 契约（exit 2）
+        r = self._run(["show"])
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--workspace", r.stderr)
+
+
+class EnTemplateMigration(unittest.TestCase):
+    """Codex 评审回归：`ingest --lang en` 建出的英文进度模板跑 `init` 迁移时，
+    英文表头行（"| Mistake ID | Chapter | … |"）绝不能被当成真实错题/疑难行迁进 state，
+    英文打卡区（check-in）与断点（Phase 1）也要照常解析。"""
+
+    RAW_EN = {
+        "course_name": "Data Structures",
+        "phases": [
+            {"phase_num": 1, "phase_name": "Linear lists", "wiki_filename": "ch1_linear.md",
+             "wiki_content": "# Linear lists\n\n## Linked list\nAccess cost is O(n)."},
+            {"phase_num": 2, "phase_name": "Sorting", "wiki_filename": "ch2_sort.md",
+             "wiki_content": "# Sorting\n\n## Merge sort\nStable, O(n log n)."},
+        ],
+        "quiz_bank": [
+            {"id": "q1", "phase": 1, "type": "choice", "question": "Linked-list access cost?",
+             "options": ["O(1)", "O(n)"], "answer": "O(n)", "source": "teacher"},
+        ],
+    }
+
+    def _build_en_ws(self):
+        tmp = tempfile.mkdtemp(prefix="enws_")
+        self.addCleanup(__import__("shutil").rmtree, tmp, ignore_errors=True)
+        raw_path = os.path.join(tmp, "raw_input.json")
+        with open(raw_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(self.RAW_EN, f, ensure_ascii=False)
+        ws = os.path.join(tmp, "ws")
+        r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "ingest.py"),
+                            "--input", raw_path, "--output-dir", ws, "--lang", "en"],
+                           capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return ws
+
+    def test_en_init_does_not_ingest_header_rows(self):
+        ws = self._build_en_ws()
+        r = _up(ws, ["init"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        st = _state(ws)
+        # 英文表头行/占位不是条目——迁移后档案必须是空的（回归：{id:"Mistake ID"} 假行）
+        self.assertEqual(st["mistake_archive"], [], st["mistake_archive"])
+        self.assertEqual(st["confusion_log"], [], st["confusion_log"])
+        # 断点解析：模板断点行 "Current phase: Phase 1: …" → current_phase=1
+        self.assertEqual(st["current_phase"], 1)
+        # 打卡区（"Knowledge-point check-in status"）被识别：2 阶段 + Mock test + Pitfall sweep
+        texts = [row["text"] for row in st["phase_checklist"]]
+        self.assertEqual(len(texts), 4, texts)
+        self.assertTrue(any("Phase 1" in t for t in texts), texts)
+        self.assertTrue(all(not row["done"] for row in st["phase_checklist"]))
+        # 打卡区没被表头行污染
+        self.assertFalse(any("Mistake ID" in t or "Trouble spot" in t for t in texts), texts)
+
+    def test_en_workspace_add_mistake_render_roundtrip_stays_clean(self):
+        ws = self._build_en_ws()
+        self.assertEqual(_up(ws, ["init"]).returncode, 0)
+        r = _up(ws, ["add-mistake", "--id", "q1", "--chapter", "1", "--note", "picked O(1)"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(_up(ws, ["render"]).returncode, 0)
+        r2 = _up(ws, ["init", "--force"])                          # 生成视图迁回 state 的恢复路径
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        st = _state(ws)
+        self.assertEqual(len(st["mistake_archive"]), 1, st["mistake_archive"])
+        self.assertEqual(st["mistake_archive"][0]["id"], "q1")
+        self.assertEqual(st["confusion_log"], [])                  # 往返不长出幽灵行
+        self.assertEqual(len(st["phase_checklist"]), 4)
+
+    def test_en_confusion_and_window_headings_recognized(self):
+        # 手写英文进度文件：trouble-spot 表行归疑难档、Knowledge window 区行归窗口档
+        md = ("# Progress\n\n"
+              "* Current phase: Phase 2\n\n"
+              "## Mistake archive\n"
+              "| Mistake ID | Chapter | Question summary | Error analysis | Status |\n"
+              "| :--- | :--- | :--- | :--- | :--- |\n"
+              "| [#q7] | 2 | quicksort stability | mixed up stable sorts | to review |\n\n"
+              "## Concept trouble-spot log\n"
+              "| No. | Chapter | Trouble spot | Answer key points | Status |\n"
+              "| :--- | :--- | :--- | :--- | :--- |\n"
+              "| 1 | 1 | modulo boundary | wrap-around rule | to revisit |\n\n"
+              "## Knowledge window (recent-mastery tracking)\n"
+              "| Knowledge point | Chapter | Status | Note |\n"
+              "| --- | --- | --- | --- |\n"
+              "| LIFO order | 1 | verified by quiz | quizzed twice |\n")
+        ws = _mk_ws(tempfile.mkdtemp(), md=md)
+        with open(os.path.join(ws, "study_plan.md"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("# Plan\n## Phase 1: Stack\n## Phase 2: Queue\n")
+        r = _up(ws, ["init"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        st = _state(ws)
+        self.assertEqual(st["current_phase"], 2)
+        self.assertEqual(len(st["mistake_archive"]), 1, st["mistake_archive"])
+        row = st["mistake_archive"][0]
+        self.assertEqual(row["id"], "q7")
+        self.assertEqual(row["chapter"], "2")                     # en 表头列角色映射（chapter 列）
+        self.assertEqual(row["status"], "to_review")              # en 显示词状态归代号
+        self.assertNotIn("to review", row["note"])                # 状态不再混进 note
+        self.assertEqual(len(st["confusion_log"]), 1, st["confusion_log"])
+        self.assertIn("modulo boundary", st["confusion_log"][0]["note"])
+        self.assertEqual(st["confusion_log"][0]["status"], "to_revisit")
+        win = st["knowledge_window"]
+        self.assertEqual(len(win), 1, win)                        # 窗口表头行不被当数据行
+        self.assertEqual(win[0]["point"], "LIFO order")
+        self.assertEqual(win[0]["status"], "verified")            # en 窗口状态词归代号
 
 
 if __name__ == "__main__":

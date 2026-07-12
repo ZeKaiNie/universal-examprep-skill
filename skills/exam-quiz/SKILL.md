@@ -43,40 +43,23 @@ Pull chapter/phase-scoped items from `references/quiz_bank.json`, present one it
    - `diagram` — do not judge the figure from memory: follow `render_hint` to run the standard algorithm first, derive the structure, then compare against the student's drawing; state that the instructor's drawing method takes precedence.
 3. **Escape hatch**: on a wrong answer, give the logic gap + the item's `explanation` + a hint. On the 2nd consecutive wrong answer, offer three choices — view hint / skip and archive the wrong item / continue — and proceed per the choice.
 4. **Archive**: record skipped or wrong items — with `study_state.json`, run `python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace <ws> add-mistake --id <qid> --chapter <ch> --note <错误原因>` (the script resolves from the skill package root — the student workspace has no `scripts/`; never resolve from the current directory) (hand-editing the generated md loses the row on the next render); without state, write into the `study_progress.md` wrong-item archive.
+   - **Persist-first (notebook CLI)** — each graded item's full feedback (verdict, logic gap, explanation, source block) is written to the notebook BEFORE the chat reply: `echo <feedback body> | python "${CLAUDE_SKILL_DIR}/scripts/notebook.py" --workspace <ws> add-entry --chapter <ch> --type feedback --id <qid> --title <question gist>` (body via STDIN; same `--id` replaces in place; `notebook/index.md` rebuilds). For a wrong or skipped item, ALSO pass `--mistake` — it mirrors the entry into `mistakes/chNN.md` and rebuilds `mistakes/index.md`; this mirror is IN ADDITION to the `update_progress.py add-mistake` state row above (the state row and the notebook entry index each other), never a replacement for it. The chat reply is a short digest ending with the pack-provided link line (zh 「完整反馈：`notebook/chNN.md#<anchor>`｜目录：`notebook/index.md`」, en `Full feedback: notebook/chNN.md#<anchor> | Index: notebook/index.md`). On a failed notebook write, TELL the student and give the full feedback in chat; file-less clients keep chat-only output per `exam-cram`'s capability dispatch.
 5. **Source honesty + per-item source block**: when an item's or answer's `source` is `ai_generated`, flag it at grading time with the full AI-generated provenance sentence in the active reply language (`中文` 「⚠️ AI生成答案，非老师/教材提供」 / `English` `⚠️ AI-generated answer — not from your teacher or textbook`; reference only, verify against the instructor/textbook). Additionally, after grading EVERY item, emit the fixed one-line source block in the active reply language — `中文` `题目来源：<文件名> 第<N>页（<source_type>）｜答案来源：<文件名/老师·教材提供/AI 推导（无教材答案）>｜<canonical 溯源标签>`, `English` `Question source: <file> p.<N> (<source_type>) | Answer source: <file p.N / teacher-provided / AI-derived (no textbook answer)> | <label>` — the trailing label is exactly one of the three canonical provenance sentences in the active reply language (`中文` 🟢 来自资料 / 🟡 AI补充，可能与你老师讲的不完全一致 / ⚠️ AI生成答案，非老师/教材提供 — `English` the three EN sentences in [`docs/language-policy.md`](../../docs/language-policy.md)). When the answer is AI-supplied (no stored / textbook answer), the label MUST be the full ⚠️ sentence AND the `解析/参考答案` block title carries it. Missing source metadata → write `中文` 「来源未知」 / `English` `Source unknown` (`Source page unknown` when only the page is missing), never fabricate a filename or page. Same contract as [`exam-tutor`](../exam-tutor/SKILL.md)'s teaching template.
 
 ## Output Contract
 - Present one item at a time; grade as pass/not-pass plus key-point feedback; refresh the progress panel at the end.
+- **Persist-first default**: grading feedback is written to `notebook/chNN.md` (`--type feedback`) before the chat reply, and wrong/skipped items carry `--mistake` so the entry ALSO lands in `mistakes/chNN.md` alongside the `add-mistake` state row (Workflow step 4); the chat reply is a digest plus the pack-provided link line. On a failed write, say so and deliver full feedback in chat; file-less clients keep chat-only output.
 - Each graded item's feedback ends with the one-line source block, rendered per the active reply language (`中文` `题目来源：…｜答案来源：…｜<🟢/🟡/⚠️ 标签>` / `English` `Question source: … | Answer source: … | <label>`) (Workflow step 5); an AI-supplied answer carries ⚠️ in both the `解析/参考答案` block title and the source label.
 - Update the check-in log and wrong-item archive — via `update_progress.py` (add-mistake / set-check) when `study_state.json` exists, else in `study_progress.md` — then hand control back to `exam-cram`.
 - Student-facing output defaults to English (Simplified Chinese if the student opened in Chinese); a persisted `study_state.json` `language` (`中文`/`English`/`双语`) switches it per exam-cram's dispatch rule with single-language purity. (See [`docs/language-policy.md`](../../docs/language-policy.md).)
 - Provenance labels in feedback follow the active reply language (`中文` verbatim markers 🟢 来自资料 / 🟡 AI补充，可能与你老师讲的不完全一致 / ⚠️ AI生成答案，非老师/教材提供 — `English` the three EN canonical sentences in [`docs/language-policy.md`](../../docs/language-policy.md)).
 
-## Student-facing Output
-判分反馈用简短、具体的中文，先点考点再给改进：
-
-- **答对**：✅ 对了。这题考什么：……（一句点考点）。顺手记个易错点：……。
-- **每题判分反馈末尾固定加一行**：题目来源：hw02.pdf 第 3 页（homework）｜答案来源：hw02_sol.pdf 第 1 页｜🟢 来自资料（AI 生成答案时末尾标签用 ⚠️，且解析块标题带 ⚠️）。
-- **部分对**：🟡 思路对了一半——你答到了「……」，但漏了「……」这一步，补上就满分。
-- **答错**：❌ 这里错了：……（指出逻辑漏洞）。标准答题步骤：1.… 2.…。再看一眼原题解析。
-- **连错两次**：要不要 ① 查看提示　② 跳过并归档错题　③ 再想想？选 ② 我就「已记录到错题本」，考前再扫雷。
-- **题/答为 AI 生成**：⚠️ AI生成答案，非老师/教材提供，仅供参考，请和老师/教材核对。
-
-### English rendering (`language=English`)
-
-Grade in pure English — same shapes as the zh sample above, zero CJK outside code spans, fixed phrasing
-verbatim from the EN canonical vocabulary in [`docs/language-policy.md`](../../docs/language-policy.md):
-
-- **Correct**: ✅ Correct. What this tests: … (one sentence). One pitfall worth noting: ….
-- **Every graded item's feedback ends with the fixed source line** (ASCII `|`): `Question source: hw02.pdf p.3 (homework) | Answer source: hw02_sol.pdf p.1 | 🟢 From your materials` — the trailing label is the FULL text of one of 🟢 From your materials / 🟡 AI-supplemented — may differ from what your teacher taught / ⚠️ AI-generated answer — not from your teacher or textbook, never the emoji alone. When the answer is AI-supplied, the trailing label is the FULL sentence ⚠️ AI-generated answer — not from your teacher or textbook (never the emoji alone) and the answer/explanation block title carries the same ⚠️ sentence. Missing source metadata → write Source unknown (or Source page unknown), never a fabricated filename or page.
-- **Partially correct**: 🟡 Halfway there — you covered "…", but missed the "…" step; add it for full marks.
-- **Wrong**: ❌ Here is the error: … (point out the logic gap). Standard answer steps: 1. … 2. …. Re-read the item's explanation.
-- **Two wrong in a row**: Would you like to ① view a hint ② skip and archive the wrong item ③ think again? On ② reply with the receipt: Recorded to the mistake archive — we sweep it again before the exam.
-- **AI-generated item/answer**: ⚠️ AI-generated answer — not from your teacher or textbook; reference only, verify against your teacher or textbook.
-- **Scope override**: emit the verbatim line ⚠️ Temporarily overriding your <scope> scope preference BEFORE the first out-of-scope item (substitute the active scope name).
-
-For `language=双语`, apply [`exam-cram`](../exam-cram/SKILL.md)'s composition rule: compose the zh unit
-first, then a `> EN:` mirror per block — each side single-language pure (no token+gloss mixing).
+## Language packs
+Student-visible wording for this skill lives in per-language packs — load the one matching `study_state.json.language` BEFORE emitting any student-visible output:
+- `zh` → [`../../locales/zh/skills/exam-quiz.md`](../../locales/zh/skills/exam-quiz.md)
+- `en` → [`../../locales/en/skills/exam-quiz.md`](../../locales/en/skills/exam-quiz.md)
+- `bilingual` → compose from the zh pack with a `> EN:` mirror line per block (rules in [`../../docs/language-policy.md`](../../docs/language-policy.md))
+Unset language → this is the first conversation: the merged first-ask (mode × time budget × language) decides it; default en unless the student opened in Chinese.
 
 ## Boundaries
 - **Structured progress state**: when `study_state.json` exists it is the SINGLE SOURCE OF TRUTH — update it via `python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace <ws> set/add-mistake/add-confusion/render` (script path resolves from the skill package root); `study_progress.md` is a GENERATED view (hand edits are lost on the next render — never hand-patch it). If a state write fails, TELL the user; never continue as if it saved. Without `study_state.json` but WITH Python (a fresh, uninitialized workspace), run `update_progress.py --workspace <ws> init` to create the source of truth FIRST — do not stop at hand-editing `study_progress.md`; only when Python truly cannot run does a hand-maintained md stay valid.

@@ -24,28 +24,21 @@ Capture the learner's concept-level confusions (why / what / how-derived questio
 1. **Detect** — decide whether the follow-up is a concept question (not a quiz item or its answer).
 2. **Answer** — give a concise, clear explanation grounded in the current wiki chapter. Label the source: 🟢 来自资料 for material-sourced content, 🟡 AI补充，可能与你老师讲的不完全一致 for AI-supplied background. Never present AI-added content as the teacher's.
 3. **Record** — persist the confusion: `关联章节` / `疑难点` (one line) / `解答要点` (≤2 sentences) / `状态` (default 待回顾). When `study_state.json` exists, the ONLY valid write path is `python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace <ws> add-confusion --chapter <ch> --note <疑难点/解答要点>` — the md table is a generated view and a hand-appended row is lost on the next render. Without state (no-Python fallback), append to the 「## 💡 概念疑难点记录」 table in `study_progress.md` directly, auto-incrementing the `序号` column.
+   - **Persist-first (notebook CLI)** — the state row stays exactly as above; ADDITIONALLY persist the full explanation itself (step 2's answer, provenance labels included) so it survives outside chat: `echo <explanation body> | python "${CLAUDE_SKILL_DIR}/scripts/notebook.py" --workspace <ws> add-entry --chapter <ch> --type confusion --id <slug> --title <confusion gist>` (body via STDIN; same `--id` replaces in place; `notebook/index.md` rebuilds; the script resolves from the skill package root). The receipt line then carries the pack-provided link line (zh 「完整解答：`notebook/chNN.md#<anchor>`｜目录：`notebook/index.md`」, en `Full explanation: notebook/chNN.md#<anchor> | Index: notebook/index.md`). On a failed notebook write, TELL the student (the chat explanation already delivered stands as the copy); file-less clients keep chat-only output per `exam-cram`'s capability dispatch.
 4. **Confirm** — tell the learner it was logged (e.g. 「已记录到疑难点」) in one short line, without breaking the teaching flow.
 
 ## Output Contract
 - Persist one confusion record (`关联章节` / `疑难点` / `解答要点` / `状态`): with `study_state.json`, the output contract IS the `update_progress.py add-confusion` call (the md table regenerates from state); without state, append one row to the 「## 💡 概念疑难点记录」 table in `study_progress.md` (`序号` auto-increments).
+- **Persist-first default**: the full confusion explanation is ALSO written into `notebook/chNN.md` via the notebook CLI (`--type confusion`, Workflow step 3) — the state row records that the confusion exists, the notebook entry preserves the explanation itself; the receipt carries the pack-provided link line. File-less clients keep chat-only output.
 - During the final sweep, read the confusion records and have the learner restate each: update `状态` **in place** — 待回顾 → 已回顾 when explained correctly; keep 待回顾 and re-explain otherwise. Never overwrite other skills' writes.
 - Student-facing output defaults to English (Simplified Chinese if the student opened in Chinese); a persisted `study_state.json` `language` (`中文`/`English`/`双语`) switches it per exam-cram's dispatch rule with single-language purity.
 
-## Student-facing Output
-进度文件里的表格格式（学生侧中文，序号按已有记录递增）：
-
-```text
-## 💡 概念疑难点记录
-
-| 序号 | 关联章节 | 疑难点 | 解答要点 | 状态 |
-|:---|:---|:---|:---|:---|
-| 1 | 晶体结构 | 为什么FCC是ABC堆垛？ | 第三层落C凹坑→FCC，落A→HCP | 待回顾 |
-```
-
-记录完后给一句简短回执（如「已记录到疑难点」），不打断教学节奏。
-
-
-Render per the persisted `study_state.json` `language` (`中文` default / `English` / `双语`) with single-language purity — `中文` output stays pure Chinese, `English` output uses the EN canonical vocabulary, `双语` composes the zh unit first + a `> EN:` mirror per block; see [`exam-cram`](../exam-cram/SKILL.md) Output Contract and [`docs/language-policy.md`](../../docs/language-policy.md).
+## Language packs
+Student-visible wording for this skill lives in per-language packs — load the one matching `study_state.json.language` BEFORE emitting any student-visible output:
+- `zh` → [`../../locales/zh/skills/confusion-tracker.md`](../../locales/zh/skills/confusion-tracker.md)
+- `en` → [`../../locales/en/skills/confusion-tracker.md`](../../locales/en/skills/confusion-tracker.md)
+- `bilingual` → compose from the zh pack with a `> EN:` mirror line per block (rules in [`../../docs/language-policy.md`](../../docs/language-policy.md))
+Unset language → this is the first conversation: the merged first-ask (mode × time budget × language) decides it; default en unless the student opened in Chinese.
 
 ## Boundaries
 - **Structured progress state**: when `study_state.json` exists it is the SINGLE SOURCE OF TRUTH — record via `python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace <ws> add-confusion`, update review status via `set-confusion-status --id <qid>|--index <N> --status 已回顾/待回顾`; never hand-patch the generated `study_progress.md`. If the state write fails, TELL the user; never continue as if it saved.
