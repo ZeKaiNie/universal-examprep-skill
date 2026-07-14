@@ -35,7 +35,11 @@ try:
         persist_payload,
         refresh_build_manifest,
     )
-    from ingestion.identifiers import is_link_or_reparse, safe_workspace_entry
+    from ingestion.identifiers import (
+        UnsafePathError,
+        is_link_or_reparse,
+        safe_workspace_entry,
+    )
 except ImportError:  # imported as scripts.ingest in unit tests
     from scripts.ingestion.pipeline import (
         compile_review_outputs,
@@ -43,7 +47,11 @@ except ImportError:  # imported as scripts.ingest in unit tests
         persist_payload,
         refresh_build_manifest,
     )
-    from scripts.ingestion.identifiers import is_link_or_reparse, safe_workspace_entry
+    from scripts.ingestion.identifiers import (
+        UnsafePathError,
+        is_link_or_reparse,
+        safe_workspace_entry,
+    )
 
 SUBJECT_TOKEN = "《科目名称》"               # 模板中待替换的科目占位符
 PHASE_TABLE_MARKER = "<!-- PHASE_TABLE -->"        # study_plan 模板里表格插入点
@@ -131,7 +139,13 @@ def _safe_output_tree(output_dir):
     root = os.path.abspath(output_dir)
     current = root
     for relative in ("references", "references/wiki"):
-        current = str(safe_workspace_entry(root, relative))
+        try:
+            current = str(safe_workspace_entry(root, relative))
+        except UnsafePathError as exc:
+            fail([
+                "输出目录 %s 含符号链接/junction/reparse point 或越界路径，拒绝写盘：%s"
+                % (relative, exc)
+            ])
         if os.path.lexists(current):
             if is_link_or_reparse(current):
                 fail([f"输出目录 {os.path.relpath(current, output_dir)} 是符号链接；拒绝经链接写出工作区"])
@@ -139,7 +153,13 @@ def _safe_output_tree(output_dir):
                 fail([f"输出路径 {os.path.relpath(current, output_dir)} 已存在但不是目录"])
         else:
             os.mkdir(current)
-        safe_workspace_entry(root, relative)
+        try:
+            safe_workspace_entry(root, relative)
+        except UnsafePathError as exc:
+            fail([
+                "输出目录 %s 在创建期间变成符号链接/junction/reparse point，拒绝写盘：%s"
+                % (relative, exc)
+            ])
     return current
 
 
