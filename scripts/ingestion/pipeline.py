@@ -49,7 +49,13 @@ _REASON_SAFE_RE = re.compile(r"[^a-z0-9_.-]+")
 
 
 def _relative(path, root):
-    value = os.path.relpath(os.path.abspath(path), os.path.abspath(root)).replace(os.sep, "/")
+    # Resolve both sides before comparing them.  Windows can expose the same
+    # directory as both an 8.3 path (RUNNER~1) and a long path (runneradmin);
+    # relpath treats those lexical spellings as unrelated and fabricates a
+    # traversal path even though the source is inside the materials root.
+    source = Path(path).resolve(strict=False)
+    base = Path(root).resolve(strict=False)
+    value = os.path.relpath(str(source), str(base)).replace(os.sep, "/")
     return normalize_workspace_path(value)
 
 
