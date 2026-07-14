@@ -3,7 +3,7 @@ name: universal-exam-cram-coach
 description: "帮助学生在临考前进行结构化极速复习：解析课程资料/大纲/重点，按章节生成 wiki 知识库与标准题库，组织针对性刷题与判分，并记录复习进度和错题。当用户即将考试、需要快速复习计划、练习题、错题复盘或考前小抄时使用（关键词：期末/备考/复习/刷题/划重点/错题；exam, cram, study plan, quiz, review）。不适用于长期学习规划、与考试无关的写作或编程任务。"
 license: MIT
 metadata:
-  version: "4.1"
+  version: "4.2"
   author: ZeKaiNie
 ---
 

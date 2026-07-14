@@ -4,11 +4,18 @@
 
 ## Unreleased
 
-- **结构化课程建库**：新增 `ingest_course.py` 作为 PDF/DOCX/PPTX/txt/Markdown 到已校验工作区的唯一常规入口；返回码 `0` 表示可进入学习，`10` 表示流程成功但 readiness 仍被内容问题阻断。
-- **类型化 AI 接管**：建库中间态统一落入 `.ingest/` 的 source manifest、ContentUnit、chapter mapping、ReviewIssue 队列与 append-only ReviewPatch 账本；`ingest_review.py` 提供认领、校验、应用、不可恢复标记、重建与复验流程。
-- **文档契约对齐**：主技能、子技能、双语文案、文件格式和跨宿主说明统一 readiness 门禁、来源漂移、页锚点与审查事实源；移除过度承诺、易漂移体积数字和运行时版本时代措辞，并明确机器 schema / canonical domain 值 / 学生视图三层语言边界。
-- **仓库结构收敛**：完成的 v4/v4.1 计划移入 `docs/history/plans/`，v3 发布说明移入 `docs/releases/`；这些维护者历史文档不再进入学生运行时分发包或 GitHub 源码归档。
-- **实验目录退役**：移除已被生产标准库 BM25 检索器吸收的 `spike/llamaindex_rag/` 独立实验，保留其历史背景但不再维护两套实现。
+- 暂无。
+
+## V4.2 — 2026-07-14
+
+> 完整审查、设计与实施记录见 [`docs/plans/knowledge-ingestion-hardening.md`](docs/plans/knowledge-ingestion-hardening.md)。
+
+- **结构化课程建库**：新增 `ingest_course.py` 作为 PDF/DOCX/PPTX/txt/Markdown 到已校验工作区的唯一常规入口；返回码 `0` 表示可进入学习，`10` 表示工程流程成功但 readiness 仍被内容问题阻断。
+- **可恢复、可追溯的事实层**：建库中间态统一落入 `.ingest/` 的 source manifest、ContentUnit、chapter mapping 与证据文件；稳定 ID、严格 schema、源文件哈希、页码与资产 provenance 让编译结果可重建、来源漂移可检测，多文件事务在中断后可回滚。
+- **类型化 AI 接管**：所有 warning、skip、缺答案与低置信页面进入 ReviewIssue 队列和 append-only ReviewPatch 账本；`ingest_review.py` 提供认领、校验、应用、不可恢复标记、重建与复验流程，不再把“AI 会接手”停留在日志里。
+- **轻量检索与发布门禁**：结构感知 chunk、概念 postings、索引完整性校验及确定性 Recall@1/5、MRR 评估共用标准库实现；validator 与运行时统一输出 `ready` / `usable_with_gaps` / `blocked`，避免结构可运行被误报为资料完整。
+- **文档与视觉提取加固**：DOCX/PPTX 提取覆盖表格、内容控件、公式/列表复核信号、讲者备注、隐藏对象与图片哈希；视觉与答案内容继续 fail-closed，无法确定的内容进入复核队列而不是静默丢失。
+- **技能与仓库结构收敛**：主技能、子技能、双语文案、文件格式和跨宿主说明统一 readiness、来源与页锚点契约；完成的历史计划/发布说明归档，退役重复索引、caption gallery 与已被生产检索器吸收的 LlamaIndex spike，保持学生运行时包轻量。
 
 ## V4.1 — 2026-07-14
 

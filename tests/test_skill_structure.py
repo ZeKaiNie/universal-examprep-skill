@@ -82,7 +82,7 @@ class TestSkillCollectionStructure(unittest.TestCase):
         version = nested_frontmatter_value(read("SKILL.md"), "metadata", "version")
         self.assertEqual(
             version,
-            "4.1",
+            "4.2",
             "root SKILL.md metadata must be bumped with the current release; stale metadata "
             "makes a current install look like an older skill",
         )
