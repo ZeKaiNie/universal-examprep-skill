@@ -48,6 +48,9 @@ from .storage import (
     atomic_write_text,
     read_json,
     read_jsonl,
+    stable_read_bytes,
+    workspace_publication_lock,
+    workspace_state_lock,
 )
 
 __all__ = [
@@ -88,4 +91,7 @@ __all__ = [
     "render_answer_value",
     "safe_workspace_entry",
     "safe_workspace_path",
+    "stable_read_bytes",
+    "workspace_publication_lock",
+    "workspace_state_lock",
 ]

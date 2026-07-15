@@ -111,6 +111,8 @@ CONTENT_METADATA_FIELDS = frozenset(
         "maybe_requires_assets",
         "answer_value",
         "asset_sha256",
+        "source_language",
+        "parser_metadata",
     )
 )
 
@@ -514,8 +516,19 @@ class ContentUnit:
                 _fail("ContentUnit cannot be paired with itself")
         metadata = _json_metadata(self.metadata)
         if metadata:
-            if self.kind not in ("question", "answer"):
-                _fail("ContentUnit.metadata is currently reserved for question/answer units")
+            non_quiz_fields = {"asset_sha256", "source_language", "parser_metadata"}
+            if (self.kind not in ("question", "answer")
+                    and set(metadata) - non_quiz_fields):
+                _fail(
+                    "non-question ContentUnit.metadata contains quiz-only fields: %r"
+                    % sorted(set(metadata) - non_quiz_fields)
+                )
+            asset_sha256 = metadata.get("asset_sha256")
+            if asset_sha256 is not None:
+                _sha(asset_sha256, "ContentUnit.metadata.asset_sha256")
+            parser_metadata = metadata.get("parser_metadata")
+            if parser_metadata is not None and not isinstance(parser_metadata, dict):
+                _fail("ContentUnit.metadata.parser_metadata must be an object")
             quiz_type = metadata.get("quiz_type")
             if quiz_type is not None:
                 _enum(quiz_type, QUIZ_TYPES, "ContentUnit.metadata.quiz_type")
@@ -554,6 +567,13 @@ class ContentUnit:
             answer_source_file = metadata.get("answer_source_file")
             if answer_source_file is not None:
                 _path(answer_source_file, "ContentUnit.metadata.answer_source_file")
+            source_language = metadata.get("source_language")
+            if source_language is not None:
+                _enum(
+                    source_language,
+                    frozenset(("zh", "en")),
+                    "ContentUnit.metadata.source_language",
+                )
             for field in ("requires_assets", "maybe_requires_assets"):
                 value = metadata.get(field)
                 if value is not None and type(value) is not bool:

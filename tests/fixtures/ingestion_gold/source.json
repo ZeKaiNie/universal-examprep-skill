@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "title": "Universal Exam Cram Coach synthetic ingestion Gold Set",
+  "license": "CC0-1.0",
+  "authorship": {
+    "kind": "project-authored-synthetic",
+    "contains_real_course_material": false,
+    "contains_third_party_media": false,
+    "contains_personal_data": false
+  },
+  "artifacts": [
+    {
+      "file": "layout.pdf",
+      "kind": "pdf",
+      "facts": {
+        "page_count": 2,
+        "pages": [
+          {
+            "page": 1,
+            "layout": "two_columns",
+            "exact_quotes": [
+              "Layout Gold Set",
+              "Left column A: alpha",
+              "Left column B: beta",
+              "Right column A: gamma",
+              "Right column B: delta"
+            ],
+            "expected_reading_order": [
+              "Layout Gold Set",
+              "Left column A: alpha",
+              "Left column B: beta",
+              "Right column A: gamma",
+              "Right column B: delta"
+            ]
+          },
+          {
+            "page": 2,
+            "layout": "vector_table_formula",
+            "exact_quotes": [
+              "Vector Table and Formula",
+              "Item",
+              "Value",
+              "f(x) = x^2 + 1"
+            ],
+            "table": true,
+            "formula": true,
+            "vector_line_count_min": 6
+          }
+        ],
+        "expected_units": [
+          {"page": 1, "kind": "heading", "exact_quote": "Layout Gold Set"},
+          {"page": 1, "kind": "text", "exact_quote": "Left column A: alpha"},
+          {"page": 2, "kind": "table", "exact_quote": "Item"},
+          {"page": 2, "kind": "formula", "exact_quote": "f(x) = x^2 + 1"}
+        ],
+        "citations": [
+          {"page": 1, "exact_quote": "Right column B: delta"},
+          {"page": 2, "exact_quote": "f(x) = x^2 + 1"}
+        ]
+      }
+    },
+    {
+      "file": "scan.pdf",
+      "kind": "pdf",
+      "facts": {
+        "page_count": 1,
+        "image_only": true,
+        "text_operators_present": false,
+        "image_dimensions": [16, 12],
+        "expected_units": [
+          {"page": 1, "kind": "figure", "visual_dependency": "full"}
+        ],
+        "citations": []
+      }
+    },
+    {
+      "file": "scan.png",
+      "kind": "raster",
+      "facts": {
+        "page_count": 1,
+        "format": "png",
+        "dimensions": [16, 12],
+        "sidecar_expected": false,
+        "expected_units": [
+          {"page": 1, "kind": "figure", "visual_dependency": "full"}
+        ],
+        "citations": []
+      }
+    },
+    {
+      "file": "shared_prompt_answer.pdf",
+      "kind": "pdf",
+      "facts": {
+        "page_count": 1,
+        "shared_prompt_answer_page": true,
+        "exact_quotes": [
+          "Question 1: Find the missing value.",
+          "Answer: 42 units.",
+          "Reason: six groups of seven."
+        ],
+        "crops": [
+          {
+            "role": "question_context",
+            "page": 1,
+            "bbox_pdf_points": [0, 396, 612, 792],
+            "must_include": ["Question 1: Find the missing value."],
+            "must_exclude": ["Answer: 42 units."]
+          },
+          {
+            "role": "answer_context",
+            "page": 1,
+            "bbox_pdf_points": [0, 0, 612, 396],
+            "must_include": ["Answer: 42 units."],
+            "must_exclude": ["Question 1: Find the missing value."]
+          }
+        ],
+        "expected_units": [
+          {"page": 1, "kind": "question", "exact_quote": "Question 1: Find the missing value."},
+          {"page": 1, "kind": "answer", "exact_quote": "Answer: 42 units."}
+        ],
+        "citations": [
+          {"page": 1, "exact_quote": "Question 1: Find the missing value."},
+          {"page": 1, "exact_quote": "Answer: 42 units."}
+        ]
+      }
+    },
+    {
+      "file": "workbook.xlsx",
+      "kind": "xlsx",
+      "facts": {
+        "page_count": 1,
+        "worksheet_order": ["Gold Data"],
+        "cells": {
+          "A1": "Topic",
+          "B1": "Points",
+          "A2": "Layout",
+          "B2": "5"
+        },
+        "formulas": {"B2": "2+3"},
+        "defined_tables": [{"name": "GoldTable", "ref": "A1:B2"}],
+        "expected_units": [
+          {"page": 1, "kind": "table", "exact_quote": "Topic"},
+          {"page": 1, "kind": "formula", "exact_quote": "2+3"}
+        ],
+        "citations": [
+          {"page": 1, "exact_quote": "Layout"}
+        ]
+      }
+    }
+  ]
+}

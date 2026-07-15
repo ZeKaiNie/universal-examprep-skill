@@ -1,0 +1,246 @@
+{
+  "artifacts": [
+    {
+      "byte_size": 1416,
+      "facts": {
+        "citations": [
+          {
+            "exact_quote": "Right column B: delta",
+            "page": 1
+          },
+          {
+            "exact_quote": "f(x) = x^2 + 1",
+            "page": 2
+          }
+        ],
+        "expected_units": [
+          {
+            "exact_quote": "Layout Gold Set",
+            "kind": "heading",
+            "page": 1
+          },
+          {
+            "exact_quote": "Left column A: alpha",
+            "kind": "text",
+            "page": 1
+          },
+          {
+            "exact_quote": "Item",
+            "kind": "table",
+            "page": 2
+          },
+          {
+            "exact_quote": "f(x) = x^2 + 1",
+            "kind": "formula",
+            "page": 2
+          }
+        ],
+        "page_count": 2,
+        "pages": [
+          {
+            "exact_quotes": [
+              "Layout Gold Set",
+              "Left column A: alpha",
+              "Left column B: beta",
+              "Right column A: gamma",
+              "Right column B: delta"
+            ],
+            "expected_reading_order": [
+              "Layout Gold Set",
+              "Left column A: alpha",
+              "Left column B: beta",
+              "Right column A: gamma",
+              "Right column B: delta"
+            ],
+            "layout": "two_columns",
+            "page": 1
+          },
+          {
+            "exact_quotes": [
+              "Vector Table and Formula",
+              "Item",
+              "Value",
+              "f(x) = x^2 + 1"
+            ],
+            "formula": true,
+            "layout": "vector_table_formula",
+            "page": 2,
+            "table": true,
+            "vector_line_count_min": 6
+          }
+        ]
+      },
+      "file": "layout.pdf",
+      "sha256": "309046db0471b9186fcbbbb8ebec30ba3e2459f8cc9de3d65aa0881b4fa9c55f"
+    },
+    {
+      "byte_size": 710,
+      "facts": {
+        "citations": [],
+        "expected_units": [
+          {
+            "kind": "figure",
+            "page": 1,
+            "visual_dependency": "full"
+          }
+        ],
+        "image_dimensions": [
+          16,
+          12
+        ],
+        "image_only": true,
+        "page_count": 1,
+        "text_operators_present": false
+      },
+      "file": "scan.pdf",
+      "sha256": "51c4790e3a7a0dae8946ea7e55fedfd0a2d849464438effd62cf8f2011020ea0"
+    },
+    {
+      "byte_size": 84,
+      "facts": {
+        "citations": [],
+        "dimensions": [
+          16,
+          12
+        ],
+        "expected_units": [
+          {
+            "kind": "figure",
+            "page": 1,
+            "visual_dependency": "full"
+          }
+        ],
+        "format": "png",
+        "page_count": 1,
+        "sidecar_expected": false
+      },
+      "file": "scan.png",
+      "sha256": "a680f8a3fbb632ffae41dbdd33039b84127cd1899a2214132d7bae3e71c6547d"
+    },
+    {
+      "byte_size": 957,
+      "facts": {
+        "citations": [
+          {
+            "exact_quote": "Question 1: Find the missing value.",
+            "page": 1
+          },
+          {
+            "exact_quote": "Answer: 42 units.",
+            "page": 1
+          }
+        ],
+        "crops": [
+          {
+            "bbox_pdf_points": [
+              0,
+              396,
+              612,
+              792
+            ],
+            "must_exclude": [
+              "Answer: 42 units."
+            ],
+            "must_include": [
+              "Question 1: Find the missing value."
+            ],
+            "page": 1,
+            "role": "question_context"
+          },
+          {
+            "bbox_pdf_points": [
+              0,
+              0,
+              612,
+              396
+            ],
+            "must_exclude": [
+              "Question 1: Find the missing value."
+            ],
+            "must_include": [
+              "Answer: 42 units."
+            ],
+            "page": 1,
+            "role": "answer_context"
+          }
+        ],
+        "exact_quotes": [
+          "Question 1: Find the missing value.",
+          "Answer: 42 units.",
+          "Reason: six groups of seven."
+        ],
+        "expected_units": [
+          {
+            "exact_quote": "Question 1: Find the missing value.",
+            "kind": "question",
+            "page": 1
+          },
+          {
+            "exact_quote": "Answer: 42 units.",
+            "kind": "answer",
+            "page": 1
+          }
+        ],
+        "page_count": 1,
+        "shared_prompt_answer_page": true
+      },
+      "file": "shared_prompt_answer.pdf",
+      "sha256": "d838737497050ad3f98f17dad113d975c672a17b61a33a7c28c73e987b231f20"
+    },
+    {
+      "byte_size": 3776,
+      "facts": {
+        "cells": {
+          "A1": "Topic",
+          "A2": "Layout",
+          "B1": "Points",
+          "B2": "5"
+        },
+        "citations": [
+          {
+            "exact_quote": "Layout",
+            "page": 1
+          }
+        ],
+        "defined_tables": [
+          {
+            "name": "GoldTable",
+            "ref": "A1:B2"
+          }
+        ],
+        "expected_units": [
+          {
+            "exact_quote": "Topic",
+            "kind": "table",
+            "page": 1
+          },
+          {
+            "exact_quote": "2+3",
+            "kind": "formula",
+            "page": 1
+          }
+        ],
+        "formulas": {
+          "B2": "2+3"
+        },
+        "page_count": 1,
+        "worksheet_order": [
+          "Gold Data"
+        ]
+      },
+      "file": "workbook.xlsx",
+      "sha256": "8d7edce933aaeeb9481679f48290a47fb733b50f1fa32e2965571e1f0b8c205d"
+    }
+  ],
+  "authorship": {
+    "contains_personal_data": false,
+    "contains_real_course_material": false,
+    "contains_third_party_media": false,
+    "kind": "project-authored-synthetic"
+  },
+  "generator": "generate.py",
+  "license": "CC0-1.0",
+  "schema_version": 1,
+  "source": "source.json",
+  "source_sha256": "427b86bf396d585fc37ad91e42b05fdafbf7118ec56b133a9eb3159059a15be0"
+}

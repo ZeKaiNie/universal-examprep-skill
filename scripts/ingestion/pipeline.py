@@ -25,10 +25,23 @@ from .models import (
     ContentUnit,
     EvidenceRef,
     ReviewIssue,
+    ReviewPatch,
     SourceRecord,
     render_answer_value,
 )
 from .quality import assess_page
+from .dedup import (
+    CANONICAL_GROUPS_PATH,
+    DUPLICATE_CANDIDATES_PATH,
+    SOURCE_CONFLICTS_PATH,
+    SOURCE_PRIORITIES_PATH,
+    build_dedup_facts,
+    build_source_conflict_review_artifacts,
+    compile_ingestion_facts,
+    load_canonical_groups,
+    load_source_priorities,
+)
+from .retrieval_folding import fold_units_for_retrieval
 from .storage import (
     IngestionStore,
     _workspace_root,
@@ -38,7 +51,9 @@ from .storage import (
 )
 
 
-PAYLOAD_VERSION = 1
+PAYLOAD_VERSION = 2
+LEGACY_PAYLOAD_VERSION = 1
+PARSER_RECEIPTS_PATH = ".ingest/parser_receipts.json"
 BUILD_MANIFEST_PATH = ".ingest/build_manifest.json"
 UNBOUND_REVIEW_PATH = ".ingest/unbound_review.json"
 
@@ -46,6 +61,7 @@ _FORMULA_RE = re.compile(
     r"(?:\$[^$]+\$|\\(?:frac|sum|int|sqrt|begin)\b|[A-Za-z0-9)]\s*[=≈≤≥]\s*[A-Za-z0-9(])"
 )
 _REASON_SAFE_RE = re.compile(r"[^a-z0-9_.-]+")
+_ACTIVE_REVIEW_STATUSES = frozenset(("pending", "claimed", "validated", "blocked"))
 
 
 def _relative(path, root):
@@ -65,6 +81,15 @@ def _media_type(path):
         ".md": "text/markdown",
         ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".tif": "image/tiff",
+        ".tiff": "image/tiff",
+        ".bmp": "image/bmp",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
     }
     return overrides.get(extension) or mimetypes.guess_type(path)[0] or "application/octet-stream"
 
@@ -144,6 +169,14 @@ def normalize_review_candidates(report, quiz_items=()):
         _reason_code(entry.get("kind") or "ai_review")
         for entry in report.get("ai_review", ()) if isinstance(entry, dict)
     }
+    ai_source_pairs = {
+        (
+            _reason_code(entry.get("kind") or "ai_review"),
+            str(entry.get("file")).replace("\\", "/"),
+        )
+        for entry in report.get("ai_review", ())
+        if isinstance(entry, dict) and isinstance(entry.get("file"), str)
+    }
     for entry in report.get("skipped", ()):
         if not isinstance(entry, dict):
             continue
@@ -171,8 +204,16 @@ def normalize_review_candidates(report, quiz_items=()):
         warning_source = None
         if ":" in warning:
             tail = warning.split(":", 1)[1].split("（", 1)[0].strip()
-            if tail and re.search(r"\.(?:pdf|docx|pptx|txt|md)\Z", tail, re.IGNORECASE):
-                warning_source = tail
+            source_match = re.match(
+                r"(.+?\.(?:pdf|docx|pptx|xlsx|txt|md|png|jpe?g|tiff?|bmp|gif|webp))"
+                r"(?=\s|\Z|[\uFF08(])",
+                tail,
+                re.IGNORECASE,
+            )
+            if source_match:
+                warning_source = source_match.group(1).strip()
+        if (_reason_code(prefix), warning_source) in ai_source_pairs:
+            continue
         add(
             prefix or "parser_warning",
             warning_source,
@@ -238,6 +279,85 @@ def _record_by_file(records, source_file):
     return matches[0] if len(matches) == 1 else None
 
 
+def _validate_auxiliary_source_bindings(units, sources):
+    """Bind parser-declared sidecars to exact first-class source revisions."""
+
+    source_by_path = {source.path: source for source in sources}
+    source_by_id = {source.source_id: source for source in sources}
+    for unit in units:
+        parser_metadata = unit.metadata.get("parser_metadata")
+        if not isinstance(parser_metadata, dict):
+            continue
+        if "sidecar" in parser_metadata and (
+                unit.kind != "page_anchor"
+                or parser_metadata.get("format") != "standalone_raster"):
+            raise ValueError(
+                "raster sidecar provenance may appear only on its image page anchor"
+            )
+        if unit.kind != "page_anchor" or parser_metadata.get("format") != "standalone_raster":
+            continue
+        raster_source = source_by_id.get(unit.source_id)
+        if raster_source is None or not raster_source.media_type.startswith("image/"):
+            raise ValueError("standalone raster metadata must belong to an image source")
+        sidecar = parser_metadata.get("sidecar")
+        if sidecar is None:
+            continue
+        expected_fields = {"source_file", "sha256", "byte_size", "discovery"}
+        if not isinstance(sidecar, dict) or set(sidecar) != expected_fields:
+            raise ValueError(
+                "standalone raster sidecar metadata has an invalid provenance schema"
+            )
+        source_file = sidecar.get("source_file")
+        source = source_by_path.get(source_file)
+        if source is None:
+            raise ValueError(
+                "standalone raster sidecar references an unknown first-class source: %r"
+                % source_file
+            )
+        if source.media_type not in ("text/plain", "text/markdown"):
+            raise ValueError("standalone raster sidecar must reference a text source")
+        if (sidecar.get("sha256") != source.sha256
+                or sidecar.get("byte_size") != source.size_bytes):
+            raise ValueError(
+                "standalone raster sidecar does not match its source revision: %s"
+                % source.path
+            )
+        if sidecar.get("discovery") not in ("explicit", "automatic"):
+            raise ValueError("standalone raster sidecar discovery mode is invalid")
+    return True
+
+
+def _deduplicate_bound_candidates(candidates):
+    """Fold candidates only after their real source/target identity is known."""
+
+    output = []
+    seen = {}
+    for candidate in candidates:
+        row = dict(candidate)
+        row["reason_codes"] = sorted(set(row.get("reason_codes") or ["review_required"]))
+        row["pages"] = sorted(set(row.get("pages") or ()))
+        row["target_unit_ids"] = sorted(set(row.get("target_unit_ids") or ()))
+        identity = (
+            tuple(row["reason_codes"]),
+            row.get("source_file"),
+            tuple(row["pages"]),
+            tuple(row["target_unit_ids"]),
+        )
+        existing = seen.get(identity)
+        if existing is None:
+            seen[identity] = row
+            output.append(row)
+            continue
+        if row.get("severity") == "blocking":
+            existing["severity"] = "blocking"
+        for field in ("description", "suggested_action"):
+            incoming = str(row.get(field) or "").strip()
+            current = str(existing.get(field) or "").strip()
+            if incoming and incoming not in current.split(" | "):
+                existing[field] = current + (" | " if current else "") + incoming
+    return output
+
+
 def _question_text(item):
     text = str(item.get("question") or "").strip()
     options = item.get("options")
@@ -285,6 +405,11 @@ def _quiz_metadata(item, answer_record=None, answer_value_marker=False):
         if value is not None:
             metadata[target_key] = value
 
+    language_key = "answer_source_language" if answer_value_marker else "source_language"
+    source_language = item.get(language_key)
+    if source_language in ("zh", "en"):
+        metadata["source_language"] = source_language
+
     source_pages = [
         page for page in item.get("source_pages") or ()
         if type(page) is int and page >= 1
@@ -325,7 +450,75 @@ def _quiz_metadata(item, answer_record=None, answer_value_marker=False):
     return metadata
 
 
-def build_payload(materials_root, source_paths, pages, sections=(), quiz_items=(), report=None):
+def _default_parser_receipt(record, produced_pages):
+    empty_config_hash = hashlib.sha256(b"{}").hexdigest()
+    produced_pages = list(produced_pages)
+    discovered_page_count = max(produced_pages, default=0)
+    full_inventory = produced_pages == list(range(1, discovered_page_count + 1))
+    if record.status in ("failed", "unsupported"):
+        receipt_status = record.status
+    elif produced_pages:
+        receipt_status = "success"
+    else:
+        receipt_status = "review_required"
+    return {
+        "schema_version": 1,
+        "adapter": "core",
+        "adapter_version": None,
+        "module": "exam-cram-core",
+        "distribution": None,
+        "source_file": record.path,
+        "source_sha256": record.sha256,
+        "media_type": record.media_type,
+        # A hand-built ingestion envelope may intentionally mount a sparse page
+        # slice (for example only answer page 3).  It must identify that slice as
+        # requested; only a contiguous 1..N inventory may claim a full parse.
+        "requested_pages": [] if full_inventory else produced_pages,
+        "produced_pages": produced_pages,
+        "discovered_page_count": discovered_page_count,
+        "config_sha256": empty_config_hash,
+        "policy": {"network": False, "upload": False, "install": False},
+        "status": receipt_status,
+    }
+
+
+def _normalize_parser_receipts(records, page_quality, parser_receipts):
+    """Bind one exact local-parser receipt to every discovered source revision."""
+
+    pages_by_source = {}
+    for row in page_quality:
+        pages_by_source.setdefault(row["source_file"], []).append(row["page"])
+    provided = {}
+    for raw in parser_receipts or ():
+        if not isinstance(raw, dict):
+            raise ValueError("parser receipt must be an object")
+        source_file = raw.get("source_file")
+        if not isinstance(source_file, str):
+            raise ValueError("parser receipt source_file must be text")
+        source_file = source_file.replace("\\", "/")
+        if source_file in provided:
+            raise ValueError("duplicate parser receipt for %s" % source_file)
+        provided[source_file] = dict(raw)
+    unknown = sorted(set(provided) - set(records))
+    if unknown:
+        raise ValueError("parser receipts reference unknown sources: %r" % unknown)
+    return [
+        provided.get(path) or _default_parser_receipt(
+            records[path], sorted(set(pages_by_source.get(path, ())))
+        )
+        for path in sorted(records)
+    ]
+
+
+def build_payload(
+    materials_root,
+    source_paths,
+    pages,
+    sections=(),
+    quiz_items=(),
+    report=None,
+    parser_receipts=(),
+):
     """Build the strict ingestion envelope embedded in ``raw_input.json``."""
 
     # ``abspath`` preserves Windows 8.3 aliases (for example RUNNER~1), while
@@ -391,19 +584,29 @@ def build_payload(materials_root, source_paths, pages, sections=(), quiz_items=(
             if isinstance(element, dict) and element.get("kind") == "figure" and element.get("asset")
         )
         text = page.get("text") if isinstance(page.get("text"), str) else ""
+        page_language = page.get("source_language")
+        if page_language not in ("zh", "en"):
+            page_language = None
         table_hint = any(isinstance(e, dict) and e.get("kind") == "table" for e in elements)
         formula_hint = any(isinstance(e, dict) and e.get("kind") == "formula" for e in elements)
         formula_hint = formula_hint or bool(_FORMULA_RE.search(text))
-        quality = assess_page({
-            "page": page_number,
-            "text": text,
-            "image_count": len(set(asset for asset in image_assets if asset)),
-            "image_area_ratio": 0.5 if image_assets and len(text.strip()) < 120 else (0.2 if image_assets else 0.0),
-            "vector_count": 0,
-            "multi_column_hint": False,
-            "table_hint": table_hint or "\t" in text,
-            "formula_hint": formula_hint,
-        })
+        supplied_quality = page.get("quality_signals")
+        if (isinstance(supplied_quality, dict)
+                and set(supplied_quality) == {"score", "route", "reason_codes"}
+                and supplied_quality.get("route") in ("fast", "recover", "review")
+                and isinstance(supplied_quality.get("reason_codes"), list)):
+            quality = supplied_quality
+        else:
+            quality = assess_page({
+                "page": page_number,
+                "text": text,
+                "image_count": len(set(asset for asset in image_assets if asset)),
+                "image_area_ratio": 0.5 if image_assets and len(text.strip()) < 120 else (0.2 if image_assets else 0.0),
+                "vector_count": 0,
+                "multi_column_hint": False,
+                "table_hint": table_hint or "\t" in text,
+                "formula_hint": formula_hint,
+            })
         page_quality.append({
             "source_file": record.path,
             "page": page_number,
@@ -426,9 +629,15 @@ def build_payload(materials_root, source_paths, pages, sections=(), quiz_items=(
 
         phase = mapping_by_page.get((record.path, page_number))
         chapter, phase_label, chapter_id, phase_id = phase or (None, None, None, None)
+        anchor_metadata = {}
+        if isinstance(page.get("metadata"), dict):
+            anchor_metadata["parser_metadata"] = page["metadata"]
+        if page_language:
+            anchor_metadata["source_language"] = page_language
         anchor = ContentUnit.create(
             record.source_id, record.sha256, record.path, "page_anchor", "", page_number,
             ordinal=0, chapter_id=chapter_id, phase_id=phase_id,
+            metadata=anchor_metadata,
             method="native", confidence=quality["score"], provenance="material",
         )
         units.append(anchor)
@@ -444,7 +653,10 @@ def build_payload(materials_root, source_paths, pages, sections=(), quiz_items=(
         if elements:
             iterable = elements
         elif text.strip():
-            iterable = [{"kind": "text", "text": text, "ordinal": 0, "bbox": None, "asset": None}]
+            iterable = [{
+                "kind": "text", "text": text, "ordinal": 0, "bbox": None,
+                "asset": None, "source_language": page_language,
+            }]
         else:
             iterable = []
 
@@ -468,6 +680,11 @@ def build_payload(materials_root, source_paths, pages, sections=(), quiz_items=(
             if (asset_path and isinstance(asset_sha256, str)
                     and re.fullmatch(r"[0-9a-f]{64}", asset_sha256)):
                 element_metadata["asset_sha256"] = asset_sha256
+            if isinstance(element.get("metadata"), dict):
+                element_metadata["parser_metadata"] = element["metadata"]
+            source_language = element.get("source_language")
+            if source_language in ("zh", "en"):
+                element_metadata["source_language"] = source_language
             unit_section = tuple(section_path)
             unit_parent = parent_id
             unit = ContentUnit.create(
@@ -478,8 +695,36 @@ def build_payload(materials_root, source_paths, pages, sections=(), quiz_items=(
                 chapter_id=chapter_id, phase_id=phase_id,
                 asset_path=asset_path, asset_role=role,
                 metadata=element_metadata,
-                method="native", confidence=quality["score"], provenance="material",
+                method=(element.get("method") if element.get("method") in (
+                    "native", "heuristic", "ocr", "vision", "manual", "ai_recovered"
+                ) else "native"),
+                confidence=(
+                    float(element["confidence"])
+                    if isinstance(element.get("confidence"), (int, float))
+                    and not isinstance(element.get("confidence"), bool)
+                    and 0 <= float(element["confidence"]) <= 1
+                    else quality["score"]
+                ),
+                provenance="material",
             )
+            if ((element_text.strip() or str(element.get("latex") or "").strip())
+                    and "source_language" not in unit.metadata):
+                quality_candidates.append({
+                    "reason_codes": ["source_language_unknown"],
+                    "source_file": record.path,
+                    "pages": [page_number],
+                    "severity": "blocking",
+                    "description": (
+                        "Semantic source content is mixed, formula-only, or otherwise lacks "
+                        "evidence for a zh/en language classification."
+                    ),
+                    "suggested_action": (
+                        "Inspect the cited source location and replace the unit with "
+                        "metadata.source_language set to zh or en only when the evidence "
+                        "supports that classification."
+                    ),
+                    "target_unit_ids": [unit.unit_id],
+                })
             if kind in ("title", "heading") and element_text.strip():
                 level = element.get("level") if type(element.get("level")) is int else 1
                 level = max(1, min(6, level))
@@ -570,6 +815,21 @@ def build_payload(materials_root, source_paths, pages, sections=(), quiz_items=(
             metadata=_quiz_metadata(item),
             method="heuristic", confidence=0.75, provenance="material",
         )
+        if "source_language" not in question.metadata:
+            quality_candidates.append({
+                "reason_codes": ["source_language_unknown"],
+                "source_file": question_record.path,
+                "pages": [page_number],
+                "severity": "blocking",
+                "description": (
+                    "Question source language is not explicitly classified as zh or en."
+                ),
+                "suggested_action": (
+                    "Inspect the cited question evidence and replace the unit with "
+                    "metadata.source_language set to zh or en."
+                ),
+                "target_unit_ids": [question.unit_id],
+            })
 
         answer_value = item.get("answer")
         answer = None
@@ -596,12 +856,29 @@ def build_payload(materials_root, source_paths, pages, sections=(), quiz_items=(
                 method="heuristic", confidence=0.75,
                 provenance=("ai_supplemented" if item.get("source") == "ai_generated" else "material"),
             )
+            if "source_language" not in answer.metadata:
+                quality_candidates.append({
+                    "reason_codes": ["answer_source_language_unknown"],
+                    "source_file": answer_record.path,
+                    "pages": [answer_page],
+                    "severity": "warning",
+                    "description": (
+                        "Answer source language is not explicitly classified as zh or en."
+                    ),
+                    "suggested_action": (
+                        "Inspect the cited answer evidence and replace the unit with "
+                        "metadata.source_language set to zh or en before claiming a "
+                        "material answer in that language."
+                    ),
+                    "target_unit_ids": [answer.unit_id],
+                })
             question = question.with_pair(answer.unit_id)
             answer = answer.with_pair(question.unit_id)
         units.append(question)
         if answer is not None:
             units.append(answer)
 
+    _validate_auxiliary_source_bindings(units, records.values())
     all_candidates = candidates + quality_candidates
     questions_by_external_id = {
         unit.external_id: unit for unit in units
@@ -657,6 +934,7 @@ def build_payload(materials_root, source_paths, pages, sections=(), quiz_items=(
             )
             bound.append(row)
 
+    bound = _deduplicate_bound_candidates(bound)
     reviewed_paths = {row["source_file"] for row in bound}
     for path in sorted(reviewed_paths):
         record = records[path]
@@ -669,6 +947,9 @@ def build_payload(materials_root, source_paths, pages, sections=(), quiz_items=(
                 status="review_required",
             )
 
+    normalized_receipts = _normalize_parser_receipts(
+        records, page_quality, parser_receipts
+    )
     return {
         "schema_version": PAYLOAD_VERSION,
         "source_root": root,
@@ -678,17 +959,24 @@ def build_payload(materials_root, source_paths, pages, sections=(), quiz_items=(
         "review_candidates": bound,
         "unbound_review_candidates": unbound,
         "page_quality": sorted(page_quality, key=lambda row: (row["source_file"], row["page"])),
+        "parser_receipts": normalized_receipts,
     }
 
 
 def _strict_payload(payload):
-    expected = {
+    legacy_expected = {
         "schema_version", "source_root", "sources", "content_units", "mappings",
         "review_candidates", "unbound_review_candidates", "page_quality",
     }
+    version = payload.get("schema_version") if isinstance(payload, dict) else None
+    expected = (
+        legacy_expected
+        if version == LEGACY_PAYLOAD_VERSION
+        else legacy_expected | {"parser_receipts"}
+    )
     if not isinstance(payload, dict) or set(payload) != expected:
         raise ValueError("ingestion payload has an invalid top-level schema")
-    if payload.get("schema_version") != PAYLOAD_VERSION:
+    if version not in (LEGACY_PAYLOAD_VERSION, PAYLOAD_VERSION):
         raise ValueError("unsupported ingestion payload schema_version")
     if not os.path.isdir(payload.get("source_root") or ""):
         raise ValueError("ingestion source_root is missing or no longer exists")
@@ -699,6 +987,327 @@ def _strict_payload(payload):
         json.dumps(payload, ensure_ascii=False, allow_nan=False, sort_keys=True)
     except (TypeError, ValueError) as exc:
         raise ValueError("ingestion payload must contain strict JSON values: %s" % exc) from exc
+
+
+def _validated_parser_receipts(payload, sources, page_quality):
+    if payload["schema_version"] == LEGACY_PAYLOAD_VERSION:
+        return None
+    expected_fields = {
+        "schema_version", "adapter", "adapter_version", "module", "distribution",
+        "source_file", "source_sha256", "media_type", "requested_pages",
+        "produced_pages", "discovered_page_count", "config_sha256", "policy", "status",
+    }
+    source_by_path = {source.path: source for source in sources}
+    expected_pages = {}
+    for row in page_quality:
+        if not isinstance(row, dict):
+            raise ValueError("page_quality rows must be objects")
+        source_file = row.get("source_file")
+        page = row.get("page")
+        if source_file not in source_by_path or type(page) is not int or page < 1:
+            raise ValueError("page_quality references an invalid source/page")
+        expected_pages.setdefault(source_file, []).append(page)
+    output = []
+    seen = set()
+    for index, receipt in enumerate(payload["parser_receipts"]):
+        if not isinstance(receipt, dict) or set(receipt) != expected_fields:
+            raise ValueError("parser receipt %d has an invalid schema" % index)
+        source_file = receipt.get("source_file")
+        source = source_by_path.get(source_file)
+        if source is None or source_file in seen:
+            raise ValueError("parser receipt source identity is unknown or duplicated")
+        seen.add(source_file)
+        if (receipt.get("schema_version") != 1
+                or receipt.get("source_sha256") != source.sha256
+                or receipt.get("media_type") != source.media_type):
+            raise ValueError("parser receipt does not match source revision: %s" % source_file)
+        if not isinstance(receipt.get("adapter"), str) or not receipt["adapter"].strip():
+            raise ValueError("parser receipt adapter must be non-empty text")
+        for field in ("adapter_version", "module", "distribution"):
+            if receipt[field] is not None and not isinstance(receipt[field], str):
+                raise ValueError("parser receipt %s must be null or text" % field)
+        for field in ("requested_pages", "produced_pages"):
+            pages = receipt[field]
+            if (not isinstance(pages, list)
+                    or any(type(page) is not int or page < 1 for page in pages)
+                    or pages != sorted(set(pages))):
+                raise ValueError("parser receipt %s must be sorted unique pages" % field)
+        if receipt["produced_pages"] != sorted(set(expected_pages.get(source_file, ()))):
+            raise ValueError("parser receipt produced_pages disagree with page inventory")
+        discovered_page_count = receipt.get("discovered_page_count")
+        if type(discovered_page_count) is not int or discovered_page_count < 0:
+            raise ValueError("parser receipt discovered_page_count must be a non-negative integer")
+        requested_pages = receipt["requested_pages"]
+        produced_pages = receipt["produced_pages"]
+        status = receipt.get("status")
+        if status not in ("success", "review_required", "failed", "unsupported"):
+            raise ValueError("parser receipt status is invalid")
+        if status in ("failed", "unsupported"):
+            if produced_pages:
+                raise ValueError(
+                    "failed/unsupported parser receipts must produce zero page anchors"
+                )
+        elif requested_pages:
+            if (produced_pages != requested_pages
+                    or requested_pages[-1] > discovered_page_count):
+                raise ValueError(
+                    "parser receipt requested page coverage disagrees with discovery inventory"
+                )
+        elif produced_pages != list(range(1, discovered_page_count + 1)):
+            raise ValueError(
+                "parser receipt full extraction must prove contiguous discovered pages"
+            )
+        if (not isinstance(receipt.get("config_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", receipt["config_sha256"])):
+            raise ValueError("parser receipt config_sha256 is invalid")
+        if receipt.get("policy") != {"network": False, "upload": False, "install": False}:
+            raise ValueError("parser receipt must prove the local no-install/no-upload policy")
+        output.append(dict(receipt))
+    if seen != set(source_by_path):
+        raise ValueError("parser receipts must account for every source")
+    return sorted(output, key=lambda row: row["source_file"])
+
+
+def _ledger_terminal_issue_outcomes(ledger_entries):
+    """Map authoritative applied ledger entries to their queue outcomes."""
+
+    outcomes = {}
+    for position, entry in enumerate(ledger_entries or ()):
+        if not isinstance(entry, dict) or not isinstance(entry.get("patch"), dict):
+            raise ValueError(
+                "review ledger entry %d cannot prove a terminal parser issue" % position
+            )
+        try:
+            patch = ReviewPatch.from_dict(entry["patch"])
+        except Exception as exc:
+            raise ValueError(
+                "review ledger entry %d has an invalid embedded patch" % position
+            ) from exc
+        if (entry.get("patch_id") != patch.patch_id
+                or entry.get("issue_id") != patch.issue_id
+                or entry.get("source_id") != patch.source_id
+                or entry.get("source_sha256") != patch.source_sha256):
+            raise ValueError(
+                "review ledger entry %d disagrees with its embedded patch" % position
+            )
+        operation_names = tuple(
+            operation["op"] for operation in patch.operations
+        )
+        if operation_names == ("mark_resolved",):
+            outcome = "resolved"
+        elif operation_names == ("mark_unrecoverable",):
+            outcome = "unrecoverable"
+        else:
+            outcome = "applied"
+        key = (patch.issue_id, patch.source_id, patch.source_sha256)
+        if key in outcomes:
+            raise ValueError(
+                "review ledger has multiple terminal patches for parser issue %s"
+                % patch.issue_id
+            )
+        outcomes[key] = outcome
+    return outcomes
+
+
+def _validate_parser_review_consistency(
+    parser_receipts, sources, page_quality, issues, ledger_entries=(),
+):
+    """Cross-check parser outcomes against persisted source and review truth."""
+
+    if parser_receipts is None:
+        return True
+    terminal_outcomes = _ledger_terminal_issue_outcomes(ledger_entries)
+    source_by_path = {source.path: source for source in sources}
+    source_by_id = {source.source_id: source for source in sources}
+    receipt_by_path = {row["source_file"]: row for row in parser_receipts}
+    if set(receipt_by_path) != set(source_by_path):
+        raise ValueError("parser/source inventory is not one-to-one")
+
+    issues_by_source = {source.source_id: [] for source in sources}
+    for issue in issues:
+        source = source_by_id.get(issue.source_id)
+        if source is None or issue.source_sha256 != source.sha256:
+            if issue.status in _ACTIVE_REVIEW_STATUSES:
+                raise ValueError(
+                    "active review issue does not match a current source revision: %s"
+                    % issue.issue_id
+                )
+            continue
+        issues_by_source[source.source_id].append(issue)
+
+    for source in sources:
+        receipt = receipt_by_path[source.path]
+        status = receipt["status"]
+        source_issues = issues_by_source[source.source_id]
+        active = [
+            issue for issue in source_issues
+            if issue.status in _ACTIVE_REVIEW_STATUSES
+        ]
+        if source.status in ("discovered", "parsed"):
+            raise ValueError(
+                "persisted SourceRecord has an unfinished parser status: %s"
+                % source.path
+            )
+        if source.status == "complete" and active:
+            raise ValueError(
+                "complete SourceRecord still has active typed review issues: %s"
+                % source.path
+            )
+        if source.status == "review_required" and not active:
+            raise ValueError(
+                "review_required SourceRecord lacks an exact active typed issue: %s"
+                % source.path
+            )
+
+        if status in ("failed", "unsupported"):
+            if receipt["produced_pages"]:
+                raise ValueError(
+                    "failed/unsupported parser receipts must produce zero page anchors"
+                )
+            allowed_source_statuses = {status, "unrecoverable"}
+            if source.status not in allowed_source_statuses:
+                raise ValueError(
+                    "parser receipt status=%s contradicts SourceRecord status=%s for %s"
+                    % (status, source.status, source.path)
+                )
+            blocking_history = [
+                issue for issue in source_issues
+                if issue.severity == "blocking" and (
+                    issue.status in _ACTIVE_REVIEW_STATUSES
+                    or terminal_outcomes.get((
+                        issue.issue_id, issue.source_id, issue.source_sha256,
+                    )) == issue.status
+                )
+            ]
+            if not blocking_history:
+                unproven_terminal = any(
+                    issue.severity == "blocking"
+                    and issue.status not in _ACTIVE_REVIEW_STATUSES
+                    for issue in source_issues
+                )
+                raise ValueError(
+                    "%s parser receipt lacks an exact blocking typed issue%s: %s"
+                    % (
+                        status,
+                        (
+                            " with an authoritative review ledger patch"
+                            if unproven_terminal else ""
+                        ),
+                        source.path,
+                    )
+                )
+        elif status == "review_required":
+            if source.status != "review_required":
+                raise ValueError(
+                    "review_required parser receipt contradicts SourceRecord status=%s for %s"
+                    % (source.status, source.path)
+                )
+            receipt_locations = set(receipt["requested_pages"] or receipt["produced_pages"])
+            if not receipt_locations and receipt["discovered_page_count"]:
+                receipt_locations = set(range(1, receipt["discovered_page_count"] + 1))
+            exact_active = [
+                issue for issue in active
+                if issue.severity == "blocking"
+                and (not issue.pages or (
+                    receipt_locations and set(issue.pages).issubset(receipt_locations)
+                ))
+            ]
+            if not exact_active:
+                raise ValueError(
+                    "review_required parser receipt lacks an exact active blocking issue: %s"
+                    % source.path
+                )
+        elif source.status in ("failed", "unsupported"):
+            raise ValueError(
+                "SourceRecord status=%s contradicts successful parser receipt for %s"
+                % (source.status, source.path)
+            )
+
+    seen_pages = set()
+    for row in page_quality:
+        if not isinstance(row, dict):
+            raise ValueError("page_quality rows must be objects")
+        source = source_by_path.get(row.get("source_file"))
+        page = row.get("page")
+        route = row.get("route")
+        reasons = row.get("reason_codes")
+        if source is None or type(page) is not int or page < 1:
+            raise ValueError("page_quality references an invalid source/location")
+        key = (source.path, page)
+        if key in seen_pages:
+            raise ValueError("page_quality contains duplicate source/location: %r" % (key,))
+        seen_pages.add(key)
+        if route not in ("fast", "recover", "review"):
+            raise ValueError("page_quality route is invalid for %s page %d" % key)
+        if (not isinstance(reasons, list)
+                or any(not isinstance(reason, str) or not reason for reason in reasons)):
+            raise ValueError("page_quality reason_codes must be non-empty strings")
+        if route != "review":
+            continue
+        expected_reasons = tuple(sorted(set(reasons or ["quality_recovery"])))
+        exact = [
+            issue for issue in issues_by_source[source.source_id]
+            if issue.status in _ACTIVE_REVIEW_STATUSES
+            and issue.severity == "blocking"
+            and issue.pages == (page,)
+            and set(expected_reasons).issubset(issue.reason_codes)
+        ]
+        if not exact:
+            raise ValueError(
+                "page_quality route=review lacks an exact active blocking issue for "
+                "%s page %d reasons=%r" % (source.path, page, expected_reasons)
+            )
+        if source.status != "review_required":
+            raise ValueError(
+                "page_quality route=review contradicts SourceRecord status=%s for %s page %d"
+                % (source.status, source.path, page)
+            )
+    return True
+
+
+def _conflict_review_snapshot(workspace, units, sources):
+    """Derive current conflicts plus stable typed-review evidence before writing.
+
+    Existing source-priority facts are retained only for still-live source
+    revisions.  Conflict identity excludes that mutable priority context, but
+    using the same retained rows for preview and compilation keeps the evidence
+    payload and persisted fact byte-for-byte aligned.
+    """
+
+    workspace_path = Path(workspace).resolve()
+    current_revisions = {
+        (source.source_id, source.sha256)
+        for source in sources
+    }
+    priority_path = safe_workspace_entry(workspace_path, SOURCE_PRIORITIES_PATH)
+    if priority_path.exists():
+        priorities = tuple(
+            row for row in load_source_priorities(workspace_path)
+            if (row.source_id, row.source_sha256) in current_revisions
+        )
+    else:
+        priorities = None
+    facts = build_dedup_facts(
+        units, sources, priorities=priorities
+    )
+    artifacts = build_source_conflict_review_artifacts(
+        facts["conflicts"], units
+    )
+    issue_ids = {
+        row["conflict_id"]: row["issue"].issue_id
+        for row in artifacts
+    }
+    return facts["priorities"], artifacts, issue_ids
+
+
+def _reconcile_conflict_review_snapshot(store, conflict_issues):
+    """Replace only the conflict-detector slice without losing other issues."""
+
+    existing_non_conflicts = [
+        issue for issue in store.review_queue.issues()
+        if "source_conflict" not in set(issue.reason_codes)
+    ]
+    store.review_queue.reconcile(existing_non_conflicts + list(conflict_issues))
 
 
 def _persist_payload_unlocked(workspace, payload):
@@ -715,6 +1324,9 @@ def _persist_payload_unlocked(workspace, payload):
     workspace_root = store.workspace
     source_root = str(store.source_root)
     sources = [SourceRecord.from_dict(row) for row in payload["sources"]]
+    parser_receipts = _validated_parser_receipts(
+        payload, sources, payload["page_quality"]
+    )
 
     source_ids = [source.source_id for source in sources]
     source_paths = [source.path for source in sources]
@@ -742,6 +1354,7 @@ def _persist_payload_unlocked(workspace, payload):
                 or unit.source_sha256 != source.sha256):
             raise ValueError("content unit does not match its source revision: %s" % unit.unit_id)
         units_by_id[unit.unit_id] = unit
+    _validate_auxiliary_source_bindings(units, sources)
     mapping_ids = set()
     for mapping in mappings:
         if mapping.unit_id in mapping_ids:
@@ -807,8 +1420,35 @@ def _persist_payload_unlocked(workspace, payload):
         issues.append(issue)
         evidence_specs.append((evidence_rel, evidence_payload))
 
+    fact_priorities = None
+    conflict_issue_ids = {}
+    if parser_receipts is not None:
+        fact_priorities, conflict_artifacts, conflict_issue_ids = (
+            _conflict_review_snapshot(workspace_root, units, sources)
+        )
+        for artifact in conflict_artifacts:
+            issue = artifact["issue"]
+            if issue.issue_id in issue_ids:
+                raise ValueError(
+                    "source conflict review issue collides with another detector issue"
+                )
+            issue_ids.add(issue.issue_id)
+            issues.append(issue)
+            evidence_specs.append(
+                (artifact["evidence_path"], artifact["evidence_payload"])
+            )
+
     unbound_path = safe_workspace_entry(workspace_root, UNBOUND_REVIEW_PATH)
     manifest_path = safe_workspace_entry(workspace_root, BUILD_MANIFEST_PATH)
+    parser_receipts_path = safe_workspace_entry(workspace_root, PARSER_RECEIPTS_PATH)
+    fact_paths = {
+        "duplicate_candidates": safe_workspace_entry(
+            workspace_root, DUPLICATE_CANDIDATES_PATH
+        ),
+        "canonical_groups": safe_workspace_entry(workspace_root, CANONICAL_GROUPS_PATH),
+        "source_conflicts": safe_workspace_entry(workspace_root, SOURCE_CONFLICTS_PATH),
+        "source_priorities": safe_workspace_entry(workspace_root, SOURCE_PRIORITIES_PATH),
+    }
     artifact_paths = {
         "source_manifest": store.manifest.path,
         "base_content_units": store.base_units_path,
@@ -819,10 +1459,19 @@ def _persist_payload_unlocked(workspace, payload):
         "review_patches": store.ledger_path,
         "unbound_review": unbound_path,
     }
+    if parser_receipts is not None:
+        artifact_paths["parser_receipts"] = parser_receipts_path
+        artifact_paths.update(fact_paths)
     transaction_paths = [
         str(path.relative_to(workspace_root)).replace(os.sep, "/")
         for path in artifact_paths.values()
     ]
+    if PARSER_RECEIPTS_PATH not in transaction_paths:
+        transaction_paths.append(PARSER_RECEIPTS_PATH)
+    for fact_path in fact_paths.values():
+        relative = str(fact_path.relative_to(workspace_root)).replace(os.sep, "/")
+        if relative not in transaction_paths:
+            transaction_paths.append(relative)
     transaction_paths.append(BUILD_MANIFEST_PATH)
     transaction_paths.extend(relative for relative, _payload in evidence_specs)
 
@@ -835,6 +1484,14 @@ def _persist_payload_unlocked(workspace, payload):
             )
         store.review_queue.reconcile(issues)
         store.refresh_source_statuses()
+        if parser_receipts is not None:
+            _validate_parser_review_consistency(
+                parser_receipts,
+                store.manifest.records(),
+                payload["page_quality"],
+                store.review_queue.issues(),
+                store.ledger_entries(),
+            )
         if not store.ledger_path.exists():
             from .storage import atomic_write_jsonl
             atomic_write_jsonl(store.ledger_path, [])
@@ -843,10 +1500,38 @@ def _persist_payload_unlocked(workspace, payload):
             "schema_version": 1,
             "entries": payload["unbound_review_candidates"],
         })
+        if parser_receipts is not None:
+            atomic_write_json(parser_receipts_path, {
+                "schema_version": 1,
+                "receipts": parser_receipts,
+            })
+        elif parser_receipts_path.exists():
+            parser_receipts_path.unlink()
+
+        if parser_receipts is not None:
+            # Fact files use per-file atomic replacement inside this rollback
+            # transaction.  The build manifest is written last and binds every
+            # exact hash; validators also rederive the live graph, so a crash or
+            # mixed-generation set fails closed rather than appearing current.
+            fact_summary = compile_ingestion_facts(
+                workspace_root,
+                store.units().values(),
+                sources,
+                priorities=fact_priorities,
+                issue_ids_by_conflict=conflict_issue_ids,
+                review_patches=store.ledger_entries(),
+            )
+        else:
+            fact_summary = None
+            for fact_path in fact_paths.values():
+                if fact_path.exists():
+                    fact_path.unlink()
 
         build_manifest = {
             "schema_version": 1,
-            "pipeline_version": "ingestion-v1",
+            "pipeline_version": (
+                "ingestion-v2" if parser_receipts is not None else "ingestion-v1"
+            ),
             "source_root": source_root,
             "source_count": len(sources),
             "page_count": len(payload["page_quality"]),
@@ -854,6 +1539,7 @@ def _persist_payload_unlocked(workspace, payload):
             "review_issue_count": len(store.review_queue.issues()),
             "unbound_review_count": len(payload["unbound_review_candidates"]),
             "page_quality": payload["page_quality"],
+            "fact_summary": fact_summary,
             "artifacts": {
                 name: {
                     "path": str(path.relative_to(workspace_root)).replace(os.sep, "/"),
@@ -875,7 +1561,7 @@ def persist_payload(workspace, payload):
         return _persist_payload_unlocked(workspace, payload)
 
 
-def refresh_build_manifest(workspace, derived_artifacts=None):
+def refresh_build_manifest(workspace, derived_artifacts=None, fact_summary=None):
     """Add compiled artifact hashes after wiki/index/question-bank generation."""
 
     workspace_path = Path(workspace).resolve()
@@ -926,6 +1612,10 @@ def refresh_build_manifest(workspace, derived_artifacts=None):
                 absolute = safe_workspace_entry(workspace_path, row["path"])
                 if absolute.is_file() and not absolute.is_symlink():
                     row["sha256"] = file_sha256(absolute)
+    if fact_summary is not None:
+        if not isinstance(fact_summary, dict):
+            raise ValueError("fact_summary must be an object")
+        manifest["fact_summary"] = fact_summary
     atomic_write_json(path, manifest)
     return manifest
 
@@ -1241,6 +1931,37 @@ def _compile_review_outputs_unlocked(workspace):
     # immutable parser output + the verified append-only ledger before consuming
     # anything, so hand edits cannot be "washed clean" by refreshing hashes.
     units, _mappings = store.rebuild_compiled_from_ledger()
+    fact_summary = None
+    retrieval_units = list(units.values())
+    if manifest.get("pipeline_version") == "ingestion-v2":
+        fact_priorities, conflict_artifacts, conflict_issue_ids = (
+            _conflict_review_snapshot(
+                workspace_path, units.values(), store.manifest.records()
+            )
+        )
+        for artifact in conflict_artifacts:
+            atomic_write_json(
+                safe_workspace_entry(workspace_path, artifact["evidence_path"]),
+                artifact["evidence_payload"],
+            )
+        _reconcile_conflict_review_snapshot(
+            store, [row["issue"] for row in conflict_artifacts]
+        )
+        store.refresh_source_statuses()
+        # Review recompilation is likewise per-file atomic.  refresh_build_manifest
+        # publishes the new hashes only after every derivative succeeds; an
+        # interruption leaves old hashes and therefore a fail-closed mixed set.
+        fact_summary = compile_ingestion_facts(
+            workspace_path,
+            units.values(),
+            store.manifest.records(),
+            priorities=fact_priorities,
+            issue_ids_by_conflict=conflict_issue_ids,
+            review_patches=store.ledger_entries(),
+        )
+        retrieval_units = fold_units_for_retrieval(
+            units.values(), load_canonical_groups(workspace_path)
+        )
     patched_unit_ids = store.ledger_touched_unit_ids()
     phases = _phase_inventory(workspace_path)
     wiki_by_chapter = {
@@ -1340,7 +2061,7 @@ def _compile_review_outputs_unlocked(workspace):
         from scripts import retrieve as retrieve_module
 
     chunks = []
-    for current in chunk_module.chunk_units(units.values()):
+    for current in chunk_module.chunk_units(retrieval_units):
         chapter_id = current.get("chapter_id")
         if chapter_id not in wiki_by_chapter:
             continue
@@ -1352,6 +2073,11 @@ def _compile_review_outputs_unlocked(workspace):
         match = re.match(r"ch0*([1-9]\d*)$", chapter_id)
         current["chapter"] = match.group(1) if match else None
         chunks.append(current)
+
+    question_unit_ids = {}
+    for unit in units.values():
+        if unit.kind == "question" and unit.external_id:
+            question_unit_ids.setdefault(unit.external_id, []).append(unit.unit_id)
 
     for item in quiz_bank:
         if not isinstance(item, dict):
@@ -1380,6 +2106,7 @@ def _compile_review_outputs_unlocked(workspace):
             "kind": "concept",
             "source_file": item.get("source_file"),
             "pages": item.get("source_pages") or [],
+            "unit_ids": sorted(question_unit_ids.get(str(item.get("id")), ())),
         })
 
     integrity = {
@@ -1398,11 +2125,24 @@ def _compile_review_outputs_unlocked(workspace):
             "file": ".ingest/content_units.jsonl",
             "sha256": file_sha256(store.units_path),
         },
+        "canonical_groups": {
+            "file": CANONICAL_GROUPS_PATH,
+            "sha256": file_sha256(
+                safe_workspace_entry(workspace_path, CANONICAL_GROUPS_PATH)
+            ),
+        } if manifest.get("pipeline_version") == "ingestion-v2" else None,
+        "source_conflicts": {
+            "file": SOURCE_CONFLICTS_PATH,
+            "sha256": file_sha256(
+                safe_workspace_entry(workspace_path, SOURCE_CONFLICTS_PATH)
+            ),
+        } if manifest.get("pipeline_version") == "ingestion-v2" else None,
         "quiz_bank": {
             "file": "references/quiz_bank.json",
             "sha256": file_sha256(quiz_path),
         },
     }
+    integrity = {key: value for key, value in integrity.items() if value is not None}
     index = retrieve_module.build_index(chunks, integrity=integrity)
     retrieval_path = workspace_path / "references" / "retrieval_index.json"
     atomic_write_json(retrieval_path, index)
@@ -1419,12 +2159,13 @@ def _compile_review_outputs_unlocked(workspace):
     })
     for row in phases:
         derived["wiki:%s" % row["chapter_id"]] = row["wiki_file"]
-    refresh_build_manifest(workspace_path, derived)
+    refresh_build_manifest(workspace_path, derived, fact_summary=fact_summary)
     return {
         "structured_visuals_by_chapter": visual_counts,
         "recovered_units_by_chapter": recovery_counts,
         "quiz_updates": quiz_updates,
         "retrieval_chunks": len(chunks),
+        "fact_summary": fact_summary,
     }
 
 

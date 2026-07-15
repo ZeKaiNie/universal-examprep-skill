@@ -14,6 +14,7 @@ import math
 import argparse
 import tempfile
 from datetime import datetime
+from pathlib import Path
 
 # 在 Windows 默认 GBK 控制台上避免中文状态输出变成乱码
 for _stream in ("stdout", "stderr"):
@@ -30,9 +31,11 @@ except ImportError:  # imported as scripts.ingest in unit tests
 
 try:
     from ingestion.pipeline import (
-        compile_review_outputs,
-        compile_structured_visuals,
-        persist_payload,
+        _compile_review_outputs_unlocked,
+        _compile_structured_visuals as _compile_structured_visuals_core,
+        _persist_payload_unlocked,
+        _phase_inventory,
+        _strict_payload,
         refresh_build_manifest,
     )
     from ingestion.identifiers import (
@@ -40,17 +43,33 @@ try:
         is_link_or_reparse,
         safe_workspace_entry,
     )
+    from ingestion.storage import (
+        ConflictError,
+        IngestionStore,
+        read_json,
+        stable_read_bytes,
+        workspace_publication_lock,
+    )
 except ImportError:  # imported as scripts.ingest in unit tests
     from scripts.ingestion.pipeline import (
-        compile_review_outputs,
-        compile_structured_visuals,
-        persist_payload,
+        _compile_review_outputs_unlocked,
+        _compile_structured_visuals as _compile_structured_visuals_core,
+        _persist_payload_unlocked,
+        _phase_inventory,
+        _strict_payload,
         refresh_build_manifest,
     )
     from scripts.ingestion.identifiers import (
         UnsafePathError,
         is_link_or_reparse,
         safe_workspace_entry,
+    )
+    from scripts.ingestion.storage import (
+        ConflictError,
+        IngestionStore,
+        read_json,
+        stable_read_bytes,
+        workspace_publication_lock,
     )
 
 SUBJECT_TOKEN = "《科目名称》"               # 模板中待替换的科目占位符
@@ -528,7 +547,7 @@ def render_template(template_name, replacements, markers, lang="zh"):
     return content
 
 
-def main():
+def _argument_parser():
     parser = argparse.ArgumentParser(description="One-shot parse and generate the cram LLM wiki directory structure and progress files")
     parser.add_argument("--input", "-i", type=str, default="raw_input.json", help="input structured-outline JSON path")
     parser.add_argument("--output-dir", "-o", type=str, default=".", help="target workspace path (default: current directory)")
@@ -539,7 +558,11 @@ def main():
                              "missing en template files fall back to the zh pack). When given "
                              "EXPLICITLY it is also seeded into the progress file so "
                              "update_progress init migrates it into study_state.language")
-    args = parser.parse_args()
+    return parser
+
+
+def _prepare_cli_input(args):
+    """Read, parse, and validate one stable input-file generation."""
 
     lang_explicit = args.lang is not None
     lang, lang_warn = i18n.canon_language(args.lang or "zh")
@@ -564,13 +587,58 @@ def main():
         sys.exit(1)
 
     print(f"[+] 正在读取输入数据: {args.input} ...")
-    with open(args.input, "r", encoding="utf-8") as f:
-        try:
-            data = strict_json.load(f)
-        except Exception as e:
-            fail([f"JSON 解析失败：{e}"])
+    try:
+        payload, _snapshot = stable_read_bytes(args.input)
+        data = strict_json.loads(payload.decode("utf-8"))
+    except Exception as e:
+        fail([f"JSON 解析失败：{e}"])
 
-    course_name, phases, quiz_bank, teaching_examples, missing_answer_ids = validate(data)
+    validated = validate(data)
+    ingestion_payload = data.get("ingestion")
+    if ingestion_payload is not None:
+        try:
+            _strict_payload(ingestion_payload)
+        except Exception as exc:
+            fail([f"结构化 ingestion envelope 校验/持久化失败：{exc}"])
+    return data, lang_explicit, lang, validated
+
+
+def _ensure_workspace_root(output_dir):
+    """Create only the workspace root; validator-visible files wait for the publication lock."""
+
+    root = os.path.abspath(output_dir)
+    if os.path.lexists(root) and is_link_or_reparse(root):
+        fail([f"输出工作区是符号链接，拒绝沿链接写盘：{root}"])
+    try:
+        os.makedirs(root, exist_ok=True)
+    except OSError as exc:
+        fail([f"无法创建输出目录：{exc}"])
+    if not os.path.isdir(root):
+        fail([f"输出路径不是目录：{root}"])
+    return root
+
+
+def _compile_visuals_unlocked(workspace):
+    """Run the structured-visual core while the caller holds the ingestion lock."""
+
+    workspace_path = Path(workspace).resolve()
+    manifest = read_json(workspace_path / ".ingest" / "build_manifest.json")
+    store = IngestionStore(workspace_path, source_root=manifest.get("source_root"))
+    units, _mappings = store.rebuild_compiled_from_ledger()
+    return _compile_structured_visuals_core(
+        workspace_path, units, _phase_inventory(workspace_path)
+    )
+
+
+def _before_publication_lock(_args, _output_dir):
+    """No-op test seam for exercising input replacement immediately before lock acquisition."""
+
+
+def _main_unlocked(args, prepared):
+    """Publish one validated input while the caller holds the required workspace locks."""
+
+    data, lang_explicit, lang, validated = prepared
+    course_name, phases, quiz_bank, teaching_examples, missing_answer_ids = validated
 
     # ── 后处理：补全 id + 规范化 true_false 答案 ──────────────────
     TRUE_FALSE_NORMALIZE = {
@@ -627,7 +695,9 @@ def main():
     ingestion_payload = data.get("ingestion")
     if ingestion_payload is not None:
         try:
-            ingestion_build_manifest = persist_payload(output_dir, ingestion_payload)
+            ingestion_build_manifest = _persist_payload_unlocked(
+                output_dir, ingestion_payload
+            )
         except Exception as exc:
             fail([f"结构化 ingestion envelope 校验/持久化失败：{exc}"])
         print(
@@ -655,7 +725,7 @@ def main():
 
     if ingestion_payload is not None:
         try:
-            visual_counts = compile_structured_visuals(output_dir)
+            visual_counts = _compile_visuals_unlocked(output_dir)
         except Exception as exc:
             fail([f"结构化图片编译进章节 wiki 失败：{exc}"])
         if sum(visual_counts.values()):
@@ -669,6 +739,20 @@ def main():
     import hashlib
     import chunk as _chunk
     import retrieve as _retrieve
+    try:
+        from ingestion.dedup import (
+            CANONICAL_GROUPS_PATH as _CANONICAL_GROUPS_PATH,
+            SOURCE_CONFLICTS_PATH as _SOURCE_CONFLICTS_PATH,
+            load_canonical_groups as _load_canonical_groups,
+        )
+        from ingestion.retrieval_folding import fold_units_for_retrieval as _fold_units
+    except ImportError:
+        from scripts.ingestion.dedup import (
+            CANONICAL_GROUPS_PATH as _CANONICAL_GROUPS_PATH,
+            SOURCE_CONFLICTS_PATH as _SOURCE_CONFLICTS_PATH,
+            load_canonical_groups as _load_canonical_groups,
+        )
+        from scripts.ingestion.retrieval_folding import fold_units_for_retrieval as _fold_units
     all_chunks = []
     wiki_by_chapter = {
         p["chapter_id"]: "references/wiki/" + os.path.basename(p["wiki_filename"].strip())
@@ -683,6 +767,17 @@ def main():
                 structured_rows = [strict_json.loads(line) for line in stream if line.strip()]
         except (OSError, ValueError) as exc:
             fail([f"结构化内容单元无法读取，拒绝构建检索索引：{exc}"])
+        try:
+            canonical_group_path = os.path.join(
+                output_dir, *_CANONICAL_GROUPS_PATH.split("/")
+            )
+            structured_rows = _fold_units(
+                structured_rows,
+                _load_canonical_groups(output_dir)
+                if os.path.isfile(canonical_group_path) else (),
+            )
+        except Exception as exc:
+            fail([f"canonical_group 检索折叠失败：{exc}"])
         for structured in _chunk.chunk_units(structured_rows):
             chapter_id = structured.get("chapter_id")
             if not chapter_id or chapter_id not in wiki_by_chapter:
@@ -710,6 +805,14 @@ def main():
                 })
 
     # Deterministic concept postings improve recall without a heavyweight vector DB.
+    question_unit_ids = {}
+    for unit in structured_rows:
+        if (isinstance(unit, dict) and unit.get("kind") == "question"
+                and unit.get("external_id")):
+            question_unit_ids.setdefault(str(unit["external_id"]), []).extend(
+                unit.get("retrieval_occurrence_unit_ids") or [unit.get("unit_id")]
+            )
+
     for item in quiz_bank:
         points = item.get("knowledge_points")
         if isinstance(points, str):
@@ -733,6 +836,7 @@ def main():
             "kind": "concept",
             "source_file": item.get("source_file"),
             "pages": item.get("source_pages") or [],
+            "unit_ids": sorted(set(question_unit_ids.get(str(item.get("id")), ()))),
         })
 
     integrity = {
@@ -766,6 +870,8 @@ def main():
     for key, relative in (
         ("source_manifest", ".ingest/source_manifest.json"),
         ("content_units", ".ingest/content_units.jsonl"),
+        ("canonical_groups", _CANONICAL_GROUPS_PATH),
+        ("source_conflicts", _SOURCE_CONFLICTS_PATH),
     ):
         absolute = os.path.join(output_dir, relative.replace("/", os.sep))
         if os.path.isfile(absolute) and not is_link_or_reparse(absolute):
@@ -888,7 +994,7 @@ def main():
         ledger_path = os.path.join(output_dir, ".ingest", "review_patches.jsonl")
         if os.path.isfile(ledger_path) and os.path.getsize(ledger_path) > 0:
             try:
-                compiled = compile_review_outputs(output_dir)
+                compiled = _compile_review_outputs_unlocked(output_dir)
             except Exception as exc:
                 fail([f"已应用 ingestion review patch 重新编译失败：{exc}"])
             print(
@@ -954,6 +1060,32 @@ def main():
 
     print(f"\n[+] 《{course_name}》工作区工程编译完成。")
     print("[!] 编译成功不等于教学就绪；请运行 validate_workspace.py，或使用 ingest_course.py 的 readiness 结果。")
+
+
+def main():
+    args = _argument_parser().parse_args()
+    output_dir = _ensure_workspace_root(args.output_dir)
+    ingest_path = os.path.join(output_dir, ".ingest")
+    ingest_preexisting = os.path.lexists(ingest_path)
+    _before_publication_lock(args, output_dir)
+
+    try:
+        with workspace_publication_lock(output_dir):
+            prepared = _prepare_cli_input(args)
+            data = prepared[0]
+            structured = data.get("ingestion") is not None
+            if ingest_preexisting and not os.path.lexists(ingest_path):
+                raise ConflictError(".ingest changed while acquiring the publication lock")
+            if structured and not ingest_preexisting:
+                # A brand-new structured workspace has no ingestion lock for
+                # workspace_publication_lock to acquire.  Create and hold it under
+                # the already-held state lock before the first validator-visible write.
+                with IngestionStore(output_dir).mutation_lock():
+                    _main_unlocked(args, prepared)
+            else:
+                _main_unlocked(args, prepared)
+    except ConflictError as exc:
+        fail([f"工作区发布冲突，未写入任何课程产物：{exc}"])
 
 
 if __name__ == "__main__":

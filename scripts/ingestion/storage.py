@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -75,6 +76,29 @@ def _exclusive_file_lock(path):
         stream.close()
 
 
+def workspace_state_lock(workspace):
+    """Serialize progress/notebook writers with atomic completion snapshots."""
+
+    root = _workspace_root(workspace)
+    return _exclusive_file_lock(safe_workspace_entry(root, ".study_state.lock"))
+
+
+@contextmanager
+def workspace_publication_lock(workspace):
+    """Serialize coordinated state/artifact publishers in state->ingestion order."""
+
+    root = _workspace_root(workspace)
+    with workspace_state_lock(root):
+        ingest = safe_workspace_entry(root, ".ingest")
+        if not os.path.lexists(str(ingest)):
+            yield
+            return
+        if not ingest.is_dir():
+            raise ConflictError(".ingest must be a real workspace directory")
+        with IngestionStore(root).mutation_lock():
+            yield
+
+
 _MISSING = object()
 
 
@@ -91,7 +115,143 @@ def _json_load(stream):
     return json.load(stream, object_pairs_hook=_no_duplicate_keys)
 
 
-def _atomic_write_text(path, text):
+def _file_identity(value):
+    inode = int(getattr(value, "st_ino", 0))
+    if inode == 0:
+        raise SchemaValidationError("filesystem does not expose a stable file identity")
+    return int(getattr(value, "st_dev", 0)), inode
+
+
+def _file_generation(value):
+    return (
+        int(value.st_size),
+        int(getattr(value, "st_mtime_ns", int(value.st_mtime * 1000000000))),
+    )
+
+
+def stable_read_bytes(path):
+    """Capture one regular-file generation and return its exact bytes and SHA-256.
+
+    Authoritative JSON must be parsed from these returned bytes, rather than
+    parsed through one open and hashed through a later pathname open.  Reading
+    the same handle twice plus checking path/handle identity and generation
+    rejects in-place mutation and rename/symlink swaps during the snapshot.
+    """
+
+    source = Path(path)
+    try:
+        before = os.lstat(source)
+        if (not stat.S_ISREG(before.st_mode) or is_link_or_reparse(source)):
+            raise SchemaValidationError(
+                "snapshot source must be a regular non-reparse file: %s" % source
+            )
+        identity = _file_identity(before)
+        with open(source, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(opened.st_mode)
+                    or _file_identity(opened) != identity
+                    or _file_generation(opened) != _file_generation(before)):
+                raise SchemaValidationError(
+                    "snapshot source changed between path check and open: %s" % source
+                )
+            generation = _file_generation(opened)
+            payload = stream.read()
+            stream.seek(0)
+            confirmation = stream.read()
+            after_handle = os.fstat(stream.fileno())
+        after_path = os.lstat(source)
+    except SchemaValidationError:
+        raise
+    except OSError as exc:
+        raise SchemaValidationError("cannot capture stable file snapshot %s: %s" % (source, exc)) from exc
+    if (payload != confirmation or len(payload) != generation[0]
+            or not stat.S_ISREG(after_path.st_mode)
+            or is_link_or_reparse(source)
+            or _file_identity(after_handle) != identity
+            or _file_identity(after_path) != identity
+            or _file_generation(after_handle) != generation
+            or _file_generation(after_path) != generation):
+        raise SchemaValidationError("snapshot source changed while it was read: %s" % source)
+    return payload, {
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size_bytes": len(payload),
+        "identity": identity,
+        "generation": generation,
+    }
+
+
+def stable_file_sha256(path):
+    """Hash one stable regular-file handle twice without buffering the file."""
+
+    source = Path(path)
+    try:
+        before = os.lstat(source)
+        if not stat.S_ISREG(before.st_mode) or is_link_or_reparse(source):
+            raise SchemaValidationError(
+                "digest source must be a regular non-reparse file: %s" % source
+            )
+        identity = _file_identity(before)
+        with open(source, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (_file_identity(opened) != identity
+                    or _file_generation(opened) != _file_generation(before)):
+                raise SchemaValidationError(
+                    "digest source changed between path check and open: %s" % source
+                )
+            generation = _file_generation(opened)
+            digests = []
+            for _unused in range(2):
+                digest = hashlib.sha256()
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+                digests.append(digest.hexdigest())
+                stream.seek(0)
+            after_handle = os.fstat(stream.fileno())
+        after_path = os.lstat(source)
+    except SchemaValidationError:
+        raise
+    except OSError as exc:
+        raise SchemaValidationError("cannot capture stable file digest %s: %s" % (source, exc)) from exc
+    if (digests[0] != digests[1]
+            or not stat.S_ISREG(after_path.st_mode)
+            or is_link_or_reparse(source)
+            or _file_identity(after_handle) != identity
+            or _file_identity(after_path) != identity
+            or _file_generation(after_handle) != generation
+            or _file_generation(after_path) != generation):
+        raise SchemaValidationError("digest source changed while it was read: %s" % source)
+    return digests[0], generation[0]
+
+
+def stable_read_json(path):
+    payload, snapshot = stable_read_bytes(path)
+    try:
+        value = json.loads(payload.decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, SchemaValidationError) as exc:
+        raise SchemaValidationError("invalid stable JSON snapshot in %s: %s" % (path, exc)) from exc
+    return value, snapshot
+
+
+def stable_read_jsonl(path):
+    payload, snapshot = stable_read_bytes(path)
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SchemaValidationError("invalid UTF-8 JSONL snapshot in %s: %s" % (path, exc)) from exc
+    rows = []
+    for line_number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line, object_pairs_hook=_no_duplicate_keys))
+        except (json.JSONDecodeError, SchemaValidationError) as exc:
+            raise SchemaValidationError(
+                "invalid JSONL in stable snapshot %s line %d: %s" % (path, line_number, exc)
+            ) from exc
+    return rows, snapshot
+
+
+def _atomic_write_text(path, text, before_publish=None):
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(
@@ -104,6 +264,8 @@ def _atomic_write_text(path, text):
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
+        if before_publish is not None:
+            before_publish()
         os.replace(temporary, str(destination))
         # Best-effort directory sync on platforms that permit opening directories.
         if os.name != "nt":
@@ -145,8 +307,12 @@ def atomic_write_text(path, text):
     _atomic_write_text(path, text)
 
 
-def atomic_write_json(path, value):
-    _atomic_write_text(path, json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+def atomic_write_json(path, value, before_publish=None):
+    _atomic_write_text(
+        path,
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        before_publish=before_publish,
+    )
 
 
 def atomic_write_jsonl(path, rows):

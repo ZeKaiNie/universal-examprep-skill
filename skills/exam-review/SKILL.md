@@ -1,51 +1,56 @@
 ---
 name: exam-review
 description: >
-  考前易错扫雷与疑难复盘：读取 study_progress.md 的错题档案与「概念疑难点记录」，重新调取原题做扫雷
-  测试，逐条请学生复述疑难点并更新状态（待回顾/已回顾）。与 confusion-tracker 协同。当进入最终复习
-  阶段、或用户要求复盘错题/查漏补缺时使用。
+  考前复盘已记录错题与概念疑难：重做原题、复述疑难、更新已订正/已回顾/待回顾状态，并形成最后扫雷清单。
+  进入最终复习阶段或用户要求复盘、查漏补缺时使用。
 license: MIT
 ---
 
-# exam-review — mistake & confusion review
+# exam-review — mistake and confusion review
 
 ## Purpose
-Clear the backlog of recorded mistakes and confusions before the exam. Replay only previously recorded items; teach no new chapters and add no new questions.
+
+Clear recorded mistakes/confusions before the exam. Replay only existing records; teach no new chapter and invent no question.
 
 ## Activation
-Run when the student enters the final review stage, or asks to 「复盘错题 / 查漏补缺 / 考前过一遍」 (replay mistakes / find gaps / final pass).
+
+Use at final review or when the student explicitly asks to replay mistakes/find gaps.
 
 ## Inputs
-- Review backlog source: `study_state.json` (`mistake_archive` / `confusion_log`) when it exists — the structured-state source of truth; otherwise `study_progress.md`'s ❌ 错题档案 and 💡 概念疑难点记录 (the md is a generated view that may be stale).
-- `references/quiz_bank.json`: source items, keyed by id, re-fetched for each recorded mistake.
+
+- `study_state.json`'s `mistake_archive` and `confusion_log` when state exists; otherwise generated 「❌ 错题档案」 and confusion compatibility rows.
+- `references/quiz_bank.json`, used to fetch each recorded mistake by exact ID.
 
 ## Workflow
-1. Reload mistake records — from `study_state.json`'s `mistake_archive` when it exists (read it or `update_progress.py show`; the generated md may be stale/hand-edited), else from `study_progress.md`. For each recorded mistake, read its item id, fetch that exact item from `references/quiz_bank.json` by id, and have the student redo it. Replay only items already recorded; never invent or add new questions.
-   - **Visual-first asset gate (fail-closed)** — if the re-fetched item has `requires_assets=true` or `maybe_requires_assets=true`, apply the same contract as [`exam-quiz`](../exam-quiz/SKILL.md) and [`docs/file-format.md`](../../docs/file-format.md) §4: before asking, explaining, hinting, or solving, render/show every question-side asset (`question_context` / `figure` / `diagram` / `table`) inline and label it per §4 in the active reply language (`中文`/`双语` `题面图`, `English` `Question-side asset`). Do not show answer-side assets (`answer_context` / `worked_solution`) before those prompt assets; show them only during solution/review and label them per §4 in the active reply language (`中文`/`双语` `答案图`, `English` `Answer-side asset`). If a question-side asset is missing/unreadable, the UI cannot render it, or you only have a non-rendering path (including malformed slash-prefixed Windows drive-letter Markdown), **skip the replay** and say it is blocked for lack of visible prompt context. Treat `stub`/`page_reference` text as non-standalone: surface the prompt asset or original page first, else skip it rather than replaying an item the student cannot see.
-2. If the student answers a replayed item correctly, mark it 已订正 in the record. If still wrong, re-explain using the item's `explanation` field and keep it in the record.
-3. Reload the confusion-tracker entries — from `study_state.json`'s `confusion_log` when it exists, else from `study_progress.md`. Read each entry aloud and have the student restate it in their own words (what it is, why it works that way).
-4. If the student restates an entry correctly, set its status to 已回顾. If still vague, re-explain once and keep its status 待回顾.
-5. Compile the open list: items still marked wrong plus entries still 待回顾. Hand this list to the final sprint and to `exam-cheatsheet` as priority input (it biases which knowledge points get the hard worked examples).
-   - **Persist-first (notebook CLI)** — review conclusions do not evaporate in chat: write the open list (the 「还没拿下的清单」) and each replay's conclusion into the notebook BEFORE replying: `echo <review body> | python "${CLAUDE_SKILL_DIR}/scripts/notebook.py" --workspace <ws> add-entry --chapter <ch> --type review --id <slug> --title <review gist>` (body via STDIN; same `--id` replaces in place; `notebook/index.md` rebuilds; the script resolves from the skill package root). The chat reply is a digest of the list plus the pack-provided link line (zh 「完整复盘：`notebook/chNN.md#<anchor>`｜目录：`notebook/index.md`」, en `Full review: notebook/chNN.md#<anchor> | Index: notebook/index.md`). On a failed write, TELL the student and give the full list in chat; file-less clients keep chat-only output per `exam-cram`'s capability dispatch.
-6. Write results back: if `study_state.json` is absent and Python works, first run `update_progress.py --workspace <ws> init`; then update statuses via `update_progress.py set-mistake-status`/`set-confusion-status` and add rows via `add-mistake`/`add-confusion` (md regenerates). Only when Python truly cannot run may an md-only workspace update each `study_progress.md` row **in place** (已订正 / 已回顾 / 待回顾) and append genuinely new records. A nonzero state command while Python runs is a fail-loud write failure, not permission to hand-edit. Never leave a mastered item as a stale wrong/待回顾 row. Do not overwrite other skills' writes.
+
+1. **Replay recorded mistakes.** Reload state (or `update_progress.py show`), fetch each exact bank item, and ask it again. Never add an unrecorded/bank-external question.
+
+   For `requires_assets=true` or `maybe_requires_assets=true`, before asking, explaining, hinting, or solving, render every question-side `question_context` / `figure` / `diagram` / `table` asset, labelled `题面图` or `Question-side asset`. Only later may solution/review show `答案图` / `Answer-side asset`. A path is not an image. Missing/unreadable or UI-unrenderable prompt assets cause a fail-closed skip; `stub` / `page_reference` also require the original prompt page first. See [`exam-quiz`](../exam-quiz/SKILL.md) and [`docs/file-format.md`](../../docs/file-format.md) §4.
+
+2. **Update mistakes.** Correct replay → `已订正`; still wrong → explain from the stored explanation and retain it.
+
+3. **Replay confusions.** Reload `confusion_log`; ask the student to restate what/why/how. Correct restatement → `已回顾`; vague → explain once and retain `待回顾`.
+
+4. **Persist the open list first.** Compile unresolved mistakes plus `待回顾` confusions for the final sprint/`exam-cheatsheet`. Pipe each conclusion/list to `python "${CLAUDE_SKILL_DIR}/scripts/notebook.py" --workspace <ws> add-entry --chapter <ch> --type review --id <slug> --title <gist>`; same IDs replace and rebuild the index. Then send a digest and language-pack notebook link. If writing fails, say so and give the full list in chat; file-less clients use chat/text breakpoints.
+
+5. **Persist row status.** If `study_state.json` is absent and Python works, run `update_progress.py --workspace <ws> init` first; only when Python truly cannot run may Markdown rows be changed in place. Write results via `update_progress.py set-mistake-status` / `set-confusion-status`, and genuinely new rows via `add-mistake` / `add-confusion`. A nonzero Python command is a fail-loud error, not permission to hand-edit. Never leave a mastered row stale or overwrite another skill's writes.
 
 ## Output Contract
-- Produce one not-yet-mastered list (「还没拿下的清单」): recorded mistakes plus confusion entries, each with its current status (已订正 / 已回顾 / 待回顾). End with a refreshed progress panel.
-- **Persist-first default**: that list and the session's review conclusions are written into `notebook/chNN.md` via the notebook CLI (`--type review`) BEFORE the chat reply — the chat carries a digest plus the pack-provided link line, never the sole copy (Workflow step 5). On a failed write, say so and deliver the full list in chat; file-less clients keep chat-only output.
-- Persist each mistake/confusion status update through `update_progress.py set-mistake-status`/`set-confusion-status` (and `add-*` for genuinely new records; the md regenerates). If state is absent but Python works, initialize it first. Only a true no-Python workspace updates `study_progress.md` directly. Never leave a mastered item still marked wrong/待回顾. Then return control to `exam-cram`.
-- Student-facing output defaults to English (Simplified Chinese if the student opened in Chinese); the persisted `study_state.json.language` code (`zh`/`en`/`bilingual`) switches it per exam-cram's dispatch rule with single-language purity. (See [`docs/language-policy.md`](../../docs/language-policy.md).)
+
+- Produce one 「还没拿下的清单」 with current `已订正` / `已回顾` / `待回顾` statuses, notebook link, and refreshed panel.
+- Persist conclusions before the digest and persist every status via `update_progress.py set-mistake-status` / `set-confusion-status`.
+- Student prose is English by default, Simplified Chinese for a Chinese opening, or explicit bilingual blocks.
 
 ## Language packs
-Student-visible wording for this skill lives in per-language packs — load the one matching `study_state.json.language` BEFORE emitting any student-visible output:
+
 - `中文` → [`../../locales/zh/skills/exam-review.md`](../../locales/zh/skills/exam-review.md)
 - `English` → [`../../locales/en/skills/exam-review.md`](../../locales/en/skills/exam-review.md)
-- `双语` → compose the zh and en packs block by block, zh first with a `> EN:` mirror (rules in [`../../docs/language-policy.md`](../../docs/language-policy.md))
-Display aliases such as `中文`, `English`, and `双语` are normalized by `update_progress.py`; route persisted state on `zh`, `en`, or `bilingual`. Unset language → the merged first-ask decides it; default English unless the student opened in Chinese.
+- `双语` → compose both blockwise, zh then `> EN:`, under [`docs/language-policy.md`](../../docs/language-policy.md)
+
+Display aliases are normalized to `zh`, `en`, or `bilingual`.
 
 ## Boundaries
-- **Structured progress state**: when `study_state.json` exists it is the SINGLE SOURCE OF TRUTH — update it via `python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace <ws> set/add-mistake/add-confusion/set-mistake-status/set-confusion-status/set-check/render` (marking a replayed row 已订正/已回顾 goes through `set-mistake-status`/`set-confusion-status --id <qid> --status <状态>`; ticking a `知识点打卡` item goes through `set-check --match <文本>|--index <N>`); `study_progress.md` is a GENERATED view (hand edits are lost on the next render — never hand-patch it). If a state write fails, TELL the user; never continue as if it saved. Without `study_state.json` but WITH Python (a fresh, uninitialized workspace), run `update_progress.py --workspace <ws> init` to create the source of truth FIRST — do not stop at hand-editing `study_progress.md`; only when Python truly cannot run does a hand-maintained md stay valid.
 
-- **Scope filter & override**: default question pool is mixed; a student-restricted range (e.g. homework-only) is a recorded scope filter — serving items outside it requires the scope-override line first in the active reply language (`中文` 「⚠️ 临时覆盖你的 <scope> 范围偏好」 / `English` `⚠️ Temporarily overriding your <scope> scope preference`), and untagged (`source_type` missing) items are excluded from restricted scopes with their count reported. Official selector: `scripts/select_questions.py`.
-
-- Replay only recorded items. Never add a question that is not already in the records or the quiz bank.
-- Share the progress record with `confusion-tracker`: in state-backed workspaces both skills go through `update_progress.py` (append via `add-confusion`, status via `set-confusion-status`); only a true no-Python md-only workspace appends/updates `study_progress.md` rows in place. Never overwrite another skill's writes.
+- `study_state.json` is the source of truth; mutate rows only via `update_progress.py`. Mark replay results via `update_progress.py set-mistake-status` / `set-confusion-status`; `set-check` alone is not a substitute.
+- Default question scope is mixed. A restricted scope excludes/counts missing `source_type`; announce any one-turn override first: 「⚠️ 临时覆盖你的 <scope> 范围偏好」 / `⚠️ Temporarily overriding your <scope> scope preference`. Use `scripts/select_questions.py`.
+- Share confusion rows with `confusion-tracker`; replay only recorded bank items and never erase concurrent writes.

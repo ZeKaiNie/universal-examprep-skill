@@ -6,13 +6,16 @@ synthetic page text, and the PDF backend is a fake object injected into run(). T
 where the optional PDF dependencies are not installed.
 """
 import importlib.util
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import types
 import unittest
+import zipfile
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -76,6 +79,67 @@ def _args(materials, **over):
 # --------------------------------------------------------------------------- pure-core tests
 
 class CoreExtraction(unittest.TestCase):
+    def test_ingestion_language_annotation_keeps_mixed_and_formula_only_unknown(self):
+        pages = [{
+            "file": "mixed.txt", "page": 1,
+            "text": "Explain the result，并说明中文条件。",
+            "elements": [{
+                "kind": "text", "text": "Explain the result，并说明中文条件。"
+            }],
+        }, {
+            "file": "formula.txt", "page": 1, "text": "V=IR",
+            "elements": [{"kind": "formula", "text": "V=IR", "latex": "V=IR"}],
+        }, {
+            "file": "english.txt", "page": 1,
+            "text": "The theorem is used in this example.",
+            "elements": [{"kind": "heading", "text": "Overview"}],
+        }]
+        report = {}
+        B._annotate_ingestion_languages(pages, report)
+        self.assertNotIn("source_language", pages[0])
+        self.assertNotIn("source_language", pages[0]["elements"][0])
+        self.assertNotIn("source_language", pages[1])
+        self.assertNotIn("source_language", pages[1]["elements"][0])
+        self.assertEqual("en", pages[2]["source_language"])
+        self.assertEqual("en", pages[2]["elements"][0]["source_language"])
+        self.assertEqual(2, report["source_language_annotations"]["pages_unresolved"])
+        self.assertEqual(2, report["source_language_annotations"]["elements_unresolved"])
+
+    def test_source_location_labels_do_not_claim_every_record_is_a_page(self):
+        self.assertEqual(
+            "DOCX explicit-break logical segment 2",
+            B._source_location_label("notes.docx", 2),
+        )
+        self.assertEqual("PPTX slide 3", B._source_location_label("deck.pptx", 3))
+        self.assertEqual("PDF page 4", B._source_location_label("paper.pdf", 4))
+        self.assertEqual("source location 5", B._source_location_label("table.xlsx", 5))
+
+    def test_source_language_classification_is_conservative_and_auditable(self):
+        self.assertEqual("en", B._classify_source_language(
+            "Determine the current using the circuit shown below."))
+        self.assertEqual("zh", B._classify_source_language("计算电路中的电流 I。"))
+        self.assertIsNone(B._classify_source_language("V=IR"))
+        self.assertIsNone(B._classify_source_language("a=1"))
+        self.assertIsNone(B._classify_source_language(
+            "Explain the result，并说明中文条件。"))
+
+        items = [{
+            "question": "Explain the result.",
+            "answer": "The answer is 4.",
+        }, {
+            "question": "V=IR",
+            "answer": "4",
+        }]
+        report = {"warnings": []}
+        B._annotate_source_languages(items, report)
+        self.assertEqual("en", items[0]["source_language"])
+        self.assertEqual("en", items[0]["answer_source_language"])
+        self.assertNotIn("source_language", items[1])
+        self.assertTrue(any(w.startswith("source_language_inferred: 2")
+                            for w in report["warnings"]))
+        self.assertTrue(any(w.startswith("source_language_review_required: 2")
+                            for w in report["warnings"]))
+
     def test_requires_assets_heuristic(self):
         self.assertTrue(B.requires_assets_heuristic("Shade the Venn diagram at right."))
         self.assertTrue(B.requires_assets_heuristic("see the figure / table below"))
@@ -749,6 +813,317 @@ class CoreExtraction(unittest.TestCase):
 # --------------------------------------------------------------------------- CLI / run() tests
 
 class CliAndRun(unittest.TestCase):
+    def test_txt_docx_and_pdf_prose_units_keep_source_language(self):
+        materials = os.path.join(tempfile.mkdtemp(prefix="language-prose-"), "materials")
+        os.makedirs(materials)
+        with open(os.path.join(materials, "ch01_notes.txt"), "w", encoding="utf-8") as stream:
+            stream.write("Chapter 1\nThe theorem is used in this text example.")
+        with open(os.path.join(materials, "ch01_notes.docx"), "wb") as stream:
+            stream.write(b"synthetic package; extractor is injected")
+        with open(os.path.join(materials, "ch01_notes.pdf"), "wb") as stream:
+            stream.write(b"%PDF-1.4 synthetic")
+        docx = [{
+            "file": "ch01_notes.docx", "page": 1,
+            "text": "Chapter 1\nThe theorem is used in this document example.",
+            "elements": [{
+                "kind": "heading", "text": "Chapter 1", "ordinal": 0, "bbox": None,
+            }, {
+                "kind": "text", "text": "The theorem is used in this document example.",
+                "ordinal": 1, "bbox": None,
+            }],
+            "embedded_assets": [], "review_signals": [],
+        }]
+        backend = FakeBackend({
+            "ch01_notes.pdf": ["Chapter 1\nThe theorem is used in this PDF example."],
+        }, can_render=False)
+        with mock.patch.object(B, "extract_ooxml", return_value=docx):
+            code, payload, unused_report = B.run(
+                _args(materials, render_pages="never"), backend=backend)
+        self.assertEqual(0, code)
+        units = payload["ingestion"]["content_units"]
+        for source_file in ("ch01_notes.txt", "ch01_notes.docx", "ch01_notes.pdf"):
+            prose = [row for row in units
+                     if row["source_file"] == source_file and row["kind"] == "text"]
+            self.assertTrue(prose, source_file)
+            self.assertTrue(all(
+                row["metadata"].get("source_language") == "en" for row in prose
+            ), source_file)
+
+    def test_programmatic_optional_adapter_runner_remains_injectable(self):
+        materials = _materials_with_pdf()
+
+        def runner(request):
+            self.assertEqual("ch01.pdf", request.source_file)
+            return {
+                "pages": [{
+                    "file": "ch01.pdf",
+                    "page": 1,
+                    "text": "Chapter 1\nGrounded adapter content.",
+                    "elements": [{
+                        "kind": "text",
+                        "text": "Chapter 1\nGrounded adapter content.",
+                        "ordinal": 0,
+                        "bbox": None,
+                        "method": "native",
+                        "confidence": 1.0,
+                    }],
+                    "embedded_assets": [],
+                    "review_signals": [],
+                }],
+                "discovered_page_count": 1,
+                "warnings": [],
+            }
+
+        code, payload, unused_report = B.run(
+            _args(materials, ingest_adapter="docling", render_pages="never"),
+            backend=B.NoBackend(),
+            adapter_runner=runner,
+        )
+        self.assertEqual(0, code)
+        receipt = payload["ingestion"]["parser_receipts"][0]
+        self.assertEqual("docling", receipt["adapter"])
+        self.assertEqual(1, receipt["discovered_page_count"])
+
+    def test_docx_review_signal_uses_explicit_break_segment_locator(self):
+        materials = os.path.join(tempfile.mkdtemp(prefix="docx-location-"), "materials")
+        os.makedirs(materials)
+        with open(os.path.join(materials, "notes.docx"), "wb") as stream:
+            stream.write(b"synthetic package; extractor is injected")
+        extracted = [{
+            "file": "notes.docx",
+            "page": 1,
+            "text": "Chapter 1\nGrounded content",
+            "elements": [],
+            "embedded_assets": [],
+            "review_signals": [{
+                "reason_code": "docx_visual_check",
+                "detail": "floating object may need review",
+            }],
+        }]
+        with mock.patch.object(B, "extract_ooxml", return_value=extracted):
+            code, unused_payload, report = B.run(_args(materials), backend=B.NoBackend())
+        self.assertEqual(0, code)
+        warning = next(value for value in report["warnings"]
+                       if value.startswith("docx_visual_check:"))
+        review = next(value for value in report["ai_review"]
+                      if value.get("kind") == "docx_visual_check")
+        self.assertIn("DOCX explicit-break logical segment 1", warning)
+        self.assertIn("DOCX explicit-break logical segment 1", review["action"])
+        self.assertNotIn("notes.docx p.1", warning)
+
+    def test_gold_xlsx_and_standalone_raster_use_dedicated_ingestion_paths(self):
+        materials = os.path.join(tempfile.mkdtemp(prefix="gold-materials-"), "materials")
+        os.makedirs(materials)
+        fixtures = os.path.join(ROOT, "tests", "fixtures", "ingestion_gold")
+        for name in ("workbook.xlsx", "scan.png"):
+            shutil.copyfile(os.path.join(fixtures, name), os.path.join(materials, name))
+
+        args = _args(materials)
+        code, payload, report = B.run(args, backend=B.NoBackend())
+        self.assertEqual(0, code)
+        units = payload["ingestion"]["content_units"]
+
+        workbook_units = [row for row in units if row["source_file"] == "workbook.xlsx"]
+        formula = next(row for row in workbook_units if row["kind"] == "formula")
+        self.assertEqual("=2+3", formula["text"])
+        self.assertEqual("B2", formula["metadata"]["parser_metadata"]["coordinate"])
+        table = next(row for row in workbook_units
+                     if row["kind"] == "table" and "Cell\tValue" in row["text"])
+        self.assertIn("A2\tLayout", table["text"])
+
+        raster = next(row for row in units
+                      if row["source_file"] == "scan.png" and row["kind"] == "figure")
+        self.assertEqual("source_page", raster["asset_role"])
+        self.assertEqual([0.0, 0.0, 16.0, 12.0], raster["bbox"])
+        self.assertTrue(os.path.isfile(os.path.join(
+            materials, "ws", *raster["asset_path"].split("/"))))
+        self.assertTrue(any(row.get("kind") == "standalone_raster_needs_ocr"
+                            for row in report["ai_review"]))
+
+        receipts = {row["source_file"]: row
+                    for row in payload["ingestion"]["parser_receipts"]}
+        self.assertEqual("stdlib:xlsx", receipts["workbook.xlsx"]["module"])
+        self.assertEqual("stdlib:raster", receipts["scan.png"]["module"])
+        self.assertEqual(1, receipts["workbook.xlsx"]["discovered_page_count"])
+        self.assertEqual(1, receipts["scan.png"]["discovered_page_count"])
+        self.assertEqual({"network": False, "upload": False, "install": False},
+                         receipts["scan.png"]["policy"])
+
+        from ingestion.pipeline import persist_payload
+        compiled = os.path.join(materials, "compiled")
+        os.makedirs(compiled)
+        manifest = persist_payload(
+            compiled, payload["ingestion"]
+        )
+        self.assertEqual(2, manifest["source_count"])
+        chapter_issues = [
+            row for row in payload["ingestion"]["review_candidates"]
+            if row["reason_codes"] == ["chapter_unassigned"]
+        ]
+        self.assertEqual(
+            len({row["source_file"] for row in chapter_issues}),
+            len(chapter_issues),
+        )
+        self.assertEqual(2, len(chapter_issues))
+        raster_ocr_issues = [
+            row for row in payload["ingestion"]["review_candidates"]
+            if "standalone_raster_needs_ocr" in row["reason_codes"]
+        ]
+        self.assertEqual(1, len(raster_ocr_issues))
+        self.assertEqual("scan.png", raster_ocr_issues[0]["source_file"])
+
+    def test_raster_sidecar_is_linked_as_first_class_source_not_image_text(self):
+        materials = os.path.join(tempfile.mkdtemp(prefix="sidecar-materials-"), "materials")
+        os.makedirs(materials)
+        fixtures = os.path.join(ROOT, "tests", "fixtures", "ingestion_gold")
+        image = os.path.join(materials, "ch01_diagram.png")
+        shutil.copyfile(os.path.join(fixtures, "scan.png"), image)
+        with open(os.path.join(materials, "ch01_diagram.ocr.txt"), "w", encoding="utf-8") as stream:
+            stream.write("Exact OCR transcript from explicit sidecar.")
+        with open(os.path.join(materials, "ch01_diagram.md"), "w", encoding="utf-8") as stream:
+            stream.write("Unrelated same-stem lecture note.")
+
+        code, payload, unused_report = B.run(_args(materials), backend=B.NoBackend())
+        self.assertEqual(0, code)
+        units = payload["ingestion"]["content_units"]
+        anchor = next(
+            row for row in units
+            if row["source_file"] == "ch01_diagram.png" and row["kind"] == "page_anchor"
+        )
+        self.assertEqual(
+            "ch01_diagram.ocr.txt",
+            anchor["metadata"]["parser_metadata"]["sidecar"]["source_file"],
+        )
+        image_units = [row for row in units if row["source_file"] == "ch01_diagram.png"]
+        self.assertFalse(any("Exact OCR transcript" in row["text"] for row in image_units))
+        self.assertTrue(any(
+            row["source_file"] == "ch01_diagram.ocr.txt"
+            and "Exact OCR transcript" in row["text"]
+            for row in units
+        ))
+        self.assertTrue(any(
+            row["source_file"] == "ch01_diagram.md"
+            and "Unrelated same-stem" in row["text"]
+            for row in units
+        ))
+        receipts = {
+            row["source_file"]: row for row in payload["ingestion"]["parser_receipts"]
+        }
+        self.assertIn("ch01_diagram.ocr.txt", receipts)
+        self.assertIn("ch01_diagram.md", receipts)
+
+    def test_builder_binds_xlsx_parse_to_initial_source_snapshot(self):
+        materials = os.path.join(tempfile.mkdtemp(prefix="xlsx-aba-"), "materials")
+        os.makedirs(materials)
+        fixture = os.path.join(ROOT, "tests", "fixtures", "ingestion_gold", "workbook.xlsx")
+        workbook = os.path.join(materials, "ch01_workbook.xlsx")
+        shutil.copyfile(fixture, workbook)
+        with open(workbook, "rb") as stream:
+            original = stream.read()
+        expected = hashlib.sha256(original).hexdigest()
+        real_extract = B.extract_xlsx
+        observed = {}
+
+        def swap_then_extract(path, source_file, **kwargs):
+            observed["expected_sha256"] = kwargs.get("expected_sha256")
+            try:
+                with zipfile.ZipFile(path, "a", compression=zipfile.ZIP_STORED) as archive:
+                    archive.writestr("custom/revision-b.txt", b"revision B")
+                return real_extract(path, source_file, **kwargs)
+            finally:
+                with open(path, "wb") as stream:
+                    stream.write(original)
+
+        with mock.patch.object(B, "extract_xlsx", side_effect=swap_then_extract):
+            code, unused_payload, report = B.run(_args(materials), backend=B.NoBackend())
+        self.assertEqual(expected, observed["expected_sha256"])
+        self.assertEqual(0, code)
+        self.assertTrue(any(
+            row.get("file") == "ch01_workbook.xlsx"
+            and "expected_sha256" in row.get("why", "")
+            for row in report["skipped"]
+        ))
+
+    def test_failed_supported_source_persists_as_inspectable_blocked_workspace(self):
+        materials = os.path.join(tempfile.mkdtemp(prefix="failed-raster-"), "materials")
+        os.makedirs(materials)
+        source = os.path.join(materials, "ch01_bad.png")
+        with open(source, "wb") as stream:
+            stream.write(b"not a raster image")
+
+        code, payload, report = B.run(_args(materials), backend=B.NoBackend())
+        self.assertEqual(0, code)
+        self.assertTrue(any(
+            row.get("file") == "ch01_bad.png" for row in report["skipped"]
+        ))
+        receipt = next(
+            row for row in payload["ingestion"]["parser_receipts"]
+            if row["source_file"] == "ch01_bad.png"
+        )
+        source_record = next(
+            row for row in payload["ingestion"]["sources"]
+            if row["path"] == "ch01_bad.png"
+        )
+        self.assertEqual("failed", receipt["status"])
+        self.assertEqual([], receipt["produced_pages"])
+        self.assertEqual("failed", source_record["status"])
+        self.assertTrue(any(
+            row["source_file"] == "ch01_bad.png" and row["severity"] == "blocking"
+            for row in payload["ingestion"]["review_candidates"]
+        ))
+
+        from ingestion.pipeline import persist_payload
+        workspace = os.path.join(materials, "compiled")
+        os.makedirs(workspace)
+        manifest = persist_payload(workspace, payload["ingestion"])
+        self.assertEqual(1, manifest["source_count"])
+        self.assertTrue(os.path.isfile(os.path.join(
+            workspace, ".ingest", "parser_receipts.json"
+        )))
+
+    def test_multiframe_rasters_persist_only_as_failed_blocked_sources(self):
+        from tests.test_raster_adapter import (
+            _animated_gif, _animated_webp, _apng, _multi_page_tiff,
+        )
+
+        materials = os.path.join(tempfile.mkdtemp(prefix="multiframe-raster-"), "materials")
+        os.makedirs(materials)
+        fixtures = {
+            "ch01_animated.gif": _animated_gif(),
+            "ch01_animated.webp": _animated_webp(),
+            "ch01_animated.png": _apng(),
+            "ch01_multipage.tiff": _multi_page_tiff(),
+        }
+        for filename, raster_payload in fixtures.items():
+            with open(os.path.join(materials, filename), "wb") as stream:
+                stream.write(raster_payload)
+
+        code, payload, report = B.run(_args(materials), backend=B.NoBackend())
+        self.assertEqual(0, code)
+        ingestion = payload["ingestion"]
+        self.assertEqual([], ingestion["content_units"])
+        self.assertEqual(set(fixtures), {
+            row["source_file"] for row in ingestion["parser_receipts"]
+            if row["status"] == "failed" and not row["produced_pages"]
+        })
+        self.assertEqual(set(fixtures), {
+            row["path"] for row in ingestion["sources"] if row["status"] == "failed"
+        })
+        self.assertEqual(set(fixtures), {
+            row["source_file"] for row in ingestion["review_candidates"]
+            if row["severity"] == "blocking"
+        })
+        self.assertEqual(set(fixtures), {
+            row["file"] for row in report["skipped"]
+        })
+
+        from ingestion.pipeline import persist_payload
+        workspace = os.path.join(materials, "compiled")
+        os.makedirs(workspace)
+        manifest = persist_payload(workspace, ingestion)
+        self.assertEqual(len(fixtures), manifest["source_count"])
+        self.assertEqual(0, manifest["unit_count"])
+
     def test_cli_help_without_pdf_deps(self):
         # the script emits UTF-8 (it reconfigures stdout); decode UTF-8 explicitly so the test is
         # independent of the OS console locale (cp1252 on CI / gbk on a zh Windows box).
@@ -756,6 +1131,7 @@ class CliAndRun(unittest.TestCase):
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         self.assertEqual(r.returncode, 0)
         self.assertIn("materials", r.stdout)
+        self.assertNotIn("--ingest-adapter", r.stdout)
 
     def test_missing_pdf_backend_clear_error(self):
         d = _materials_with_pdf()
@@ -964,6 +1340,68 @@ class CliAndRun(unittest.TestCase):
 
 # --------------------------------------------------------------------------- ingest integration
 
+class PublicationLocking(unittest.TestCase):
+    def test_official_workspace_main_publishes_under_new_ingestion_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = os.path.abspath(temp)
+            materials = os.path.join(root, "materials")
+            workspace = os.path.join(root, "workspace")
+            os.makedirs(materials)
+            os.makedirs(workspace)
+            with open(os.path.join(materials, "ch01.txt"), "w", encoding="utf-8") as stream:
+                stream.write("Chapter 1\nA source-backed concept.\n")
+            out = os.path.join(workspace, ".ingest", "source_raw_input.json")
+            report = os.path.join(workspace, ".ingest", "parse_report.json")
+            assets = os.path.join(workspace, "references", "assets")
+
+            code = B.main([
+                "--materials", materials,
+                "--out", out,
+                "--report", report,
+                "--asset-root", assets,
+                "--render-pages", "never",
+            ], backend=B.NoBackend())
+
+            self.assertEqual(0, code)
+            with open(out, encoding="utf-8") as stream:
+                self.assertIsInstance(json.load(stream), dict)
+            with open(report, encoding="utf-8") as stream:
+                self.assertIsInstance(json.load(stream), dict)
+            self.assertTrue(os.path.isfile(
+                os.path.join(workspace, ".ingest", "mutation.lock")
+            ))
+
+    def test_official_workspace_conflict_publishes_no_assets_or_json(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = os.path.abspath(temp)
+            materials = os.path.join(root, "materials")
+            workspace = os.path.join(root, "workspace")
+            os.makedirs(materials)
+            os.makedirs(workspace)
+            with open(os.path.join(materials, "ch01.txt"), "w", encoding="utf-8") as stream:
+                stream.write("Chapter 1\nA source-backed concept.\n")
+            out = os.path.join(workspace, ".ingest", "source_raw_input.json")
+            report = os.path.join(workspace, ".ingest", "parse_report.json")
+            assets = os.path.join(workspace, "references", "assets")
+
+            with B.workspace_publication_lock(workspace):
+                code = B.main([
+                    "--materials", materials,
+                    "--out", out,
+                    "--report", report,
+                    "--asset-root", assets,
+                    "--render-pages", "never",
+                ], backend=B.NoBackend())
+
+            self.assertEqual(7, code)
+            self.assertFalse(os.path.exists(out))
+            self.assertFalse(os.path.exists(report))
+            self.assertFalse(os.path.exists(
+                os.path.join(workspace, ".ingest", "ai_review_manifest.json")
+            ))
+            self.assertFalse(os.path.exists(assets))
+
+
 def _ingest(raw_input_path, out_dir):
     return subprocess.run([sys.executable, os.path.join(SCRIPTS, "ingest.py"),
                            "-i", raw_input_path, "-o", out_dir],
@@ -1070,6 +1508,14 @@ class Hygiene(unittest.TestCase):
         for rel in tracked:
             low = rel.lower()
             if low.endswith(".pdf"):
+                if low in {
+                    "tests/fixtures/ingestion_gold/layout.pdf",
+                    "tests/fixtures/ingestion_gold/scan.pdf",
+                    "tests/fixtures/ingestion_gold/shared_prompt_answer.pdf",
+                }:
+                    # Project-authored, reproducible CC0 parser-regression fixtures.  Keep
+                    # this allowlist exact so real course PDFs can never hide under fixtures/.
+                    continue
                 self.fail("committed PDF found: %s" % rel)
             if low.endswith((".png", ".jpg", ".jpeg")):
                 if rel.split("/")[0] == "assets":              # project branding (mascot/hero), intentional

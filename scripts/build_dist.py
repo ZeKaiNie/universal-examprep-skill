@@ -45,14 +45,28 @@ RUNTIME_DIRS = (
     ("prompts", (".md",)),
     ("docs", (".md", ".json")),
 )
-# dev-only scripts that live in scripts/ but must NOT ship (nothing today; listed for the test seam)
-SCRIPT_EXCLUDES = ("build_dist.py",)   # the builder itself is a dev tool
-# Maintainer-only documentation is useful in a source checkout but is not part of the
+# Source-checkout-only build/evaluation tools.  Runtime commands and adapters
+# stay included; the frozen retrieval gate lives under benchmark/ and is not a
+# student execution path, so its library ships with that harness rather than
+# inflating every installed skill.
+SCRIPT_EXCLUDES = ("build_dist.py", "retrieval_evaluation.py")
+# Maintainer-only paths are useful in a source checkout but are not part of the
 # student-facing runtime contract. Prefixes use normalized repo-relative forward slashes.
 PATH_EXCLUDES = (
+    # Imported only by the maintainer ingestion-Gold test suite; no runtime
+    # command, skill, or host adapter references this evaluator.
+    "scripts/ingestion/evaluation.py",
     "docs/plans/",
     "docs/history/",
     "docs/releases/",
+    # The executable benchmark harness and frozen Gold sets are source-checkout
+    # maintainer tools, so do not ship a runtime document whose commands are absent.
+    "docs/retrieval-evaluation.md",
+    # Repository-maintenance architecture/localization notes are linked from
+    # the source README, which is itself outside the student runtime.  The live
+    # language and portability contracts remain shipped separately.
+    "docs/skill-architecture.md",
+    "docs/localization.md",
 )
 
 

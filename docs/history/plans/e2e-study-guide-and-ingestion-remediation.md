@@ -4,7 +4,7 @@ Status: in progress
 
 Owner: Codex
 
-Baseline: `origin/main` at `d9835578ade4ea828b8c5d86c2b19bf10eb41384`
+Baseline: `origin/main` at `85cf7473263aebcec75cbed226248ce10298aa1a` after PR 1
 
 Primary audit: `D:\EEC 160\universal-examprep-e2e-audit-2026-07-14.md`
 
@@ -17,7 +17,7 @@ Real-course source materials: `D:\EEC 160`
 Deliver two independently reviewable and independently mergeable pull requests.
 
 1. The first PR repairs the end-to-end teaching and Study Guide path. A document may be called a Study Guide only after its current chapter has source-backed concepts, complete example coverage, persisted walkthroughs, language-complete explanations, capability-specific readiness, and a consistent PDF/QA receipt.
-2. The second PR expands the lightweight ingestion/retrieval core with redistribution-safe layout/OCR fixtures, optional high-fidelity adapters, dedicated XLSX/image/scan routes, duplicate/conflict facts, claim-level citation verification, and an evidence gate for any future hybrid retriever.
+2. The second PR expands the lightweight ingestion/retrieval core with redistribution-safe layout/OCR fixtures, optional host-runner parser adapters, dedicated XLSX/image/scan routes, duplicate/conflict facts, exact-location claim receipts bound to the current guide revision (not semantic-entailment proof), and an evidence gate for any future optional hybrid retriever.
 
 The following output rules are explicit acceptance requirements:
 
@@ -120,56 +120,57 @@ No release is part of this request. Both PRs will be ready for review and may be
 
 ### 4.1 Redistribution-safe Gold Set
 
-- [ ] Add tiny, project-authored PDF fixtures for text layout, multicolumn order, vector/table/formula pages, image-only scans, and shared prompt/answer crop behavior.
-- [ ] Store generation sources and expected page/unit/citation facts so binary fixtures are reproducible and redistribution-safe.
-- [ ] Add parser-capability matrix tests that skip optional adapters honestly rather than weakening the default stdlib floor.
+- [x] Add tiny, project-authored PDF fixtures for text layout, multicolumn order, vector/table/formula pages, image-only scans, and shared prompt/answer crop behavior.
+- [x] Store stdlib generation sources and expected location/unit/citation facts so binary fixtures are reproducible and redistribution-safe.
+- [x] Add parser-capability matrix tests that skip optional adapters honestly rather than weakening the default stdlib floor.
 
 ### 4.2 Optional high-fidelity parser adapters
 
-- [ ] Introduce a narrow adapter protocol and capability receipt for core, MinerU, and Docling routes.
-- [ ] Keep MinerU/Docling imports lazy and optional; never install or upload silently.
-- [ ] Route only eligible files/pages after probing, and preserve normalized element/provenance semantics regardless of backend.
-- [ ] Document license/privacy/installation consent and record the exact backend/version/config in build facts.
+- [x] Introduce a narrow normalized adapter protocol and capability/extraction receipts for core plus MinerU/Docling host-runner identities. Package presence alone is not an executable vendor integration.
+- [x] Keep MinerU/Docling imports absent from the normal path. The adapter itself does not install, access the network, or upload; its policy is a validated configuration declaration, not a sandbox/attestation of the host-supplied runner, whose operator owns enforcement.
+- [x] Route only eligible PDF/OOXML files through the explicitly selected runner while XLSX/raster retain dedicated core routes, and validate normalized element/provenance semantics regardless of backend.
+- [x] Document the local-only privacy/install boundary and record exact backend/module/distribution/version/config/source/output anchors in parser receipts.
 
 ### 4.3 XLSX, standalone images, and scans
 
-- [ ] Add XLSX OOXML ingestion for workbook/sheet/cell/table/formula/image metadata without requiring Excel.
-- [ ] Add standalone raster ingestion with dimensions, hashes, page-equivalent anchors, OCR/vision review tasks, and sidecar text where present.
-- [ ] Add a scan path that renders evidence and routes to an installed OCR/high-fidelity adapter or typed agent review; no fake empty-text success.
+- [x] Add XLSX OOXML ingestion for workbook/sheet/cell/table/formula/image metadata without requiring Excel or evaluating formulas.
+- [x] Add standalone raster ingestion with signature-checked dimensions/hashes, one page-equivalent anchor, OCR/vision review tasks, and strict UTF-8 sidecar text where present.
+- [x] Add a scan path that preserves evidence and routes to an installed local OCR/vision runner or typed agent review; no fake empty-text success.
 
 ### 4.4 Canonical groups, near duplicates, and source conflicts
 
-- [ ] Add `canonical_group` facts without changing immutable unit identity.
-- [ ] Implement deterministic exact/near-duplicate candidates using normalized fingerprints and a configurable similarity threshold.
-- [ ] Preserve every source occurrence while folding display/retrieval duplicates.
-- [ ] Model conflicts separately with source priority, differing claims/answers, and unresolved status; never silently choose a winner.
+- [x] Add revision-bound `canonical_group` derived facts without rewriting the location-derived `unit_id` or any source occurrence.
+- [x] Implement deterministic exact/near-duplicate candidates using normalized fingerprints and a configurable similarity threshold; near candidates are not automatically canonical.
+- [x] Preserve every source occurrence while folding only validated display/retrieval duplicates.
+- [x] Model conflicts separately with revision-bound source priority, differing claims/answers, and explicit resolution status; priority never silently chooses a winner and unresolved conflicts fail closed.
 
-### 4.5 Claim-level citation verification
+### 4.5 Exact-location claim verification
 
-- [ ] Add a claim record linking normalized claim text to an exact quote span and source unit/revision.
-- [ ] Verify quote containment, span offsets, source digest, answer-side leakage boundaries, and rebuild freshness.
-- [ ] Require verified claims for material-provenance guide assertions; otherwise use the AI-supplemented/unknown contract.
+- [x] Add a strict claim record linking an authored claim position to an exact Unicode code-point quote span and source unit/revision.
+- [x] Verify exact quote containment/offsets, payload and source/unit digests, prompt-vs-answer-side boundaries, and bound artifact freshness.
+- [x] Limit the location-only receipt to explicitly referenced claims whose subject coordinates locate authored guide text exactly equal to `claim_text`, then bind it to the canonical strict-JSON current guide hash plus source/content/group/conflict/claim hashes. Wire the ingestion-v2 typed-guide gate to recompute that receipt, require same-ref unit/role binding, and cover direct material knowledge-point explanations, formulas, printed prompts, and material answers while preserving v1 compatibility. Explicitly do not claim that the quote entails, supports, proves, or semantically agrees with the authored assertion; provenance still requires agent/human judgment.
 
 ### 4.6 Evidence-gated hybrid retrieval
 
-- [ ] Keep BM25 as the default and publish a reproducible query Gold Set with Recall@k/MRR and hard negatives.
-- [ ] Define retriever-result and fusion receipts without claiming dense/RRF/reranker support prematurely.
-- [ ] Activate Dense + Sparse, RRF, or reranking only if the committed real Recall evidence crosses a documented failure threshold and the optional backend passes consent/capability checks.
-- [ ] If BM25 is adequate or evidence is insufficient, record the no-go decision and do not add heavyweight runtime dependencies.
+- [x] Keep BM25 as the default and publish a strict reproducible query-Gold/run schema with Recall@k/MRR, near-miss, hard-negative, source, and index bindings. The committed synthetic sample is intentionally insufficient and is not promotion evidence.
+- [x] Define experimental retriever-result/fusion receipts plus bounded RRF/reranker helpers without presenting dense/RRF/reranker as a production student backend.
+- [x] Permit Dense + Sparse/RRF/reranking only when a sufficient frozen **real multi-course** recall Gold Set crosses every documented quality/safety/resource threshold and the optional backend separately passes consent/capability checks.
+- [x] Return `INSUFFICIENT_EVIDENCE` or `NO_GO` when appropriate and keep heavyweight runtime dependencies absent. Even `GO_OPTIONAL` authorizes only an opt-in backend, not replacement of BM25.
 
 ### 4.7 Documentation honesty and packaging
 
-- [ ] Correct statements that currently describe candidate adapters, immutable revisions, content-derived IDs, RRF extension points, DOCX physical pages, or release/test state as implemented facts.
-- [ ] Keep runtime manuals concise; detailed adapter and schema material belongs in directly linked references.
-- [ ] Ensure the public source checkout and distribution manifest clearly distinguish source tests/CI from the slim runtime package.
-- [ ] Run skill structure validation and verify no real course material enters the repository.
+- [x] Correct statements that described host-runner adapters as turnkey vendor parsers, source files/IDs as immutable/content-derived revisions, experimental RRF as production support, or DOCX logical segments as physical pages.
+- [x] Keep runtime manuals concise and put exact parser/fact/claim/retrieval schemas in directly linked references.
+- [x] Keep the source checkout's benchmark/tests distinct from the slim runtime manifest while shipping the executable runtime adapters/contracts.
+- [x] Keep the Gold Set project-authored and redistribution-safe; run skill/document consistency validation before delivery.
 
 ### 4.8 Optional workflow orchestration boundary
 
-- [ ] Document the executable workflow as an explicit state graph (`confirm -> ingest -> review loop -> validate -> tutor/notebook -> typed guide -> render -> per-page QA -> complete`) with fail-closed transition guards.
-- [ ] Keep the local Python commands and persisted receipts as the normative, zero-extra-dependency execution core.
-- [ ] Define an optional LangGraph host adapter for agents that already use LangGraph, mapping checkpoints to existing receipts and human-in-the-loop interrupts to typed review/visual-QA gates.
-- [ ] Do not add LangGraph to the default runtime dependency set; add an adapter only if it can call the same commands without weakening replay, idempotency, source-hash, or completion guarantees.
+- [x] Document the executable workflow as an explicit state graph (`confirm -> ingest -> review loop -> validate -> tutor/notebook -> typed guide -> render -> per-page QA -> complete`) with fail-closed transition guards.
+- [x] Keep the local Python commands, workspace state, and persisted receipts as the normative zero-extra-dependency execution core.
+- [x] Define an optional LangGraph host adapter for agents that already use LangGraph, mapping checkpoints to bounded routing hints and human-in-the-loop interrupts to existing typed review/visual-QA commands.
+- [x] Keep LangGraph out of the default dependency set; require lazy import, a host-supplied durable checkpointer, and receipt/state rehydration so a graph checkpoint or resume flag never substitutes for source-hash, review, QA, or completion truth.
+- [x] Serialize every coordinated validator-visible writer under the workspace registry/state/ingestion lock protocol. Official CLI conflict paths write nothing; completion uses one bound snapshot; input and fact parsing use stable byte generations; no parent lock spans a child process. Treat out-of-band writers and custom non-idempotent host APIs as explicit trusted-host boundaries rather than capabilities supplied by LangGraph.
 
 ## 5. Real EEC 160 acceptance run
 
@@ -195,9 +196,9 @@ This run happens only after both PRs merge, using the merged `origin/main` code 
 | Git/GitHub baseline verified | complete | clean tree; authenticated account has write permission on upstream |
 | PR 1 implementation | complete | executable session gates, capability readiness, typed Study Guide, exact coverage/source/asset/notebook binding, PDF receipt and all-page QA implemented; final adversarial review found P0=0 and residual P1=0 |
 | PR 1 tests | complete | full suite: 1653 tests passed, 34 optional-platform skips; focused remediation matrix: 361 tests passed, 17 skips; Python compile and `git diff --check` passed |
-| PR 1 merged | pending | — |
-| PR 2 implementation | pending | — |
-| PR 2 tests | pending | — |
+| PR 1 merged | complete | upstream PR [#24](https://github.com/ZeKaiNie/universal-examprep-skill/pull/24), merge commit `85cf7473263aebcec75cbed226248ce10298aa1a`; Ubuntu/Windows × Python 3.8/3.12 CI all passed |
+| PR 2 implementation | complete | Gold fixtures, optional parser and LangGraph host adapters, dedicated XLSX/raster paths, canonical/conflict facts, exact-location claim receipts, evidence-gated retrieval, package cleanup, and coordinated publication/input snapshot hardening implemented; final adversarial review found P0=0 and residual P1=0 |
+| PR 2 tests | complete | final full suite: 1865 passed, 39 optional-platform skips; focused evidence: ingestion/retrieval/package 381 passed (7 skips), publication/registry/host/LangGraph 235 passed (5 skips), claim/host/LangGraph 70 passed; Python compile, 11 skill validations, `git diff --check`, and the 93-file 592,678-byte runtime package cap passed |
 | PR 2 merged | pending | — |
 | EEC 160 rebuilt | pending | — |
 | Chapter 1 full visual QA | pending | — |

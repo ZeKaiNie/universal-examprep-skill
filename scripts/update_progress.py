@@ -33,6 +33,7 @@ import os
 import re
 import stat
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -44,6 +45,8 @@ for _s in ("stdout", "stderr"):
 
 import i18n
 import notebook as _notebook
+from ingestion import workspace_publication_lock
+from ingestion.storage import _exclusive_file_lock
 
 STATE_NAME = "study_state.json"
 MD_NAME = "study_progress.md"
@@ -2360,7 +2363,30 @@ def run(argv=None):
                          help='machine shape {"workspaces":[...]} (newest first)')
     args = ap.parse_args(argv)
     if args.cmd == "workspace-register":
-        return cmd_workspace_register(args)
+        # Registry writers are serialized globally, then lock every workspace row
+        # whose ownership can change.  This keeps an exact-pair confirmation from
+        # changing underneath a completion/artifact publication snapshot, including
+        # the case where an existing course is moved from one workspace to another.
+        if not os.path.isdir(args.path):
+            return cmd_workspace_register(args)
+        with _exclusive_file_lock(_registry_path() + ".lock"):
+            registry = load_registry()
+            target = os.path.abspath(args.path)
+            affected = [target]
+            for row in registry.get("workspaces", []):
+                row_path = row.get("path") if isinstance(row, dict) else None
+                if not isinstance(row_path, str) or not os.path.isdir(row_path):
+                    continue
+                if row.get("course") == (args.course or "").strip() \
+                        or _same_canonical_path(row_path, target):
+                    affected.append(row_path)
+            unique = {}
+            for value in affected:
+                unique[_canonical_path(value)] = value
+            with ExitStack() as locks:
+                for key in sorted(unique):
+                    locks.enter_context(workspace_publication_lock(unique[key]))
+                return cmd_workspace_register(args)
     if args.cmd == "workspace-list":
         return cmd_workspace_list(args)
     if args.workspace is None:
@@ -2369,31 +2395,32 @@ def run(argv=None):
     ws = args.workspace
     if not os.path.isdir(ws):
         _die("workspace 不存在: %s" % ws)
-    if args.cmd == "init":
-        return cmd_init(ws, args)
-    if args.cmd == "set":
-        return cmd_set(ws, args)
-    if args.cmd == "add-mistake":
-        return cmd_add(ws, args, "mistake_archive", "错题")
-    if args.cmd == "add-confusion":
-        return cmd_add(ws, args, "confusion_log", "疑难")
-    if args.cmd == "set-mistake-status":
-        return cmd_set_status(ws, args, "mistake_archive", "错题")
-    if args.cmd == "set-confusion-status":
-        return cmd_set_status(ws, args, "confusion_log", "疑难")
-    if args.cmd == "window-add":
-        return cmd_window_add(ws, args)
-    if args.cmd == "window-set-status":
-        return cmd_window_set_status(ws, args)
-    if args.cmd == "set-check":
-        return cmd_set_check(ws, args)
-    if args.cmd == "record-phase-evidence":
-        return cmd_record_phase_evidence(ws, args)
-    if args.cmd == "complete-phase":
-        return cmd_complete_phase(ws, args)
-    if args.cmd == "render":
+    if args.cmd == "show":
+        return cmd_show(ws, args)
+    with workspace_publication_lock(ws):
+        if args.cmd == "init":
+            return cmd_init(ws, args)
+        if args.cmd == "set":
+            return cmd_set(ws, args)
+        if args.cmd == "add-mistake":
+            return cmd_add(ws, args, "mistake_archive", "错题")
+        if args.cmd == "add-confusion":
+            return cmd_add(ws, args, "confusion_log", "疑难")
+        if args.cmd == "set-mistake-status":
+            return cmd_set_status(ws, args, "mistake_archive", "错题")
+        if args.cmd == "set-confusion-status":
+            return cmd_set_status(ws, args, "confusion_log", "疑难")
+        if args.cmd == "window-add":
+            return cmd_window_add(ws, args)
+        if args.cmd == "window-set-status":
+            return cmd_window_set_status(ws, args)
+        if args.cmd == "set-check":
+            return cmd_set_check(ws, args)
+        if args.cmd == "record-phase-evidence":
+            return cmd_record_phase_evidence(ws, args)
+        if args.cmd == "complete-phase":
+            return cmd_complete_phase(ws, args)
         return cmd_render(ws, args)
-    return cmd_show(ws, args)
 
 
 if __name__ == "__main__":

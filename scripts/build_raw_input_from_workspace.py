@@ -3,18 +3,22 @@
 """Official pre-ingest: scan a course-materials folder → raw_input.json (+ optional page-image
 assets + a parse report) for scripts/ingest.py.
 
-This is NOT an OCR project. It is a deterministic, honest, first official entrypoint that:
+This is not itself an OCR engine. It is a deterministic, honest ingestion entrypoint that:
   - preserves page provenance (source_file / source_pages),
   - preserves full-page renders for figure-dependent lecture pages (so diagram questions keep context),
+  - extracts DOCX/PPTX, XLSX worksheets, standalone raster files, and text/Markdown through
+    dedicated local paths,
   - extracts obvious lecture Example/Quiz problem-solution pairs into quiz_bank items,
   - never pretends lossy text extraction is complete, and
-  - fails / warns clearly when the OPTIONAL PDF backends are unavailable.
+  - fails / warns clearly when an optional backend is unavailable.
 
 stdlib-only core + tests. PDF *text extraction* and *page rendering* are OPTIONAL backends:
   - text:   pypdf OR PyMuPDF (`fitz`)
   - render: PyMuPDF (`fitz`, native PNG, no extra deps) OR pypdfium2 + Pillow (its to_pil adapter)
 Install only if you need them, e.g.:  pip install pypdf pymupdf   (or: pip install pypdf pypdfium2 Pillow)
 Rendering also needs --asset-root <workspace>/references/assets (where the page PNGs are written).
+Docling/MinerU are explicit host-runner adapters only: this script never installs packages,
+downloads models, enables network access, or uploads course material.
 
 Usage:
   python scripts/build_raw_input_from_workspace.py \\
@@ -27,6 +31,7 @@ Usage:
 import argparse
 import hashlib
 import importlib
+import importlib.metadata
 import zlib
 import json
 import os
@@ -35,12 +40,34 @@ import sys
 import tempfile
 
 try:
-    from ingestion import is_link_or_reparse
+    from ingestion import (
+        ConflictError,
+        IngestionStore,
+        atomic_write_json,
+        is_link_or_reparse,
+        workspace_publication_lock,
+    )
     from ingestion.ooxml import OOXMLExtractionError, extract_ooxml
+    from ingestion.adapters import (
+        AdapterError, ExtractionRequest, resolve_adapter,
+    )
+    from ingestion.raster import RasterExtractionError, extract_raster
+    from ingestion.xlsx import XLSXExtractionError, extract_xlsx
     from ingestion.pipeline import build_payload as build_ingestion_payload
 except ImportError:  # imported as scripts.build_raw_input_from_workspace in unit tests
-    from scripts.ingestion import is_link_or_reparse
+    from scripts.ingestion import (
+        ConflictError,
+        IngestionStore,
+        atomic_write_json,
+        is_link_or_reparse,
+        workspace_publication_lock,
+    )
     from scripts.ingestion.ooxml import OOXMLExtractionError, extract_ooxml
+    from scripts.ingestion.adapters import (
+        AdapterError, ExtractionRequest, resolve_adapter,
+    )
+    from scripts.ingestion.raster import RasterExtractionError, extract_raster
+    from scripts.ingestion.xlsx import XLSXExtractionError, extract_xlsx
     from scripts.ingestion.pipeline import build_payload as build_ingestion_payload
 
 try:
@@ -1840,7 +1867,10 @@ def _scan_materials(materials_dir):
                 continue
             if low.endswith(".pdf"):
                 pdfs.append(full)
-            elif low.endswith((".txt", ".md", ".docx", ".pptx")):
+            elif low.endswith((
+                    ".txt", ".md", ".docx", ".pptx", ".xlsx",
+                    ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp",
+            )):
                 documents.append(full)
             elif not fn.startswith((".", "~$")) and low not in ("thumbs.db", "desktop.ini"):
                 others.append(full)                    # 不支持的格式也要留痕，绝不零痕迹丢弃
@@ -1881,6 +1911,24 @@ def _fmt_pages(nums):
         out.append(str(nums[i]) if i == j else "%d-%d" % (nums[i], nums[j]))
         i = j + 1
     return ",".join(out)
+
+
+def _source_location_label(source_file, ordinal):
+    """Return an honest, format-specific human locator for one extracted record.
+
+    ``page`` remains the stable integer field in the ingestion envelope, but it
+    does not always denote a rendered physical page.  In particular, DOCX
+    records are logical segments created only by explicit page-break markup.
+    """
+
+    extension = os.path.splitext(str(source_file or ""))[1].lower()
+    if extension == ".docx":
+        return "DOCX explicit-break logical segment %d" % ordinal
+    if extension == ".pptx":
+        return "PPTX slide %d" % ordinal
+    if extension == ".pdf":
+        return "PDF page %d" % ordinal
+    return "source location %d" % ordinal
 
 
 # ---- D4: 保守题型启发——只认高置信形态，判不准保持 subjective（汇总警报交 AI 复核）----
@@ -1966,6 +2014,148 @@ def _apply_typed_answer(item):
                 item["options"] = opts2
                 item["answer"] = m.group(1).upper()
                 item.pop("keywords", None)
+
+
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_ENGLISH_SIGNAL_RE = re.compile(
+    r"(?i)\b(?:the|a|an|and|or|of|to|in|for|with|from|by|is|are|was|were|"
+    r"what|which|why|how|find|calculate|compute|determine|derive|explain|show|"
+    r"prove|given|assume|using|answer|solution|true|false)\b"
+)
+
+
+def _source_language_evidence(value):
+    """Return ``zh``, ``en``, ``mixed``, or ``unknown`` from textual evidence."""
+
+    if value in (None, "", [], {}):
+        return "unknown"
+    if not isinstance(value, str):
+        try:
+            value = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            value = str(value)
+    cjk = len(_CJK_RE.findall(value))
+    latin = len(re.findall(r"[A-Za-z]", value))
+    if cjk:
+        # Latin variables and domain terms are normal in Chinese materials, but
+        # an English function-word/question phrase is evidence of mixed prose.
+        if latin >= 3 and _ENGLISH_SIGNAL_RE.search(value):
+            return "mixed"
+        return "zh"
+    if (re.search(r"[=+*/^<>≤≥∑∫√±]", value)
+            and not re.search(r"\b[A-Za-z]{3,}\b", value)):
+        return "unknown"
+    if latin and _ENGLISH_SIGNAL_RE.search(value):
+        return "en"
+    return "unknown"
+
+
+def _classify_source_language(value):
+    """Conservatively classify only Chinese-script or clearly English prose.
+
+    Latin script alone is not enough because it could be another language.  An
+    ambiguous/mixed/formula-only payload deliberately returns ``None`` and is
+    routed to typed review by the ingestion layer.
+    """
+
+    value = _source_language_evidence(value)
+    return value if value in ("zh", "en") else None
+
+
+def _formula_only_language_value(element):
+    if element.get("kind") == "formula" or element.get("latex"):
+        return True
+    text = element.get("text") if isinstance(element.get("text"), str) else ""
+    if not text.strip() or _CJK_RE.search(text):
+        return False
+    return bool(
+        re.search(r"[=+*/^<>≤≥∑∫√±]", text)
+        and not re.search(r"\b[A-Za-z]{3,}\b", text)
+    )
+
+
+def _annotate_ingestion_languages(pages, report):
+    """Attach only evidence-backed page/element language labels.
+
+    Mixed prose and formula-only records deliberately remain unlabeled.  A
+    short/ambiguous element may inherit a proven page language, but a mixed or
+    formula-only element may not.
+    """
+
+    counters = {
+        "pages_inferred": 0,
+        "pages_unresolved": 0,
+        "elements_inferred": 0,
+        "elements_inherited": 0,
+        "elements_unresolved": 0,
+    }
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        page_language = page.get("source_language")
+        if page_language not in ("zh", "en"):
+            page.pop("source_language", None)
+            page_evidence = _source_language_evidence(page.get("text"))
+            if page_evidence in ("zh", "en"):
+                page_language = page_evidence
+                page["source_language"] = page_language
+                counters["pages_inferred"] += 1
+            else:
+                page_language = None
+                if str(page.get("text") or "").strip():
+                    counters["pages_unresolved"] += 1
+        for element in page.get("elements") or ():
+            if not isinstance(element, dict):
+                continue
+            explicit = element.get("source_language")
+            if explicit in ("zh", "en"):
+                continue
+            element.pop("source_language", None)
+            evidence = _source_language_evidence(element.get("text"))
+            if evidence in ("zh", "en"):
+                element["source_language"] = evidence
+                counters["elements_inferred"] += 1
+            elif (evidence == "unknown" and page_language
+                  and not _formula_only_language_value(element)):
+                element["source_language"] = page_language
+                counters["elements_inherited"] += 1
+            elif (str(element.get("text") or "").strip()
+                  or str(element.get("latex") or "").strip()):
+                counters["elements_unresolved"] += 1
+    report["source_language_annotations"] = counters
+
+
+def _annotate_source_languages(items, report):
+    inferred = 0
+    unresolved = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("source_language") not in ("zh", "en"):
+            detected = _classify_source_language(item.get("question"))
+            if detected:
+                item["source_language"] = detected
+                inferred += 1
+            else:
+                unresolved += 1
+        if item.get("answer") not in (None, "", [], {}):
+            if item.get("answer_source_language") not in ("zh", "en"):
+                detected = _classify_source_language(item.get("answer"))
+                if detected:
+                    item["answer_source_language"] = detected
+                    inferred += 1
+                else:
+                    unresolved += 1
+    if inferred:
+        report["warnings"].append(
+            "source_language_inferred: %d question/answer payloads were classified by "
+            "conservative Unicode/English-signal rules" % inferred
+        )
+    if unresolved:
+        report["warnings"].append(
+            "source_language_review_required: %d question/answer payloads remain "
+            "unclassified and will enter typed review" % unresolved
+        )
 
 
 # 选择题提示词——题干里得有「选/哪/下列/which/choose…」这类线索，大写小问
@@ -2063,6 +2253,134 @@ def _rel(path, base):
     return os.path.relpath(path, base).replace(os.sep, "/")
 
 
+def _explicit_raster_sidecars(image_path):
+    """Return only unambiguous OCR-sidecar naming conventions.
+
+    A generic same-stem ``.txt``/``.md`` file may be unrelated course material,
+    so it is never auto-bound to an image.  The supported explicit conventions
+    are ``diagram.ocr.txt`` and ``diagram.png.txt``.
+    """
+
+    stem, unused_extension = os.path.splitext(image_path)
+    candidates = (stem + ".ocr.txt", image_path + ".txt")
+    return [candidate for candidate in candidates if os.path.isfile(candidate)]
+
+
+def _media_type_for_path(path):
+    extension = os.path.splitext(path)[1].lower()
+    return {
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".txt": "text/plain",
+        ".md": "text/markdown",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".tif": "image/tiff",
+        ".tiff": "image/tiff",
+        ".bmp": "image/bmp",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+    }.get(extension, "application/octet-stream")
+
+
+def _installed_parser_versions(backend):
+    candidates = {
+        "pypdf": "pypdf",
+        "fitz": "PyMuPDF",
+        "pymupdf": "PyMuPDF",
+        "pypdfium2": "pypdfium2",
+        "pillow": "Pillow",
+    }
+    tokens = set(str(getattr(backend, "name", "core")).lower().split("+"))
+    output = []
+    for token in sorted(tokens):
+        distribution = candidates.get(token)
+        if distribution is None:
+            continue
+        try:
+            version = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            version = "unknown"
+        output.append("%s=%s" % (distribution, version))
+    return ";".join(output) or None
+
+
+def _core_parser_receipts(materials, source_paths, pages, source_hashes, backend, report):
+    pages_by_source = {}
+    for page in pages:
+        source_file = page.get("file") if isinstance(page, dict) else None
+        page_number = page.get("page") if isinstance(page, dict) else None
+        if isinstance(source_file, str) and type(page_number) is int and page_number >= 1:
+            pages_by_source.setdefault(source_file, set()).add(page_number)
+    skipped = {
+        str(row.get("file")).replace("\\", "/")
+        for row in report.get("skipped", ())
+        if isinstance(row, dict) and row.get("file")
+    }
+    backend_name = str(getattr(backend, "name", "core"))
+    version = _installed_parser_versions(backend)
+    receipts = []
+    for source_path in sorted(source_paths):
+        source_file = _rel(source_path, materials)
+        produced = sorted(pages_by_source.get(source_file, ()))
+        extension = os.path.splitext(source_path)[1].lower()
+        if extension in (".txt", ".md"):
+            module = "stdlib:text"
+            adapter_version = sys.version.split()[0]
+        elif extension in (".docx", ".pptx", ".xlsx"):
+            module = "stdlib:xlsx" if extension == ".xlsx" else "stdlib:ooxml"
+            adapter_version = sys.version.split()[0]
+        elif extension in (
+                ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"):
+            module = "stdlib:raster"
+            adapter_version = sys.version.split()[0]
+        elif extension == ".pdf":
+            module = backend_name
+            adapter_version = version
+        else:
+            module = "unsupported"
+            adapter_version = None
+        config = {
+            "backend": backend_name,
+            "parser": module,
+        }
+        config_hash = hashlib.sha256(json.dumps(
+            config, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+        receipts.append({
+            "schema_version": 1,
+            "adapter": "core",
+            "adapter_version": adapter_version,
+            "module": module,
+            "distribution": None,
+            "source_file": source_file,
+            "source_sha256": source_hashes[source_path],
+            "media_type": _media_type_for_path(source_path),
+            "requested_pages": [],
+            "produced_pages": produced,
+            "discovered_page_count": len(produced),
+            "config_sha256": config_hash,
+            "policy": {"network": False, "upload": False, "install": False},
+            "status": (
+                "success" if produced else "unsupported" if extension not in (
+                    ".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md",
+                    ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp",
+                ) else "failed" if source_file in skipped else "review_required"
+            ),
+        })
+    return receipts
+
+
+def _merge_parser_receipts(core_receipts, optional_receipts):
+    merged = {receipt["source_file"]: receipt for receipt in core_receipts}
+    for receipt in optional_receipts:
+        merged[receipt["source_file"]] = receipt
+    return [merged[key] for key in sorted(merged)]
+
+
 # 常用汉字频表（简体+繁体各 ~120 高频字 + 课程域词）——GBK/Big5 双解码都成功时的确定性裁决：
 # 正确解码产出常用字、错误解码产出生僻乱码，占比一目了然；两边都低分则按不确定移交 AI
 _COMMON_HAN = set(
@@ -2141,7 +2459,7 @@ def build_arg_parser():
         epilog="Optional deps: text extraction pip install pypdf or pymupdf; rendering pip install pymupdf (bundles PNG) or pypdfium2 Pillow. "
                "(.txt/.md materials need none.)")
     p.add_argument("--materials", required=True,
-                   help="course materials folder (PDF / DOCX / PPTX / txt / md)")
+                   help="course materials folder (PDF / DOCX / PPTX / XLSX / images / txt / md)")
     p.add_argument("--out", default="raw_input.json", help="output raw_input.json path")
     p.add_argument("--report", default="parse_report.json", help="parse report JSON path")
     p.add_argument("--asset-root", default=None,
@@ -2154,10 +2472,63 @@ def build_arg_parser():
     p.add_argument("--extract-homework", choices=["never", "auto"], default="auto",
                    help="extract homework items (incl. auto-pairing of split question/answer PDFs and inline Solutions): never/auto")
     p.add_argument("--course-name", default=None, help="subject name (defaults to the materials directory name)")
+    p.add_argument(
+        "--ingest-adapter", choices=("core", "docling", "mineru"), default="core",
+        help=argparse.SUPPRESS,
+    )
     return p
 
 
-def run(args, backend=None):
+def _publication_workspace(args, explicit=None):
+    """Resolve the workspace whose validator-visible outputs this run publishes.
+
+    Standalone compatibility outputs outside ``.ingest`` remain ordinary files.
+    The official workspace shape is unambiguous from ``.ingest/*.json`` and/or
+    ``references/assets``.  Reject mixed roots instead of locking one workspace
+    while writing another.
+    """
+
+    candidates = []
+    if explicit is not None:
+        candidates.append(os.path.abspath(str(explicit)))
+    for value in (getattr(args, "out", None), getattr(args, "report", None)):
+        if not value:
+            continue
+        parent = os.path.dirname(os.path.abspath(value))
+        if os.path.basename(parent).lower() == ".ingest":
+            candidates.append(os.path.dirname(parent))
+    asset_root = getattr(args, "asset_root", None)
+    if asset_root:
+        asset_root = os.path.abspath(asset_root)
+        references = os.path.dirname(asset_root)
+        if (os.path.basename(asset_root).lower() == "assets"
+                and os.path.basename(references).lower() == "references"):
+            candidates.append(os.path.dirname(references))
+    if not candidates:
+        return None
+    canonical = {os.path.normcase(os.path.normpath(path)) for path in candidates}
+    if len(canonical) != 1:
+        raise ValueError("validator-visible builder outputs target different workspaces")
+    workspace = candidates[0]
+    if _path_has_link_or_reparse(workspace):
+        raise ValueError("builder publication workspace is link/reparse-backed")
+    os.makedirs(workspace, exist_ok=True)
+    if not os.path.isdir(workspace) or _path_has_link_or_reparse(workspace):
+        raise ValueError("builder publication workspace is not a safe directory")
+    return workspace
+
+
+def _writes_ingestion_files(args, workspace):
+    ingest = os.path.normcase(os.path.normpath(os.path.join(workspace, ".ingest")))
+    return any(
+        os.path.normcase(os.path.normpath(os.path.dirname(os.path.abspath(value))))
+        == ingest
+        for value in (getattr(args, "out", None), getattr(args, "report", None))
+        if value
+    )
+
+
+def _run_unlocked(args, backend=None, adapter_runner=None):
     """Core run. `backend` injectable for tests (a fake with page_texts/render_page_png)."""
     backend = backend or detect_backend()
     report = {"materials": args.materials, "backend": getattr(backend, "name", "none"),
@@ -2194,18 +2565,22 @@ def run(args, backend=None):
             })
     texts = [path for path in documents if path.lower().endswith((".txt", ".md"))]
     ooxmls = [path for path in documents if path.lower().endswith((".docx", ".pptx"))]
+    xlsxs = [path for path in documents if path.lower().endswith(".xlsx")]
+    rasters = [path for path in documents if path.lower().endswith((
+        ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp",
+    ))]
     for op in others:
         rel_o = _rel(op, materials)
         report["skipped"].append({
             "file": rel_o,
-            "why": "不支持的格式（当前解析 PDF/DOCX/PPTX/.txt/.md）",
+            "why": "不支持的格式（当前解析 PDF/DOCX/PPTX/XLSX/常见图片/.txt/.md）",
         })
         report["warnings"].append("unsupported_format: %s（内容不会进 wiki/题库——请 AI 接管）" % rel_o)
         report["ai_review"].append({
             "kind": "unsupported_format", "file": rel_o,
             "action": "该文件格式本工具不解析、内容未导入。请 AI 直接读取该文件，把知识点/题目"
                       "以带证据的 review patch 补进工作区，或转换为受支持格式后重新构建。"})
-    all_source_paths = texts + ooxmls + pdfs + others
+    all_source_paths = texts + ooxmls + xlsxs + rasters + pdfs + others
     report["files_scanned"] = [_rel(p, materials) for p in all_source_paths]
     report["pruned_dirs"] = pruned
     if pruned:   # fail-loud: a prior workspace/tooling dir was skipped, so the user knows why it's ignored
@@ -2222,8 +2597,30 @@ def run(args, backend=None):
         report["warnings"].append("source_snapshot_failed: %s" % exc)
         return 5, {"error": "提取前无法建立材料哈希快照：%s" % exc}, report
 
+    registered_source_paths = {
+        os.path.normcase(os.path.abspath(path)): path for path in all_source_paths
+    }
+
+    selected_adapter = None
+    if args.ingest_adapter != "core":
+        try:
+            selected_adapter = resolve_adapter(
+                args.ingest_adapter, runner=adapter_runner
+            )
+            capability = selected_adapter.probe().to_dict()
+        except AdapterError as exc:
+            return 3, {"error": "可选解析器配置无效：%s" % exc}, report
+        report["parser_adapter_capability"] = capability
+        if not capability.get("available") or not capability.get("runner_configured"):
+            return 3, {
+                "error": (
+                    "%s 仅在 host 显式配置本地 runner 后可用；本工具不会自动安装、"
+                    "下载模型、联网或上传材料。" % args.ingest_adapter
+                )
+            }, report
+
     # Honest dependency failure: PDFs present but no text backend → stop with a clear, actionable error.
-    if pdfs and not backend.can_text():
+    if pdfs and selected_adapter is None and not backend.can_text():
         report["warnings"].append("no_pdf_text_backend")
         return 3, {"error": "发现 %d 个 PDF，但没有可用的 PDF 文本后端。请安装可选依赖："
                             "`pip install pypdf` 或 `pip install pymupdf`（PDF 文本提取需要其一；把页面渲染成图还需 "
@@ -2231,35 +2628,82 @@ def run(args, backend=None):
                             "纯 .txt/.md 材料无需任何依赖。" % len(pdfs)}, report
 
     pages = []
+    optional_parser_receipts = []
     residue_files = {}
     residue_page_keys = set()
     page_pdf_all_raw = {}
+
+    def record_adapter_signals(records, relative):
+        for record in records:
+            for signal in record.get("review_signals") or ():
+                reason = signal.get("reason_code") or "adapter_review_required"
+                detail = signal.get("detail") or "adapter output needs visual review"
+                location = _source_location_label(relative, record["page"])
+                report["warnings"].append(
+                    "%s: %s %s（%s）" % (reason, relative, location, detail)
+                )
+                report["ai_review"].append({
+                    "kind": reason,
+                    "file": relative,
+                    "pages": [record["page"]],
+                    "action": (
+                        "%s。请直接视觉核对原始文件的 %s，并用带来源证据的 review "
+                        "patch 补录遗漏内容。" % (detail, location)
+                    ),
+                })
+
+    def optional_extract(source_path, relative):
+        request = ExtractionRequest.from_path(
+            source_path,
+            relative,
+            _media_type_for_path(source_path),
+            asset_root=args.asset_root,
+            config={"route": args.ingest_adapter},
+        )
+        result = selected_adapter.extract(request)
+        optional_parser_receipts.append(result.receipt.to_dict())
+        report["warnings"].extend(result.warnings)
+        records = [dict(record) for record in result.pages]
+        record_adapter_signals(records, relative)
+        return records
+
     for tp in texts:
         pages.extend(_read_text_file_pages(tp, _rel(tp, materials), report))
     for package_path in ooxmls:
         rel = _rel(package_path, materials)
         try:
-            extracted = extract_ooxml(package_path, rel, asset_root=args.asset_root)
+            extracted = (
+                optional_extract(package_path, rel)
+                if selected_adapter is not None
+                else extract_ooxml(
+                    package_path,
+                    rel,
+                    asset_root=args.asset_root,
+                    expected_sha256=source_snapshot_hashes[package_path],
+                )
+            )
             for record in extracted:
                 # OOXML assets are filenames relative to --asset-root.  The ingestion
                 # envelope later canonicalizes them as references/assets/<filename>.
                 pages.append(record)
-                for signal in record.get("review_signals") or ():
+                for signal in (() if selected_adapter is not None else (
+                        record.get("review_signals") or ())):
                     reason = signal.get("reason_code") or "ooxml_review_required"
                     detail = signal.get("detail") or "OOXML content needs visual review"
+                    location = _source_location_label(rel, record["page"])
                     report["warnings"].append(
-                        "%s: %s p.%d（%s）" % (reason, rel, record["page"], detail)
+                        "%s: %s %s（%s）" % (reason, rel, location, detail)
                     )
                     report["ai_review"].append({
                         "kind": reason,
                         "file": rel,
                         "pages": [record["page"]],
                         "action": (
-                            "%s。请直接视觉阅读原始 DOCX/PPTX 的该页/幻灯片，"
-                            "用带来源证据的 review patch 补录遗漏内容。" % detail
+                            "%s。请直接视觉核对原始文件的 %s，并用带来源证据的 "
+                            "review patch 补录遗漏内容。" % (detail, location)
                         ),
                     })
-        except OOXMLExtractionError as exc:
+        except (OOXMLExtractionError, AdapterError) as exc:
             report["skipped"].append({"file": rel, "why": "OOXML 提取失败: %s" % exc})
             report["warnings"].append("ooxml_extract_failed: %s（%s——整份内容未导入）" % (rel, exc))
             report["ai_review"].append({
@@ -2268,32 +2712,112 @@ def run(args, backend=None):
                 "action": "DOCX/PPTX 安全解析失败。请核对文件是否损坏、加密或含外部关系；"
                           "修复后重建，或直接视觉阅读并提交带证据的 review patch。",
             })
+    for workbook_path in xlsxs:
+        rel = _rel(workbook_path, materials)
+        try:
+            extracted = extract_xlsx(
+                workbook_path,
+                rel,
+                asset_root=args.asset_root,
+                expected_sha256=source_snapshot_hashes[workbook_path],
+            )
+            pages.extend(extracted)
+            record_adapter_signals(extracted, rel)
+        except XLSXExtractionError as exc:
+            report["skipped"].append({"file": rel, "why": "XLSX 提取失败: %s" % exc})
+            report["warnings"].append("xlsx_extract_failed: %s（%s）" % (rel, exc))
+            report["ai_review"].append({
+                "kind": "xlsx_extract_failed", "file": rel,
+                "action": "工作簿未导入；请检查损坏/加密/外部关系，或转成受支持格式后重建。",
+            })
+    for raster_path in rasters:
+        rel = _rel(raster_path, materials)
+        try:
+            sidecars = []
+            for candidate in _explicit_raster_sidecars(raster_path):
+                registered = registered_source_paths.get(
+                    os.path.normcase(os.path.abspath(candidate))
+                )
+                if registered is not None and registered not in sidecars:
+                    sidecars.append(registered)
+            sidecar_path = None
+            if len(sidecars) == 1:
+                sidecar_path = sidecars[0]
+            elif len(sidecars) > 1:
+                report["warnings"].append(
+                    "raster_sidecar_ambiguous: %s (%s)"
+                    % (rel, ", ".join(_rel(path, materials) for path in sidecars))
+                )
+                report["ai_review"].append({
+                    "kind": "raster_sidecar_ambiguous",
+                    "file": rel,
+                    "pages": [1],
+                    "action": (
+                        "Multiple explicitly named OCR sidecars exist. Inspect the image and "
+                        "sidecars, retain one exact revision link, and rebuild."
+                    ),
+                })
+            sidecar_rel = _rel(sidecar_path, materials) if sidecar_path else None
+            extracted = extract_raster(
+                raster_path,
+                rel,
+                asset_root=args.asset_root,
+                sidecar_path=sidecar_path,
+                auto_sidecar=False,
+                sidecar_source_file=sidecar_rel,
+                expected_sha256=source_snapshot_hashes[raster_path],
+                expected_sidecar_sha256=(
+                    source_snapshot_hashes[sidecar_path] if sidecar_path else None
+                ),
+            )
+            pages.extend(extracted)
+            record_adapter_signals(extracted, rel)
+        except RasterExtractionError as exc:
+            report["skipped"].append({"file": rel, "why": "图片提取失败: %s" % exc})
+            report["warnings"].append("raster_extract_failed: %s（%s）" % (rel, exc))
+            report["ai_review"].append({
+                "kind": "raster_extract_failed", "file": rel,
+                "action": "独立图片未导入；请检查格式/损坏，或用视觉工具读取后提交证据补丁。",
+            })
     for pdf in pdfs:
         rel = _rel(pdf, materials)   # subdir-qualified identifier, not bare basename (avoids collisions)
         try:
             nonblank, no_content, total = 0, [], 0
             extracted_pages = []
-            pdf_texts = list(backend.page_texts(pdf))
-            text_methods = list(getattr(backend, "last_text_methods", ()) or ())
+            if selected_adapter is not None:
+                adapted = optional_extract(pdf, rel)
+                pdf_texts = [record.get("text") or "" for record in adapted]
+                text_methods = []
+            else:
+                adapted = None
+                pdf_texts = list(backend.page_texts(pdf))
+                text_methods = list(getattr(backend, "last_text_methods", ()) or ())
             default_text_method = getattr(
                 backend, "name", backend.__class__.__name__.lower()
             )
             for i, txt in enumerate(pdf_texts):
-                extracted_pages.append({
-                    "file": rel,
-                    "page": i + 1,
-                    "text": txt,
-                    "_pdf": pdf,
-                    "_text_method": (
-                        text_methods[i] if i < len(text_methods) else default_text_method
-                    ),
-                })
+                if adapted is not None:
+                    page_record = dict(adapted[i])
+                    page_record["_pdf"] = pdf
+                    page_record["_text_method"] = args.ingest_adapter
+                else:
+                    page_record = {
+                        "file": rel,
+                        "page": i + 1,
+                        "text": txt,
+                        "_pdf": pdf,
+                        "_text_method": (
+                            text_methods[i] if i < len(text_methods) else default_text_method
+                        ),
+                    }
+                extracted_pages.append(page_record)
                 total += 1
                 # 残渣感知判定：每页只剩页码「12」的扫描件不能算有文本（审计实测骗过精确空判定）
+                actual_page = page_record["page"]
                 if _page_has_content(txt):
                     nonblank += 1
                 else:
-                    no_content.append(i + 1)
+                    no_content.append(actual_page)
             if text_methods:
                 report.setdefault("pdf_text_methods", {})[rel] = text_methods
             # Commit per source only after the backend reaches EOF.  A generator
@@ -2452,6 +2976,7 @@ def run(args, backend=None):
                                                         exclude=exam_rerouted)
         report["warnings"].extend(hw_rep.pop("warnings"))
         report.update(hw_rep)
+    _annotate_source_languages(lecture_items + homework_items, report)
     # ---- render assets for figure-dependent items ----
     asset_root = args.asset_root
     page_pdf = {(pg["file"], pg["page"]): pg["_pdf"] for pg in pages if pg.get("_pdf")}
@@ -2737,6 +3262,7 @@ def run(args, backend=None):
             "error": "提取期间材料字节发生变化，已拒绝把旧文本与新版本哈希绑定：%s"
                      % "、".join(changed_sources)
         }, report
+    _annotate_ingestion_languages(ingestion_pages, report)
     raw_input = build_raw_input(course, sections, lecture_items, homework_items)
     try:
         raw_input["ingestion"] = build_ingestion_payload(
@@ -2746,6 +3272,17 @@ def run(args, backend=None):
             sections=sections,
             quiz_items=raw_input["quiz_bank"],
             report=report,
+            parser_receipts=_merge_parser_receipts(
+                _core_parser_receipts(
+                    materials,
+                    all_source_paths,
+                    ingestion_pages,
+                    source_snapshot_hashes,
+                    backend,
+                    report,
+                ),
+                optional_parser_receipts,
+            ),
         )
     except Exception as exc:
         # The compatibility output must never claim success when its durable
@@ -2755,38 +3292,51 @@ def run(args, backend=None):
     return 0, raw_input, report
 
 
-def main(argv=None, backend=None):
-    # reconfigure BEFORE parse_args so argparse's Chinese --help text prints on Windows consoles
-    # (cp1252) without a UnicodeEncodeError that would make `--help` exit non-zero.
-    for _stream in (sys.stdout, sys.stderr):
-        try:
-            _stream.reconfigure(encoding="utf-8")
-        except Exception:
-            pass
-    args = build_arg_parser().parse_args(argv)
-    code, raw_input, report = run(args, backend=backend)
+def run(args, backend=None, adapter_runner=None, *, _publication_locked=False,
+        publication_workspace=None):
+    """Build in memory while serializing every validator-visible asset write."""
+
+    workspace = _publication_workspace(args, explicit=publication_workspace)
+    if workspace is not None and not _publication_locked:
+        with workspace_publication_lock(workspace):
+            return _run_unlocked(
+                args, backend=backend, adapter_runner=adapter_runner
+            )
+    return _run_unlocked(args, backend=backend, adapter_runner=adapter_runner)
+
+
+def _main_locked(args, backend=None, publication_workspace=None):
+    """Run and publish while the caller owns the workspace publication lock."""
+
+    code, raw_input, report = run(
+        args,
+        backend=backend,
+        _publication_locked=True,
+        publication_workspace=publication_workspace,
+    )
     if code != 0:
         sys.stderr.write((raw_input or {}).get("error", "失败") + "\n")
         if report is not None:
-            with open(args.report, "w", encoding="utf-8") as f:
-                json.dump(report, f, ensure_ascii=False, indent=2)
+            atomic_write_json(args.report, report)
             if report.get("ai_review"):
                 # 失败退出同样要留接管清单——exit 4（全是扫描件）正是最需要 AI 接管的场景
                 mp = os.path.join(os.path.dirname(os.path.abspath(args.report)), "ai_review_manifest.json")
-                with open(mp, "w", encoding="utf-8") as f:
-                    json.dump({"note": "程序无法处理/不确定的材料清单——AI 必须逐条处理，绝不静默略过",
-                               "entries": report["ai_review"]}, f, ensure_ascii=False, indent=2)
+                atomic_write_json(
+                    mp,
+                    {"note": "程序无法处理/不确定的材料清单——AI 必须逐条处理，绝不静默略过",
+                     "entries": report["ai_review"]},
+                )
                 print("[!] AI 接管清单：%d 条未能自动处理的材料 → %s（请逐条处理）"
                       % (len(report["ai_review"]), mp))
         return code
-    with open(args.out, "w", encoding="utf-8") as f:
-        json.dump(raw_input, f, ensure_ascii=False, indent=2)
-    with open(args.report, "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
+    atomic_write_json(args.out, raw_input)
+    atomic_write_json(args.report, report)
     manifest_path = os.path.join(os.path.dirname(os.path.abspath(args.report)), "ai_review_manifest.json")
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump({"note": "程序无法处理/不确定的材料清单——AI 必须逐条处理，绝不静默略过",
-                   "entries": report.get("ai_review", [])}, f, ensure_ascii=False, indent=2)
+    atomic_write_json(
+        manifest_path,
+        {"note": "程序无法处理/不确定的材料清单——AI 必须逐条处理，绝不静默略过",
+         "entries": report.get("ai_review", [])},
+    )
     if report.get("ai_review"):
         print("[!] AI 接管清单：%d 条未能自动处理的材料 → %s（请逐条处理）"
               % (len(report["ai_review"]), manifest_path))
@@ -2796,6 +3346,42 @@ def main(argv=None, backend=None):
     print("[+] report: %s（后端 %s，渲染 %d 页，警告 %d）"
           % (args.report, report["backend"], report["pages_rendered"], len(report["warnings"])))
     return 0
+
+
+def main(argv=None, backend=None):
+    # Reconfigure before parse_args so Chinese --help text prints on Windows.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+    args = build_arg_parser().parse_args(argv)
+    try:
+        workspace = _publication_workspace(args)
+        if workspace is None:
+            return _main_locked(args, backend=backend)
+        ingest_path = os.path.join(workspace, ".ingest")
+        ingest_preexisting = os.path.lexists(ingest_path)
+        with workspace_publication_lock(workspace):
+            if ingest_preexisting and not os.path.lexists(ingest_path):
+                raise ConflictError(".ingest changed while acquiring the publication lock")
+            if (not ingest_preexisting
+                    and _writes_ingestion_files(args, workspace)):
+                # publication_lock holds state.  A new .ingest did not exist for
+                # it to lock, so create/hold mutation.lock before the first JSON.
+                with IngestionStore(workspace).mutation_lock():
+                    return _main_locked(
+                        args, backend=backend, publication_workspace=workspace
+                    )
+            return _main_locked(
+                args, backend=backend, publication_workspace=workspace
+            )
+    except ConflictError as exc:
+        sys.stderr.write("builder publication conflict: %s\n" % exc)
+        return 7
+    except (OSError, ValueError) as exc:
+        sys.stderr.write("builder publication failed: %s\n" % exc)
+        return 2
 
 
 if __name__ == "__main__":

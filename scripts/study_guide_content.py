@@ -23,7 +23,39 @@ import stat
 import sys
 import tempfile
 import unicodedata
+from contextlib import contextmanager
 from pathlib import PurePosixPath
+
+try:
+    from ingestion.claims import (
+        CLAIM_RECORDS_PATH,
+        CLAIM_RECEIPTS_DIR,
+        ClaimVerificationReceipt,
+        canonical_fact_snapshot_sha256,
+        canonical_manifest_sha256,
+        load_claim_records,
+        validate_guide_claim_coverage,
+        verify_claim_records,
+    )
+    from ingestion.dedup import validate_workspace_fact_integrity
+    from ingestion.identifiers import file_sha256
+    from ingestion.models import ContentUnit, SchemaValidationError, SourceRecord
+    from ingestion.storage import ConflictError, workspace_publication_lock
+except ImportError:  # imported as ``scripts.study_guide_content`` from the repo root
+    from scripts.ingestion.claims import (
+        CLAIM_RECORDS_PATH,
+        CLAIM_RECEIPTS_DIR,
+        ClaimVerificationReceipt,
+        canonical_fact_snapshot_sha256,
+        canonical_manifest_sha256,
+        load_claim_records,
+        validate_guide_claim_coverage,
+        verify_claim_records,
+    )
+    from scripts.ingestion.dedup import validate_workspace_fact_integrity
+    from scripts.ingestion.identifiers import file_sha256
+    from scripts.ingestion.models import ContentUnit, SchemaValidationError, SourceRecord
+    from scripts.ingestion.storage import ConflictError, workspace_publication_lock
 
 
 SCHEMA_VERSION = 1
@@ -35,6 +67,14 @@ SOLUTION_KINDS = {"formula", "concept", "procedure"}
 SOURCE_ROLES = {"concept", "formula", "question", "answer", "solution"}
 SOURCE_TYPES = {"lecture", "homework", "quiz", "mock_exam", "past_exam", "textbook", "other"}
 ANSWER_PROVENANCE = {"material", "ai_supplemented", "ai_generated"}
+EXPLANATION_PROVENANCE = {"material", "ai_translation", "ai_supplement"}
+EXPLANATION_PROVENANCE_LABELS = {
+    "material": ("🟢 来自资料", "🟢 From your materials"),
+    "ai_translation": ("🟡 AI翻译，原资料为另一种语言",
+                       "🟡 AI translation — source material is in another language"),
+    "ai_supplement": ("🟡 AI补充，可能与你老师讲的不完全一致",
+                      "🟡 AI supplement — may differ from what your teacher taught"),
+}
 SEMANTIC_UNIT_KINDS = {
     "title", "heading", "text", "list", "table", "formula", "figure", "diagram",
     "caption", "code", "speaker_notes", "other",
@@ -66,6 +106,7 @@ MARKER_PREFIX = "EXAMPREP-STUDY-GUIDE-CONTENT:"
 _ID_RE = re.compile(r"^[^\s\[\]#|`/\\]+$")
 _DRIVE_RE = re.compile(r"^[A-Za-z]:")
 _SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+_CLAIM_ID_RE = re.compile(r"^claim_[0-9a-f]{64}$")
 
 
 class ContentError(ValueError):
@@ -507,7 +548,10 @@ def _source_ref(ws, value, path, unit_index=None, structured=False):
         value,
         path,
         ("source_file", "pages"),
-        ("source_unit_id", "quote_span", "asset_path", "role", "contains_full_prompt"),
+        (
+            "source_unit_id", "quote_span", "asset_path", "role",
+            "contains_full_prompt", "claim_id",
+        ),
     )
     source_file = _safe_relative_path(value["source_file"], path + ".source_file")
     pages = _positive_pages(value["pages"], path + ".pages")
@@ -532,6 +576,10 @@ def _source_ref(ws, value, path, unit_index=None, structured=False):
                                % (path, unit, source_unit.get("page")))
     if "quote_span" in value:
         _text(value["quote_span"], path + ".quote_span")
+    if "claim_id" in value:
+        claim_id = value["claim_id"]
+        if not isinstance(claim_id, str) or not _CLAIM_ID_RE.fullmatch(claim_id):
+            raise ContentError("%s.claim_id must be claim_<sha256>" % path)
     if "asset_path" in value:
         asset_path = _workspace_asset(ws, value["asset_path"], path + ".asset_path")
         if source_unit is not None:
@@ -910,7 +958,7 @@ def _knowledge_ref_unit_ids(refs, expected_role, chapter, unit_index, path):
 def _validate_knowledge_point(ws, value, language, path, formula_ids, formula_symbols,
                               chapter=None, unit_index=None, structured=False):
     required = ["id", "title", "explanation", "formulas", "source_refs", "example_ids"]
-    optional = []
+    optional = ["explanation_provenance"]
     if structured:
         required.append("source_unit_ids")
     else:
@@ -918,7 +966,21 @@ def _validate_knowledge_point(ws, value, language, path, formula_ids, formula_sy
     _shape(value, path, required, optional)
     kp_id = _identifier(value["id"], path + ".id")
     _localized(value["title"], language, path + ".title")
-    _localized(value["explanation"], language, path + ".explanation")
+    explanation = _localized(value["explanation"], language, path + ".explanation")
+    provenance = value.get("explanation_provenance")
+    if provenance is not None:
+        _shape(provenance, path + ".explanation_provenance", (), ("zh", "en"))
+        if set(provenance) != set(explanation):
+            raise ContentError(
+                "%s.explanation_provenance must label every authored explanation language"
+                % path
+            )
+        for code, label in provenance.items():
+            if label not in EXPLANATION_PROVENANCE:
+                raise ContentError(
+                    "%s.explanation_provenance.%s must be one of %s"
+                    % (path, code, sorted(EXPLANATION_PROVENANCE))
+                )
     concept_refs = _source_refs(
         ws, value["source_refs"], path + ".source_refs",
         unit_index=unit_index, structured=structured,
@@ -1512,7 +1574,110 @@ def _validate_walkthrough_notebook_anchors(ws, chapter, walkthroughs, require_al
     return validated
 
 
-def validate_manifest(workspace, chapter, manifest):
+def _ingestion_pipeline_version(ws):
+    """Return the declared ingestion generation without upgrading legacy workspaces.
+
+    Structured workspaces must declare their generation explicitly.  This
+    prevents deleting one field from silently downgrading a v2 workspace around
+    its claim gate.  Genuine v1 builds remain supported when they say so.
+    """
+
+    path = os.path.join(ws, ".ingest", "build_manifest.json")
+    if not os.path.lexists(path):
+        raise ContentError(
+            "structured workspace requires .ingest/build_manifest.json with explicit pipeline_version"
+        )
+    _guard_workspace_child(ws, path, ".ingest/build_manifest.json", require_file=True)
+    document = _read_json(path, ".ingest/build_manifest.json")
+    if not isinstance(document, dict) or document.get("schema_version") != 1:
+        raise ContentError(".ingest/build_manifest.json has an invalid schema_version")
+    version = document.get("pipeline_version")
+    if version not in ("ingestion-v1", "ingestion-v2"):
+        raise ContentError(".ingest/build_manifest.json pipeline_version is unsupported")
+    return version
+
+
+def _validate_v2_claim_gate(ws, chapter, manifest, inventory):
+    """Recompute the current location-only receipt and enforce material coverage."""
+
+    chapter_id = "ch%02d" % chapter
+    ingest_paths = {
+        "source_manifest": ".ingest/source_manifest.json",
+        "content_units": ".ingest/content_units.jsonl",
+        "canonical_groups": ".ingest/canonical_groups.jsonl",
+        "source_conflicts": ".ingest/source_conflicts.jsonl",
+        "claim_records": CLAIM_RECORDS_PATH,
+        "receipt": "%s/%s.json" % (CLAIM_RECEIPTS_DIR, chapter_id),
+    }
+    absolute = {}
+    for label, relative in ingest_paths.items():
+        path = os.path.join(ws, *relative.split("/"))
+        _guard_workspace_child(ws, path, relative, require_file=True)
+        absolute[label] = path
+    try:
+        source_document = _read_json(absolute["source_manifest"], ".ingest/source_manifest.json")
+        if (not isinstance(source_document, dict)
+                or set(source_document) != {"schema_version", "sources"}
+                or source_document.get("schema_version") != 1
+                or not isinstance(source_document.get("sources"), list)):
+            raise ContentError(".ingest/source_manifest.json has an invalid exact schema")
+        sources = tuple(SourceRecord.from_dict(row) for row in source_document["sources"])
+        units = tuple(ContentUnit.from_dict(row) for row in inventory["units"])
+        records = load_claim_records(ws, allow_empty=True)
+        fact_integrity = validate_workspace_fact_integrity(ws)
+        conflicts = fact_integrity["conflicts"]
+        unresolved = sorted(
+            conflict.conflict_id for conflict in conflicts
+            if conflict.status == "unresolved"
+        )
+        if unresolved:
+            raise ContentError(
+                "ingestion-v2 Study Guide is blocked by unresolved source conflicts: %s"
+                % unresolved
+            )
+        coverage = validate_guide_claim_coverage(
+            records, manifest, chapter_id, units
+        )
+        receipt_document = _read_json(
+            absolute["receipt"], ".ingest/claim_verification_receipts/%s.json" % chapter_id
+        )
+        receipt = ClaimVerificationReceipt.from_dict(receipt_document)
+        expected = verify_claim_records(
+            records,
+            units,
+            sources,
+            chapter_id,
+            manifest=manifest,
+            guide_content_sha256=canonical_manifest_sha256(manifest),
+            source_manifest_sha256=file_sha256(absolute["source_manifest"]),
+            content_units_sha256=file_sha256(absolute["content_units"]),
+            canonical_groups_sha256=file_sha256(absolute["canonical_groups"]),
+            source_conflicts_sha256=file_sha256(absolute["source_conflicts"]),
+            claim_records_sha256=file_sha256(absolute["claim_records"]),
+            fact_snapshot_sha256=canonical_fact_snapshot_sha256(
+                fact_integrity["snapshot"]
+            ),
+        )
+        if receipt.to_dict() != expected.to_dict():
+            raise ContentError(
+                "claim verification receipt is stale or does not match the current guide/source facts"
+            )
+    except ContentError:
+        raise
+    except (OSError, ValueError, TypeError) as exc:
+        raise ContentError("ingestion-v2 claim verification failed: %s" % exc)
+    return {
+        "required": True,
+        "verification_scope": "location_only",
+        "receipt_id": receipt.receipt_id,
+        "verified_claim_count": receipt.verified_claim_count,
+        "fact_snapshot_sha256": receipt.fact_snapshot_sha256,
+        "required_material_assertion_count": len(coverage),
+        "fact_integrity": fact_integrity["snapshot"],
+    }
+
+
+def validate_manifest(workspace, chapter, manifest, _enforce_v2_claims=True):
     """Validate a parsed manifest against the current chapter source slices.
 
     ``full`` is an exact set equality gate. ``abridged`` must partition the same expected set
@@ -1681,7 +1846,14 @@ def validate_manifest(workspace, chapter, manifest):
             raise ContentError("profile=abridged must partition all expected items; unaccounted=%s"
                                % sorted(expected - walkthrough_ids - omission_ids))
 
-    return {
+    claim_verification = None
+    if (structured and _enforce_v2_claims
+            and _ingestion_pipeline_version(ws) == "ingestion-v2"):
+        claim_verification = _validate_v2_claim_gate(
+            ws, chapter, manifest, inventory
+        )
+
+    report = {
         "ok": True,
         "schema_version": SCHEMA_VERSION,
         "chapter": chapter,
@@ -1701,6 +1873,9 @@ def validate_manifest(workspace, chapter, manifest):
         },
         "notebook_anchor_count": notebook_anchor_count,
     }
+    if claim_verification is not None:
+        report["claim_verification"] = claim_verification
+    return report
 
 
 def manifest_path(workspace, chapter):
@@ -1708,6 +1883,17 @@ def manifest_path(workspace, chapter):
     if isinstance(chapter, bool) or not isinstance(chapter, int) or chapter < 1:
         raise ContentError("chapter must be an integer >= 1")
     return os.path.join(ws, "notebook", "ch%02d.guide.json" % chapter)
+
+
+@contextmanager
+def _study_guide_mutation_lock(ws):
+    """Use the global state->ingestion lock order for Guide publication."""
+
+    try:
+        with workspace_publication_lock(ws):
+            yield
+    except (ConflictError, SchemaValidationError, OSError) as exc:
+        raise ContentError("cannot mutate Study Guide: %s" % exc) from exc
 
 
 def load_and_validate_manifest(workspace, chapter, path=None):
@@ -1781,6 +1967,17 @@ def render_notebook_block(manifest):
         lines.append("#### `%s` · %s" % (kp["id"], _heading_title(kp["title"], language)))
         lines.append("")
         _localized_lines(lines, "解释", "Explanation", kp["explanation"], language)
+        explanation_provenance = kp.get("explanation_provenance") or {
+            code: "material" for code in kp["explanation"]
+        }
+        for code in ("zh", "en"):
+            if code not in _target_languages(language):
+                continue
+            label = EXPLANATION_PROVENANCE_LABELS[explanation_provenance[code]][
+                0 if code == "zh" else 1]
+            lines.append("- **%s (%s)%s** %s" % (
+                _view_label(language, "解释来源性质", "Explanation provenance"),
+                "中文" if code == "zh" else "English", colon, label))
         lines.append("- **%s%s** %s" % (
             _view_label(language, "例题", "Examples"),
             "：" if language == "zh" else ":",
@@ -2001,7 +2198,7 @@ def _read_optional_text(path):
     return text
 
 
-def _atomic_write_text(path, text):
+def _atomic_write_text(path, text, before_publish=None):
     directory = os.path.dirname(path)
     descriptor, temporary = tempfile.mkstemp(
         prefix=".%s." % os.path.basename(path), suffix=".tmp", dir=directory)
@@ -2010,6 +2207,8 @@ def _atomic_write_text(path, text):
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
+        if before_publish is not None:
+            before_publish()
         os.replace(temporary, path)
         if os.name != "nt":
             try:
@@ -2032,11 +2231,33 @@ def _publish_manifest(ws, chapter, manifest, report):
     updated_notebook = _merge_notebook(existing, chapter, rendered)
     canonical_json = json.dumps(
         manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    expected_facts = (
+        (report.get("claim_verification") or {}).get("fact_integrity")
+    )
+
+    def recheck_before_manifest_publish():
+        if expected_facts is None:
+            return
+        try:
+            current = validate_workspace_fact_integrity(ws)["snapshot"]
+        except (OSError, TypeError, ValueError) as exc:
+            raise ContentError(
+                "ingestion fact integrity changed before Study Guide import publication: %s"
+                % exc
+            ) from exc
+        if current != expected_facts:
+            raise ContentError(
+                "ingestion fact inputs changed before Study Guide import publication"
+            )
     # Ordering is intentional: a failed notebook update must never publish a manifest that claims
     # durable tutor evidence.  Both individual replacements are atomic and fail loud.
     try:
         _atomic_write_text(md_path, updated_notebook)
-        _atomic_write_text(json_path, canonical_json)
+        _atomic_write_text(
+            json_path,
+            canonical_json,
+            before_publish=recheck_before_manifest_publish,
+        )
     except OSError as exc:
         raise ContentError("cannot atomically publish study-guide content: %s" % exc)
     report.update({
@@ -2050,10 +2271,12 @@ def _publish_manifest(ws, chapter, manifest, report):
 def import_manifest(workspace, chapter, input_path):
     """Validate, update the notebook marker first, then atomically publish canonical JSON."""
     ws = _guard_workspace(workspace)
-    manifest, report = load_and_validate_manifest(ws, chapter, input_path)
-    report["notebook_anchor_count"] = _validate_walkthrough_notebook_anchors(
-        ws, chapter, manifest["walkthroughs"], require_all=True)
-    return _publish_manifest(ws, chapter, manifest, report)
+    with _study_guide_mutation_lock(ws):
+        manifest, report = load_and_validate_manifest(ws, chapter, input_path)
+        report["notebook_anchor_count"] = _validate_walkthrough_notebook_anchors(
+            ws, chapter, manifest["walkthroughs"], require_all=True)
+        report["invalidated_artifacts"] = _invalidate_chapter_artifacts(ws, chapter)
+        return _publish_manifest(ws, chapter, manifest, report)
 
 
 def _invalidate_chapter_artifacts(ws, chapter):
@@ -2098,51 +2321,110 @@ def _invalidate_chapter_artifacts(ws, chapter):
     return invalidated
 
 
-def relocalize_manifest(workspace, chapter, language):
-    """Project already-authored locale blocks into the newly selected language.
+def relocalize_manifest(workspace, chapter, language, output_path=None):
+    """Project already-authored locale blocks into a selected language.
 
-    This performs no translation.  A switch that needs a missing authored locale fails and asks
-    the tutor to add it.  Translation fields are narrowed to exactly the language absent from a
-    visible full-prompt source, preventing the old original-question duplication from returning.
+    This performs no translation.  In ingestion-v2 a language change alters the
+    canonical guide hash and may add new material-claim slots, so the command
+    writes a staging draft when ``output_path`` is supplied.  The caller then
+    refreshes claims/receipt and imports that exact draft.  v1 keeps the legacy
+    one-command publish behavior.
     """
+
     ws = _guard_workspace(workspace)
     if language not in LANGUAGES:
         raise ContentError("language must be zh/en/bilingual")
-    path = manifest_path(ws, chapter)
-    original = _read_json(path, "study-guide content manifest")
-    if not isinstance(original, dict) or original.get("language") not in LANGUAGES:
-        raise ContentError("existing study-guide manifest has no valid canonical language")
-    manifest = copy.deepcopy(original)
-    walks = manifest.get("walkthroughs")
-    if not isinstance(walks, list):
-        raise ContentError("existing study-guide manifest walkthroughs must be an array")
-    for index, walk in enumerate(walks):
-        if not isinstance(walk, dict):
-            raise ContentError("walkthroughs[%d] must be an object" % index)
-        original_language = walk.get("original_language")
-        if original_language not in ORIGINAL_LANGUAGES:
-            raise ContentError("walkthroughs[%d].original_language is invalid" % index)
-        translation = walk.get("translation")
-        if not isinstance(translation, dict):
-            raise ContentError("walkthroughs[%d].translation must be an object" % index)
-        source_languages = {
-            "zh": {"zh"}, "en": {"en"}, "mixed": {"zh", "en"}, "unknown": set(),
-        }[original_language]
-        needed = _target_languages(language) - source_languages
-        missing = needed - set(translation)
-        if missing:
-            raise ContentError(
-                "cannot relocalize walkthrough %r to %s; authored prompt translation is missing: %s"
-                % (walk.get("item_id"), language, sorted(missing)))
-        # Preserve authored non-source locale blocks so a later language switch is reversible.
-        # Validation and the renderer select only the target language(s) needed for this view.
-        walk["translation"] = dict(translation)
-    manifest["language"] = language
-    report = validate_manifest(ws, chapter, manifest)
-    report["relocalized_from"] = original["language"]
-    report["relocalized_to"] = language
-    report["invalidated_artifacts"] = _invalidate_chapter_artifacts(ws, chapter)
-    return _publish_manifest(ws, chapter, manifest, report)
+    with _study_guide_mutation_lock(ws):
+        path = manifest_path(ws, chapter)
+        original = _read_json(path, "study-guide content manifest")
+        if not isinstance(original, dict) or original.get("language") not in LANGUAGES:
+            raise ContentError("existing study-guide manifest has no valid canonical language")
+        manifest = copy.deepcopy(original)
+        walks = manifest.get("walkthroughs")
+        if not isinstance(walks, list):
+            raise ContentError("existing study-guide manifest walkthroughs must be an array")
+        for index, walk in enumerate(walks):
+            if not isinstance(walk, dict):
+                raise ContentError("walkthroughs[%d] must be an object" % index)
+            original_language = walk.get("original_language")
+            if original_language not in ORIGINAL_LANGUAGES:
+                raise ContentError("walkthroughs[%d].original_language is invalid" % index)
+            translation = walk.get("translation")
+            if not isinstance(translation, dict):
+                raise ContentError("walkthroughs[%d].translation must be an object" % index)
+            source_languages = {
+                "zh": {"zh"}, "en": {"en"}, "mixed": {"zh", "en"}, "unknown": set(),
+            }[original_language]
+            needed = _target_languages(language) - source_languages
+            missing = needed - set(translation)
+            if missing:
+                raise ContentError(
+                    "cannot relocalize walkthrough %r to %s; authored prompt translation is missing: %s"
+                    % (walk.get("item_id"), language, sorted(missing)))
+            # Preserve authored non-source locale blocks so a later language switch is reversible.
+            walk["translation"] = dict(translation)
+        manifest["language"] = language
+        pipeline_version = (
+            _ingestion_pipeline_version(ws)
+            if os.path.lexists(os.path.join(ws, ".ingest")) else "ingestion-v1"
+        )
+        if pipeline_version == "ingestion-v2":
+            if output_path is None:
+                raise ContentError(
+                    "ingestion-v2 relocalize requires --output staging JSON; refresh its claims "
+                    "and chNN receipt, then run study_guide_content import"
+                )
+            if os.path.isabs(output_path):
+                raise ContentError(
+                    "ingestion-v2 relocalize --output must be a workspace-relative notebook draft"
+                )
+            relative_output = _safe_relative_path(
+                output_path, "relocalized staging manifest"
+            )
+            staging_pattern = r"notebook/ch%02d(?:\.[A-Za-z0-9_-]+)*\.draft\.json" % chapter
+            if not re.fullmatch(staging_pattern, relative_output):
+                raise ContentError(
+                    "ingestion-v2 relocalize --output must match "
+                    "notebook/ch%02d.*.draft.json" % chapter
+                )
+            destination = os.path.join(ws, *relative_output.split("/"))
+            _guard_workspace_child(
+                ws, destination, "relocalized staging manifest", allow_missing=True
+            )
+            if destination == os.path.abspath(path):
+                raise ContentError("relocalized staging output must not overwrite the canonical manifest")
+            report = validate_manifest(
+                ws, chapter, manifest, _enforce_v2_claims=False
+            )
+            parent = os.path.dirname(destination)
+            os.makedirs(parent, exist_ok=True)
+            _guard_workspace_child(ws, parent, "relocalized staging directory")
+            _atomic_write_text(
+                destination,
+                json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+            )
+            report.update({
+                "relocalized_from": original["language"],
+                "relocalized_to": language,
+                "prepared": True,
+                "imported": False,
+                "artifact_ready": False,
+                "claim_verification": {
+                    "required": True,
+                    "status": "pending",
+                    "verification_scope": "location_only",
+                },
+                "staging_path": destination,
+                "invalidated_artifacts": [],
+            })
+            return report
+        if output_path is not None:
+            raise ContentError("--output is only needed for ingestion-v2 relocalization")
+        report = validate_manifest(ws, chapter, manifest)
+        report["relocalized_from"] = original["language"]
+        report["relocalized_to"] = language
+        report["invalidated_artifacts"] = _invalidate_chapter_artifacts(ws, chapter)
+        return _publish_manifest(ws, chapter, manifest, report)
 
 
 def _parser():
@@ -2163,6 +2445,10 @@ def _parser():
         "relocalize", help="reuse already-authored locale blocks after a state language switch")
     relocalize.add_argument("--chapter", required=True, type=int)
     relocalize.add_argument("--language", required=True, choices=sorted(LANGUAGES))
+    relocalize.add_argument(
+        "--output",
+        help="ingestion-v2 staging JSON inside the workspace; verify claims, then import it",
+    )
     relocalize.add_argument("--json", action="store_true")
     return parser
 
@@ -2178,7 +2464,9 @@ def run(argv=None):
             report = import_manifest(args.workspace, args.chapter, args.input)
             report["command"] = "import"
         else:
-            report = relocalize_manifest(args.workspace, args.chapter, args.language)
+            report = relocalize_manifest(
+                args.workspace, args.chapter, args.language, args.output
+            )
             report["command"] = "relocalize"
     except ContentError as exc:
         if getattr(args, "json", False):
@@ -2189,10 +2477,18 @@ def run(argv=None):
     if getattr(args, "json", False):
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
-        action = "imported" if report.get("imported") else "valid"
-        print("[+] chapter %d study-guide content %s (%s, %d walkthroughs, %d omissions)"
-              % (report["chapter"], action, report["profile"],
-                 len(report["walkthrough_item_ids"]), len(report["omitted_item_ids"])))
+        if report.get("prepared") and not report.get("imported"):
+            print(
+                "[+] chapter %d unsigned staging prepared; claim verification pending "
+                "(%s, %d walkthroughs, %d omissions)"
+                % (report["chapter"], report["profile"],
+                   len(report["walkthrough_item_ids"]), len(report["omitted_item_ids"]))
+            )
+        else:
+            action = "imported" if report.get("imported") else "valid"
+            print("[+] chapter %d study-guide content %s (%s, %d walkthroughs, %d omissions)"
+                  % (report["chapter"], action, report["profile"],
+                     len(report["walkthrough_item_ids"]), len(report["omitted_item_ids"])))
     return 0
 
 

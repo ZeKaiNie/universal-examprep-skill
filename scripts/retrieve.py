@@ -277,7 +277,10 @@ def _verify_integrity(ws, integrity):
     if not isinstance(wiki, list):
         _die("retrieval_index.json integrity.wiki 必须是数组——请重跑 ingest 重建")
     rows = list(wiki)
-    for key in ("source_manifest", "content_units", "quiz_bank"):
+    for key in (
+        "source_manifest", "content_units", "canonical_groups",
+        "source_conflicts", "quiz_bank",
+    ):
         if integrity.get(key) is not None:
             rows.append(integrity[key])
     for row in rows:
@@ -335,7 +338,10 @@ def load_index(ws):
     integrity_files = set()
     if isinstance(idx["integrity"], dict):
         integrity_rows = list(idx["integrity"].get("wiki") or ())
-        for key in ("source_manifest", "content_units", "quiz_bank"):
+        for key in (
+            "source_manifest", "content_units", "canonical_groups",
+            "source_conflicts", "quiz_bank",
+        ):
             if idx["integrity"].get(key) is not None:
                 integrity_rows.append(idx["integrity"][key])
         for row in integrity_rows:

@@ -161,7 +161,10 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
             "knowledge_points": [{
                 "id": "kp-speed", "title": both("平均速度", "Average speed"),
                 "explanation": both("把总路程平均分配到每个单位时间。",
-                                    "Distribute total distance over each unit of time."),
+                                     "Distribute total distance over each unit of time."),
+                "explanation_provenance": {
+                    "zh": "ai_translation", "en": "material",
+                },
                 "formulas": [formula], "source_refs": [self._source("concept")],
                 "example_ids": ["ex-lecture-1"],
             }],
@@ -182,6 +185,7 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
         self.assertIn("代入数字 / 条件 / Substitute values / conditions", document)
         self.assertIn("⑦ 来源追踪 / ⑦ Source trace", document)
         self.assertIn("🟡 AI补充，可能与你老师讲的不完全一致", document)
+        self.assertIn("🟡 AI翻译，原资料为另一种语言", document)
         self.assertNotIn("🟢 来自资料", document)
         self.assertIn("🟢 From your materials", document)
         expected_uri = Path(os.path.join(

@@ -1,6 +1,7 @@
 # Slim source archives: GitHub's auto-generated release zip/tarball ("Source code" links)
-# excludes dev-only trees via export-ignore, so a student who downloads the archive gets the
-# runtime surface (~16% of the repo) instead of the full dev monorepo. Cloning is unaffected.
+# exclude the large dev/test trees, but remain a source archive with README-linked docs.
+# They are deliberately not the exact student runtime manifest; scripts/build_dist.py is
+# authoritative for that surface and exam_start.py hashes the same custom manifest.
 # Mark both the tree entry and its contents: Git attributes do not make a
 # directory pattern recursive, while a contents-only pattern leaves an empty
 # directory entry in `git archive`.
@@ -22,3 +23,8 @@ docs/releases   export-ignore
 docs/releases/** export-ignore
 .gitattributes  export-ignore
 .gitignore      export-ignore
+
+# Reproducible Gold Set/media fixtures must never receive text/EOL conversion.
+*.pdf binary
+*.png binary
+*.xlsx binary
