@@ -24,7 +24,7 @@ Activate when the confirmed workspace lacks its wiki, bank, or progress state; w
 
 ## Workflow
 
-1. **Use the official one-command entry.** Run from the package root:
+1. **Pass the executable start gate, then use the official ingestion entry.** The exact materials/workspace pair and all three choices must already have been persisted with `exam_start.py confirm` as specified by `exam-cram`; a bare registry row or `update_progress.py set` is insufficient. Verify read-only with `exam_start.py status --materials <dir> --workspace <ws> --json`, then run from the package root:
 
    ```text
    python scripts/ingest_course.py --materials <dir> --workspace <ws> --json [--course-name <name>] [--lang zh|en] [--artifact-mode chat|visual]
@@ -64,7 +64,7 @@ Load the matching student wording before emitting a receipt:
 - `English` → [`../../locales/en/skills/exam-ingest.md`](../../locales/en/skills/exam-ingest.md)
 - `双语` → compose both packs block by block, Chinese first with a `> EN:` mirror
 
-`zh`, `en`, and `bilingual` are command aliases only; they are normalized before persistence and stored language values are canonical.
+`zh`, `en`, and `bilingual` are the persisted canonical values. `中文`, `English`, and `双语` are display/legacy input aliases normalized before storage.
 
 ## Boundaries
 

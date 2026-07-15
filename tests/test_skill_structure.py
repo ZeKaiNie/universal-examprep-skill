@@ -160,11 +160,19 @@ class TestSkillCollectionStructure(unittest.TestCase):
 
     def test_human_reading_view_is_routed_without_silent_skill_download(self):
         tutor = read("skills", "exam-tutor", "SKILL.md")
+        study_guide = read("skills", "exam-study-guide", "SKILL.md")
         agents = read("AGENTS.md")
-        self.assertIn("study_guide_render.py", tutor)
-        self.assertIn("pdf-capability-adapters.md", tutor)
-        self.assertIn("never silently download", tutor.lower())
-        self.assertIn("pdf-capability-adapters.json", agents)
+        # The tutor owns the teaching/completion decision, but delegates the
+        # renderer-specific workflow to the dedicated artifact sub-skill.
+        self.assertIn("invoke `exam-study-guide`", tutor)
+        self.assertIn("visual", tutor)
+        self.assertIn("one-shot", tutor.lower())
+        self.assertNotIn("study_guide_render.py", tutor)
+
+        self.assertIn("study_guide_render.py", study_guide)
+        self.assertIn("pdf-capability-adapters.md", study_guide)
+        self.assertIn("never install silently", study_guide.lower())
+        self.assertIn("silently install a dependency/skill", agents.lower())
 
     def test_artifact_mode_is_explicit_economical_and_one_shot_safe(self):
         cram = read("skills", "exam-cram", "SKILL.md")
@@ -180,7 +188,7 @@ class TestSkillCollectionStructure(unittest.TestCase):
         self.assertIn("subscription tier", cram.lower())
         self.assertIn("one-shot", cram.lower())
         self.assertIn("does not modify the persisted value", cheatsheet)
-        self.assertIn("不自动生成章节 HTML/PDF", help_zh)
+        self.assertIn("不自动生成章节 `HTML/PDF`", help_zh)
         self.assertIn("do not automatically build chapter HTML/PDF", help_en)
 
 

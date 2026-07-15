@@ -49,8 +49,8 @@ def run(argv=None):
     ap.add_argument("--id", required=True, help="question id")
     ap.add_argument("--with-answer", action="store_true", help="append answer-side assets afterwards (hidden by default)")
     ap.add_argument("--lang", default="zh",
-                    help="reply-language mode for the visible asset label. Accepts zh/en or the "
-                         "persisted study_state.json values `中文`/`English`/`双语` (`中文` and `双语` "
+                    help="reply-language mode for the visible asset label. Accepts canonical "
+                         "zh/en/bilingual plus legacy/display aliases `中文`/`English`/`双语` (`中文` and `双语` "
                          "map to zh labels `题面图`/`答案图`; `English` maps to en labels "
                          "Question-side/Answer-side asset). The `双语` caller emits the zh labels and "
                          "adds its own `> EN:` mirror.")
@@ -59,7 +59,7 @@ def run(argv=None):
     import i18n                                  # 同目录
     code, _w = i18n.canon_language(str(args.lang))
     if code not in i18n.LANGS:
-        _die("--lang 只接受 zh/en/bilingual 或持久化值 中文/English/双语，收到: %r" % args.lang)
+        _die("--lang 只接受规范值 zh/en/bilingual 或显示别名 中文/English/双语，收到: %r" % args.lang)
     lang = "en" if code == "en" else "zh"
     q_label = "题面图" if lang == "zh" else "Question-side asset"
     a_label = "答案图" if lang == "zh" else "Answer-side asset"

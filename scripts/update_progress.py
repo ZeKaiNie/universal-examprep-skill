@@ -31,7 +31,9 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
+from pathlib import Path
 from urllib.parse import unquote
 
 for _s in ("stdout", "stderr"):
@@ -848,10 +850,10 @@ def _phase_scope_context(ws, record, phase):
 
 
 def _phase_manifest_content(ws, record, phase):
-    """Return (problems, teaching_required) for a complete v4.1 manifest trio."""
+    """Return (problems, teaching_required, chapter_keys) for the v4.1 manifest trio."""
     problems, wiki_names, chapter_keys = _phase_scope_context(ws, record, phase)
     if not phase_manifest_present(ws):
-        return problems, True
+        return problems, True, chapter_keys
     refs = os.path.join(ws, "references")
     figure, ferr = _read_json_value(os.path.join(refs, "figure_page_index.json"))
     image, ierr = _read_json_value(os.path.join(refs, "image_question_index.json"))
@@ -859,7 +861,7 @@ def _phase_manifest_content(ws, record, phase):
     quiz, qerr = _read_json_value(os.path.join(refs, "quiz_bank.json"))
     problems.extend(x for x in (ferr, ierr, terr, qerr) if x)
     if any((ferr, ierr, terr, qerr)):
-        return problems, True
+        return problems, True, chapter_keys
 
     # Zero suspects is meaningful only when the recall net actually ran with all needed backends and
     # source PDFs.  These warning prefixes make one or more denominators unknowable, so accepting the
@@ -987,7 +989,74 @@ def _phase_manifest_content(ws, record, phase):
     if missing_examples:
         problems.append("教学例题 evidence 未覆盖本阶段 manifest 全集: %s"
                         % ", ".join(sorted(missing_examples)))
-    return problems, bool(expected)
+    return problems, bool(expected), chapter_keys
+
+
+def _structured_study_guide_problems(ws, state, chapter_keys):
+    """Fail closed on the typed chapter/visual gates for structured workspaces only.
+
+    ``study_guide_content`` owns the expected-item denominator and source-reference validation.
+    This phase gate deliberately does not duplicate that schema: it loads the canonical manifest,
+    requires the non-abridged profile, and (only for standing visual mode) asks the shared
+    capability model whether the rendered artifact and all-page QA are ready.
+    """
+    ingest = os.path.join(ws, ".ingest")
+    if not os.path.lexists(ingest):
+        return []
+    if os.path.islink(ingest) or not os.path.isdir(ingest):
+        return ["结构化工作区标记 .ingest 必须是工作区内的普通目录"]
+
+    chapters = []
+    for key in sorted(chapter_keys, key=lambda value: int(value) if str(value).isdigit() else 10 ** 9):
+        try:
+            chapter = int(key)
+        except (TypeError, ValueError):
+            return ["无法从当前阶段确定章节号，不能加载 typed Study Guide manifest"]
+        if chapter < 1:
+            return ["当前阶段章节号必须 >=1，不能加载 typed Study Guide manifest"]
+        chapters.append(chapter)
+    if not chapters:
+        return ["无法从当前阶段确定章节号，不能加载 typed Study Guide manifest"]
+
+    problems = []
+    try:
+        from study_guide_content import ContentError, load_and_validate_manifest
+    except (ImportError, OSError) as exc:
+        return ["无法加载 Study Guide manifest validator：%s" % exc]
+
+    for chapter in chapters:
+        try:
+            _manifest, report = load_and_validate_manifest(ws, chapter)
+        except (ContentError, OSError, UnicodeDecodeError, ValueError) as exc:
+            problems.append("当前章 ch%02d 的 typed Study Guide manifest 未通过验证：%s"
+                            % (chapter, exc))
+            continue
+        if report.get("profile") != "full":
+            problems.append("当前章 ch%02d 的 typed Study Guide manifest 必须 profile=full，当前为 %r"
+                            % (chapter, report.get("profile")))
+
+    if i18n.workspace_artifact_mode(state) != "visual":
+        return problems
+
+    # Lazy by design: chat-mode phase completion must not import the PDF/artifact stack.
+    try:
+        from readiness import capability_readiness
+    except (ImportError, OSError) as exc:
+        problems.append("visual 阶段完成无法加载 artifact readiness：%s" % exc)
+        return problems
+    for chapter in chapters:
+        try:
+            capabilities = capability_readiness(ws, chapter=chapter)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            problems.append("当前章 ch%02d 无法计算 artifact readiness：%s" % (chapter, exc))
+            continue
+        artifact = capabilities.get("artifact_ready") if isinstance(capabilities, dict) else None
+        if not isinstance(artifact, dict) or artifact.get("status") != "ready":
+            reasons = artifact.get("reason_codes") if isinstance(artifact, dict) else None
+            suffix = ", ".join(str(reason) for reason in (reasons or [])) or "unknown"
+            problems.append("当前章 ch%02d 的 artifact_ready 必须为 ready（原因：%s）；"
+                            "先完成渲染、receipt 哈希绑定与逐页 QA" % (chapter, suffix))
+    return problems
 
 
 def phase_evidence_ref_error(ws, field, ref):
@@ -1726,8 +1795,9 @@ def _phase_record_problems(ws, state, phase, status):
             problem = phase_evidence_ref_error(ws, field, ref)
             if problem:
                 problems.append("%s 引用无效：%s" % (field, problem))
-    content_problems, teaching_required = _phase_manifest_content(ws, record, phase)
+    content_problems, teaching_required, chapter_keys = _phase_manifest_content(ws, record, phase)
     problems.extend(content_problems)
+    problems.extend(_structured_study_guide_problems(ws, state, chapter_keys))
     problems.extend(_phase_completion_problems(record, status, teaching_required=teaching_required))
     if status == "verified" and _no_questions_preference(state):
         problems.append("preferences.no_questions=true 时不能标为 verified；阶段上限是 covered_unverified")
@@ -1886,6 +1956,7 @@ def cmd_show(ws, _args):
 
 REGISTRY_NAME = "workspaces.json"
 REGISTRY_VERSION = 1
+WORKSPACE_CONFIRMATION_VERSION = 2
 
 
 def _registry_home():
@@ -1895,6 +1966,159 @@ def _registry_home():
 
 def _registry_path():
     return os.path.join(_registry_home(), REGISTRY_NAME)
+
+
+def _canonical_path(path):
+    """Return the comparison form used by workspace confirmation receipts."""
+    # ``realpath`` can preserve a Windows 8.3 spelling (RUNNER~1) while pathlib and
+    # user-facing receipts expose the long spelling (runneradmin).  Resolve once through
+    # pathlib so both spellings have one stable comparison form.
+    return os.path.normcase(str(Path(os.path.abspath(path)).resolve(strict=False)))
+
+
+def _is_link_or_reparse(path):
+    if os.path.islink(path):
+        return True
+    isjunction = getattr(os.path, "isjunction", None)
+    if isjunction is not None:
+        try:
+            if isjunction(path):
+                return True
+        except OSError:
+            pass
+    try:
+        attrs = getattr(os.lstat(path), "st_file_attributes", 0)
+    except OSError:
+        return False
+    return bool(attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+
+
+def _path_has_link_or_reparse(path):
+    current = os.path.abspath(path)
+    while True:
+        if os.path.lexists(current) and _is_link_or_reparse(current):
+            return True
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent
+
+
+def _same_canonical_path(left, right):
+    if not isinstance(left, str) or not left or not isinstance(right, str) or not right:
+        return False
+    try:
+        return _canonical_path(left) == _canonical_path(right)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def workspace_confirmation_status(workspace, materials, registry=None):
+    """Check whether *this exact* workspace/materials pair was confirmed.
+
+    Legacy registry rows remain valid for discovery but do not grant write
+    permission.  A confirmation receipt is intentionally tied to both paths;
+    moving either side invalidates it instead of silently authorizing a new
+    target.
+    """
+    workspace = os.path.abspath(workspace)
+    materials = os.path.abspath(materials)
+    if not os.path.isdir(workspace) or not os.path.isdir(materials):
+        return {
+            "confirmed": False,
+            "reason": "confirmation_path_missing_or_not_directory",
+            "workspace": workspace,
+            "materials": materials,
+        }
+    if _path_has_link_or_reparse(workspace) or _path_has_link_or_reparse(materials):
+        return {
+            "confirmed": False,
+            "reason": "confirmation_path_link_backed",
+            "workspace": workspace,
+            "materials": materials,
+        }
+    reg = registry if registry is not None else load_registry()
+    workspace_key = _canonical_path(workspace)
+    materials_key = _canonical_path(materials)
+    path_rows = [
+        row for row in reg.get("workspaces", [])
+        if _same_canonical_path(row.get("path"), workspace_key)
+    ]
+    if not path_rows:
+        return {
+            "confirmed": False,
+            "reason": "workspace_not_registered",
+            "workspace": workspace,
+            "materials": materials,
+        }
+    if len(path_rows) != 1:
+        return {
+            "confirmed": False,
+            "reason": "workspace_registration_ambiguous",
+            "workspace": workspace,
+            "materials": materials,
+            "candidate_count": len(path_rows),
+        }
+    material_rows = [
+        row for row in path_rows
+        if _same_canonical_path(row.get("materials"), materials_key)
+    ]
+    if not material_rows:
+        return {
+            "confirmed": False,
+            "reason": "materials_mismatch",
+            "workspace": workspace,
+            "materials": materials,
+            "course": path_rows[0].get("course"),
+        }
+    if len(material_rows) != 1:
+        return {
+            "confirmed": False,
+            "reason": "workspace_registration_ambiguous",
+            "workspace": workspace,
+            "materials": materials,
+            "candidate_count": len(material_rows),
+        }
+    row = material_rows[0]
+    receipt = row.get("confirmation")
+    if not isinstance(receipt, dict) \
+            or receipt.get("version") != WORKSPACE_CONFIRMATION_VERSION \
+            or receipt.get("confirmed") is not True:
+        return {
+            "confirmed": False,
+            "reason": "confirmation_missing",
+            "workspace": workspace,
+            "materials": materials,
+            "course": row.get("course"),
+        }
+    receipt_workspace = receipt.get("workspace")
+    receipt_materials = receipt.get("materials")
+    if not _same_canonical_path(receipt_workspace, workspace_key) \
+            or not _same_canonical_path(receipt_materials, materials_key):
+        return {
+            "confirmed": False,
+            "reason": "confirmation_path_mismatch",
+            "workspace": workspace,
+            "materials": materials,
+            "course": row.get("course"),
+        }
+    if receipt.get("workspace_canonical") != workspace_key \
+            or receipt.get("materials_canonical") != materials_key:
+        return {
+            "confirmed": False,
+            "reason": "confirmation_target_drift",
+            "workspace": workspace,
+            "materials": materials,
+            "course": row.get("course"),
+        }
+    return {
+        "confirmed": True,
+        "reason": "confirmed",
+        "workspace": workspace,
+        "materials": materials,
+        "course": row.get("course"),
+        "confirmation": dict(receipt),
+    }
 
 
 def load_registry():
@@ -1942,21 +2166,56 @@ def save_registry(reg):
 
 def cmd_workspace_register(args):
     course = (args.course or "").strip()
+    confirmed = bool(getattr(args, "confirmed", False))
+    urgent = bool(getattr(args, "urgent", False))
     if not course:
         _die("--course 不能为空")
+    if urgent and not confirmed:
+        _die("--urgent only applies to an explicit --confirmed registration")
+    if confirmed and args.materials is None:
+        _die("--confirmed requires --materials so the receipt binds both exact paths")
     if not os.path.isdir(args.path):
         _die("--path 不存在或不是目录: %s——workspace-register 只登记已存在的工作区（建区必确认，"
              "本命令不代建目录）" % args.path)
-    path = os.path.abspath(args.path)           # 存绝对+归一化路径：换目录/新会话都能找回
-    materials = None
+    path_lexical = os.path.abspath(args.path)
+    materials_lexical = None
     if args.materials is not None:
         if not os.path.isdir(args.materials):
             _die("--materials 不存在或不是目录: %s" % args.materials)
-        materials = os.path.abspath(args.materials)
+        materials_lexical = os.path.abspath(args.materials)
+    # Inspect the caller's lexical chain before resolving it so a user-controlled link cannot
+    # disappear from the security check.  Store the resolved long spelling only afterwards.
+    if confirmed and (_path_has_link_or_reparse(path_lexical)
+                      or _path_has_link_or_reparse(materials_lexical)):
+        _die("--confirmed paths must not contain a symlink/junction/reparse component")
+    # Discovery-only rows retain the long-standing ``abspath`` display contract.  Exact
+    # confirmations use the resolved long spelling because that value is also embedded in
+    # runtime/artifact receipts.  Identity checks use ``_canonical_path`` for both forms.
+    path = (str(Path(path_lexical).resolve(strict=False)) if confirmed else path_lexical)
+    materials = (
+        (str(Path(materials_lexical).resolve(strict=False))
+         if confirmed else materials_lexical)
+        if materials_lexical is not None else None
+    )
     reg = load_registry()
     rows = reg["workspaces"]
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    hit = next((w for w in rows if w.get("course") == course), None)
+    course_hits = [w for w in rows if w.get("course") == course]
+    if len(course_hits) > 1:
+        _die("工作区注册表里课程 %r 有多个记录——拒绝猜测；请先修复重复记录再重试" % course, 1)
+    hit = course_hits[0] if course_hits else None
+    workspace_conflicts = [
+        w for w in rows
+        if w is not hit and _same_canonical_path(w.get("path"), path)
+    ]
+    if workspace_conflicts and not confirmed:
+        _die("工作区 %s 已登记给其他课程——未确认登记不能改写其归属；请用 exam_start.py confirm 明确确认新的课程/材料组合"
+             % path, 1)
+    if confirmed and workspace_conflicts:
+        # An explicit exact-pair confirmation transfers this workspace to one
+        # owner.  Keeping stale rows would make artifact commands guess which
+        # materials root supplies source links.
+        rows[:] = [w for w in rows if w not in workspace_conflicts]
     if hit is not None:
         # 同课程重复登记 = 原地更新（换路径/补材料/刷新最近使用），绝不追加重复行；
         # 未显式给 --materials 时保留旧值——换工作区路径不应顺手抹掉材料线索
@@ -1968,7 +2227,30 @@ def cmd_workspace_register(args):
         verb = "更新"
     else:
         rows.append({"course": course, "path": path, "materials": materials, "last_used": now})
+        hit = rows[-1]
         verb = "登记"
+    if confirmed:
+        hit["confirmation"] = {
+            "version": WORKSPACE_CONFIRMATION_VERSION,
+            "confirmed": True,
+            "course": course,
+            "workspace": path,
+            "materials": materials,
+            "workspace_canonical": _canonical_path(path),
+            "materials_canonical": _canonical_path(materials),
+            "urgent": urgent,
+            "confirmed_at": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        }
+    else:
+        # A discovery-only re-registration may retain an existing receipt only
+        # while it still names the exact same workspace/materials pair.
+        receipt = hit.get("confirmation")
+        if isinstance(receipt, dict):
+            receipt_workspace = receipt.get("workspace")
+            receipt_materials = receipt.get("materials")
+            if not _same_canonical_path(receipt_workspace, hit.get("path")) \
+                    or not _same_canonical_path(receipt_materials, hit.get("materials")):
+                hit.pop("confirmation", None)
     save_registry(reg)
     print("[+] workspace-register：%s「%s」→ %s（注册表：%s）" % (verb, course, path, _registry_path()))
     return 0
@@ -2065,6 +2347,14 @@ def run(argv=None):
     p_wreg.add_argument("--course", required=True, help="course name (registry key; re-register updates in place)")
     p_wreg.add_argument("--path", required=True, help="workspace directory (must already exist)")
     p_wreg.add_argument("--materials", default=None, help="materials directory (must exist if given)")
+    p_wreg.add_argument(
+        "--confirmed", action="store_true",
+        help="record an explicit exact workspace/materials confirmation receipt",
+    )
+    p_wreg.add_argument(
+        "--urgent", action="store_true",
+        help="mark that the caller explicitly applied the documented urgent-open exception",
+    )
     p_wlist = sub.add_parser("workspace-list")
     p_wlist.add_argument("--json", action="store_true",
                          help='machine shape {"workspaces":[...]} (newest first)')

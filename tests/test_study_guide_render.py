@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -7,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -525,6 +527,50 @@ class PathSafety(WorkspaceMixin, unittest.TestCase):
 
 
 class CliContract(WorkspaceMixin, unittest.TestCase):
+    def test_html_href_allowlist_accepts_only_existing_fragments_and_material_files(self):
+        materials = tempfile.mkdtemp(prefix="study-guide-materials-")
+        outside_dir = tempfile.mkdtemp(prefix="study-guide-outside-")
+        try:
+            source_dir = os.path.join(materials, "slides & notes")
+            os.makedirs(source_dir)
+            source = os.path.join(source_dir, "课件 1.pdf")
+            with open(source, "wb") as stream:
+                stream.write(b"%PDF-1.4\nsource")
+            href = sgr.Path(source).resolve().as_uri() + "#page=4"
+            good = (
+                '<!doctype html><html><body><section id="kp-speed"></section>'
+                '<article id="example-q1"></article><a href="#kp-speed">kp</a>'
+                '<a href="#example-q1">example</a><a href="%s">source</a>'
+                '</body></html>' % href
+            )
+            sgr.validate_generated_html(good, materials_root=materials)
+
+            outside = os.path.join(outside_dir, "outside.pdf")
+            with open(outside, "wb") as stream:
+                stream.write(b"%PDF-1.4\noutside")
+            bad_hrefs = (
+                "https://example.com/source.pdf#page=1",
+                "javascript:alert(1)",
+                "data:text/html,boom",
+                "slides/source.pdf#page=1",
+                "../source.pdf#page=1",
+                sgr.Path(outside).resolve().as_uri() + "#page=1",
+                sgr.Path(os.path.join(materials, "missing.pdf")).resolve().as_uri() + "#page=1",
+            )
+            for bad in bad_hrefs:
+                with self.subTest(href=bad):
+                    document = '<!doctype html><html><body><a href="%s">bad</a></body></html>' % bad
+                    with self.assertRaises(sgr.GuideError):
+                        sgr.validate_generated_html(document, materials_root=materials)
+            with self.assertRaisesRegex(sgr.GuideError, "不存在的同页锚点"):
+                sgr.validate_generated_html(
+                    '<!doctype html><html><body><a href="#kp-missing">bad</a></body></html>',
+                    materials_root=materials,
+                )
+        finally:
+            shutil.rmtree(materials, ignore_errors=True)
+            shutil.rmtree(outside_dir, ignore_errors=True)
+
     def test_print_copy_opens_quiz_details_without_opening_persisted_html(self):
         source = '<!doctype html><html><body><details class="quiz-answer"><summary>x</summary>' \
                  '<div>answer</div></details></body></html>'
@@ -565,14 +611,14 @@ class CliContract(WorkspaceMixin, unittest.TestCase):
             merged.update(env)
         return subprocess.run(
             [PY, os.path.join(SCRIPTS, "study_guide_render.py"), "--workspace", ws,
-             "--chapter", "1"] + list(extra),
+             "--chapter", "1", "--artifact-type", "source_packet"] + list(extra),
             capture_output=True, text=True, encoding="utf-8", env=merged,
         )
 
     def test_missing_math_dependency_exit_3_and_removes_stale_outputs(self):
         ws = self.make_ws()
         os.makedirs(os.path.join(ws, "study_guide"))
-        stale = os.path.join(ws, "study_guide", "ch01.html")
+        stale = os.path.join(ws, "study_guide", "ch01.source-packet.html")
         with open(stale, "w", encoding="utf-8") as f:
             f.write("STALE")
         try:
@@ -586,7 +632,7 @@ class CliContract(WorkspaceMixin, unittest.TestCase):
     def test_legacy_formula_removes_stale_html(self):
         ws = self.make_ws(wiki="# X\n\n(A\\cup B)\n", quizzes=[])
         os.makedirs(os.path.join(ws, "study_guide"))
-        stale = os.path.join(ws, "study_guide", "ch01.html")
+        stale = os.path.join(ws, "study_guide", "ch01.source-packet.html")
         with open(stale, "w", encoding="utf-8") as f:
             f.write("STALE")
         try:
@@ -600,14 +646,16 @@ class CliContract(WorkspaceMixin, unittest.TestCase):
     def test_no_browser_exit_3_preserves_valid_html_and_removes_stale_pdf(self):
         ws = self.make_ws(wiki="# X\n\nNo formula.\n", quizzes=[])
         os.makedirs(os.path.join(ws, "study_guide"))
-        stale_pdf = os.path.join(ws, "study_guide", "ch01.pdf")
+        stale_pdf = os.path.join(ws, "study_guide", "ch01.source-packet.pdf")
         with open(stale_pdf, "wb") as f:
             f.write(b"OLD PDF")
         try:
-            result = self.run_cli(ws, "--pdf", env={"EXAMPREP_NO_BROWSER": "1"})
+            result = self.run_cli(ws, "--pdf-backend", "browser", "--pdf",
+                                  env={"EXAMPREP_NO_BROWSER": "1"})
             self.assertEqual(result.returncode, 3, result.stderr)
             self.assertIn("no_browser", result.stderr)
-            self.assertTrue(os.path.isfile(os.path.join(ws, "study_guide", "ch01.html")))
+            self.assertTrue(os.path.isfile(os.path.join(
+                ws, "study_guide", "ch01.source-packet.html")))
             self.assertFalse(os.path.exists(stale_pdf))
         finally:
             shutil.rmtree(ws, ignore_errors=True)
@@ -615,8 +663,9 @@ class CliContract(WorkspaceMixin, unittest.TestCase):
     def test_direct_run_with_injected_converter_writes_atomically(self):
         ws = self.make_ws()
         try:
-            self.assertEqual(sgr.run(["--workspace", ws, "--chapter", "1"], fake_math), 0)
-            path = os.path.join(ws, "study_guide", "ch01.html")
+            self.assertEqual(sgr.run(["--workspace", ws, "--chapter", "1",
+                                      "--artifact-type", "source_packet"], fake_math), 0)
+            path = os.path.join(ws, "study_guide", "ch01.source-packet.html")
             self.assertTrue(os.path.isfile(path))
             self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(os.path.dirname(path))))
         finally:
@@ -630,6 +679,190 @@ class CliContract(WorkspaceMixin, unittest.TestCase):
             result = self.run_cli(ws)
             self.assertEqual(result.returncode, 2)
             self.assertIn("恰好对应一个", result.stderr)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+
+class TypedManifestPublicationTOCTOU(WorkspaceMixin, unittest.TestCase):
+    DOCUMENT = "<!doctype html><html><body><p>typed snapshot</p></body></html>"
+
+    @staticmethod
+    def _manifest_path(ws):
+        return os.path.join(ws, "notebook", "ch01.guide.json")
+
+    def _write_manifest(self, ws, payload=b'{"generation":1}'):
+        path = self._manifest_path(ws)
+        with open(path, "wb") as stream:
+            stream.write(payload)
+        return path, payload
+
+    @staticmethod
+    def _gate(ws, digest="a" * 64):
+        return {
+            "ready_to_use": True,
+            "workspace": ws,
+            "materials": ws,
+            "registered_course": "TOCTOU",
+            "runtime_provenance": {"receipt": {
+                "runtime_digest": digest,
+                "runtime_file_count": 1,
+                "skill_version": "test",
+                "git_commit": "b" * 40,
+                "git_branch": "test",
+                "git_dirty": False,
+                "python_executable": sys.executable,
+            }},
+        }
+
+    @staticmethod
+    def _validation_report():
+        return {
+            "ok": True,
+            "schema_version": 1,
+            "chapter": 1,
+            "language": "en",
+            "profile": "full",
+            "expected_item_ids": ["item-1"],
+            "walkthrough_item_ids": ["item-1"],
+            "omitted_item_ids": [],
+        }
+
+    def _run_typed(self, ws, renderer, gate_side_effect=None):
+        import study_guide_content as content
+        import study_guide_document as document
+
+        gate_patch = (
+            mock.patch.object(sgr, "_start_gate_or_raise", side_effect=gate_side_effect)
+            if gate_side_effect is not None else
+            mock.patch.object(sgr, "_start_gate_or_raise", return_value=self._gate(ws))
+        )
+        with gate_patch, \
+                mock.patch.object(content, "validate_manifest",
+                                  return_value=self._validation_report()), \
+                mock.patch.object(document, "render_manifest", side_effect=renderer):
+            return sgr.run([
+                "--workspace", ws, "--chapter", "1", "--profile", "full",
+                "--pdf-backend", "html",
+            ], fake_math)
+
+    @staticmethod
+    def _assert_no_publication(ws):
+        output = os.path.join(ws, "study_guide")
+        for name in ("ch01.html", "ch01.pdf", "ch01.receipt.json"):
+            if os.path.exists(os.path.join(output, name)):
+                raise AssertionError("unexpected mixed-generation publication: %s" % name)
+
+    def test_mocked_manifest_hash_drift_during_render_fails_closed(self):
+        ws = self.make_ws(language="en")
+        manifest_path, _payload = self._write_manifest(ws)
+
+        def render_and_mutate(*_args, **_kwargs):
+            with open(manifest_path, "wb") as stream:
+                stream.write(b'{"generation":2}')
+            return self.DOCUMENT, {}
+
+        try:
+            with self.assertRaisesRegex(sgr.ArtifactDriftError, "SHA-256 changed"):
+                self._run_typed(ws, render_and_mutate)
+            self._assert_no_publication(ws)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_concurrent_same_bytes_path_replacement_is_rejected_by_identity(self):
+        ws = self.make_ws(language="en")
+        manifest_path, payload = self._write_manifest(ws)
+        renderer_entered = threading.Event()
+        replacement_done = threading.Event()
+
+        def replace_while_rendering():
+            if not renderer_entered.wait(5):
+                return
+            replacement = manifest_path + ".replacement"
+            with open(replacement, "wb") as stream:
+                stream.write(payload)
+            os.replace(replacement, manifest_path)
+            replacement_done.set()
+
+        def blocked_renderer(*_args, **_kwargs):
+            renderer_entered.set()
+            if not replacement_done.wait(5):
+                raise AssertionError("concurrent replacement did not finish")
+            return self.DOCUMENT, {}
+
+        worker = threading.Thread(target=replace_while_rendering, daemon=True)
+        worker.start()
+        try:
+            with self.assertRaisesRegex(sgr.ArtifactDriftError, "path was replaced"):
+                self._run_typed(ws, blocked_renderer)
+            worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self._assert_no_publication(ws)
+        finally:
+            renderer_entered.set()
+            worker.join(5)
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_manifest_drift_while_receipt_is_staged_prevents_atomic_publish(self):
+        ws = self.make_ws(language="en")
+        manifest_path, _payload = self._write_manifest(ws)
+        original_atomic_json = sgr._atomic_json
+
+        def mutate_before_receipt_stage(path, value, before_publish=None):
+            with open(manifest_path, "wb") as stream:
+                stream.write(b'{"generation":3}')
+            return original_atomic_json(
+                path, value, before_publish=before_publish)
+
+        try:
+            with mock.patch.object(sgr, "_atomic_json",
+                                   side_effect=mutate_before_receipt_stage):
+                with self.assertRaisesRegex(sgr.ArtifactDriftError, "SHA-256 changed"):
+                    self._run_typed(
+                        ws, lambda *_args, **_kwargs: (self.DOCUMENT, {}))
+            self._assert_no_publication(ws)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_runtime_identity_drift_during_render_fails_like_manifest_drift(self):
+        ws = self.make_ws(language="en")
+        self._write_manifest(ws)
+        current = {"digest": "a" * 64}
+
+        def gate_provider(_ws):
+            return self._gate(ws, current["digest"])
+
+        def render_and_drift_runtime(*_args, **_kwargs):
+            current["digest"] = "c" * 64
+            return self.DOCUMENT, {}
+
+        try:
+            with self.assertRaisesRegex(
+                    sgr.ArtifactDriftError, "runtime identity changed"):
+                self._run_typed(ws, render_and_drift_runtime, gate_provider)
+            self._assert_no_publication(ws)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_receipt_hashes_bind_exact_atomically_published_bytes(self):
+        ws = self.make_ws(language="en")
+        manifest_path, manifest_payload = self._write_manifest(ws)
+        try:
+            result = self._run_typed(
+                ws, lambda *_args, **_kwargs: (self.DOCUMENT, {}))
+            self.assertEqual(result, 0)
+            html_path = os.path.join(ws, "study_guide", "ch01.html")
+            receipt_path = os.path.join(ws, "study_guide", "ch01.receipt.json")
+            with open(html_path, "rb") as stream:
+                html_payload = stream.read()
+            with open(receipt_path, "r", encoding="utf-8") as stream:
+                receipt = json.load(stream)
+            self.assertEqual(html_payload, self.DOCUMENT.encode("utf-8"))
+            self.assertEqual(receipt["html_sha256"], hashlib.sha256(
+                html_payload).hexdigest())
+            self.assertEqual(receipt["content_manifest_sha256"], hashlib.sha256(
+                manifest_payload).hexdigest())
+            self.assertEqual(receipt["content_manifest"], "notebook/ch01.guide.json")
+            self.assertTrue(os.path.samefile(manifest_path, self._manifest_path(ws)))
         finally:
             shutil.rmtree(ws, ignore_errors=True)
 

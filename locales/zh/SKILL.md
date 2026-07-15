@@ -19,8 +19,8 @@
 
 ## 语言与断点
 
-- `study_state.json.language` 的持久化规范值只有 `中文`、`English`、`双语`；`zh`、`en`、`bilingual` 只是命令输入别名，必须先由 `update_progress.py` 归一化，不能拿别名直接派发。
-- `中文` 模式输出纯简体中文；`English` 载入英文入口；`双语` 逐块先中文，再输出一条 `> EN:` 镜像。首次未设置时默认英文；学生用中文开场则默认简体中文；绝不静默推断双语。
+- `study_state.json.language` 的持久化规范值是语言中性代号 `zh`、`en`、`bilingual`；显示输入 `中文`、`English`、`双语` 是可接受的命令别名与旧状态迁移值，由 `update_progress.py` 归一化。
+- `zh` 模式输出纯简体中文；`en` 载入英文入口；`bilingual` 逐块先中文，再输出一条 `> EN:` 镜像。首次未设置时默认英文；学生用中文开场则默认简体中文；绝不静默推断双语。
 - **断点状态锁定 (`study_state.json`)**：它存在时先读它，它是进度唯一事实源；`study_progress.md` 是生成视图，不得手改。它不存在但 Python 可运行时，先跑 `python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace <ws> init`，再用 `set`、`add-mistake`、`add-confusion`、`set-check`、`record-phase-evidence`、`complete-phase` 写入。只有 Python 确实无法启动时才允许手工维护进度文件；命令业务失败必须明确报错，不能伪装成“无 Python”。
 - 在本地创建或修改工作区前，先用 `workspace-list --json` 查看登记项，并让学生明确确认绝对路径；不能把当前仓库或进程目录当默认课程工作区。
 
@@ -50,5 +50,5 @@
 ## 持久化与教材
 
 - 实质讲解、判分、疑难解答和复盘结论先通过 `scripts/notebook.py add-entry` 写入 `notebook/`，再在对话中给摘要和链接；写入失败必须告知学生并在对话中给完整内容。
-- `artifact_mode=chat` 是安全默认，只做对话教学和正常状态、笔记持久化；显式 `visual` 或一次性教材请求才调用 [`exam-study-guide`](../../skills/exam-study-guide/SKILL.md)。不得根据订阅档位猜测，也不得静默安装依赖。
+- `artifact_mode=chat` 是安全默认：正常对话教学、状态/笔记持久化，并在结构化工作区完成阶段前建立必需的 `profile=full` 强类型章节清单，但不自动生成 `HTML/PDF`。结构化阶段完成前调用 [`exam-study-guide`](../../skills/exam-study-guide/SKILL.md) 验证/导入清单；只有显式 `visual` 或一次性教材请求才继续渲染与质量验收。不得根据订阅档位猜测，也不得静默安装依赖。
 - 建库后必须逐条接管解析报告、人工审阅清单和缺答案清单中的所有告警；能恢复的立即恢复，不能恢复的逐项告诉学生材料名和原因，绝不静默跳过。

@@ -226,6 +226,30 @@ class TestValidateWorkspace(unittest.TestCase):
         self.assertEqual(V._exit_code(errors), 0)
         self.assertTrue(any("无 answer" in w["msg"] for w in warnings))
 
+    def test_legacy_non_gradable_item_is_excluded_from_quiz_readiness(self):
+        d = self.make_ws([{
+            "id": "worked-only", "chapter": 1, "type": "subjective",
+            "question": "Completed demonstration", "gradable": False,
+            "answer_status": "unknown", "source": "material",
+        }])
+        errors, warnings, stats = V.validate(d)
+        self.assertEqual(V._exit_code(errors), 0, err_text(errors))
+        self.assertFalse(any("worked-only" in w["msg"] for w in warnings))
+        self.assertEqual(stats["quiz_items"], 1)
+        self.assertEqual(stats["quiz_items_gradable"], 0)
+        self.assertEqual(stats["quiz_items_non_gradable"], 1)
+        self.assertEqual(stats["quiz_types"], {})
+
+    def test_quiz_and_teaching_gradable_flags_must_be_booleans(self):
+        d = self.make_ws([{
+            "id": "bad", "chapter": 1, "type": "subjective", "question": "q",
+            "answer": "a", "gradable": "false",
+        }])
+        self.write_teaching_examples(d, [self.teaching_example(gradable=0)])
+        errors, _, _ = V.validate(d)
+        self.assertEqual(V._exit_code(errors), 1)
+        self.assertGreaterEqual(err_text(errors).count("gradable 必须是布尔型"), 2)
+
     def test_missing_chapter_or_phase_warns_not_error(self):
         # ingest.py does NOT require chapter/phase, so Tier 1 must warn, not hard-fail (Codex r2)
         d = self.make_ws([{"id": "x", "type": "choice", "question": "q",

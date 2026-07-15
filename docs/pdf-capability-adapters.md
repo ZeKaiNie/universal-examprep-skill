@@ -15,9 +15,9 @@
 3. 后备能力不足且用户同意：只建议安装该宿主的官方来源。
 4. 依赖、浏览器或渲染能力仍缺失：明确失败并给出缺项；禁止留下含 raw LaTeX 的伪成品。
 
-每条实际执行路径都必须遵守同一顺序：**探测并选定后端 → 对当前章和该后端做依赖预检 →
-生成并验证 HTML → 生成 PDF → 逐页视觉验收**。选择原生能力不等于先生成文件；依赖预检仍须发生在
-章节 HTML 渲染之前。
+每条实际执行路径都必须遵守同一顺序：**验证/import 强类型章节教学清单 → 探测并选定后端 →
+对当前章和该后端做依赖预检 → 生成并验证 HTML → 生成 PDF → `study_guide_qa.py render` →
+逐页视觉检查 → 显式 accept**。选择原生能力不等于先生成文件；依赖预检仍须发生在章节 HTML 渲染之前。
 
 公式渲染使用经审查固定的 `latex2mathml==3.60.0`（MIT，审查 commit
 `de87cf0f228416e3152218c12b8bdb4ee6f4ecca`）。该版本支持本仓库的 Python 3.7+ 范围；上游当前
@@ -29,11 +29,21 @@
 python scripts/check_deps.py --workspace <ws> --chapter <N> --artifact-mode visual --pdf-backend <native|browser|html>
 ```
 
-只有本章实际含标准公式时才把 `latex2mathml` 标为需要；只有选中 `browser` 后端时才把 Edge/Chrome
-标为需要。缺失时只给固定安装建议，仍须用户同意。
+只有本章实际含标准公式（包括 typed manifest 的公式与代入式）时才把 `latex2mathml` 标为需要；
+`formula_hint`、控制字符或乱码等未恢复证据产生 `chapter_math_status=needs_recovery` 并阻止 visual，绝不能
+解释成“本章没有公式”。只有选中 `browser` 后端时才把 Edge/Chrome 标为需要。缺失时只给固定安装建议，
+仍须用户同意。
 
-无论走哪条路径，最终 PDF 都必须把每一页渲染为 PNG，检查最新渲染，并在已知视觉缺陷为零后
-才能交付。外部 skill 负责提供工具能力，不能替代这项验收。
+无论走哪条路径，最终 PDF 都必须把每一页渲染为 PNG，检查最新渲染，并在已知视觉缺陷为零后运行：
+
+```text
+python scripts/study_guide_qa.py --workspace <ws> --chapter <N> --json render
+python scripts/study_guide_qa.py --workspace <ws> --chapter <N> accept --inspected-pages all --reviewer <name> --reviewer-kind agent --page-verdict 1=pass
+```
+
+多页 PDF 必须为每一页重复传入一次 `--page-verdict N=pass:<notes>`；上面是一页 PDF 的最小命令形状。
+
+只有 receipt 的哈希仍匹配且 `visual_qa.status=ready` 才能交付。外部 skill 负责提供工具能力，不能替代验收。
 
 ## Agent-specific adapters
 

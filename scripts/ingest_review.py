@@ -3,19 +3,20 @@
 """Inspect, claim, validate, apply, and rebuild typed ingestion review work."""
 
 import argparse
+import collections
 import json
 import os
 import sys
 
 try:
-    from ingestion import IngestionStore, ReviewPatch, read_json
+    from ingestion import IngestionStore, ReviewPatch, atomic_write_json, read_json
     from ingestion.pipeline import (
         BUILD_MANIFEST_PATH,
         compile_review_outputs,
         refresh_build_manifest,
     )
 except ImportError:
-    from scripts.ingestion import IngestionStore, ReviewPatch, read_json
+    from scripts.ingestion import IngestionStore, ReviewPatch, atomic_write_json, read_json
     from scripts.ingestion.pipeline import (
         BUILD_MANIFEST_PATH,
         compile_review_outputs,
@@ -75,6 +76,41 @@ def _template(issue):
     }
 
 
+def _bounded_details_path(workspace, value):
+    """Keep potentially huge detail exports inside the confirmed workspace."""
+    if value is None:
+        return None
+    candidate = os.path.abspath(os.path.join(workspace, value))
+    try:
+        contained = os.path.commonpath((workspace, candidate)) == workspace
+    except ValueError:
+        contained = False
+    if not contained:
+        _die("--details-file must stay inside the workspace")
+    parent = os.path.dirname(candidate)
+    if not os.path.isdir(parent):
+        _die("--details-file parent does not exist: %s" % parent)
+    if os.path.lexists(candidate) and os.path.islink(candidate):
+        _die("--details-file must not be a symbolic link")
+    return candidate
+
+
+def _issue_summary(issues):
+    by_status = collections.Counter()
+    by_severity = collections.Counter()
+    by_reason = collections.Counter()
+    for issue in issues:
+        by_status[issue.status] += 1
+        by_severity[issue.severity] += 1
+        for reason in issue.reason_codes:
+            by_reason[reason] += 1
+    return {
+        "by_status": dict(sorted(by_status.items())),
+        "by_severity": dict(sorted(by_severity.items())),
+        "by_reason": dict(sorted(by_reason.items())),
+    }
+
+
 def run(argv=None):
     parser = argparse.ArgumentParser(
         description="Typed AI/human review queue for .ingest workspaces"
@@ -87,6 +123,26 @@ def run(argv=None):
     list_parser.add_argument(
         "--status", action="append",
         help="filter by status (repeatable; default all)",
+    )
+    list_parser.add_argument(
+        "--reason", action="append",
+        help="filter by reason code (repeatable; any matching reason is included)",
+    )
+    list_parser.add_argument(
+        "--cursor", type=int, default=0,
+        help="zero-based resume cursor into the stable filtered queue",
+    )
+    list_parser.add_argument(
+        "--limit", type=int, default=50,
+        help="maximum issues returned in chat-safe JSON (1-200; default 50)",
+    )
+    list_parser.add_argument(
+        "--summary-only", action="store_true",
+        help="return counts without issue bodies",
+    )
+    list_parser.add_argument(
+        "--details-file",
+        help="optional workspace-relative JSON file receiving the complete filtered issue list",
     )
     show_parser = sub.add_parser("show", help="show one issue and patch operation shapes")
     show_parser.add_argument("issue_id")
@@ -101,6 +157,10 @@ def run(argv=None):
     )
     mark_parser.add_argument("issue_id")
     mark_parser.add_argument("--reason", required=True)
+    mark_parser.add_argument(
+        "--evidence-note",
+        help="issue-specific pages/files/search scope reviewed before declaring recovery impossible",
+    )
     mark_parser.add_argument("--reviewer", default="ai")
     resolved_parser = sub.add_parser(
         "mark-resolved", help="confirm from evidence that extraction is already complete"
@@ -119,15 +179,40 @@ def run(argv=None):
     workspace, store = _store(args.workspace)
 
     if args.command == "list":
+        if args.cursor < 0:
+            _die("--cursor must be >= 0")
+        if args.limit < 1 or args.limit > 200:
+            _die("--limit must be between 1 and 200")
         statuses = set(args.status or ())
+        reasons = set(args.reason or ())
         issues = [
             issue for issue in store.review_queue.issues()
-            if not statuses or issue.status in statuses
+            if (not statuses or issue.status in statuses)
+            and (not reasons or reasons.intersection(issue.reason_codes))
         ]
+        total = len(issues)
+        if args.cursor > total:
+            _die("--cursor %d exceeds filtered issue count %d" % (args.cursor, total))
+        details_path = _bounded_details_path(workspace, args.details_file)
+        if details_path is not None:
+            atomic_write_json(details_path, {
+                "workspace": workspace,
+                "count": total,
+                "summary": _issue_summary(issues),
+                "issues": [_issue_payload(issue) for issue in issues],
+            })
+        page = [] if args.summary_only else issues[args.cursor:args.cursor + args.limit]
+        next_cursor = args.cursor + len(page)
         payload = {
             "workspace": workspace,
-            "count": len(issues),
-            "issues": [_issue_payload(issue) for issue in issues],
+            "count": total,
+            "returned": len(page),
+            "cursor": args.cursor,
+            "next_cursor": next_cursor if next_cursor < total else None,
+            "has_more": next_cursor < total,
+            "summary": _issue_summary(issues),
+            "details_file": details_path,
+            "issues": [_issue_payload(issue) for issue in page],
         }
     elif args.command == "show":
         issue = store.review_queue.get(args.issue_id)
@@ -169,16 +254,27 @@ def run(argv=None):
         issue = store.review_queue.get(args.issue_id)
         if issue is None:
             _die("unknown issue_id: %s" % args.issue_id)
+        evidence_note = getattr(args, "evidence_note", None)
+        if (args.command == "mark-unrecoverable"
+                and "missing_answer" in issue.reason_codes
+                and not (evidence_note or "").strip()):
+            _die(
+                "missing_answer cannot be marked unrecoverable with a generic reason; "
+                "provide --evidence-note naming the candidate files/pages and search scope"
+            )
         try:
             operation = (
                 "mark_resolved" if args.command == "mark-resolved"
                 else "mark_unrecoverable"
             )
+            reason = args.reason.strip()
+            if args.command == "mark-unrecoverable" and evidence_note:
+                reason += "\nEvidence review: " + evidence_note.strip()
             patch = ReviewPatch.create(
                 issue.issue_id,
                 issue.source_id,
                 issue.source_sha256,
-                [{"op": operation, "reason": args.reason}],
+                [{"op": operation, "reason": reason}],
                 list(issue.evidence),
                 reviewer=args.reviewer,
                 status="validated",

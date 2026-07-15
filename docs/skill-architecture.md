@@ -16,7 +16,7 @@ skills/
   exam-cram/          # 恢复断点、模式与阶段编排
   exam-ingest/        # 材料建库、告警接管、工作区初始化
   exam-tutor/         # 当前章惰性授课、七步精讲
-  exam-study-guide/   # 当前章 HTML/PDF 阅读视图
+  exam-study-guide/   # profile=full typed manifest → HTML/PDF → receipt/全页 QA
   exam-quiz/          # 题库抽题与判分
   exam-review/        # 错题和疑难复盘
   exam-cheatsheet/    # 考前小抄
@@ -37,7 +37,7 @@ skills/
 | 讲当前章 | `exam-tutor` | 一个 wiki 章节 + 当前章教学例题切片 |
 | 做当前章题 | `exam-quiz` | 题库的当前章筛选结果 |
 | 复盘错题/疑难 | `exam-review` | 状态中的未掌握项 + 对应题目 |
-| 生成视觉教材 | `exam-study-guide` | 已持久化的当前章 wiki、例题、题目、图片、笔记 |
+| 建立/生成章节教材 | `exam-study-guide` | 已验证的 `notebook/chNN.guide.json` + 其引用资产；receipt/QA 是视觉交付证据 |
 | 冲刺小抄 | `exam-cheatsheet` | 错题、疑难、知识窗口与 wiki |
 | 体检 | `exam-audit` | 工作区清单与一致性证据 |
 
@@ -60,8 +60,11 @@ references/retrieval_index.json  # freshness-bound 轻量检索派生物
 references/teaching_examples.json
 references/teaching_baseline.json
 notebook/chNN.md                 # 持久化完整教学与反馈
+notebook/chNN.guide.json         # 当前章已验证的 profile=full 强类型完成清单
 mistakes/chNN.md                 # 错题镜像
 study_guide/chNN.html|pdf        # 当前章派生阅读产物
+study_guide/chNN.receipt.json    # manifest/HTML/PDF 哈希与 QA 状态
+study_guide/qa/chNN_pNNN.png     # 最新 PDF 的逐页验收证据
 ```
 
 常规材料入口是 `scripts/ingest_course.py`：预检 → 解析 → 结构化编译 → 状态初始化 → 视觉索引 → validator。退出 10 表示程序完成但内容 readiness 被阻断，必须用 `scripts/ingest_review.py` 逐项接管；不能因为 wiki/题库已经出现就开始教学。review patch 绑定来源哈希并写入 append-only ledger，再重编译 wiki、题库和检索索引。
@@ -72,7 +75,7 @@ study_guide/chNN.html|pdf        # 当前章派生阅读产物
 
 - 控制规则：`skills/*/SKILL.md`，以英文、精确、可测试的流程为主；触发 metadata、规范状态值和逐字学生话术是明确例外。
 - 学生文案：`locales/<lang>/skills/*.md`、消息目录和模板。
-- 规范语言值：`中文` / `English` / `双语`；根路由器按这些值派发。
+- 持久化规范语言值：`zh` / `en` / `bilingual`；`中文` / `English` / `双语` 只是显示别名和旧状态迁移输入，根路由器先归一化再派发。
 - 原始材料的逐字引文可保留原语言并标明；智能体生成 prose 必须遵守所选语言。
 - 机器契约：JSON keys、stable IDs、hash、reason code 和 lifecycle status 固定，不随翻译改变。
 - 人类可读视图：智能体生成的 notebook、回执与教材按选择语言渲染；状态枚举保持 canonical。若 legacy/generated 进度视图仍是中文 canonical，代理只把它当状态视图读取，再按当前语言复述，不能把两层混为一谈。
@@ -86,7 +89,9 @@ study_guide/chNN.html|pdf        # 当前章派生阅读产物
 - 学习模式和时间档位影响节奏，但不解除来源、状态或资产门禁。
 - 图结构题先运行确定性算法，再渲染。
 - 教学、判分、疑难和复盘先写 notebook，再返回对话摘要。
-- `artifact_mode=chat` 不自动生成 HTML/PDF；`visual` 或一次性请求才进入视觉产物流程。
+- 结构化工作区在阶段完成前必须验证当前章 `profile=full` typed manifest；`artifact_mode=chat` 到此停止，不要求 HTML/PDF。
+- `visual` 或一次性请求才进入视觉产物流程；`visual` 只有在 receipt 哈希匹配、逐页全部验收、零未解决缺陷且 `artifact_ready=ready` 后才能交付和完成阶段，不能把“请求生成”写成“已经成功”。
+- 修改 `study_state.json.language` 会使旧语言 manifest/HTML/PDF/QA stale；先 relocalize/补齐语言块，再重新渲染和验收。
 - 建库程序的 warnings、skipped、人工审阅项和缺答案项必须逐条接管。
 - 结构化工作区 `readiness=blocked` 时禁止进入授课、测验或阶段完成。
 

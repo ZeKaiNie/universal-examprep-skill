@@ -25,11 +25,15 @@
 
 ## 文件型 host 的建库边界
 
-能读写本地文件并运行 Python 的 host 使用同一条常规入口：
+能读写本地文件并运行 Python 的 host 先执行同一个确认门禁，再使用常规建库入口：
 
 ```bash
+python scripts/exam_start.py status --materials <dir> --workspace <ws> --json
+python scripts/exam_start.py confirm --course <name> --materials <dir> --workspace <ws> --mode <mode> --time-budget <tier> --language <zh|en|bilingual> --json
 python scripts/ingest_course.py --materials <confirmed-materials-dir> --workspace <confirmed-workspace-dir> --json
 ```
+
+`confirm` 只在用户已经确认精确路径和三项学习选择后调用；它一次写入 exact-pair confirmation、`study_state.json` 与 runtime provenance receipt。`ingest_course.py` 和真正的 Study Guide 都会重验这些事实，不能用裸 `workspace-register` 绕过。
 
 该入口处理 PDF、DOCX、PPTX、纯文本和 Markdown，建立 `.ingest/` 结构化事实源，编译学生工作区并运行最终 validator。正常返回值有明确业务语义：
 
@@ -46,6 +50,11 @@ PDF/教材产物先经过资源偏好门禁，再做能力级路由：缺少 `ar
 `visual`，或本次明确要求 HTML/PDF/打印版时，才进入 host-specific 路由；单次请求不改持久状态。
 不同 host 不共享同一安装入口，详见 [`pdf-capability-adapters.md`](pdf-capability-adapters.md) 与机器可读的
 [`pdf-capability-adapters.json`](pdf-capability-adapters.json)。任何模式都不授权静默下载安装外部 skill 或依赖。
+
+`.ingest/` 存在时，所有 host 都必须在阶段完成前消费并验证当前章 `notebook/chNN.guide.json`，且要求
+`profile=full`；`chat` 到此停止，不需要 PDF。所有视觉 route 都从这份已验证清单生成，只有 receipt 中的
+manifest/HTML/PDF 哈希仍匹配、全部页面已验收、零未解决缺陷且 `artifact_ready=ready` 才能交付并完成阶段。
+修改课程语言后旧 manifest/产物立即 stale：先 relocalize 或补齐语言块，再重新渲染并重复全页 QA。
 
 > 兼容性：根目录 `SKILL.md` 是默认触发入口和语言中性路由器，按 `study_state.json.language` 的规范值加载
 > `skills/` 中的共享控制规则与 `locales/zh/SKILL.md` / `locales/en/SKILL.md` 的轻量兼容文案索引。

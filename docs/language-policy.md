@@ -7,7 +7,7 @@ The project uses an English control plane and two student-facing wording packs. 
 ## 1. Language state and canonical dispatch
 
 - 状态字段：`study_state.json.language`。
-- 持久化规范值只有 `中文`、`English`、`双语`。`zh`、`en`、`bilingual` 仅为 `update_progress.py set --language` 接受的输入别名；脚本归一化后才能持久化，代理不得按别名读取状态。
+- 持久化规范值是语言中性代号 `zh`、`en`、`bilingual`。显示输入 `中文`、`English`、`双语` 与旧状态值仍可由 `update_progress.py set --language` 接受并迁移，但新写入统一保存代号。
 - 首次普通对话在“一次合并首问”中确定学习模式、时间宽裕度和回复语言，并用一次 `set` 调用保存。默认 `English`；学生用中文开场则默认 `中文`。
 - 紧迫开场静默推断语言和其余两项并立刻授课，绝不推断 `双语`。中途切换从下一条回复生效。
 - 脚本对缺失语言的中文兜底只服务旧工作区，不改变新会话的默认策略。
@@ -16,9 +16,9 @@ Dispatch is exact:
 
 | Persisted value | Wording source | Student-visible rendering |
 | --- | --- | --- |
-| `中文` | `locales/zh/skills/<skill>.md` | Simplified Chinese only |
-| `English` | `locales/en/skills/<skill>.md` | English only |
-| `双语` | both packs | Chinese block, then a `> EN:` mirror for every block |
+| `zh` | `locales/zh/skills/<skill>.md` | Simplified Chinese only; display choice `中文` |
+| `en` | `locales/en/skills/<skill>.md` | English only; display choice `English` |
+| `bilingual` | both packs | Chinese block, then a `> EN:` mirror for every block; display choice `双语` |
 
 ## 2. SINGLE-LANGUAGE PURITY
 
@@ -71,8 +71,9 @@ Rules:
 Language is split into three layers that must not be conflated:
 
 1. **Machine schema.** JSON keys, stable IDs, issue/patch statuses, reason codes, CLI subcommands, and structured control output keep their defined machine spelling (normally English). Never translate `issue_id`, `content_unit_id`, `pending`, `validated`, `applied`, or an equivalent schema token merely because the student selected Chinese.
-2. **Canonical domain values.** Existing `study_state.json` enums remain byte-stable: learning modes, time budgets, language values, knowledge-window states, and preference values use their current canonical forms, many of which are Chinese. Input aliases may be normalized, but persisted values are not localized per session. When English prose needs to mention one, put the raw value in a code span and explain it in English.
+2. **Canonical domain values.** New `study_state.json` writes use the neutral codes defined by `scripts/i18n.py`: modes `from_scratch|shore_up|fill_gaps`, time budgets `le1d|d1_3|d3_7|gt7d`, languages `zh|en|bilingual`, and the documented status codes. Historical Chinese display values remain migration inputs and generated-view wording, not the new schema truth. Persisted values are never localized per session. When prose needs to mention a code, put it in a code span and explain it in the active language.
 3. **Human-readable views.** Agent-authored chat, notebook explanations, study guides, receipts, and summaries follow the selected student language. A renderer that still produces a Chinese-canonical compatibility view (notably a legacy/generated progress view) does not exempt the agent from English purity: treat that file as a state-backed machine/compatibility artifact and restate its meaning in the active language instead of pasting it as English prose.
+**Language-switch consequence.** Changing `study_state.json.language` makes a prior-language `chNN.guide.json`, HTML/PDF, receipt, and QA stale for completion/delivery. Relocalize or source-consciously author every newly required block, re-import the typed manifest, and—when visual output is requested—rerender and repeat all-page QA. `≤1天` may shorten both language blocks but may not omit either side of bilingual content.
 
 Script output must also declare which layer it belongs to. JSON intended for automation stays machine-stable; a message intended for the student uses the locale catalog. Tests for English rendering use the English vocabulary above, while state and ingestion-ledger tests use exact canonical schema/value spellings.
 

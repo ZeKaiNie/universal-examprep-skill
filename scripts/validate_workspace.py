@@ -26,6 +26,7 @@ import update_progress as _progress
 import i18n as _i18n
 import retrieve as _retrieve
 import strict_json as _strict_json
+import readiness as _readiness_matrix
 from ingestion.identifiers import is_link_or_reparse
 
 SIX_TYPES = {"choice", "subjective", "diagram", "fill_blank", "true_false", "code"}
@@ -728,6 +729,14 @@ def validate(ws):
             err("quiz_bank.json 顶层必须是 JSON 数组", level="fatal")
             return errors, warnings, stats
         stats["quiz_items"] = len(data)
+        stats["quiz_items_gradable"] = sum(
+            1 for item in data
+            if isinstance(item, dict) and item.get("gradable") is not False
+        )
+        stats["quiz_items_non_gradable"] = sum(
+            1 for item in data
+            if isinstance(item, dict) and item.get("gradable") is False
+        )
         seen, type_counts = set(), {}
         for i, q in enumerate(data):
             if not isinstance(q, dict):
@@ -761,19 +770,26 @@ def validate(ws):
                 if qid in seen:
                     err(f"重复的题目 id: {qid}")
                 seen.add(qid)
+            gradable_raw = q.get("gradable")
+            if gradable_raw is not None and not isinstance(gradable_raw, bool):
+                err(f"{tag} gradable 必须是布尔型 true/false，当前 {gradable_raw!r}")
+            is_gradable = gradable_raw is not False
             t = q.get("type")
             if t is not None and not isinstance(t, str):
                 err(f"{tag} 的 type 必须是字符串，当前为 {type(t).__name__}")
                 t = None
             if t is not None:
-                type_counts[t] = type_counts.get(t, 0) + 1
+                if is_gradable:
+                    type_counts[t] = type_counts.get(t, 0) + 1
                 if t not in SIX_TYPES:
                     err(f"{tag} 的 type 非法: {t!r}（应为 {sorted(SIX_TYPES)} 之一）")
 
             # per-type required/recommended
-            if t == "choice" and not (isinstance(q.get("options"), list) and q.get("options")):
+            if (is_gradable and t == "choice"
+                    and not (isinstance(q.get("options"), list) and q.get("options"))):
                 err(f"{tag} choice 题必须有非空 options")
-            if (t == "choice" and isinstance(q.get("options"), list) and q.get("options")
+            if (is_gradable and t == "choice"
+                    and isinstance(q.get("options"), list) and q.get("options")
                     and q.get("answer") not in (None, "")):
                 # the answer may name an option by label ("A"), full option string, or just the option
                 # TEXT after the label ("先进后出" for "A. 先进后出" — common in exported banks)
@@ -789,13 +805,14 @@ def validate(ws):
                 if (q["answer"] not in q["options"] and ans_label not in labels
                         and str(q["answer"]).strip() not in texts):
                     err(f"{tag} choice 的 answer {q['answer']!r} 不在 options 中")
-            if t == "subjective" and not q.get("keywords"):
+            if is_gradable and t == "subjective" and not q.get("keywords"):
                 warn(f"{tag} subjective 题建议提供 keywords（要点检索判分）")
-            if t == "diagram" and not q.get("diagram_type"):
+            if is_gradable and t == "diagram" and not q.get("diagram_type"):
                 warn(f"{tag} diagram 题建议提供 diagram_type / 渲染说明（画图先跑算法再画）")
-            if t == "code" and not (q.get("language") and (q.get("expected_behavior") or q.get("tests"))):
+            if (is_gradable and t == "code"
+                    and not (q.get("language") and (q.get("expected_behavior") or q.get("tests")))):
                 warn(f"{tag} code 题建议提供 language 与 expected_behavior/tests")
-            if t == "true_false":
+            if is_gradable and t == "true_false":
                 a = q.get("answer")
                 if a is not None and not (isinstance(a, bool) or str(a).strip().lower() in TRUE_FALSE_OK):
                     # a present-but-non-boolean answer has no usable gold -> error (missing answer stays a warning)
@@ -921,7 +938,7 @@ def validate(ws):
             has_answer = (answer_val not in (None, "", [], {})
                           and not (isinstance(answer_val, str) and not answer_val.strip()))
             status = str(q.get("answer_status", "")).strip().lower()
-            if not has_answer:
+            if is_gradable and not has_answer:
                 if status == "unknown" or src in {"ai_generated", "unknown"}:
                     warn(f"{tag} 无 answer，已按 unknown/ai_generated 标注（考前需补全/核对）")
                 else:
@@ -929,7 +946,7 @@ def validate(ws):
                     # answer_status nor source — so a valid ingest output must NOT fail Tier 1. Keep this a
                     # WARNING (the "AI answer hidden as teacher" case above stays a hard error).
                     warn(f"{tag} 无 answer（建议补 answer，或标 answer_status=unknown / source=ai_generated）")
-            elif src is None:
+            elif is_gradable and src is None:
                 warn(f"{tag} 有答案但未标 source（建议标 teacher/material/ai_generated）")
 
             # ---- A2: source taxonomy + tag schema（可选字段，老题库不带照常有效）----
@@ -998,6 +1015,9 @@ def validate(ws):
                 err(f"{tag} teaching_role 非法: {role!r}（应为 paired_problem/worked_example）")
             else:
                 role_counts[role] += 1
+            teaching_gradable = ex.get("gradable")
+            if teaching_gradable is not None and not isinstance(teaching_gradable, bool):
+                err(f"{tag} gradable 必须是布尔型 true/false，当前 {teaching_gradable!r}")
             if ex.get("chapter") in (None, "") and ex.get("phase") in (None, ""):
                 err(f"{tag} 缺少 chapter 或 phase（无法按当前章惰性列举）")
             question = ex.get("question")
@@ -1069,7 +1089,11 @@ def validate(ws):
     quiz_items_for_overlap = data if has_qb and isinstance(data, list) else []
     quiz_ids = {q.get("id") for q in quiz_items_for_overlap
                 if isinstance(q, dict)
+                and q.get("gradable") is not False
                 and isinstance(q.get("id"), (str, int, float, bool))}
+    reachable_quiz_ids = {q.get("id") for q in quiz_items_for_overlap
+                          if isinstance(q, dict)
+                          and isinstance(q.get("id"), (str, int, float, bool))}
     stats["teaching_quiz_overlap"] = len(teaching_ids & quiz_ids)
 
     ingest_report_path = os.path.join(ws, "ingest_report.json")
@@ -1134,7 +1158,10 @@ def validate(ws):
                     err(f"{baseline_name} 的逐章教学例题 ID 与 teaching_example_ids 全集不一致")
         elif baseline_name == "references/teaching_baseline.json":
             err("references/teaching_baseline.json 缺少 teaching_example_ids_by_chapter")
-    missing_from_both = expected_teaching_ids - teaching_ids - quiz_ids
+    # A legacy ``gradable=false`` record is not a quiz, but it still prevents a
+    # false data-loss alarm while a workspace is being migrated into the
+    # dedicated teaching manifest.
+    missing_from_both = expected_teaching_ids - teaching_ids - reachable_quiz_ids
     stats["teaching_examples_expected"] = len(expected_teaching_ids)
     stats["teaching_example_baseline_chapters"] = len(expected_teaching_by_chapter)
     stats["teaching_examples_retained"] = len(expected_teaching_ids & teaching_ids)
@@ -1365,33 +1392,114 @@ def _readiness(errors, warnings):
     return "usable_with_gaps" if warnings else "ready"
 
 
+def _details_path(workspace, value):
+    if value is None:
+        return None
+    root = os.path.abspath(workspace)
+    candidate = os.path.abspath(os.path.join(root, value))
+    try:
+        contained = os.path.commonpath((root, candidate)) == root
+    except ValueError:
+        contained = False
+    if not contained:
+        raise ValueError("--details-file 必须位于 workspace 内")
+    parent = os.path.dirname(candidate)
+    if not os.path.isdir(parent):
+        raise ValueError("--details-file 父目录不存在：%s" % parent)
+    if os.path.lexists(candidate) and os.path.islink(candidate):
+        raise ValueError("--details-file 不得是符号链接")
+    return candidate
+
+
+def _atomic_json(path, payload):
+    temporary = path + ".tmp"
+    if os.path.lexists(temporary) and os.path.islink(temporary):
+        raise ValueError("details 临时文件不得是符号链接")
+    try:
+        with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.isfile(temporary):
+            os.remove(temporary)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Validate a cram workspace against docs/file-format.md")
     ap.add_argument("workspace", help="workspace directory")
     ap.add_argument("--json", action="store_true", help="output errors/warnings/stats as JSON")
+    ap.add_argument("--chapter", type=int, help="capability readiness chapter; default current phase")
+    ap.add_argument(
+        "--max-items", type=int, default=25,
+        help="maximum errors and warnings returned inline (1-200; default 25)",
+    )
+    ap.add_argument("--full", action="store_true", help="return every error and warning inline")
+    ap.add_argument(
+        "--details-file",
+        help="optional workspace-relative JSON file receiving every error and warning",
+    )
     args = ap.parse_args(argv)
     try:
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
 
+    if args.max_items < 1 or args.max_items > 200:
+        ap.error("--max-items 必须在 1 到 200 之间")
     errors, warnings, stats = validate(args.workspace)
     code = _exit_code(errors)
     readiness = _readiness(errors, warnings)
+    capabilities = _readiness_matrix.capability_readiness(
+        args.workspace, errors, warnings, stats, chapter=args.chapter
+    )
+    limit = max(len(errors), len(warnings)) if args.full else args.max_items
+    shown_errors = errors[:limit]
+    shown_warnings = warnings[:limit]
+    try:
+        details_path = _details_path(args.workspace, args.details_file)
+        if details_path:
+            _atomic_json(details_path, {
+                "workspace": os.path.abspath(args.workspace),
+                "readiness": readiness,
+                "capabilities": capabilities,
+                "errors": errors,
+                "warnings": warnings,
+                "stats": stats,
+            })
+    except (OSError, ValueError) as exc:
+        sys.stderr.write("validate_workspace: 无法写入 details：%s\n" % exc)
+        return 2
 
     if args.json:
         print(json.dumps({"exit_code": code, "ok": code == 0, "workspace": args.workspace,
-                          "readiness": readiness,
-                          "errors": errors, "warnings": warnings, "stats": stats},
+                          "readiness": readiness, "capabilities": capabilities,
+                          "error_count": len(errors), "warning_count": len(warnings),
+                          "error_summary": _readiness_matrix.summarize_messages(errors),
+                          "warning_summary": _readiness_matrix.summarize_messages(warnings),
+                          "truncated": {
+                              "errors": max(0, len(errors) - len(shown_errors)),
+                              "warnings": max(0, len(warnings) - len(shown_warnings)),
+                          },
+                          "details_file": details_path,
+                          "errors": shown_errors, "warnings": shown_warnings, "stats": stats},
                          ensure_ascii=False, indent=2))
     else:
         print(f"工作区: {args.workspace}")
         if stats:
             print("  统计:", ", ".join(f"{k}={v}" for k, v in stats.items()))
-        for e in errors:
+        for e in shown_errors:
             print(f"  [{'致命' if e['level'] == 'fatal' else '错误'}] {e['msg']}")
-        for w in warnings:
+        for w in shown_warnings:
             print(f"  [告警] {w['msg']}")
+        if len(errors) > len(shown_errors) or len(warnings) > len(shown_warnings):
+            print("  [摘要] 已限制内联输出；另有错误 %d 条、告警 %d 条。使用 --full 或 --details-file 查看。" % (
+                len(errors) - len(shown_errors), len(warnings) - len(shown_warnings)))
+        print("  能力:", ", ".join(
+            "%s=%s" % (name, value["status"])
+            for name, value in capabilities.items() if name != "chapter"))
         verdict = {
             "ready": "✓ ready（可运行，且静态检查无告警）",
             "usable_with_gaps": "△ usable_with_gaps（可运行，但仍有告警/完整性缺口）",

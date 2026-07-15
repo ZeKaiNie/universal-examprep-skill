@@ -18,11 +18,11 @@ def read(rel):
 class CanonicalLanguageRouting(unittest.TestCase):
     def test_root_routes_on_persisted_values_not_aliases(self):
         text = read("SKILL.md")
-        for value in ("`中文`", "`English`", "`双语`"):
-            self.assertIn("- %s →" % value, text)
-        for alias in ("zh", "en", "bilingual"):
-            self.assertNotIn("- `%s` →" % alias, text)
-        self.assertIn("accepted input aliases only", text)
+        for value in ("zh", "en", "bilingual"):
+            self.assertIn("- `%s` (display choice" % value, text)
+        for alias in ("`中文`", "`English`", "`双语`"):
+            self.assertNotIn("- %s →" % alias, text)
+        self.assertIn("accepted user-facing input aliases", text)
 
     def test_every_control_language_section_uses_canonical_values(self):
         paths = glob.glob(os.path.join(ROOT, "skills", "*", "SKILL.md"))
@@ -85,10 +85,11 @@ class SafetySemanticContracts(unittest.TestCase):
 
     def test_source_quotes_do_not_exempt_generated_prose(self):
         text = read("skills/exam-study-guide/SKILL.md")
-        self.assertIn("verbatim source quotations", text)
-        self.assertIn("original-language quotation", text)
-        self.assertIn("every agent-generated heading", text)
-        self.assertIn("English purity does not require rewriting a quoted Chinese exam question", text)
+        self.assertIn("Source quotations/images stay original-language evidence", text)
+        self.assertIn("Do not silently machine-translate source evidence", text)
+        self.assertIn("Translation fields are explicitly AI-authored/localized teaching blocks", text)
+        self.assertIn("Dispatch every agent-authored heading, explanation, step, answer", text)
+        self.assertIn("Bilingual content is complete blockwise zh+en", text)
 
 
 class DocumentationConsistency(unittest.TestCase):

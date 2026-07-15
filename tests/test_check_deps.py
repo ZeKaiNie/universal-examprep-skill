@@ -12,26 +12,132 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(ROOT, "scripts")
 sys.path.insert(0, SCRIPTS)
 import check_deps  # noqa: E402
+import notebook as notebook_engine  # noqa: E402
 PY = sys.executable
 
 
 def make_workspace(root, wiki="# Chapter 1\n\nNo formulas.\n", teaching=None,
-                   quizzes=None, notebook=None):
+                   quizzes=None, notebook=None, guide_formula=None,
+                   guide_substitution=None):
+    teaching = [dict(row) for row in (teaching or [])]
+    quizzes = [dict(row) for row in (quizzes or [])]
+    for index, row in enumerate(teaching, 1):
+        row.setdefault("id", "teaching-%d" % index)
+    for index, row in enumerate(quizzes, 1):
+        row.setdefault("id", "quiz-%d" % index)
+    # A true Study Guide cannot be an empty source packet.  Most dependency
+    # tests deliberately exercise only a wiki/notebook formula, so give those
+    # fixtures one plain, real chapter teaching item without changing the math
+    # signal under test.
+    if not any(str(row.get("chapter") or row.get("phase")) == "1"
+               for row in teaching + quizzes):
+        teaching.append({
+            "id": "fixture-teaching-1", "chapter": 1,
+            "question": "What is the chapter's plain fixture concept?",
+            "answer": "The plain fixture concept.", "source_type": "lecture",
+        })
     os.makedirs(os.path.join(root, "references", "wiki"), exist_ok=True)
     with open(os.path.join(root, "references", "wiki", "ch01.md"),
               "w", encoding="utf-8") as stream:
         stream.write(wiki)
     with open(os.path.join(root, "references", "teaching_examples.json"),
               "w", encoding="utf-8") as stream:
-        json.dump(teaching or [], stream, ensure_ascii=False)
+        json.dump(teaching, stream, ensure_ascii=False)
     with open(os.path.join(root, "references", "quiz_bank.json"),
               "w", encoding="utf-8") as stream:
-        json.dump(quizzes or [], stream, ensure_ascii=False)
-    if notebook is not None:
-        os.makedirs(os.path.join(root, "notebook"), exist_ok=True)
-        with open(os.path.join(root, "notebook", "ch01.md"),
-                  "w", encoding="utf-8") as stream:
-            stream.write(notebook)
+        json.dump(quizzes, stream, ensure_ascii=False)
+    os.makedirs(os.path.join(root, "notebook"), exist_ok=True)
+    if guide_formula is None:
+        visible = [wiki, notebook or ""]
+        for row in teaching:
+            if str(row.get("chapter") or row.get("phase")) == "1":
+                visible.extend(row.get(key) for key in ("question", "answer", "explanation"))
+        for row in quizzes:
+            if str(row.get("chapter") or row.get("phase")) != "1":
+                continue
+            answer = row.get("answer")
+            visible.extend((row.get("question"), row.get("options"), answer))
+            if check_deps._has_displayable_answer(answer):
+                visible.append(row.get("explanation"))
+        guide_formula = any(check_deps._contains_standard_math(value) for value in visible)
+    source = {"source_file": "course/ch01.pdf", "pages": [1], "role": "concept"}
+    expected = []
+    source_types = {}
+    aliases = {"example": "lecture", "lecture_quiz": "quiz",
+               "practice_exam": "mock_exam", "exam": "past_exam"}
+    for rows, quiz_layer in ((teaching, False), (quizzes, True)):
+        for row in rows:
+            if str(row.get("chapter") or row.get("phase")) != "1":
+                continue
+            item_id = str(row["id"])
+            if item_id not in expected:
+                expected.append(item_id)
+            if row.get("source_type"):
+                source_types[item_id] = aliases.get(row["source_type"], row["source_type"])
+    # Build the persisted evidence with the notebook engine's own heading,
+    # metadata, and GitHub-anchor rules.  The typed manifest may refer only to
+    # these pre-existing walkthrough entries.
+    notebook_pre = (notebook or "").rstrip().splitlines()
+    notebook_blocks = []
+    walkthrough_label = notebook_engine.i18n.display(
+        "notebook_type", "walkthrough", "en")
+    for item_id in expected:
+        title = "Example " + item_id
+        notebook_blocks.append({
+            "id": item_id,
+            "title": title,
+            "lines": notebook_engine.make_entry_lines(
+                item_id, title, walkthrough_label, "2026-07-14 00:00",
+                "Fixture walkthrough for %s." % item_id,
+            ),
+        })
+    notebook_anchors = notebook_engine.anchors_for(notebook_pre, notebook_blocks)
+    anchor_by_item = {
+        block["id"]: anchor for block, anchor in zip(notebook_blocks, notebook_anchors)
+    }
+    with open(os.path.join(root, "notebook", "ch01.md"),
+              "w", encoding="utf-8") as stream:
+        stream.write(notebook_engine.render_chapter(notebook_pre, notebook_blocks))
+    formulas = []
+    if guide_formula:
+        formulas.append({
+            "id": "f1", "latex": "x=y", "explanation": {"en": "A formula."},
+            "variables": [], "applicability": {"en": "When the variables apply."},
+            "source_refs": [dict(source, role="formula")],
+        })
+    walkthroughs = []
+    for item_id in expected:
+        formula_uses = []
+        if guide_substitution:
+            formula_uses.append({
+                "formula_id": "f1", "why_applicable": {"en": "It applies."},
+                "variable_mapping": [], "substitution": guide_substitution,
+            })
+        walkthroughs.append({
+            "item_id": item_id, "source_type": source_types.get(item_id, "other"),
+            "answer_provenance": "material",
+            "knowledge_point_ids": ["kp1"], "title": {"en": "Example " + item_id},
+            "notebook_anchor": anchor_by_item[item_id],
+            "original_language": "en", "prompt_asset_mode": "none",
+            "prompt_asset_paths": [], "answer_asset_paths": [], "translation": {},
+            "prompt_text": "Question " + item_id, "what_asked": {"en": "Solve it."},
+            "known_quantities": [], "unknown_quantities": [],
+            "formula_uses": formula_uses, "steps": [{"en": "Work the problem."}],
+            "answer": {"en": "Answer."}, "self_check": {"en": "Check it."},
+            "source_trace": [dict(source, role="question"), dict(source, role="answer")],
+        })
+    manifest = {
+        "schema_version": 1, "chapter": 1, "language": "en", "profile": "full",
+        "knowledge_points": [{
+            "id": "kp1", "title": {"en": "Concept"},
+            "explanation": {"en": "A source-backed concept."},
+            "formulas": formulas, "source_refs": [source], "example_ids": expected,
+        }],
+        "walkthroughs": walkthroughs, "omissions": [],
+    }
+    with open(os.path.join(root, "notebook", "ch01.guide.json"),
+              "w", encoding="utf-8") as stream:
+        json.dump(manifest, stream, ensure_ascii=False)
     return root
 
 
@@ -217,6 +323,7 @@ class ChapterContentAwareness(unittest.TestCase):
                 pdf_backend="html",
             )
         self.assertIs(rep["chapter_has_standard_math"], False)
+        self.assertEqual(rep["chapter_math_status"], "none")
         self.assertIs(self.row(rep, "mathml")["needed"], False)
         self.assertNotIn("mathml", rep["missing_needed"])
 
@@ -238,6 +345,7 @@ class ChapterContentAwareness(unittest.TestCase):
                             pdf_backend="html",
                         )
                 self.assertIs(rep["chapter_has_standard_math"], True)
+                self.assertEqual(rep["chapter_math_status"], "standard")
                 self.assertIs(self.row(rep, "mathml")["needed"], True)
                 self.assertIn("mathml", rep["missing_needed"])
 
@@ -254,6 +362,55 @@ class ChapterContentAwareness(unittest.TestCase):
         self.assertIs(rep["chapter_has_standard_math"], False)
         self.assertIs(self.row(rep, "mathml")["needed"], False)
 
+    def test_raw_source_math_is_ignored_when_validated_guide_has_no_math(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            make_workspace(workspace, wiki="# Raw source\n\n$x^2$\n", guide_formula=False)
+            rep = check_deps.build_report(
+                artifact_mode="visual", workspace=workspace, chapter=1,
+                pdf_backend="html",
+            )
+        self.assertEqual("none", rep["chapter_math_status"])
+        self.assertIs(rep["chapter_has_standard_math"], False)
+        self.assertIs(self.row(rep, "mathml")["needed"], False)
+
+    def test_validated_guide_substitution_needs_mathml_even_without_formula_list(self):
+        quizzes = [{"id": "q1", "chapter": 1, "question": "plain"}]
+        with tempfile.TemporaryDirectory() as workspace:
+            # A substitution must reference a declared formula, so the fixture has
+            # both; the assertion specifically checks the substitution count exposed
+            # by the machine-readable preflight receipt.
+            make_workspace(workspace, quizzes=quizzes, guide_formula=True,
+                           guide_substitution="x=2+3=5")
+            rep = check_deps.build_report(
+                artifact_mode="visual", workspace=workspace, chapter=1,
+                pdf_backend="html",
+            )
+        self.assertEqual("standard", rep["chapter_math_status"])
+        self.assertEqual(1, rep["chapter_math_counts"]["substitutions"])
+
+    def test_active_formula_review_is_needs_recovery_not_no_math(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            make_workspace(workspace, guide_formula=False)
+            os.makedirs(os.path.join(workspace, ".ingest"), exist_ok=True)
+            with open(os.path.join(workspace, ".ingest", "content_units.jsonl"), "w",
+                      encoding="utf-8") as stream:
+                stream.write(json.dumps({"unit_id": "u1", "chapter_id": "ch01"}) + "\n")
+            with open(os.path.join(workspace, ".ingest", "review_queue.jsonl"), "w",
+                      encoding="utf-8") as stream:
+                stream.write(json.dumps({
+                    "status": "pending", "reason_codes": ["formula_hint"],
+                    "target_unit_ids": ["u1"],
+                }) + "\n")
+            rep = check_deps.build_report(
+                artifact_mode="visual", workspace=workspace, chapter=1,
+                pdf_backend="html",
+            )
+        self.assertEqual("needs_recovery", rep["chapter_math_status"])
+        self.assertIsNone(rep["chapter_has_standard_math"])
+        self.assertIn("chapter_source_recovery_pending", rep["chapter_math_reasons"])
+        self.assertEqual("probe_error", self.row(rep, "mathml")["needed"])
+        self.assertNotIn("mathml", rep["missing_needed"])
+
     def test_chat_mode_keeps_mathml_optional_even_when_selected_chapter_has_formula(self):
         with tempfile.TemporaryDirectory() as workspace:
             make_workspace(workspace, wiki="# X\n\n$x$\n")
@@ -263,6 +420,17 @@ class ChapterContentAwareness(unittest.TestCase):
         self.assertIs(rep["chapter_has_standard_math"], True)
         self.assertIs(self.row(rep, "mathml")["needed"], False)
         self.assertNotIn("mathml", rep["missing_needed"])
+
+    def test_chat_mode_reports_recovery_without_failing_visual_preflight(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            make_workspace(workspace)
+            os.remove(os.path.join(workspace, "notebook", "ch01.guide.json"))
+            rep = check_deps.build_report(
+                artifact_mode="chat", workspace=workspace, chapter=1
+            )
+        self.assertEqual("needs_recovery", rep["chapter_math_status"])
+        self.assertIsNone(rep["probe_error"])
+        self.assertIs(self.row(rep, "mathml")["needed"], False)
 
     def test_quiz_explanation_math_is_needed_only_when_renderer_will_show_it(self):
         cases = (

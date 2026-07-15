@@ -8,7 +8,7 @@ One screen to understand this exam-prep skill suite. Detailed rules live in the 
 ### Four-step workflow
 1. **Build and validate the library** (`exam-ingest`): upload your materials → run the one-command course ingest → build structured source records, the wiki, quiz bank, and progress state → review any blocked items before studying.
 2. **Teach** (`exam-tutor`): lazy-load chapter by chapter; metaphor-first concept teaching / key-problem walkthroughs / run the algorithm before drawing.
-   Compile a completed chapter with `exam-study-guide` only after an explicit standing `visual` choice or an explicit one-shot HTML/PDF/print request; the default `chat` mode performs no automatic compilation.
+   Before completing a structured chapter, use `exam-study-guide` to validate/import its `profile=full` typed guide. The default `chat` mode stops there without HTML/PDF; standing `visual` or a one-shot request continues through the requested rendering and QA path.
 3. **Quiz** (`exam-quiz`): draw questions from the quiz bank and grade; after two misses you get a hint / skip / archive.
 4. **Review + cheat sheet** (`exam-review` / `exam-cheatsheet`): clear out mistakes and confusion points. An automatically reached final review under `chat` stays conversational; an explicit cheat-sheet request may compile `cheatsheet.md`, while PDF rendering requires `visual` or an explicit PDF/print request.
 
@@ -20,13 +20,13 @@ One screen to understand this exam-prep skill suite. Detailed rules live in the 
 ### Artifact output mode (not a fourth required first-contact question)
 The workspace field is `artifact_mode`, with only the canonical values `chat` / `visual`.
 - **`chat` (economical conversation, default)**: missing legacy state and unknown values also resolve here. Teach in the conversation and keep normal notebook/state persistence; do not automatically build chapter HTML/PDF or a cheat-sheet PDF.
-- **`visual` (visual study guide)**: persist it only after the student explicitly chooses it, via `update_progress.py set --artifact-mode visual`. Completed chapters receive HTML + PDF and full-page visual QA; the final cheat sheet may also receive a printable PDF. Dependencies or external skills still must never be installed silently.
+- **`visual` (visual study guide)**: persist it only after the student explicitly chooses it, via `update_progress.py set --artifact-mode visual`. It requests the typed manifest → HTML/PDF → receipt → all-page QA pipeline; a chapter is deliverable and phase-completable only after `artifact_ready=ready`. A failed route stays blocked/degraded. The final cheat sheet may also receive a printable PDF. Dependencies or external skills still must never be installed silently.
 - An explicit one-shot HTML/PDF/print request may temporarily override `chat` without modifying the stored choice; `set --artifact-mode chat` returns to the standing economical path. The agent never reads or guesses the student's subscription plan and never switches based on a presumed quota.
 
 ### Workspace files
 - `.ingest/` is the build/review truth: source versions, structured content units, typed review issues, replayable patches, and integrity hashes. Do not edit it by hand.
 - `study_state.json` is progress truth and is read first after a restart; `study_progress.md` is its generated compatibility view. If that renderer retains canonical Chinese state vocabulary, the coach restates it in English instead of pasting it as English teaching prose.
-- `references/wiki/chN_*.md` is the compiled per-chapter teaching source · `references/quiz_bank.json` is the only quiz/grading source · `notebook/` stores full explanations · `study_guide/chNN.html` is an optional reading artifact.
+- `references/wiki/chN_*.md` is the compiled per-chapter concept-teaching source · `references/quiz_bank.json` is the only quiz/grading source · `notebook/chNN.md` stores full explanations · `notebook/chNN.guide.json` is the validated typed chapter source · `study_guide/chNN.html|pdf`, `chNN.receipt.json`, and `qa/` are gated derived reading/QA artifacts.
 
 ### Ingestion readiness
 The normal entry is `scripts/ingest_course.py`. Exit 10 means the files were compiled but content readiness is blocked; the coach must resolve the typed review queue and validate again before teaching or quizzing. `usable_with_gaps` is usable only after the remaining warnings are named; `ready` has no current validator errors or warnings.
@@ -43,4 +43,4 @@ The normal entry is `scripts/ingest_course.py`. Exit 10 means the files were com
 `exam-ingest` build the library · `exam-tutor` teach · `exam-study-guide` compile visual material · `exam-quiz` quiz · `exam-review` review · `exam-cheatsheet` cheat sheet · `exam-audit` read-only checkup · `exam-cram` overall orchestrator.
 
 ### Language
-Student-facing output defaults to English (Simplified Chinese if the student opened in Chinese); a persisted `language` (`中文` / `English` / `双语`) switches it per the dispatch rule, and control instructions stay English / precise. See [`docs/language-policy.md`](../../../docs/language-policy.md).
+Student-facing output defaults to English (Simplified Chinese if the student opened in Chinese); a persisted `language` code (`zh` / `en` / `bilingual`) switches it per the dispatch rule, and control instructions stay English / precise. See [`docs/language-policy.md`](../../../docs/language-policy.md).

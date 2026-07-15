@@ -396,11 +396,15 @@ def validate(data):
         qtype = q.get("type")
         if qtype not in VALID_QUIZ_TYPES:
             errors.append(f"题目 {tag} 的 type 必须是 {'/'.join(sorted(VALID_QUIZ_TYPES))} 之一（当前为 {qtype!r}）。")
+        gradable = q.get("gradable")
+        if gradable is not None and not isinstance(gradable, bool):
+            errors.append(f"题目 {tag} 的 gradable 必须是布尔型 true/false（当前为 {gradable!r}）。")
+        is_gradable = gradable is not False
         if not q.get("question"):
             errors.append(f"题目 {tag} 缺少题干 question。")
-        if qtype == "choice" and not q.get("options"):
+        if is_gradable and qtype == "choice" and not q.get("options"):
             errors.append(f"选择题 {tag} 缺少 options 选项。")
-        if is_blank(q.get("answer")):
+        if is_gradable and is_blank(q.get("answer")):
             missing_answer_ids.append(tag)
 
     # Optional, backward-compatible teaching layer.  ``None`` means a legacy raw input omitted the
@@ -431,6 +435,11 @@ def validate(data):
                 errors.append(
                     f"{tag} 的 teaching_role 必须是 "
                     f"{'/'.join(sorted(VALID_TEACHING_ROLES))} 之一（当前为 {role!r}）。"
+                )
+            gradable = ex.get("gradable")
+            if gradable is not None and not isinstance(gradable, bool):
+                errors.append(
+                    f"{tag} 的 gradable 必须是布尔型 true/false（当前为 {gradable!r}）。"
                 )
             if ex.get("chapter") in (None, "") and ex.get("phase") in (None, ""):
                 errors.append(f"{tag} 缺少 chapter 或 phase，无法按当前章惰性列举。")
@@ -594,7 +603,8 @@ def main():
     # 补号后重算缺答案清单——validate 阶段无 id 的题记的是「#序号」占位，
     # 持久化报告必须指向题库里真实存在的 id，后续会话的 AI 才能定位接手
     missing_answer_ids = [
-        str(q["id"]).strip() for q in quiz_bank if is_blank(q.get("answer"))
+        str(q["id"]).strip() for q in quiz_bank
+        if q.get("gradable") is not False and is_blank(q.get("answer"))
     ]
 
     print(f"[+] 识别到科目: {course_name}")

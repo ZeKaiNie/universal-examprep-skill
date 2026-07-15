@@ -28,14 +28,14 @@ Capture the learner's concept-level confusions (why / what / how-derived questio
 - Persist one confusion record (`关联章节` / `疑难点` / `解答要点` / `状态`) through `update_progress.py add-confusion`; initialize state first when Python works. Only a true no-Python fallback appends one row to the 「## 💡 概念疑难点记录」 table in `study_progress.md` (`序号` auto-increments).
 - **Persist-first default**: the full confusion explanation is ALSO written into `notebook/chNN.md` via the notebook CLI (`--type confusion`, Workflow step 3) — the state row records that the confusion exists, the notebook entry preserves the explanation itself; the receipt carries the pack-provided link line. File-less clients keep chat-only output.
 - During the final sweep, read the confusion records and have the learner restate each: update `状态` **in place** — 待回顾 → 已回顾 when explained correctly; keep 待回顾 and re-explain otherwise. Never overwrite other skills' writes.
-- Student-facing output defaults to English (Simplified Chinese if the student opened in Chinese); a persisted `study_state.json` `language` (`中文`/`English`/`双语`) switches it per exam-cram's dispatch rule with single-language purity.
+- Student-facing output defaults to English (Simplified Chinese if the student opened in Chinese); the persisted `study_state.json.language` code (`zh`/`en`/`bilingual`) switches it per exam-cram's dispatch rule with single-language purity.
 
 ## Language packs
 Student-visible wording for this skill lives in per-language packs — load the one matching `study_state.json.language` BEFORE emitting any student-visible output:
 - `中文` → [`../../locales/zh/skills/confusion-tracker.md`](../../locales/zh/skills/confusion-tracker.md)
 - `English` → [`../../locales/en/skills/confusion-tracker.md`](../../locales/en/skills/confusion-tracker.md)
 - `双语` → compose the zh and en packs block by block, zh first with a `> EN:` mirror (rules in [`../../docs/language-policy.md`](../../docs/language-policy.md))
-Aliases such as `zh`, `en`, and `bilingual` are normalized by `update_progress.py`; do not route on them as stored values. Unset language → the merged first-ask decides it; default English unless the student opened in Chinese.
+Display aliases such as `中文`, `English`, and `双语` are normalized by `update_progress.py`; route persisted state on `zh`, `en`, or `bilingual`. Unset language → the merged first-ask decides it; default English unless the student opened in Chinese.
 
 ## Boundaries
 - **Structured progress state**: when `study_state.json` exists it is the SINGLE SOURCE OF TRUTH — record via `python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace <ws> add-confusion`, update review status via `set-confusion-status --id <qid>|--index <N> --status 已回顾/待回顾`; never hand-patch the generated `study_progress.md`. If the state write fails, TELL the user; never continue as if it saved.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Render one chapter of an exam workspace as a self-contained study guide.
+"""Render one chapter as a typed Study Guide or an explicitly branded source packet.
 
 Markdown/JSON files remain the auditable sources.  This renderer builds a human-facing HTML
 view with native MathML and data-URI images, then optionally asks a local Edge/Chrome to print
@@ -13,6 +13,8 @@ validated HTML and removes any stale PDF.
 """
 import argparse
 import base64
+import datetime
+import hashlib
 import html
 from html.parser import HTMLParser
 import json
@@ -22,13 +24,15 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+from urllib.parse import unquote, urlsplit
 import xml.etree.ElementTree as ET
 
 import i18n
-from check_deps import (LATEX2MATHML_PIN, LATEX2MATHML_VERSION,
+from check_deps import (LATEX2MATHML_PIN, LATEX2MATHML_VERSION, build_report,
                         installed_distribution_version)
 from validate_workspace import LATEX_COMMAND_RE
 
@@ -43,6 +47,7 @@ for _stream in ("stdout", "stderr"):
 QUESTION_ROLES = {"question_context", "figure", "diagram", "table"}
 ANSWER_ROLES = {"answer_context", "worked_solution"}
 ALL_ROLES = QUESTION_ROLES | ANSWER_ROLES
+ARTIFACT_RECEIPT_SCHEMA_VERSION = 2
 SOURCE_LABELS_ZH = {
     "teacher": "🟢 来自资料",
     "material": "🟢 来自资料",
@@ -184,6 +189,13 @@ class GuideError(Exception):
         self.code = code
 
 
+class ArtifactDriftError(GuideError):
+    """A source/runtime changed while an artifact publication was in flight."""
+
+    def __init__(self, message):
+        super().__init__("artifact input drift: %s" % message, 1)
+
+
 class MissingMathDependency(GuideError):
     def __init__(self, detected_version=None):
         command = '"%s" -m pip install %s' % (sys.executable, LATEX2MATHML_PIN)
@@ -216,13 +228,18 @@ def _reject_symlink_components(ws, path, label):
     cur = ws
     for part in (() if rel == "." else rel.split(os.sep)):
         cur = os.path.join(cur, part)
-        if os.path.islink(cur):
+        try:
+            reparse = _is_reparse_stat(os.lstat(cur))
+        except OSError:
+            reparse = False
+        if os.path.islink(cur) or reparse:
             raise GuideError("%s 含符号链接路径组件：%s" % (label, part))
 
 
 def _guard_workspace(workspace):
     ws = os.path.abspath(workspace)
-    if os.path.islink(ws):
+    if (os.path.islink(ws)
+            or (os.path.lexists(ws) and _is_reparse_stat(os.lstat(ws)))):
         raise GuideError("--workspace 不得是符号链接：%s" % workspace)
     if not os.path.isdir(ws):
         raise GuideError("workspace 不存在或不是目录：%s" % workspace)
@@ -1019,6 +1036,11 @@ def _render_quizzes(renderer, workspace, items, language):
 
 
 def render_study_guide(sources, math_converter=None):
+    """Render the legacy four-layer source packet.
+
+    Kept as a Python compatibility API.  The CLI never labels this output a Study Guide; callers
+    must explicitly select ``--artifact-type source_packet``.
+    """
     ws, chapter = sources["workspace"], sources["chapter"]
     language = sources.get("language", "中文")
     if language not in CANON_LANGUAGES:
@@ -1125,13 +1147,52 @@ blockquote { margin:.8em 0; padding:.35em 1em; border-left:4px solid #96add0; co
     return document
 
 
+render_source_packet = render_study_guide
+
+
 class _SelfContainedHTMLCheck(HTMLParser):
-    def __init__(self):
+    def __init__(self, materials_root=None):
         super().__init__(convert_charrefs=True)
         self.errors = []
+        self.materials_root = (
+            os.path.realpath(os.path.abspath(materials_root))
+            if isinstance(materials_root, str) and materials_root else None
+        )
+        self.element_ids = set()
+        self.fragment_links = []
+
+    def _file_href_allowed(self, value):
+        if self.materials_root is None:
+            return False
+        if (not os.path.isdir(self.materials_root) or os.path.islink(self.materials_root)):
+            return False
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return False
+        if parsed.scheme.lower() != "file" or parsed.netloc not in ("", "localhost"):
+            return False
+        if parsed.query or not re.fullmatch(r"page=[1-9]\d*", parsed.fragment or ""):
+            return False
+        decoded = unquote(parsed.path)
+        if os.name == "nt" and re.match(r"^/[A-Za-z]:/", decoded):
+            decoded = decoded[1:]
+        target = os.path.abspath(decoded.replace("/", os.sep))
+        target_real = os.path.realpath(target)
+        try:
+            contained = os.path.commonpath((self.materials_root, target_real)) == self.materials_root
+        except ValueError:
+            contained = False
+        if not contained or os.path.islink(target) or not os.path.isfile(target):
+            return False
+        canonical = Path(target_real).resolve().as_uri() + "#" + parsed.fragment
+        return value == canonical
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
+        element_id = attrs.get("id")
+        if isinstance(element_id, str) and element_id:
+            self.element_ids.add(element_id)
         if tag.lower() in {"script", "iframe", "object", "embed", "link"}:
             self.errors.append("禁止标签 <%s>" % tag)
         for key, value in attrs.items():
@@ -1141,13 +1202,18 @@ class _SelfContainedHTMLCheck(HTMLParser):
             if low == "src" and not (value or "").startswith("data:image/"):
                 self.errors.append("非内嵌 src")
             if low == "href":
-                self.errors.append("外部/可导航 href")
+                if (isinstance(value, str)
+                        and re.fullmatch(r"#(?:example|kp)-[A-Za-z0-9_.:-]+", value)):
+                    self.fragment_links.append(value[1:])
+                elif not isinstance(value, str) or not self._file_href_allowed(value):
+                    self.errors.append("不安全或未绑定的 href")
 
 
-def validate_generated_html(document):
+def validate_generated_html(document, workspace=None, materials_root=None):
+    del workspace  # reserved for callers that keep both roots explicit
     if not document.lstrip().lower().startswith("<!doctype html>"):
         raise GuideError("生成 HTML 缺少 doctype", 1)
-    check = _SelfContainedHTMLCheck()
+    check = _SelfContainedHTMLCheck(materials_root=materials_root)
     try:
         check.feed(document)
         check.close()
@@ -1155,6 +1221,9 @@ def validate_generated_html(document):
         raise GuideError("生成 HTML 无法解析（%s）" % exc, 1)
     if check.errors:
         raise GuideError("生成 HTML 未通过自包含安全检查：%s" % ", ".join(check.errors), 1)
+    missing_fragments = sorted(set(check.fragment_links) - check.element_ids)
+    if missing_fragments:
+        raise GuideError("生成 HTML 含不存在的同页锚点：%s" % ", ".join(missing_fragments), 1)
     for prefix in ("STUDYGUIDEPROTECTED", "STUDYGUIDEMATHTOKEN", "STUDYGUIDEOPAQUETOKEN"):
         if prefix in document:
             raise GuideError("生成 HTML 残留渲染器保留 token：%s" % prefix, 1)
@@ -1190,15 +1259,19 @@ def _remove_stale(path, label):
             raise GuideError("无法移除过期 %s（%s）" % (label, exc), 1)
 
 
-def _atomic_write(path, content):
+def _atomic_write(path, content, before_publish=None):
+    """Atomically publish exact UTF-8 bytes, with a last-moment input recheck hook."""
     _guard_output(path, os.path.basename(path))
     directory = os.path.dirname(path)
     fd, tmp = tempfile.mkstemp(prefix=".study-guide-", suffix=".tmp", dir=directory)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            f.write(content)
+        payload = content.encode("utf-8")
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
             f.flush()
             os.fsync(f.fileno())
+        if before_publish is not None:
+            before_publish()
         os.replace(tmp, path)
     except Exception:
         try:
@@ -1206,6 +1279,344 @@ def _atomic_write(path, content):
         except OSError:
             pass
         raise
+
+
+def _atomic_json(path, value, before_publish=None):
+    _guard_output(path, os.path.basename(path))
+    directory = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(prefix=".study-guide-receipt-", suffix=".tmp", dir=directory)
+    try:
+        payload = (json.dumps(
+            value, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        if before_publish is not None:
+            before_publish()
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _sha256_bytes(payload):
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _is_reparse_stat(value):
+    attrs = getattr(value, "st_file_attributes", 0)
+    return bool(attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+
+
+def _stat_identity(value):
+    """Return the filesystem identity used to reject same-bytes path replacement.
+
+    ``st_ino`` is available for regular files on supported CPython/Windows and POSIX builds.  A
+    zero inode cannot prove that a path still names the same file, so artifact publication fails
+    closed instead of degrading to a hash-only check.
+    """
+    device = int(getattr(value, "st_dev", 0))
+    inode = int(getattr(value, "st_ino", 0))
+    if inode == 0:
+        raise GuideError("filesystem does not expose a stable regular-file identity", 1)
+    return device, inode
+
+
+def _stat_generation(value):
+    return (
+        int(value.st_size),
+        int(getattr(value, "st_mtime_ns", int(value.st_mtime * 1_000_000_000))),
+    )
+
+
+def _capture_regular_file_snapshot(ws, path, label):
+    """Read one stable regular-file generation and retain its exact bytes/hash/identity."""
+    path = os.path.abspath(path)
+    _guard_existing_file(ws, path, label)
+    try:
+        before = os.lstat(path)
+        if (not stat.S_ISREG(before.st_mode) or _is_reparse_stat(before)
+                or os.path.islink(path)):
+            raise GuideError("%s is not a non-reparse regular file" % label)
+        before_identity = _stat_identity(before)
+        with open(path, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(opened.st_mode) or _is_reparse_stat(opened)
+                    or _stat_identity(opened) != before_identity):
+                raise ArtifactDriftError("%s changed between path check and open" % label)
+            opened_generation = _stat_generation(opened)
+            payload = stream.read()
+            stream.seek(0)
+            confirmation = stream.read()
+            after_read = os.fstat(stream.fileno())
+        after = os.lstat(path)
+    except ArtifactDriftError:
+        raise
+    except GuideError:
+        raise
+    except OSError as exc:
+        raise GuideError("cannot read stable %s snapshot: %s" % (label, exc), 1)
+    if (not stat.S_ISREG(after_read.st_mode) or not stat.S_ISREG(after.st_mode)
+            or _is_reparse_stat(after_read) or _is_reparse_stat(after)
+            or os.path.islink(path)):
+        raise ArtifactDriftError("%s stopped being a regular file while it was read" % label)
+    if (_stat_identity(after_read) != before_identity
+            or _stat_identity(after) != before_identity):
+        raise ArtifactDriftError("%s path identity changed while it was read" % label)
+    if (_stat_generation(after_read) != opened_generation
+            or _stat_generation(after) != opened_generation
+            or len(payload) != opened_generation[0]
+            or confirmation != payload):
+        raise ArtifactDriftError("%s contents changed while its snapshot was read" % label)
+    return {
+        "path": path,
+        "identity": before_identity,
+        "sha256": _sha256_bytes(payload),
+        "bytes": payload,
+    }
+
+
+def _verify_file_snapshot(ws, snapshot, label):
+    """Reopen ``snapshot.path`` and prove both filesystem identity and bytes are unchanged."""
+    try:
+        current = _capture_regular_file_snapshot(ws, snapshot["path"], label)
+    except ArtifactDriftError:
+        raise
+    except (GuideError, OSError, KeyError, TypeError) as exc:
+        raise ArtifactDriftError("%s cannot be revalidated (%s)" % (label, exc))
+    if current["identity"] != snapshot["identity"]:
+        raise ArtifactDriftError("%s path was replaced, even though bytes may match" % label)
+    if current["sha256"] != snapshot["sha256"]:
+        raise ArtifactDriftError("%s SHA-256 changed during rendering" % label)
+    return current
+
+
+def _reject_duplicate_json_object(pairs):
+    value = {}
+    for key, child in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key: %s" % key)
+        value[key] = child
+    return value
+
+
+def _load_typed_manifest_snapshot(ws, chapter):
+    """Parse and validate the exact bytes captured at the start of this render run."""
+    import study_guide_content as content
+
+    path = content.manifest_path(ws, chapter)
+    snapshot = _capture_regular_file_snapshot(
+        ws, path, "study-guide content manifest")
+    if len(snapshot["bytes"]) > content.MAX_JSON_BYTES:
+        raise GuideError("study-guide content manifest exceeds %d bytes" %
+                         content.MAX_JSON_BYTES)
+    try:
+        manifest = json.loads(
+            snapshot["bytes"].decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_object,
+            parse_constant=_reject_constant,
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise GuideError("study-guide content manifest is not strict UTF-8 JSON: %s" % exc)
+    try:
+        report = content.validate_manifest(ws, chapter, manifest)
+    except (ValueError, OSError) as exc:
+        raise GuideError("study-guide content manifest is invalid: %s" % exc)
+    report["input_path"] = path
+    return manifest, report, snapshot
+
+
+def _canonical_hash(value):
+    return _sha256_bytes(json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8"))
+
+
+def _utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).replace(
+        microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _preflight_or_raise(ws, chapter, backend, math_converter):
+    if math_converter is not None:
+        return {"status": "injected-test-converter", "pdf_backend": backend,
+                "missing_needed": [], "probe_error": None}
+    report = build_report(
+        artifact_mode="visual", workspace=ws, chapter=chapter, pdf_backend=backend)
+    if report.get("probe_error"):
+        raise GuideError("visual dependency preflight failed: %s" % report["probe_error"], 3)
+    if report.get("missing_needed"):
+        raise GuideError("visual dependency preflight is missing: %s" %
+                         ", ".join(report["missing_needed"]), 3)
+    report["status"] = "passed"
+    return report
+
+
+def _start_gate_or_raise(ws):
+    import exam_start
+
+    gate = exam_start.check_registered_workspace_gate(ws)
+    if not gate.get("ready_to_use"):
+        blockers = []
+        for attempt in gate.get("attempts") or []:
+            blockers.extend(attempt.get("blockers") or [])
+        detail = ", ".join(sorted(set(blockers))) or gate.get("reason") or "unknown"
+        raise GuideError(
+            "Study Guide rendering requires the confirmed workspace/materials pair, all "
+            "learning choices, and a matching runtime receipt; rerun exam_start confirm "
+            "(%s)" % detail,
+            2,
+        )
+    return gate
+
+
+def _start_gate_snapshot(gate):
+    runtime = ((gate.get("runtime_provenance") or {}).get("receipt") or {})
+    return {
+        "ready_to_use": bool(gate.get("ready_to_use")),
+        "workspace": gate.get("workspace"),
+        "materials": gate.get("materials"),
+        "registered_course": gate.get("registered_course"),
+        "runtime_digest": runtime.get("runtime_digest"),
+        "runtime_file_count": runtime.get("runtime_file_count"),
+        "skill_version": runtime.get("skill_version"),
+        "git_commit": runtime.get("git_commit"),
+        "git_branch": runtime.get("git_branch"),
+        "git_dirty": runtime.get("git_dirty"),
+        "python_executable": runtime.get("python_executable"),
+    }
+
+
+def _verify_start_gate_snapshot(ws, expected):
+    try:
+        current_gate = _start_gate_or_raise(ws)
+    except GuideError as exc:
+        raise ArtifactDriftError("confirmed workspace/runtime gate no longer passes (%s)" % exc)
+    current = _start_gate_snapshot(current_gate)
+    if current != expected:
+        raise ArtifactDriftError("confirmed workspace/runtime identity changed during rendering")
+    return current_gate
+
+
+def _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot):
+    _verify_file_snapshot(ws, manifest_snapshot, "study-guide content manifest")
+    _verify_start_gate_snapshot(ws, start_gate_snapshot)
+
+
+def _conversion_run_hash(chapter, profile, language, html_sha256, pdf_sha256,
+                         conversion_input_html_sha256, converter,
+                         conversion_started_at, conversion_completed_at,
+                         start_gate):
+    return _canonical_hash({
+        "artifact_type": "study_guide",
+        "chapter": chapter,
+        "profile": profile,
+        "language": language,
+        "html_sha256": html_sha256,
+        "pdf_sha256": pdf_sha256,
+        "conversion_input_html_sha256": conversion_input_html_sha256,
+        "converter": converter,
+        "conversion_started_at": conversion_started_at,
+        "conversion_completed_at": conversion_completed_at,
+        "start_gate": start_gate,
+    })
+
+
+def _write_guide_receipt(ws, receipt_path, chapter, manifest_snapshot,
+                         manifest_report, html_snapshot, pdf_path, backend,
+                         preflight, start_gate_snapshot, conversion=None):
+    _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot)
+    _verify_file_snapshot(ws, html_snapshot, "published Study Guide HTML")
+    manifest_path = manifest_snapshot["path"]
+    html_path = html_snapshot["path"]
+    html_sha256 = html_snapshot["sha256"]
+    has_pdf = conversion is not None
+    if has_pdf and (backend != "browser" or not os.path.isfile(pdf_path)):
+        raise GuideError("browser PDF receipt requires a PDF produced by this render run", 1)
+    if has_pdf and not isinstance(conversion, dict):
+        raise GuideError("browser converter did not return a conversion receipt", 1)
+    pdf_snapshot = (
+        _capture_regular_file_snapshot(ws, pdf_path, "published Study Guide PDF")
+        if has_pdf else None
+    )
+    pdf_sha256 = pdf_snapshot["sha256"] if pdf_snapshot else None
+    converter = conversion.get("converter") if has_pdf else None
+    conversion_started_at = conversion.get("started_at") if has_pdf else None
+    conversion_completed_at = conversion.get("completed_at") if has_pdf else None
+    conversion_input_html_sha256 = conversion.get("input_html_sha256") if has_pdf else None
+    if has_pdf:
+        required_strings = {
+            "converter": converter,
+            "conversion_started_at": conversion_started_at,
+            "conversion_completed_at": conversion_completed_at,
+        }
+        for label, value in required_strings.items():
+            if (not isinstance(value, str) or not value.strip()
+                    or any(char in value for char in ("\x00", "\r", "\n"))):
+                raise GuideError("browser conversion receipt has invalid %s" % label, 1)
+        for label, value in (
+                ("conversion_input_html_sha256", conversion_input_html_sha256),
+                ("source_html_sha256", conversion.get("source_html_sha256"))):
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise GuideError("browser conversion receipt has invalid %s" % label, 1)
+        if conversion.get("source_html_sha256") != html_sha256:
+            raise GuideError("browser conversion receipt does not bind the current HTML", 1)
+    conversion_run_sha256 = (
+        _conversion_run_hash(
+            chapter, manifest_report["profile"], manifest_report["language"],
+            html_sha256, pdf_sha256, conversion_input_html_sha256, converter,
+            conversion_started_at, conversion_completed_at, start_gate_snapshot,
+        ) if has_pdf else None
+    )
+    receipt = {
+        "schema_version": ARTIFACT_RECEIPT_SCHEMA_VERSION,
+        "artifact_type": "study_guide",
+        "chapter": chapter,
+        "profile": manifest_report["profile"],
+        "language": manifest_report["language"],
+        "content_manifest": os.path.relpath(manifest_path, os.path.dirname(os.path.dirname(html_path))).replace("\\", "/"),
+        "content_manifest_sha256": manifest_snapshot["sha256"],
+        "expected_item_ids": manifest_report["expected_item_ids"],
+        "rendered_item_ids": manifest_report["walkthrough_item_ids"],
+        "omitted_item_ids": manifest_report["omitted_item_ids"],
+        "html_file": "study_guide/%s" % os.path.basename(html_path),
+        "html_sha256": html_sha256,
+        "pdf_file": "study_guide/%s" % os.path.basename(pdf_path) if has_pdf else None,
+        "pdf_sha256": pdf_sha256,
+        "pdf_backend": backend,
+        "converter": converter,
+        "conversion_input_html_sha256": conversion_input_html_sha256,
+        "conversion_started_at": conversion_started_at,
+        "conversion_completed_at": conversion_completed_at,
+        "conversion_run_sha256": conversion_run_sha256,
+        "preflight": preflight,
+        "start_gate": start_gate_snapshot,
+        "generated_at": _utc_now(),
+        "status": "qa_pending" if has_pdf else (
+            "awaiting_native_pdf" if backend == "native" else "html_ready"),
+        "visual_qa": {"schema_version": 1, "status": "pending"} if has_pdf else {
+            "schema_version": 1, "status": "not_requested"},
+    }
+
+    def recheck_before_receipt_publish():
+        _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot)
+        _verify_file_snapshot(ws, html_snapshot, "published Study Guide HTML")
+        if pdf_snapshot is not None:
+            _verify_file_snapshot(ws, pdf_snapshot, "published Study Guide PDF")
+
+    _atomic_json(
+        receipt_path, receipt, before_publish=recheck_before_receipt_publish)
+    return receipt
 
 
 def find_browser():
@@ -1224,7 +1635,7 @@ def find_browser():
     return next((p for p in candidates if os.path.isfile(p)), None)
 
 
-def _print_ready_html(document):
+def _print_ready_html(document, workspace=None, materials_root=None):
     """Materialize open quiz disclosures for Chromium print.
 
     Chromium does not honor CSS that tries to expose children of a closed ``details`` element.
@@ -1234,11 +1645,13 @@ def _print_ready_html(document):
     ready = document.replace(
         '<details class="quiz-answer">', '<details open class="quiz-answer">'
     )
-    validate_generated_html(ready)
+    validate_generated_html(ready, workspace=workspace, materials_root=materials_root)
     return ready
 
 
-def print_pdf(browser, html_path, pdf_path, timeout=120):
+def print_pdf(browser, html_path, pdf_path, timeout=120, workspace=None,
+              materials_root=None, expected_html_sha256=None):
+    started_at = _utc_now()
     _remove_stale(pdf_path, os.path.basename(pdf_path))
     directory = os.path.dirname(pdf_path)
     fd, tmp_pdf = tempfile.mkstemp(prefix=".study-guide-", suffix=".pdf", dir=directory)
@@ -1246,16 +1659,40 @@ def print_pdf(browser, html_path, pdf_path, timeout=120):
     os.remove(tmp_pdf)  # Chromium requires a non-existing print target.
     fd, tmp_html = tempfile.mkstemp(prefix=".study-guide-print-", suffix=".html", dir=directory)
     try:
-        with open(html_path, "r", encoding="utf-8") as f:
-            print_document = _print_ready_html(f.read())
+        snapshot_root = os.path.abspath(workspace or os.path.dirname(html_path))
+        try:
+            html_snapshot = _capture_regular_file_snapshot(
+                snapshot_root, html_path, "Study Guide HTML conversion input")
+        except ArtifactDriftError:
+            raise
+        except GuideError as exc:
+            if expected_html_sha256 is not None:
+                raise ArtifactDriftError(
+                    "published HTML conversion input cannot be revalidated (%s)" % exc)
+            raise
+        if (expected_html_sha256 is not None
+                and html_snapshot["sha256"] != expected_html_sha256):
+            raise ArtifactDriftError(
+                "published HTML bytes differ from the atomic render payload before PDF conversion")
+        try:
+            source_document = html_snapshot["bytes"].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise GuideError("published Study Guide HTML is not UTF-8: %s" % exc, 1)
+        print_document = _print_ready_html(
+            source_document, workspace=workspace, materials_root=materials_root)
+        print_payload = print_document.encode("utf-8")
+        source_html_sha256 = html_snapshot["sha256"]
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             f.write(print_document)
+            f.flush()
+            os.fsync(f.fileno())
         try:
             with tempfile.TemporaryDirectory(prefix="exam-study-guide-browser-") as profile:
                 command = [
                     browser, "--headless=new", "--disable-gpu", "--disable-extensions",
-                    "--disable-background-networking", "--no-pdf-header-footer",
+                    "--disable-background-networking",
                     "--user-data-dir=%s" % profile,
+                    "--no-pdf-header-footer",
                     "--print-to-pdf=%s" % os.path.abspath(tmp_pdf),
                     Path(tmp_html).resolve().as_uri(),
                 ]
@@ -1276,7 +1713,16 @@ def print_pdf(browser, html_path, pdf_path, timeout=120):
             head = f.read(5)
         if head != b"%PDF-" or os.path.getsize(tmp_pdf) < 100:
             raise GuideError("浏览器没有生成有效 PDF", 1)
+        _verify_file_snapshot(
+            snapshot_root, html_snapshot, "Study Guide HTML conversion input")
         os.replace(tmp_pdf, pdf_path)
+        return {
+            "converter": os.path.abspath(browser),
+            "started_at": started_at,
+            "completed_at": _utc_now(),
+            "input_html_sha256": _sha256_bytes(print_payload),
+            "source_html_sha256": source_html_sha256,
+        }
     finally:
         if os.path.exists(tmp_pdf):
             os.remove(tmp_pdf)
@@ -1286,50 +1732,176 @@ def print_pdf(browser, html_path, pdf_path, timeout=120):
 
 def run(argv=None, math_converter=None):
     parser = argparse.ArgumentParser(
-        description="Render one chapter as self-contained HTML with native MathML and images."
+        description="Render one chapter as a validated Study Guide or explicit source packet."
     )
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--chapter", required=True, type=int)
+    parser.add_argument("--artifact-type", choices=("study_guide", "source_packet"),
+                        default="study_guide")
+    parser.add_argument("--profile", choices=("full", "abridged"), default=None,
+                        help="optional assertion; must match the typed chapter manifest")
+    parser.add_argument("--pdf-backend", choices=("html", "browser", "native"), default="html")
     parser.add_argument("--pdf", action="store_true", help="also print chNN.pdf via local Edge/Chrome")
     args = parser.parse_args(argv)
     if args.chapter < 1:
         raise GuideError("--chapter 必须是正整数")
     ws = _guard_workspace(args.workspace)
+    if args.pdf and args.pdf_backend != "browser":
+        raise GuideError("--pdf requires --pdf-backend browser; native adapters run outside this script")
+    if args.artifact_type == "source_packet" and args.profile is not None:
+        raise GuideError("--profile applies only to artifact-type study_guide")
+    if args.artifact_type == "study_guide" and args.profile is None:
+        raise GuideError("artifact-type study_guide requires explicit --profile full|abridged", 2)
     output_dir = _prepare_output_dir(ws)
-    html_path = os.path.join(output_dir, "ch%02d.html" % args.chapter)
-    pdf_path = os.path.join(output_dir, "ch%02d.pdf" % args.chapter)
+    suffix = "" if args.artifact_type == "study_guide" else ".source-packet"
+    html_path = os.path.join(output_dir, "ch%02d%s.html" % (args.chapter, suffix))
+    pdf_path = os.path.join(output_dir, "ch%02d%s.pdf" % (args.chapter, suffix))
+    receipt_path = os.path.join(output_dir, "ch%02d.receipt.json" % args.chapter)
     _guard_output(html_path, os.path.basename(html_path))
     _guard_output(pdf_path, os.path.basename(pdf_path))
+    if args.artifact_type == "study_guide":
+        _guard_output(receipt_path, os.path.basename(receipt_path))
+        # Invalidate all prior publication claims before beginning a new true-guide render.
+        # In particular, an HTML-only/native run must never inherit or bind an older PDF.
+        _remove_stale(receipt_path, os.path.basename(receipt_path))
+        if not args.pdf:
+            _remove_stale(pdf_path, os.path.basename(pdf_path))
 
+    typed_guide = args.artifact_type == "study_guide"
     try:
-        sources = load_chapter_sources(ws, args.chapter)
-        document = render_study_guide(sources, math_converter=math_converter)
+        if args.artifact_type == "source_packet":
+            sources = load_chapter_sources(ws, args.chapter)
+            document = render_source_packet(sources, math_converter=math_converter)
+            manifest = manifest_report = manifest_snapshot = None
+            # The compatibility packet deliberately has no artifact-readiness claim.  Its own
+            # renderer and browser checks remain fail-closed, while typed-guide readiness is not
+            # incorrectly imposed on this explicitly separate output.
+            preflight = None
+            start_gate = start_gate_snapshot = None
+        else:
+            from study_guide_document import render_manifest
+            start_gate = _start_gate_or_raise(ws)
+            start_gate_snapshot = _start_gate_snapshot(start_gate)
+            manifest, manifest_report, manifest_snapshot = (
+                _load_typed_manifest_snapshot(ws, args.chapter))
+            if manifest_report["profile"] != args.profile:
+                raise GuideError("typed manifest profile=%s, not requested %s" %
+                                 (manifest_report["profile"], args.profile))
+            preflight = _preflight_or_raise(ws, args.chapter, args.pdf_backend, math_converter)
+            _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot)
+            document, rendered_report = render_manifest(
+                ws, manifest, math_converter=math_converter,
+                materials_root=start_gate.get("materials"))
+            manifest_report.update(rendered_report)
+            _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot)
     except GuideError:
         # Never let an older guide masquerade as the result of a failed source/math render.
         _remove_stale(html_path, os.path.basename(html_path))
         if args.pdf:
             _remove_stale(pdf_path, os.path.basename(pdf_path))
+        if args.artifact_type == "study_guide":
+            _remove_stale(receipt_path, os.path.basename(receipt_path))
         raise
     except Exception as exc:
         _remove_stale(html_path, os.path.basename(html_path))
         if args.pdf:
             _remove_stale(pdf_path, os.path.basename(pdf_path))
+        if args.artifact_type == "study_guide":
+            _remove_stale(receipt_path, os.path.basename(receipt_path))
         raise GuideError("章节渲染发生未预期错误：%s" % exc, 1)
-    _atomic_write(html_path, document)
-    print("[+] 人类可读教材：%s" % html_path)
+    expected_html_sha256 = _sha256_bytes(document.encode("utf-8"))
+
+    def recheck_before_html_publish():
+        if typed_guide:
+            _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot)
+
+    try:
+        if typed_guide:
+            _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot)
+        _atomic_write(
+            html_path, document, before_publish=recheck_before_html_publish)
+        html_snapshot = _capture_regular_file_snapshot(
+            ws, html_path, "published Study Guide HTML")
+        if html_snapshot["sha256"] != expected_html_sha256:
+            raise ArtifactDriftError(
+                "atomically published HTML bytes differ from the rendered payload")
+        if typed_guide:
+            _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot)
+    except ArtifactDriftError:
+        _remove_stale(html_path, os.path.basename(html_path))
+        _remove_stale(pdf_path, os.path.basename(pdf_path))
+        if typed_guide:
+            _remove_stale(receipt_path, os.path.basename(receipt_path))
+        raise
+    except GuideError as exc:
+        _remove_stale(html_path, os.path.basename(html_path))
+        _remove_stale(pdf_path, os.path.basename(pdf_path))
+        if typed_guide:
+            _remove_stale(receipt_path, os.path.basename(receipt_path))
+        raise ArtifactDriftError(
+            "HTML publication path could not be revalidated (%s)" % exc)
+    print("[+] %s：%s" % ("Study Guide" if args.artifact_type == "study_guide" else "source packet",
+                           html_path))
+
+    browser = None
+    conversion = None
+    if args.pdf:
+        if typed_guide:
+            try:
+                _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot)
+                _verify_file_snapshot(ws, html_snapshot, "published Study Guide HTML")
+            except ArtifactDriftError:
+                _remove_stale(html_path, os.path.basename(html_path))
+                _remove_stale(pdf_path, os.path.basename(pdf_path))
+                _remove_stale(receipt_path, os.path.basename(receipt_path))
+                raise
+        browser = find_browser()
+        if not browser:
+            _remove_stale(pdf_path, os.path.basename(pdf_path))
+            if args.artifact_type == "study_guide":
+                _remove_stale(receipt_path, os.path.basename(receipt_path))
+            sys.stderr.write(
+                "study_guide_render: no_browser: no local Edge/Chrome matched the selected "
+                "browser preflight; validated HTML was preserved.\n"
+            )
+            return 3
+        try:
+            conversion = print_pdf(
+                browser, html_path, pdf_path, workspace=ws,
+                materials_root=start_gate.get("materials") if start_gate else None,
+                expected_html_sha256=expected_html_sha256)
+        except ArtifactDriftError:
+            _remove_stale(html_path, os.path.basename(html_path))
+            _remove_stale(pdf_path, os.path.basename(pdf_path))
+            if typed_guide:
+                _remove_stale(receipt_path, os.path.basename(receipt_path))
+            raise
+        if typed_guide:
+            try:
+                _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot)
+                _verify_file_snapshot(ws, html_snapshot, "published Study Guide HTML")
+            except ArtifactDriftError:
+                _remove_stale(html_path, os.path.basename(html_path))
+                _remove_stale(pdf_path, os.path.basename(pdf_path))
+                _remove_stale(receipt_path, os.path.basename(receipt_path))
+                raise
+        print("[+] PDF：%s" % pdf_path)
+
+    if args.artifact_type == "study_guide":
+        try:
+            _write_guide_receipt(
+                ws, receipt_path, args.chapter, manifest_snapshot, manifest_report,
+                html_snapshot, pdf_path, args.pdf_backend, preflight,
+                start_gate_snapshot, conversion=conversion)
+        except ArtifactDriftError:
+            _remove_stale(html_path, os.path.basename(html_path))
+            _remove_stale(pdf_path, os.path.basename(pdf_path))
+            _remove_stale(receipt_path, os.path.basename(receipt_path))
+            raise
+        print("[+] render receipt (visual QA still required for PDF): %s" % receipt_path)
 
     if not args.pdf:
         return 0
-    browser = find_browser()
-    if not browser:
-        _remove_stale(pdf_path, os.path.basename(pdf_path))
-        sys.stderr.write(
-            "study_guide_render: no_browser: 未找到本地 Edge/Chrome；已保留验证通过的 HTML。"
-            "安装浏览器后重跑 --pdf，或打开 HTML 后打印为 PDF。\n"
-        )
-        return 3
-    print_pdf(browser, html_path, pdf_path)
-    print("[+] 打印教材：%s" % pdf_path)
     return 0
 
 

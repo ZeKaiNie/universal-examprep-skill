@@ -9,6 +9,7 @@
 <workspace>/
   study_plan.md            # 阶段复习计划（各阶段关联哪个 wiki 章节）
   study_state.json         # 结构化进度唯一事实源（存在时）
+  exam_runtime_receipt.json # confirm 原子写入的运行来源/版本证明；运行时不得改 package
   study_progress.md        # state 的生成视图；无 Python 时才手工维护
   ingest_report.json       # 导入告警、当前快照统计与兼容基线
   .ingest/                 # 结构化导入事实源（新工作区；不得手改）
@@ -29,9 +30,9 @@
     mutation.lock          # 审查写操作互斥锁；运行时临时文件
   references/
     wiki/
-      ch1_concepts.md      # 分章节知识库（唯一知识源，按需 lazy-load）
+      ch1_concepts.md      # 编译后的分章概念教学源（按需 lazy-load）
       ch2_*.md
-    quiz_bank.json         # 标准题库（唯一答案源）
+    quiz_bank.json         # 标准题库（唯一测验/判分题源）
     teaching_examples.json # 可选教学例题层（不是判分答案源，按章 lazy-load）
     teaching_baseline.json # append-only 教学例题保留事实源；不得手改或缩减
     figure_page_index.json # 材料视觉页 + wiki 视觉覆盖
@@ -40,11 +41,13 @@
     terms.json             # 可选课程术语桥
     assets/                # 本地题面、答案与 wiki 页面图
   notebook/                # 持久化讲解/反馈（条目锚点可作阶段证据）
-  study_guide/             # 派生的人类阅读版：chNN.html；可选 chNN.pdf
+    chNN.guide.json        # 已验证的强类型章节教材清单
+  study_guide/             # chNN.html/PDF + receipt；qa/ 保存逐页验收证据
 ```
 
 约定：
 
+- `exam_runtime_receipt.json` records the absolute package root, root `SKILL.md` version, SHA-256 manifest/digest of the shipped runtime surface, Git commit/branch/dirty state (or an explicit unavailable reason), Python executable, and UTC creation time. `exam_start.py confirm` is its only writer. The workspace must be outside the installed package. Every ingestion start recomputes the identity and fails closed on a missing, malformed, link-backed, or drifted receipt; it never edits the installed skill/package to make the comparison pass.
 - `references/wiki/` 下每个文件名须为安全相对名 `^[\w.\-]+\.md$`（不得含 `..`、绝对路径、子目录穿越）。
 - `study_progress.md` 的「当前阶段」应能对应到 `study_plan.md` 列出的某个阶段。
 - `study_progress.md` 应含「💡 概念疑难点记录」区（由 confusion-tracker 维护）。
@@ -282,24 +285,25 @@ python scripts/update_progress.py --workspace <ws> record-phase-evidence --kind 
 python scripts/update_progress.py --workspace <ws> record-phase-evidence --kind teaching-example --ref ch01-example-1
 python scripts/update_progress.py --workspace <ws> record-phase-evidence --kind notebook --ref notebook/ch01.md#example-1
 python scripts/update_progress.py --workspace <ws> record-phase-evidence --kind checkpoint --ref ch01-q1 --outcome passed
+# 结构化工作区先验证/import profile=full guide；standing visual 再生成并完成全页 QA，使 artifact_ready=ready
 python scripts/update_progress.py --workspace <ws> complete-phase --status verified --next-phase 2
 ```
 
-`covered_unverified` 要求 wiki、visual、notebook 及非空教学清单的全覆盖；`verified` 还要求至少 2 个不同的已处理 checkpoint，其中至少 1 个 `passed`。显式 `preferences.no_questions=true` 时上限是 `covered_unverified`。`≤1天` 只跳过开场澄清/偏好询问和反思式追问，不禁止必要的题库 checkpoint；学生明确不要出题时才应用上述上限。
+`covered_unverified` 要求 wiki、visual、notebook 及非空教学清单的全覆盖；`verified` 还要求至少 2 个不同的已处理 checkpoint，其中至少 1 个 `passed`。此外，`.ingest/` 存在的结构化工作区无论采用哪种状态，都必须先由 `study_guide_content.py` 加载并验证当前章 `notebook/chNN.guide.json`，且 `profile=full`；题目分母与 source-unit/source-reference 完整性由该 typed validator 负责，`update_progress.py` 不复制第二套口径。显式 `preferences.no_questions=true` 时上限是 `covered_unverified`。`≤1天` 只跳过开场澄清/偏好询问和反思式追问，不禁止必要的题库 checkpoint；学生明确不要出题时才应用上述上限。
 
 两份视觉索引必须带完全一致的 `integrity` 快照：`schema_version`、UTC `generated_at`、生成
 `mode`，以及 quiz bank、teaching manifest、append-only teaching baseline、ingest report、全部 wiki、题库资产、实际计入 wiki coverage 的图片、原始 PDF 内容与 PDF 路径清单 SHA-256；两份派生索引自身也分别绑定 canonical 输出摘要。完成阶段时重新哈希当前输入；索引后任一内容/图片/PDF 被修改、替换、增删都视为 stale，必须重跑
 `build_visual_index.py`。当前章声明 `requires_assets` / `maybe_requires_assets` 的题还会独立重查可读的
 题面侧 asset，不能只靠旧快照或手写空 suspects 绕过。
 
-只有完整视觉/教学 manifest trio（含 `wiki_visual_coverage` 的 figure 索引、含 `prompt_suspects`/`answer_suspects` 的 image 索引、教学 manifest）才启用硬门禁。真正的旧 schema 继续兼容并告警；partial/broken 新 manifest 必须 fail-loud，不能伪装成 legacy 以绕过门禁。阶段完成只能作用于 `current_phase`，推进只能去 `study_plan.md` 中紧接的下一阶段。
+只有完整视觉/教学 manifest trio（含 `wiki_visual_coverage` 的 figure 索引、含 `prompt_suspects`/`answer_suspects` 的 image 索引、教学 manifest）才启用旧的视觉/教学证据硬门禁。真正的旧 schema 继续兼容并告警；partial/broken 新 manifest 必须 fail-loud，不能伪装成 legacy 以绕过门禁。独立于此，`.ingest/` 是结构化工作区标记并启用当前章 full typed-guide 门禁；standing `visual` 还会 lazy-load capability readiness，只有 `artifact_ready=ready` 才能完成阶段。阶段完成只能作用于 `current_phase`，推进只能去 `study_plan.md` 中紧接的下一阶段。
 
 ## 8. Validator 结论语义
 
 `scripts/validate_workspace.py --json` 同时输出两个维度：
 
-- `ok=true` / `exit_code=0`：没有结构化错误，工作区可以运行；warnings 仍可能存在。
-- `readiness=ready`：无 errors 且无 warnings；`usable_with_gaps`：无 errors 但仍有 warning/完整性缺口；`blocked`：存在任一 error。
+- `ok=true` / `exit_code=0`：结构化验证过程完成且没有全局致命错误；warnings 仍可能存在。
+- 顶层 `readiness=ready|usable_with_gaps|blocked` 保留兼容汇总，但实际动作还必须查看 `capabilities.workspace_structural|teaching_ready|quiz_ready|artifact_ready`。例如可聊天授课不代表可判分，存在一个 HTML/PDF 也不代表教材通过视觉验收。
 
 因此 schema 校验通过、`prompt_suspects=0` 或某一覆盖率为 100% 都不能被单独改写成“全部内容完整”。上层报告必须保留真实分母、剩余 warning 与 readiness 原词。
 
@@ -311,7 +315,7 @@ Markdown 是可检索、可 diff、可溯源的事实源，不保证每个聊天
 `study_state.json.artifact_mode` 是独立的资源偏好，canonical 值为 `chat` / `visual`：
 
 - 缺字段的旧工作区与 `chat` 一样，只保留正常对话、state 与 notebook，不自动编译 HTML/PDF；
-- `visual` 只在用户明确选择后持久化，完整章节生成 HTML + PDF；
+- `visual` 只在用户明确选择后持久化，并请求“typed manifest → HTML/PDF → receipt → 全页 QA”流程；只有 `artifact_ready=ready` 才能声明生成成功并完成阶段；
 - 用户明确提出一次性 HTML/PDF/打印请求时可临时覆盖 `chat`，但不改写长期偏好；
 - Agent 不读取或猜测订阅等级。未知值运行时按 `chat` 处理并告警，任何值都不授权静默装依赖。
 
@@ -323,22 +327,39 @@ Markdown 是可检索、可 diff、可溯源的事实源，不保证每个聊天
 - `validate_workspace.py` 忽略代码围栏和行内代码，但会对事实源正文中的 raw/伪分隔 LaTeX
   发出 warning，使 readiness 降为 `usable_with_gaps`。它不猜测并自动重写公式，因为错误迁移
   可能改变数学含义。
-- 人类阅读版由当前章惰性编译：
+- 人类阅读版不是四层原文件拼接。Agent 先为当前章制作严格的教学清单，验证后原子导入：
 
   ```text
-  python scripts/study_guide_render.py --workspace <ws> --chapter <N>
+  python scripts/study_guide_content.py --workspace <ws> validate --chapter <N> --input <draft.json> --json
+  python scripts/study_guide_content.py --workspace <ws> import --chapter <N> --input <draft.json> --json
   ```
 
-  输出 `study_guide/chNN.html`，将 TeX 离线转成原生 MathML，并把安全的本地图片内嵌为 data URI。
-  教材汇集当前章 wiki、`teaching_examples.json` 切片、题库切片与 `notebook/chNN.md`；不读其他章，
-  不现场生成新题或答案。题面图位于题面正文/答案之前，答案图只出现在后续可展开答案区。
-  若存在 `study_state.json`，界面标题、空层说明、题面/答案标签、展开按钮与来源标签按其 canonical
-  `language` 派发；双语界面显示中英两侧。事实正文保持原样，渲染器不自动翻译，所需双语讲解必须
-  先由 tutor 按来源契约写入 notebook/wiki。
-  唯一路径兼容例外是 `--apply-wiki` 在 `references/wiki/*.md` 中生成的
-  `../assets/<安全相对路径>`：渲染器只在解析结果严格位于 `references/assets/`、路径各级均非符号链接
-  时接受它。题库/教学清单/notebook 中的 `..` 仍一律拒绝。
-- `--pdf` 使用本地 Edge/Chrome 生成 `study_guide/chNN.pdf`。公式转换依赖或浏览器缺失时命令
-  非零退出并显示精确缺项，不静默安装，也不把含 raw LaTeX 的文件留作成功产物。
+  `notebook/chNN.guide.json` 是 renderer 与结构化阶段完成门禁的强类型输入。`full` 的知识点映射和 walkthrough 必须精确覆盖
+  当前章 `teaching_examples`、全部题库项（`gradable=false` 仍作为教学例题而非测验题）以及 typed question units
+  的去重 ID；`abridged` 也必须用逐项省略清单
+  完整解释差集，但不能满足阶段完成。结构化工作区还要求知识点的 `source_unit_ids` 与带理由的
+  `semantic_exclusions` 精确分割当前章全部 material/AI-recovered 语义单元；公式单元不得排除。这里的“精确覆盖”仍只证明显式分母，不证明原材料中每个语义主张都已召回。每道例题固定记录 `source_type`、`answer_provenance`、题面、语言、公式使用、变量映射、
+  代入式、步骤、答案、自检和来源；`material` 答案必须有 answer/solution 来源证据，AI 答案必须显示完整
+  黄/警告标签。直接绑定的题面/答案单元必须显式提供 `metadata.source_language=zh|en`；原题文字、材料答案和
+  材料公式按规范化后的精确 payload 绑定，不能用同一文件/页码或模糊关键词冒充内容证据。每个 walkthrough 的
+  `notebook_anchor` 也必须指向导入前已经由 `notebook.py` 持久化的真实锚点。完整题面已经在原讲义图片中时不得再粘贴 OCR/原题文字；只显示当前语言尚缺的翻译。
+  仅含图表的 `figure_only` 图片不能替代题干文字。
+- 用户切换 `study_state.json.language` 后，旧语言 manifest、HTML、PDF、receipt 与 QA 立即视为 stale，不能满足阶段完成或视觉交付。若目标语言块已在清单中写好，运行
+  `study_guide_content.py ... relocalize --language zh|en|bilingual` 可无机器翻译地重建当前语言视图；缺少的
+  教学/题面翻译必须先由 agent 按来源契约补写。未激活的翻译会保留以支持可逆切换，但不会渲染到当前教材；视觉模式还必须重新渲染并逐页验收。
+- 通过清单门禁后按明确后端渲染：
+
+  ```text
+  python scripts/study_guide_render.py --workspace <ws> --chapter <N> --profile full --pdf-backend html
+  python scripts/study_guide_render.py --workspace <ws> --chapter <N> --profile full --pdf-backend browser --pdf
+  ```
+
+  输出 `study_guide/chNN.html`、可选 `chNN.pdf` 和 `chNN.receipt.json`。公式转成原生 MathML，图片内嵌
+  为 data URI，答案直接出现在打印文档而非隐藏控件中。每个例题卡只出现一次，并放在主要知识点之后；
+  同时涉及的其他知识点在卡片中列明。`--artifact-type source_packet` 可生成单独的
+  `chNN.source-packet.html` 供诊断，但它不是教材且不能满足 `artifact_ready`。
+- PDF 生成后执行 `study_guide_qa.py render`，用视觉能力检查全部 PNG，再以
+  `accept --inspected-pages all` 并为每页重复传入 `--page-verdict N=pass:<notes>` 后才写入验收。PDF、HTML、清单或任何页面哈希漂移都会使旧验收失效；
+  `visual_qa.status=ready`、全页证据与零未解决缺陷缺一不可。
 - PDF 工具按宿主选择，见 [`pdf-capability-adapters.md`](pdf-capability-adapters.md)；无论使用 Codex、
   Claude Code 或通用后备，交付前都必须逐页渲染为 PNG 并检查最新版本。

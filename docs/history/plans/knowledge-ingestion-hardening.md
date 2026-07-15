@@ -41,7 +41,7 @@ The audit found correctness problems, not merely missing polish:
 | I-06 | P0 | The official ingest sub-skill does not require a final workspace validation gate. | An agent can deliver a structurally invalid or materially incomplete workspace. |
 | I-07 | P0 | Fully scanned or image-only documents can have no source anchor in the generated wiki. | Later visual repair may have no deterministic place to attach recovered content. |
 | I-08 | P0 | Web prompts permit AI-authored quiz questions when no bank is mounted. | This violates the bank-only anti-fabrication contract. |
-| I-09 | P0 | Language routing compares aliases (`zh`, `en`, `bilingual`) while persisted state uses `中文`, `English`, `双语`. | Strict agents can load the wrong pack or fail to load one. |
+| I-09 | P0 | Historical manuals disagreed with the v4 neutral persisted codes (`zh`, `en`, `bilingual`). | Strict agents could load the wrong pack or reject valid state. |
 | I-10 | P0 | Several sub-skills permit unsafe fallback or direct Markdown state edits on any script failure. | Parser bugs can be hidden and later rendering can discard progress records. |
 | I-11 | P1 | Ingestion and visual scripts rescan the same PDFs and own overlapping backend, page, asset, and wiki-write logic. | Two facts sources drift and make failures difficult to reproduce. |
 | I-12 | P1 | Roughly 462 ingestion-related tests use fake PDF backends; there are no real PDF/DOCX/PPTX fixtures. | Regex regressions are covered, but real layout, adapter, OCR, and recall behavior is not. |
@@ -241,7 +241,7 @@ Exit gate: source-to-chunk-to-answer trace is complete and stale indexes fail cl
 
 ### Phase D - skill and language contract repair
 
-- [x] Route canonical state values (`中文`, `English`, `双语`) correctly; aliases are input-only.
+- [x] Route the canonical v4 state codes (`zh`, `en`, `bilingual`) correctly while accepting display strings as migration/input aliases.
 - [x] Remove the web-prompt exception that invents quiz questions without a bank.
 - [x] Permit manual ingest fallback only after a real Python capability probe; business failures remain visible.
 - [x] Require workspace registry/path confirmation in the ingest sub-skill.

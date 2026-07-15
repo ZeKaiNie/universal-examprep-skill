@@ -149,6 +149,15 @@ class CliIO(unittest.TestCase):
         self.assertFalse(obj["state_loaded"])
         self.assertEqual({it["id"] for it in obj["items"]}, {"easy", "mid", "hard"})
 
+    def test_legacy_non_gradable_item_is_never_selected(self):
+        self.bank.append(_q("worked-only", chapter=1, difficulty=1, gradable=False,
+                            answer=None))
+        with open(os.path.join(self.ws, "references", "quiz_bank.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(self.bank, f, ensure_ascii=False, indent=2)
+        obj = json.loads(self._run().stdout)
+        self.assertNotIn("worked-only", [item["id"] for item in obj["items"]])
+
     def test_reads_mode_from_state(self):
         self._state({"mode": "零基础从头讲"})                     # 旧代 zh 显示词输入仍被接受
         obj = json.loads(self._run().stdout)

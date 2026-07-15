@@ -4,26 +4,74 @@
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
+from unittest import mock
 
-from scripts import ingest_course
+from scripts import exam_start, ingest_course
 from scripts.ingestion import ContentUnit, IngestionStore, ReviewPatch
 from scripts.ingestion.pipeline import compile_review_outputs
 
 
 class IngestCourseTest(unittest.TestCase):
-    def run_course(self, materials, workspace):
+    def test_validator_protocol_rejects_crash_or_inconsistent_json(self):
+        bad_results = [
+            SimpleNamespace(returncode=1, stdout="", stderr="traceback"),
+            SimpleNamespace(returncode=0, stdout="{}", stderr=""),
+            SimpleNamespace(
+                returncode=1,
+                stdout=json.dumps({"readiness": "blocked", "exit_code": 0,
+                                   "error_count": 1}), stderr=""),
+            SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"readiness": "blocked", "exit_code": 0,
+                                   "error_count": 1}), stderr=""),
+        ]
+        for result in bad_results:
+            with self.subTest(result=result):
+                with self.assertRaises(ValueError):
+                    ingest_course._validated_workspace_payload(result)
+
+    def test_validator_protocol_accepts_content_block(self):
+        result = SimpleNamespace(
+            returncode=1,
+            stdout=json.dumps({"readiness": "blocked", "exit_code": 1,
+                               "error_count": 3}), stderr="")
+        self.assertEqual(
+            "blocked", ingest_course._validated_workspace_payload(result)["readiness"])
+
+    def run_course(self, materials, workspace, confirm=True):
         output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            code = ingest_course.run([
-                "--materials", str(materials),
-                "--workspace", str(workspace),
-                "--render-pages", "never",
-                "--visual-index", "never",
-                "--json",
-            ])
+        home = workspace.parent / ".examprep-home"
+        identity = exam_start._capture_runtime_identity()
+        with mock.patch.dict(os.environ, {"EXAMPREP_HOME": str(home)}), \
+                mock.patch.object(
+                    exam_start, "_capture_runtime_identity", return_value=identity
+                ):
+            if confirm and materials.is_dir():
+                confirmation_output = io.StringIO()
+                with contextlib.redirect_stdout(confirmation_output):
+                    confirmation_code = exam_start.run([
+                        "confirm", "--course", "test-course",
+                        "--materials", str(materials),
+                        "--workspace", str(workspace),
+                        "--mode", "from_scratch",
+                        "--time-budget", "le1d",
+                        "--language", "en",
+                        "--json",
+                    ])
+                self.assertEqual(0, confirmation_code, confirmation_output.getvalue())
+            with contextlib.redirect_stdout(output):
+                code = ingest_course.run([
+                    "--materials", str(materials),
+                    "--workspace", str(workspace),
+                    "--render-pages", "never",
+                    "--visual-index", "never",
+                    "--json",
+                ])
         return code, json.loads(output.getvalue())
 
     def test_clean_text_course_is_ready(self):
@@ -123,10 +171,70 @@ class IngestCourseTest(unittest.TestCase):
             root = Path(temp)
             missing = root / "missing"
             workspace = root / "workspace"
-            code, payload = self.run_course(missing, workspace)
+            code, payload = self.run_course(missing, workspace, confirm=False)
             self.assertEqual(2, code)
             self.assertFalse(payload["process_success"])
             self.assertFalse(workspace.exists())
+
+    def test_unconfirmed_ingestion_fails_closed_before_workspace_creation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            materials = root / "materials"
+            workspace = root / "workspace"
+            materials.mkdir()
+            (materials / "ch01_lecture.txt").write_text(
+                "Chapter 1\nA source-backed explanation.", encoding="utf-8"
+            )
+
+            code, payload = self.run_course(materials, workspace, confirm=False)
+
+            self.assertEqual(2, code)
+            self.assertFalse(payload["process_success"])
+            self.assertFalse(payload["start_gate"]["ready_to_ingest"])
+            self.assertEqual("blocked", payload["steps"][0]["status"])
+            self.assertFalse(workspace.exists())
+
+    def test_runtime_receipt_drift_blocks_before_ingestion_outputs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            materials = root / "materials"
+            workspace = root / "workspace"
+            home = root / ".examprep-home"
+            materials.mkdir()
+            (materials / "ch01_lecture.txt").write_text(
+                "Chapter 1\nA source-backed explanation.", encoding="utf-8"
+            )
+            confirmation_output = io.StringIO()
+            identity = exam_start._capture_runtime_identity()
+            with mock.patch.dict(os.environ, {"EXAMPREP_HOME": str(home)}), \
+                    mock.patch.object(
+                        exam_start, "_capture_runtime_identity", return_value=identity
+                    ), \
+                    contextlib.redirect_stdout(confirmation_output):
+                confirmation_code = exam_start.run([
+                    "confirm", "--course", "test-course",
+                    "--materials", str(materials), "--workspace", str(workspace),
+                    "--mode", "from_scratch", "--time-budget", "le1d",
+                    "--language", "en", "--json",
+                ])
+            self.assertEqual(0, confirmation_code, confirmation_output.getvalue())
+
+            receipt_path = workspace / "exam_runtime_receipt.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["python"]["executable"] = str(root / "different-python")
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+            code, payload = self.run_course(materials, workspace, confirm=False)
+            self.assertEqual(2, code)
+            self.assertFalse(payload["process_success"])
+            self.assertEqual("blocked", payload["steps"][0]["status"])
+            self.assertIn(
+                "runtime_provenance", payload["steps"][0]["blockers"]
+            )
+            self.assertEqual(
+                "runtime_drift", payload["start_gate"]["runtime_provenance"]["reason"]
+            )
+            self.assertFalse((workspace / ".ingest").exists())
 
 
 if __name__ == "__main__":

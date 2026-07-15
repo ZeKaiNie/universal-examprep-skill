@@ -181,7 +181,9 @@ def normalize_review_candidates(report, quiz_items=()):
         )
 
     for item in quiz_items or ():
-        if not isinstance(item, dict) or item.get("answer") not in (None, "", []):
+        if (not isinstance(item, dict)
+                or item.get("gradable") is False
+                or item.get("answer") not in (None, "", [])):
             continue
         source_file = item.get("source_file")
         add(
@@ -287,7 +289,11 @@ def _quiz_metadata(item, answer_record=None, answer_value_marker=False):
         page for page in item.get("source_pages") or ()
         if type(page) is int and page >= 1
     ]
-    if source_pages:
+    # ``source_pages`` belongs to the question source.  An answer unit can point
+    # at a separate solutions file, so copying question-side page metadata onto
+    # that unit violates the store's same-source page-anchor invariant.  The
+    # answer side has its own ``answer_source_pages`` field below.
+    if source_pages and not answer_value_marker:
         metadata["source_pages"] = source_pages
     answer_pages = [
         page for page in item.get("answer_source_pages") or ()
@@ -1320,7 +1326,9 @@ def _compile_review_outputs_unlocked(workspace):
         if isinstance(ingest_report, dict):
             ingest_report["missing_answer_ids"] = [
                 item.get("id") for item in quiz_bank
-                if isinstance(item, dict) and item.get("answer") in (None, "", [])
+                if (isinstance(item, dict)
+                    and item.get("gradable") is not False
+                    and item.get("answer") in (None, "", []))
             ]
             atomic_write_json(ingest_report_path, ingest_report)
 

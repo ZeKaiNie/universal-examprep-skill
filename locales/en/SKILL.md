@@ -19,8 +19,8 @@
 
 ## Language and breakpoint state
 
-- The only persisted canonical values for `study_state.json.language` are `中文`, `English`, and `双语`. Inputs such as `zh`, `en`, and `bilingual` are aliases normalized by `update_progress.py`; never route as though those aliases were stored values.
-- `English` produces English-only agent prose. `中文` loads the Chinese entry. `双语` composes each Chinese block followed by a `> EN:` mirror. When unset, default to English unless the student opened in Chinese. Never infer bilingual mode.
+- The persisted canonical values for `study_state.json.language` are the neutral codes `zh`, `en`, and `bilingual`. Display inputs `中文`, `English`, and `双语` are accepted aliases and legacy migration values normalized by `update_progress.py`.
+- `en` produces English-only agent prose. `zh` loads the Chinese entry. `bilingual` composes each Chinese block followed by a `> EN:` mirror. When unset, default to English unless the student opened in Chinese. Never infer bilingual mode.
 - Restore `study_state.json` first when it exists; it is the single source of truth and `study_progress.md` is a generated view. If state is absent but Python works, run `python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace <ws> init` before `set`, `add-mistake`, `add-confusion`, `set-check`, `record-phase-evidence`, or `complete-phase`. Direct Markdown writes are allowed only when Python truly cannot start. A nonzero business command is a fail-loud error, never evidence of a no-Python environment.
 - Before creating or modifying a local workspace, run `workspace-list --json` and obtain explicit confirmation of its absolute path. Never default to the repository or process working directory.
 
@@ -50,5 +50,5 @@ A verbatim quotation from slides, an exam question, or a teacher-provided answer
 ## Persistence and reading artifacts
 
 - Persist substantive walkthroughs, grading feedback, confusion explanations, and review conclusions through `scripts/notebook.py add-entry` before replying with a digest and link. If the write fails, tell the student and provide the complete content in chat.
-- `artifact_mode=chat` is the safe default: normal teaching plus state and notebook persistence, without automatic HTML/PDF. Invoke [`exam-study-guide`](../../skills/exam-study-guide/SKILL.md) only for an explicit standing `visual` preference or a one-shot handout request. Never infer a subscription tier and never install a dependency silently.
+- `artifact_mode=chat` is the safe default: normal teaching plus state/notebook persistence and the structured workspace's mandatory `profile=full` typed chapter manifest, without automatic HTML/PDF. Invoke [`exam-study-guide`](../../skills/exam-study-guide/SKILL.md) before structured phase completion to validate/import that manifest; only standing `visual` or a one-shot handout request continues through rendering and QA. Never infer a subscription tier and never install a dependency silently.
 - After ingestion, take over every warning, skipped item, review-manifest entry, and missing-answer entry one by one. Recover what is recoverable and name every unrecoverable material and reason; never skip an alert silently.

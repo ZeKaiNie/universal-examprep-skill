@@ -62,7 +62,10 @@ class Manifest(unittest.TestCase):
                   "scripts/update_progress.py", "scripts/notebook.py", "scripts/retrieve.py",
                   "scripts/cheatsheet_render.py", "prompts/web_prompt.md",
                   "docs/language-policy.md", "docs/pdf-capability-adapters.json",
-                  "skills/exam-study-guide/SKILL.md", "scripts/study_guide_render.py"):
+                  "skills/exam-study-guide/SKILL.md", "scripts/exam_start.py",
+                  "scripts/readiness.py", "scripts/study_guide_content.py",
+                  "scripts/study_guide_document.py", "scripts/study_guide_render.py",
+                  "scripts/study_guide_qa.py"):
             self.assertIn(f, self.files, f"核心运行时文件不在清单: {f}")
 
     def test_manifest_files_exist_on_disk(self):

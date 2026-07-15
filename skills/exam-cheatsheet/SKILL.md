@@ -42,14 +42,14 @@ Trigger when the user explicitly asks for 「给我一份考前小抄 / 速记 /
 - Every top-level bullet carries its `[→](…)` source link (notebook / mistakes / wiki); `validate_workspace.py` must pass on the written sheet before it is shown.
 - Under `artifact_mode=chat`, automatic final review stays conversational; an explicit cheat-sheet request delivers the validated `cheatsheet.md` but does not render PDF unless that request also asks for PDF/print. Under standing `visual`, or an explicit one-shot PDF/print request, deliver `cheatsheet.pdf` at the requested page count (default 2) via `scripts/cheatsheet_render.py`, or `cheatsheet.html` + print instruction on the no-browser degradation path. Margins stay ≥12 mm; density is tuned with `--font-size`, never by shrinking margins.
 - Provenance is inline and honest: AI-supplemented lines carry 🟡 AI补充，可能与你老师讲的不完全一致; AI-generated answers carry ⚠️ AI生成答案，非老师/教材提供; unlabeled lines are material-sourced (per-line 🟢 tagging not required).
-- Student-facing output defaults to English (Simplified Chinese if the student opened in Chinese); a persisted `study_state.json` `language` (`中文`/`English`/`双语`) switches it per exam-cram's dispatch rule with single-language purity. (See [`docs/language-policy.md`](../../docs/language-policy.md).)
+- Student-facing output defaults to English (Simplified Chinese if the student opened in Chinese); the persisted `study_state.json.language` code (`zh`/`en`/`bilingual`) switches it per exam-cram's dispatch rule with single-language purity. (See [`docs/language-policy.md`](../../docs/language-policy.md).)
 
 ## Language packs
 Student-visible wording for this skill lives in per-language packs — load the one matching `study_state.json.language` BEFORE emitting any student-visible output:
 - `中文` → [`../../locales/zh/skills/exam-cheatsheet.md`](../../locales/zh/skills/exam-cheatsheet.md)
 - `English` → [`../../locales/en/skills/exam-cheatsheet.md`](../../locales/en/skills/exam-cheatsheet.md)
 - `双语` → compose the zh and en packs block by block, zh first with a `> EN:` mirror (rules in [`../../docs/language-policy.md`](../../docs/language-policy.md))
-Aliases such as `zh`, `en`, and `bilingual` are normalized by `update_progress.py`; do not route on them as stored values. Unset language → the merged first-ask decides it; default English unless the student opened in Chinese.
+Display aliases such as `中文`, `English`, and `双语` are normalized by `update_progress.py`; route persisted state on `zh`, `en`, or `bilingual`. Unset language → the merged first-ask decides it; default English unless the student opened in Chinese.
 
 ## Boundaries
 - Do not put content into the cram sheet that the materials do not cover unless it is tagged 🟡 or ⚠️.

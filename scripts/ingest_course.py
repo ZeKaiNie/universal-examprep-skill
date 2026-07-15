@@ -13,12 +13,12 @@ import subprocess
 import sys
 
 try:
-    import build_raw_input_from_workspace as builder
-    from ingestion import is_link_or_reparse, safe_workspace_entry
+    import exam_start
+    from ingestion import safe_workspace_entry
     from ingestion.storage import atomic_write_json
 except ImportError:
-    from scripts import build_raw_input_from_workspace as builder
-    from scripts.ingestion import is_link_or_reparse, safe_workspace_entry
+    from scripts import exam_start
+    from scripts.ingestion import safe_workspace_entry
     from scripts.ingestion.storage import atomic_write_json
 
 
@@ -44,9 +44,40 @@ def _emit(payload, as_json):
             payload.get("readiness") or "unknown",
         ))
         for step in payload.get("steps", []):
-            print("[%s] %s" % (step.get("status"), step.get("name")))
+            suffix = ""
+            if step.get("name") == "workspace_validation":
+                suffix = " errors=%s warnings=%s" % (
+                    step.get("errors", 0), step.get("warnings", 0))
+            print("[%s] %s%s" % (step.get("status"), step.get("name"), suffix))
         if payload.get("workspace"):
             print("workspace=%s" % payload["workspace"])
+
+
+def _validated_workspace_payload(result):
+    """Parse the validator protocol, distinguishing content blocks from crashes."""
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("validator did not return valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("validator JSON must be an object")
+    readiness = payload.get("readiness")
+    if readiness not in ("ready", "usable_with_gaps", "blocked"):
+        raise ValueError("validator returned an invalid readiness")
+    declared_exit = payload.get("exit_code")
+    if isinstance(declared_exit, bool) or not isinstance(declared_exit, int):
+        raise ValueError("validator JSON omitted its integer exit_code")
+    if declared_exit != result.returncode:
+        raise ValueError("validator process/JSON exit codes disagree")
+    error_count = payload.get("error_count")
+    if isinstance(error_count, bool) or not isinstance(error_count, int) or error_count < 0:
+        raise ValueError("validator returned an invalid error_count")
+    if readiness == "blocked":
+        if result.returncode not in (1, 2) or error_count < 1:
+            raise ValueError("blocked validator result is internally inconsistent")
+    elif result.returncode != 0 or error_count != 0:
+        raise ValueError("non-blocked validator result is internally inconsistent")
+    return payload
 
 
 def run(argv=None, backend=None):
@@ -80,6 +111,10 @@ def run(argv=None, backend=None):
         payload["error"] = "materials directory does not exist"
         _emit(payload, args.as_json)
         return 2
+    if exam_start._path_has_link_or_reparse(materials):
+        payload["error"] = "materials path contains a symbolic link, junction, or reparse point"
+        _emit(payload, args.as_json)
+        return 2
     materials_real = os.path.realpath(materials)
     workspace_real = os.path.realpath(workspace)
     try:
@@ -94,8 +129,51 @@ def run(argv=None, backend=None):
         )
         _emit(payload, args.as_json)
         return 2
-    if os.path.lexists(workspace) and is_link_or_reparse(workspace):
-        payload["error"] = "workspace must not be a symbolic link, junction, or reparse point"
+    if exam_start._path_has_link_or_reparse(workspace):
+        payload["error"] = "workspace path contains a symbolic link, junction, or reparse point"
+        _emit(payload, args.as_json)
+        return 2
+    start_gate = exam_start.check_start_gate(workspace, materials)
+    payload["start_gate"] = start_gate
+    steps.append({
+        "name": "exam_start_gate",
+        "status": "passed" if start_gate.get("ready_to_ingest") else "blocked",
+        "ready_to_ingest": bool(start_gate.get("ready_to_ingest")),
+        "blockers": list(
+            (start_gate.get("ingestion_permission") or {}).get("blockers") or []
+        ),
+    })
+    if not start_gate.get("ready_to_ingest"):
+        payload["error"] = (
+            "ingestion requires an exact workspace/materials confirmation and "
+            "mode, time_budget, language, and a matching runtime provenance receipt; "
+            "run exam_start.py confirm with the intended installed skill first"
+        )
+        _emit(payload, args.as_json)
+        return 2
+
+    runtime_rechecks = []
+    payload["runtime_rechecks"] = runtime_rechecks
+
+    def runtime_ok(stage):
+        gate = exam_start.check_start_gate(workspace, materials)
+        ok = bool(gate.get("ready_to_ingest"))
+        runtime_rechecks.append({
+            "stage": stage,
+            "status": "passed" if ok else "failed",
+            "runtime_reason": (gate.get("runtime_provenance") or {}).get("reason"),
+            "blockers": list(
+                (gate.get("ingestion_permission") or {}).get("blockers") or []
+            ),
+        })
+        if not ok:
+            payload["error"] = (
+                "runtime/start provenance drifted before %s; stop and rerun exam_start confirm"
+                % stage
+            )
+        return ok
+
+    if not runtime_ok("dependency_preflight"):
         _emit(payload, args.as_json)
         return 2
     os.makedirs(workspace, exist_ok=True)
@@ -126,6 +204,14 @@ def run(argv=None, backend=None):
         _emit(payload, args.as_json)
         return preflight.returncode
 
+    if not runtime_ok("material_build"):
+        _emit(payload, args.as_json)
+        return 2
+    try:
+        import build_raw_input_from_workspace as builder
+    except ImportError:
+        from scripts import build_raw_input_from_workspace as builder
+
     raw_path = os.path.join(workspace, ".ingest", "source_raw_input.json")
     report_path = os.path.join(workspace, ".ingest", "parse_report.json")
     asset_root = os.path.join(workspace, "references", "assets")
@@ -139,6 +225,9 @@ def run(argv=None, backend=None):
         "--extract-homework", "auto",
     ] + (["--course-name", args.course_name] if args.course_name else []))
     code, raw_input, report = builder.run(build_args, backend=backend)
+    if not runtime_ok("material_build_publish"):
+        _emit(payload, args.as_json)
+        return 2
     os.makedirs(os.path.dirname(report_path), exist_ok=True)
     atomic_write_json(report_path, report or {})
     steps.append({
@@ -161,6 +250,10 @@ def run(argv=None, backend=None):
         },
     )
 
+    if not runtime_ok("workspace_compile"):
+        _emit(payload, args.as_json)
+        return 2
+
     ingest_command = [
         sys.executable,
         os.path.join(SCRIPT_DIR, "ingest.py"),
@@ -182,6 +275,9 @@ def run(argv=None, backend=None):
 
     state_path = os.path.join(workspace, "study_state.json")
     if not os.path.isfile(state_path):
+        if not runtime_ok("study_state_init"):
+            _emit(payload, args.as_json)
+            return 2
         initialized = _run([
             sys.executable,
             os.path.join(SCRIPT_DIR, "update_progress.py"),
@@ -198,6 +294,9 @@ def run(argv=None, backend=None):
             _emit(payload, args.as_json)
             return initialized.returncode
     if args.artifact_mode is not None:
+        if not runtime_ok("artifact_preference"):
+            _emit(payload, args.as_json)
+            return 2
         preference = _run([
             sys.executable,
             os.path.join(SCRIPT_DIR, "update_progress.py"),
@@ -215,6 +314,9 @@ def run(argv=None, backend=None):
             return preference.returncode
 
     if args.visual_index != "never":
+        if not runtime_ok("visual_index"):
+            _emit(payload, args.as_json)
+            return 2
         visual = _run([
             sys.executable,
             os.path.join(SCRIPT_DIR, "build_visual_index.py"),
@@ -251,6 +353,10 @@ def run(argv=None, backend=None):
             _emit(payload, args.as_json)
             return visual.returncode or 1
 
+    if not runtime_ok("workspace_validation"):
+        _emit(payload, args.as_json)
+        return 2
+
     validated = _run([
         sys.executable,
         os.path.join(SCRIPT_DIR, "validate_workspace.py"),
@@ -258,25 +364,45 @@ def run(argv=None, backend=None):
         "--json",
     ])
     try:
-        validation = json.loads(validated.stdout)
-    except ValueError:
-        validation = {
-            "readiness": "blocked",
-            "errors": [{"msg": (validated.stderr or validated.stdout).strip()}],
-            "warnings": [],
-        }
+        validation = _validated_workspace_payload(validated)
+    except ValueError as exc:
+        steps.append({
+            "name": "workspace_validation",
+            "status": "failed",
+            "exit_code": validated.returncode,
+            "operation_error": str(exc),
+        })
+        detail = (validated.stderr or validated.stdout or "").strip()
+        payload["error"] = "workspace validator operation failed: %s%s" % (
+            exc, ("; " + detail[:500]) if detail else "")
+        _emit(payload, args.as_json)
+        return validated.returncode if validated.returncode not in (0, 10) else 1
     readiness = validation.get("readiness") or "blocked"
     steps.append({
         "name": "workspace_validation",
-        "status": "passed" if readiness in ("ready", "usable_with_gaps") else "blocked",
+        "status": {"ready": "passed", "usable_with_gaps": "warning",
+                   "blocked": "blocked"}.get(readiness, "blocked"),
         "exit_code": validated.returncode,
         "readiness": readiness,
-        "errors": len(validation.get("errors") or []),
-        "warnings": len(validation.get("warnings") or []),
+        "errors": validation.get("error_count", len(validation.get("errors") or [])),
+        "warnings": validation.get("warning_count", len(validation.get("warnings") or [])),
+        "error_summary": validation.get("error_summary") or {},
+        "warning_summary": validation.get("warning_summary") or {},
+        "truncated": validation.get("truncated") or {},
     })
     payload["process_success"] = True
     payload["readiness"] = readiness
     payload["validation"] = validation
+    payload["capabilities"] = validation.get("capabilities") or {}
+    payload["next_action"] = {
+        "ready": "resume_exam_coach",
+        "usable_with_gaps": "name_warnings_then_resume_or_review",
+        "blocked": "ingest_review",
+    }.get(readiness, "inspect_validation")
+    if not runtime_ok("final_receipt"):
+        payload["process_success"] = False
+        _emit(payload, args.as_json)
+        return 2
     _emit(payload, args.as_json)
     return 10 if readiness == "blocked" else 0
 

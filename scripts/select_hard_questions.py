@@ -260,7 +260,12 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     bank = sd.load_bank(args.workspace)
-    items = [q for q in bank if isinstance(q, dict) and q.get("id") is not None]
+    items = [
+        q for q in bank
+        if (isinstance(q, dict)
+            and q.get("id") is not None
+            and q.get("gradable") is not False)
+    ]
     state = load_state(args.workspace)
     raw_mode = args.mode or (state or {}).get("mode")
     mode = _normalize_mode(raw_mode)[0] if raw_mode else "fill_gaps"   # 旧四模式/中文词→代号，词表同源 i18n

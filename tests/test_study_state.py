@@ -4,6 +4,7 @@ validator schema, T4 JSON snapshots, entry-point contract."""
 import json
 import hashlib
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(ROOT, "scripts")
 sys.path.insert(0, SCRIPTS)
 import i18n
+import notebook as notebook_engine
+import study_guide_qa as artifact_qa
 
 LEGACY_MD = ("# 🎯 复习进度\n\n## ⏱️ 当前复习断点\n* **当前进行阶段**：阶段 3：树\n\n"
              "## ❌ 错题档案记录\n| 错题ID | 关联章节 | 题目内容简述 | 错误原因分析 | 状态 |\n"
@@ -30,8 +33,16 @@ def _mk_ws(tmp, md=LEGACY_MD):
 
 
 def _up(ws, args):
+    env = None
+    home_marker = os.path.join(ws, ".phase-test-examprep-home")
+    if os.path.isfile(home_marker):
+        with open(home_marker, "r", encoding="utf-8") as stream:
+            fixture_home = stream.read().strip()
+        env = dict(os.environ)
+        env["EXAMPREP_HOME"] = fixture_home
     return subprocess.run([sys.executable, os.path.join(SCRIPTS, "update_progress.py"),
-                           "--workspace", ws] + args, capture_output=True, text=True, encoding="utf-8")
+                           "--workspace", ws] + args, capture_output=True, text=True,
+                          encoding="utf-8", env=env)
 
 
 def _state(ws):
@@ -98,6 +109,10 @@ def _phase_evidence_ws():
     md = ("# 复习进度\n\n## ⏱️ 当前复习断点\n* **当前进行阶段**：阶段 1\n\n"
           "## 📊 知识点打卡状态\n- [ ] **阶段 1**：基础\n")
     ws = _mk_ws(tempfile.mkdtemp(), md=md)
+    fixture_home = os.path.join(os.path.dirname(ws), "examprep-home")
+    with open(os.path.join(ws, ".phase-test-examprep-home"), "w",
+              encoding="utf-8") as stream:
+        stream.write(fixture_home)
     os.makedirs(os.path.join(ws, "references", "wiki"))
     os.makedirs(os.path.join(ws, "notebook"))
     with open(os.path.join(ws, "study_plan.md"), "w", encoding="utf-8", newline="\n") as f:
@@ -149,6 +164,219 @@ def _phase_evidence_ws():
     if r.returncode != 0:
         raise AssertionError(r.stderr)
     return ws
+
+
+def _enable_phase_structured(ws):
+    """Give phase-gate tests a minimal but genuine current-chapter ingestion IR."""
+    ingest_dir = os.path.join(ws, ".ingest")
+    os.makedirs(ingest_dir, exist_ok=True)
+    rows = [{
+        "unit_id": "phase-sem-1", "source_file": "course.pdf", "page": 1,
+        "kind": "text", "chapter_id": "ch01", "provenance": "material",
+        "text": "Addition combines two quantities.",
+    }]
+    for index, item_id in enumerate(("ex1", "q1", "q2"), 1):
+        rows.extend(({
+            "unit_id": "phase-q-" + item_id, "source_file": "course.pdf",
+            "page": index * 2, "kind": "question", "chapter_id": "ch01",
+            "provenance": "material", "external_id": item_id,
+            "text": "Question " + item_id, "metadata": {"source_language": "en"},
+        }, {
+            "unit_id": "phase-a-" + item_id, "source_file": "course.pdf",
+            "page": index * 2 + 1, "kind": "answer", "chapter_id": "ch01",
+            "provenance": "material", "external_id": item_id,
+            "text": "Answer " + item_id, "metadata": {"source_language": "en"},
+        }))
+    with open(os.path.join(ingest_dir, "content_units.jsonl"), "w",
+              encoding="utf-8", newline="\n") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    titles = {"ex1": "例题一", "q1": "Example q1", "q2": "Example q2"}
+    lines = ["# 第一章笔记", ""]
+    for minute, item_id in enumerate(("ex1", "q1", "q2")):
+        lines.extend(notebook_engine.make_entry_lines(
+            item_id, titles[item_id], "Walkthrough",
+            "2026-07-14 10:%02d" % minute,
+            "Seven-step walkthrough for %s." % item_id,
+        ))
+        lines.append("")
+    with open(os.path.join(ws, "notebook", "ch01.md"), "w",
+              encoding="utf-8", newline="\n") as stream:
+        stream.write("\n".join(lines).rstrip() + "\n")
+    return {
+        item_id: notebook_engine.entry_anchor(item_id, titles[item_id])
+        for item_id in titles
+    }
+
+
+def _write_phase_guide(ws, profile="full", language="en"):
+    """Write a real schema-valid ch01 typed guide for update_progress gate tests."""
+    anchors = _enable_phase_structured(ws)
+    state_path = os.path.join(ws, "study_state.json")
+    state = json.load(open(state_path, encoding="utf-8"))
+    state["language"] = language
+    with open(state_path, "w", encoding="utf-8") as stream:
+        json.dump(state, stream, ensure_ascii=False)
+
+    expected = ["ex1", "q1", "q2"]
+    def localized(text):
+        if language == "bilingual":
+            return {"zh": text, "en": text}
+        return {language: text}
+
+    source = {
+        "source_file": "course.pdf", "pages": [1],
+        "source_unit_id": "phase-sem-1", "role": "concept",
+    }
+    walkthroughs = []
+    for index, item_id in enumerate(expected, 1):
+        original_language = "en"
+        answer_provenance = (
+            {"zh": "ai_supplemented", "en": "material"}
+            if language == "bilingual" else {language: "material"}
+        )
+        walkthroughs.append({
+            "item_id": item_id, "source_type": "other",
+            "answer_provenance": answer_provenance,
+            "knowledge_point_ids": ["kp1"], "title": localized("Example " + item_id),
+            "knowledge_point_uses": {"kp1": localized("Apply the addition concept.")},
+            "notebook_anchor": anchors[item_id],
+            "original_language": original_language, "prompt_asset_mode": "none",
+            "prompt_asset_paths": [], "answer_asset_paths": [], "translation": {},
+            "prompt_text": "Question " + item_id, "what_asked": localized("Solve it."),
+            "known_quantities": [], "unknown_quantities": [], "formula_uses": [],
+            "solution_kind": "concept",
+            "no_formula_reason": localized("This conceptual item needs no formula."),
+            "steps": [localized("Work the problem.")],
+            "answer": localized("Answer " + item_id),
+            "self_check": localized("Check it."),
+            "source_trace": [{
+                "source_file": "course.pdf", "pages": [index * 2],
+                "source_unit_id": "phase-q-" + item_id, "role": "question",
+            }, {
+                "source_file": "course.pdf", "pages": [index * 2 + 1],
+                "source_unit_id": "phase-a-" + item_id, "role": "answer",
+            }],
+        })
+    omissions = []
+    if profile == "abridged":
+        omitted = walkthroughs.pop()
+        omissions.append({
+            "item_id": omitted["item_id"], "knowledge_point_ids": ["kp1"],
+            "reason": localized("Shortened by explicit request."),
+            "source_refs": [omitted["source_trace"][0]],
+        })
+    manifest = {
+        "schema_version": 1, "chapter": 1, "language": language, "profile": profile,
+        "knowledge_points": [{
+            "id": "kp1", "title": localized("Concept"),
+            "explanation": localized("A source-backed concept."), "formulas": [],
+            "source_refs": [source], "source_unit_ids": ["phase-sem-1"],
+            "example_ids": expected,
+        }],
+        "walkthroughs": walkthroughs, "omissions": omissions,
+        "semantic_exclusions": [],
+    }
+    with open(os.path.join(ws, "notebook", "ch01.guide.json"),
+              "w", encoding="utf-8") as stream:
+        json.dump(manifest, stream, ensure_ascii=False)
+
+
+def _write_visual_receipt(ws):
+    state = _state(ws)
+    with open(os.path.join(ws, ".phase-test-examprep-home"), "r",
+              encoding="utf-8") as stream:
+        fixture_home = stream.read().strip()
+    materials = os.path.join(os.path.dirname(ws), "materials")
+    env = dict(os.environ)
+    env["EXAMPREP_HOME"] = fixture_home
+    confirmed = subprocess.run([
+        sys.executable, os.path.join(SCRIPTS, "exam_start.py"), "confirm",
+        "--course", "phase-fixture", "--workspace", ws, "--materials", materials,
+        "--mode", state.get("mode") or "from_scratch",
+        "--time-budget", state.get("time_budget") or "le1d",
+        "--language", state.get("language") or "en",
+        "--artifact-mode", state.get("artifact_mode") or "chat", "--json",
+    ], capture_output=True, text=True, encoding="utf-8", env=env)
+    if confirmed.returncode != 0:
+        raise AssertionError(confirmed.stdout + confirmed.stderr)
+
+    guide_dir = os.path.join(ws, "study_guide")
+    os.makedirs(guide_dir, exist_ok=True)
+    paths = {
+        "html": os.path.join(guide_dir, "ch01.html"),
+        "pdf": os.path.join(guide_dir, "ch01.pdf"),
+    }
+    payloads = {
+        "html": b"<!doctype html><html><body>Readable fixture guide.</body></html>",
+        "pdf": b"%PDF-1.4\nfixture guide",
+    }
+    digests = {}
+    for kind, path in paths.items():
+        with open(path, "wb") as stream:
+            stream.write(payloads[kind])
+        digests[kind] = hashlib.sha256(payloads[kind]).hexdigest()
+    old_home = os.environ.get("EXAMPREP_HOME")
+    os.environ["EXAMPREP_HOME"] = fixture_home
+    try:
+        gate = artifact_qa.exam_start.check_registered_workspace_gate(ws)
+        start_gate = artifact_qa._start_gate_snapshot(gate)
+        manifest_path = os.path.join(ws, "notebook", "ch01.guide.json")
+        input_hash = artifact_qa._conversion_input_hash(paths["html"])
+        converter = os.path.abspath("C:/browser/msedge.exe")
+        started = "2026-07-14T10:00:00Z"
+        completed = "2026-07-14T10:00:01Z"
+        receipt = {
+            "schema_version": 2, "artifact_type": "study_guide", "chapter": 1,
+            "profile": "full", "language": state.get("language") or "en",
+            "content_manifest": "notebook/ch01.guide.json",
+            "content_manifest_sha256": artifact_qa._sha256_file(manifest_path),
+            "expected_item_ids": ["ex1", "q1", "q2"],
+            "rendered_item_ids": ["ex1", "q1", "q2"], "omitted_item_ids": [],
+            "html_file": "study_guide/ch01.html", "html_sha256": digests["html"],
+            "pdf_file": "study_guide/ch01.pdf", "pdf_sha256": digests["pdf"],
+            "pdf_backend": "browser", "converter": converter,
+            "conversion_input_html_sha256": input_hash,
+            "conversion_started_at": started, "conversion_completed_at": completed,
+            "conversion_run_sha256": artifact_qa._conversion_run_hash(
+                1, "full", state.get("language") or "en", digests["html"],
+                digests["pdf"], input_hash, converter, started, completed, start_gate),
+            "preflight": {"status": "passed", "pdf_backend": "browser"},
+            "start_gate": start_gate, "generated_at": "2026-07-14T10:00:02Z",
+            "status": "qa_pending",
+            "visual_qa": {"schema_version": 1, "status": "pending"},
+        }
+        with open(os.path.join(guide_dir, "ch01.receipt.json"),
+                  "w", encoding="utf-8") as stream:
+            json.dump(receipt, stream, ensure_ascii=False)
+
+        class Backend(object):
+            name = "phase-fixture-renderer"
+
+            def render_pages(self, unused_path):
+                png = (artifact_qa.PNG_SIGNATURE + b"\x00\x00\x00\x0dIHDR"
+                       + struct.pack(">II", 1200, 1800) + b"phase-page-one")
+                return [{
+                    "png": png,
+                    "text": "Readable chapter study guide content for phase evidence.\nPage 1 of 1",
+                    "width": 1200, "height": 1800, "white_ratio": 0.93,
+                }]
+
+        code, summary = artifact_qa.render(
+            ws, 1, backend=Backend(), now="2026-07-14T10:01:00Z")
+        if code != 0:
+            raise AssertionError(summary)
+        code, summary = artifact_qa.accept(
+            ws, 1, "all", "phase-fixture", page_verdicts=["1=pass:visually checked"],
+            now="2026-07-14T10:02:00Z")
+        if code != 0:
+            raise AssertionError(summary)
+    finally:
+        if old_home is None:
+            os.environ.pop("EXAMPREP_HOME", None)
+        else:
+            os.environ["EXAMPREP_HOME"] = old_home
 
 
 class Migration(unittest.TestCase):
@@ -425,6 +653,66 @@ class PhaseEvidence(unittest.TestCase):
         self.assertEqual(st["phase_evidence"]["1"].get("checkpoint", []), [])
         rendered = open(os.path.join(ws, "study_progress.md"), encoding="utf-8").read()
         self.assertIn("已覆盖但未验证", rendered)
+
+    def test_structured_phase_completion_requires_valid_full_typed_guide_for_both_statuses(self):
+        for status in ("covered_unverified", "verified"):
+            with self.subTest(status=status):
+                ws = _phase_evidence_ws()
+                _enable_phase_structured(ws)
+                self.assertEqual(_up(ws, ["set", "--language", "en"]).returncode, 0)
+                self._record_core(ws)
+                if status == "verified":
+                    for qid, outcome in (("q1", "passed"), ("q2", "wrong")):
+                        result = _up(ws, ["record-phase-evidence", "--kind", "checkpoint",
+                                          "--ref", qid, "--outcome", outcome])
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                before = open(os.path.join(ws, "study_state.json"), "rb").read()
+                result = _up(ws, ["complete-phase", "--status", status])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("typed Study Guide manifest", result.stderr)
+                self.assertIn("ch01", result.stderr)
+                self.assertEqual(open(os.path.join(ws, "study_state.json"), "rb").read(), before)
+
+    def test_structured_phase_rejects_valid_abridged_guide_but_chat_accepts_full_without_pdf(self):
+        ws = _phase_evidence_ws()
+        _enable_phase_structured(ws)
+        _write_phase_guide(ws, profile="abridged")
+        self._record_core(ws)
+        result = _up(ws, ["complete-phase", "--status", "covered_unverified"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("profile=full", result.stderr)
+
+        _write_phase_guide(ws, profile="full")
+        result = _up(ws, ["complete-phase", "--status", "covered_unverified"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(os.path.exists(os.path.join(ws, "study_guide", "ch01.pdf")))
+
+    def test_structured_visual_phase_requires_artifact_ready_then_accepts_full_page_qa(self):
+        ws = _phase_evidence_ws()
+        _enable_phase_structured(ws)
+        _write_phase_guide(ws, profile="full")
+        self.assertEqual(_up(ws, ["set", "--artifact-mode", "visual"]).returncode, 0)
+        self._record_core(ws)
+        before = open(os.path.join(ws, "study_state.json"), "rb").read()
+        result = _up(ws, ["complete-phase", "--status", "covered_unverified"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("artifact_ready", result.stderr)
+        self.assertIn("chapter_artifact_receipt_missing", result.stderr)
+        self.assertEqual(open(os.path.join(ws, "study_state.json"), "rb").read(), before)
+
+        _write_visual_receipt(ws)
+        result = _up(ws, ["complete-phase", "--status", "covered_unverified"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_language_change_makes_old_typed_guide_invalid_until_relocalized(self):
+        ws = _phase_evidence_ws()
+        _enable_phase_structured(ws)
+        _write_phase_guide(ws, profile="full", language="en")
+        self.assertEqual(_up(ws, ["set", "--language", "zh"]).returncode, 0)
+        self._record_core(ws)
+        result = _up(ws, ["complete-phase", "--status", "covered_unverified"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match study_state.json.language=zh", result.stderr)
 
     def test_phase_completion_rejects_stale_bank_teaching_and_wiki_digests(self):
         for rel in ("references/quiz_bank.json", "references/teaching_examples.json",

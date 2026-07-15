@@ -1525,8 +1525,9 @@ def build_raw_input(course_name, sections, lecture_items, homework_items=None):
     """Assemble a raw_input.json compatible with scripts/ingest.py.
 
     `teaching_examples` is a PARALLEL snapshot of every detected lecture Example.  It may
-    deliberately overlap the canonical bank: later review may remove a non-assessable worked
-    example from quiz_bank without making the material unreachable to the tutor.
+    deliberately overlap the canonical bank for assessable problem/solution pairs.  A completed
+    worked demonstration without an independent grading key stays teaching-only instead of
+    manufacturing a missing-answer quiz blocker.
     """
     phases = []
     for n, sec in enumerate(sections, 1):
@@ -1549,13 +1550,42 @@ def build_raw_input(course_name, sections, lecture_items, homework_items=None):
     # strip internal render-only keys (e.g. _answer_pages) so they don't leak into the bank
     def _clean(it):
         return {k: v for (k, v) in it.items() if not k.startswith("_")}
-    bank = [_clean(it) for it in (list(lecture_items) + list(homework_items or []))]
+
+    def _has_independent_grade_key(it):
+        def _nonblank(value):
+            if isinstance(value, str):
+                return bool(value.strip())
+            if isinstance(value, (list, tuple)):
+                return any(_nonblank(part) for part in value)
+            if isinstance(value, dict):
+                return bool(value)
+            return value is not None
+
+        return any(_nonblank(it.get(field)) for field in (
+            "answer", "answer_keywords", "keywords"
+        ))
+
+    def _teaching_role(it):
+        return (it.get("_teaching_role") or it.get("teaching_role")
+                or ("worked_example"
+                    if str(it.get("id", "")).startswith("lecture_example_") else None))
+
+    def _teaching_only_worked_example(it):
+        return (_teaching_role(it) == "worked_example"
+                and not _has_independent_grade_key(it))
+
+    bank = [
+        _clean(it) for it in lecture_items
+        if not _teaching_only_worked_example(it)
+    ] + [_clean(it) for it in (homework_items or [])]
     teaching_examples = []
     for it in lecture_items:
         if not str(it.get("id", "")).startswith("lecture_example_"):
             continue
         snap = _clean(it)
-        snap["teaching_role"] = it.get("_teaching_role", "worked_example")
+        snap["teaching_role"] = _teaching_role(it)
+        if _teaching_only_worked_example(it):
+            snap["gradable"] = False
         snap["title"] = it.get("_teaching_title") or str(it.get("id"))
         teaching_examples.append(snap)
     return {"course_name": course_name, "phases": phases, "quiz_bank": bank,
@@ -1732,6 +1762,25 @@ ALWAYS_PRUNE = {".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "
 # generated skill-workspace files (not course material) → skipped even if they sit at the materials root.
 SKIP_FILES = {"study_plan.md", "study_progress.md", "walkthrough.md", "raw_input.json",
               "parse_report.json", "ingest_report.json", "ai_review_manifest.json"}
+GENERATED_CONTROL_FILE_PATTERNS = (
+    re.compile(r"^universal-examprep-e2e-audit(?:-[0-9]{4}-[0-9]{2}-[0-9]{2})?\.md$", re.I),
+)
+
+
+def _is_generated_control_file(filename):
+    """Return whether a root file is framework output rather than course material.
+
+    The E2E auditor intentionally writes its report beside the selected source
+    PDFs so a maintainer can inspect one evidence folder.  Re-ingesting that
+    report as lecture notes contaminates the course corpus with implementation
+    findings.  Keep this allow-list narrow: ordinary ``audit.md`` or student
+    Markdown remains valid material.
+    """
+    low = str(filename or "").lower()
+    return low in SKIP_FILES or any(
+        pattern.fullmatch(str(filename or ""))
+        for pattern in GENERATED_CONTROL_FILE_PATTERNS
+    )
 
 
 def _is_leftover_workspace(path, name):
@@ -1782,7 +1831,7 @@ def _scan_materials(materials_dir):
             # at the selected materials root.  Requiring an already-complete
             # workspace signature here lets partial/failed prior runs leak back
             # into the next build as course notes.
-            if at_root and low in SKIP_FILES:
+            if at_root and _is_generated_control_file(fn):
                 pruned.append(os.path.relpath(os.path.join(dirpath, fn), materials_dir).replace(os.sep, "/"))
                 continue
             full = os.path.join(dirpath, fn)

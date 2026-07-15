@@ -14,13 +14,13 @@ This root file is a language-neutral ROUTER, not the manual: it only dispatches 
 
 ## Language dispatch
 
-Read the canonical `study_state.json.language` value and load the matching compatibility entry plus its per-skill wording pack BEFORE emitting any student-visible output:
+Read the canonical, language-neutral `study_state.json.language` code and load the matching compatibility entry plus its per-skill wording pack BEFORE emitting any student-visible output:
 
-- `中文` → [`locales/zh/SKILL.md`](locales/zh/SKILL.md) plus the selected sub-skill's zh wording pack under `locales/zh/skills/`
-- `English` → [`locales/en/SKILL.md`](locales/en/SKILL.md) plus the selected sub-skill's en wording pack under `locales/en/skills/`
-- `双语` → compose the zh and en wording block by block, with zh first and a `> EN:` mirror for each block (composition rules in [`docs/language-policy.md`](docs/language-policy.md))
+- `zh` (display choice `中文`) → [`locales/zh/SKILL.md`](locales/zh/SKILL.md) plus the selected sub-skill's zh wording pack under `locales/zh/skills/`
+- `en` (display choice `English`) → [`locales/en/SKILL.md`](locales/en/SKILL.md) plus the selected sub-skill's en wording pack under `locales/en/skills/`
+- `bilingual` (display choice `双语`) → compose the zh and en wording block by block, with zh first and a `> EN:` mirror for each block (composition rules in [`docs/language-policy.md`](docs/language-policy.md))
 
-`zh`, `en`, and `bilingual` are accepted input aliases only; `update_progress.py set --language` normalizes them and they MUST NOT be treated as persisted state values. Unset language → this is the first conversation: the merged first-ask (mode × time budget × language, persisted in one `update_progress.py set` call) decides it; default English unless the student opened in Chinese. `set --language` can switch mid-session; from the next turn on, load the new pack.
+`中文`, `English`, and `双语` remain accepted user-facing input aliases. Unset language means this is the first conversation: the merged first ask decides mode × time budget × language, and `exam_start.py confirm` persists the initial three canonical values together with the exact workspace/materials receipt. Later changes use one `update_progress.py set` call; `set --language` switches the pack from the next turn onward. Default English unless the student opened in Chinese; bilingual remains explicit-only.
 
 ## Control layer (behavior)
 
@@ -42,7 +42,7 @@ Generic agents that will not read the full rules: [`AGENTS.md`](AGENTS.md) (one-
 
 ## Install & run essentials
 
-- Engine scripts live under [`scripts/`](scripts/): `ingest_course.py` is the normal one-command materials-to-validated-workspace entry; exit 10 means compilation succeeded but content readiness is blocked and must enter the typed `ingest_review.py` workflow. `ingest.py` is the lower-level compiler for an already-built raw payload. `update_progress.py` owns `study_state.json` (the single source of truth — `study_progress.md` is a generated view, never hand-edit it); `select_questions.py` / `select_hard_questions.py` are the official question selectors.
+- Engine scripts live under [`scripts/`](scripts/): first use `exam_start.py status`, then `exam_start.py confirm --course <name> --materials <dir> --workspace <ws> --mode <mode> --time-budget <tier> --language <lang>` after the exact paths and three choices are established. That command writes the confirmation, state, and runtime receipt required by `ingest_course.py` and true Study Guide rendering. `ingest_course.py` is then the normal materials-to-validated-workspace entry; exit 10 means compilation succeeded but content readiness is blocked and must enter the typed `ingest_review.py` workflow. `ingest.py` is the lower-level compiler for an already-built raw payload. `update_progress.py` owns `study_state.json` (the single source of truth — `study_progress.md` is a generated view, never hand-edit it); `select_questions.py` / `select_hard_questions.py` are the official question selectors.
 - Workspace file contract (wiki / quiz bank / state / asset metadata): [`docs/file-format.md`](docs/file-format.md).
 - Language policy (single-language purity, EN canonical vocabulary, persisted canonical values): [`docs/language-policy.md`](docs/language-policy.md).
 - Install in Claude Code at `~/.claude/skills/universal-exam-cram-coach/` or project-local `.claude/skills/universal-exam-cram-coach/`; load matrix for other hosts: [`docs/agent-portability.md`](docs/agent-portability.md).

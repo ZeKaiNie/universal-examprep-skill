@@ -159,6 +159,25 @@ class IngestionPipelineTest(unittest.TestCase):
             ]),
         )
 
+    def test_non_gradable_legacy_item_creates_no_missing_answer_review(self):
+        payload = build_payload(
+            str(self.materials),
+            [str(self.source)],
+            [{"file": "ch01.txt", "page": 1,
+              "text": "Chapter 1\nCompleted demonstration"}],
+            sections=[{"chapter": 1, "page_keys": [("ch01.txt", 1)]}],
+            quiz_items=[{
+                "id": "worked-only", "chapter": 1, "type": "subjective",
+                "question": "Completed demonstration", "answer": "",
+                "gradable": False, "source_file": "ch01.txt", "source_pages": [1],
+            }],
+            report={"warnings": [], "skipped": [], "ai_review": []},
+        )
+        self.assertFalse(any(
+            "missing_answer" in candidate["reason_codes"]
+            for candidate in payload["review_candidates"]
+        ))
+
     def test_typed_answers_keep_value_and_deterministic_display_text(self):
         for index, value in enumerate((False, 0, ["A", 2], {"z": 1, "a": 2})):
             with self.subTest(value=value):
@@ -187,6 +206,47 @@ class IngestionPipelineTest(unittest.TestCase):
                 target = self.root / ("typed-workspace-%d" % index)
                 target.mkdir()
                 persist_payload(target, payload)
+
+    def test_split_question_and_answer_sources_keep_page_metadata_owned(self):
+        solutions = self.materials / "solutions.txt"
+        solutions.write_text("Official solutions\nAnswer on page three", encoding="utf-8")
+        payload = build_payload(
+            str(self.materials),
+            [str(self.source), str(solutions)],
+            [
+                {"file": "ch01.txt", "page": 1,
+                 "text": "Chapter 1\nExplain the core concept."},
+                {"file": "solutions.txt", "page": 3,
+                 "text": "Official solutions\nThe core concept is ..."},
+            ],
+            sections=[{"chapter": 1, "page_keys": [("ch01.txt", 1)]}],
+            quiz_items=[{
+                "id": "split-q1", "chapter": 1, "type": "subjective",
+                "question": "Explain the core concept.",
+                "answer": "The core concept is ...", "source": "material",
+                "source_file": "ch01.txt", "source_pages": [1],
+                "answer_source_file": "solutions.txt", "answer_source_pages": [3],
+            }],
+            report={"warnings": [], "skipped": [], "ai_review": []},
+        )
+        question = next(row for row in payload["content_units"]
+                        if row["kind"] == "question")
+        answer = next(row for row in payload["content_units"]
+                      if row["kind"] == "answer")
+        self.assertEqual([1], question["metadata"]["source_pages"])
+        self.assertNotIn("source_pages", answer["metadata"])
+        self.assertEqual([3], answer["metadata"]["answer_source_pages"])
+        self.assertEqual("solutions.txt", answer["source_file"])
+
+        # This is the strict boundary that previously rejected the answer unit
+        # because question page 1 did not belong to solutions.txt.
+        persist_payload(self.workspace, payload)
+        store = IngestionStore(self.workspace, source_root=self.materials)
+        stored_answer = next(unit for unit in store.units().values()
+                             if unit.kind == "answer" and unit.external_id == "split-q1")
+        self.assertEqual("solutions.txt", stored_answer.source_file)
+        self.assertNotIn("source_pages", stored_answer.metadata)
+        self.assertEqual([3], stored_answer.metadata["answer_source_pages"])
 
     def test_validated_answer_patch_compiles_and_survives_base_resync(self):
         payload = self.payload()

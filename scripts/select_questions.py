@@ -55,6 +55,10 @@ def _chapter_of(q):
 
 
 def match(q, args):
+    # Backward compatibility for banks produced before worked examples became
+    # teaching-only: an explicit false flag is a hard assessment exclusion.
+    if q.get("gradable") is False:
+        return False
     if args.source_type:
         # missing source_type NEVER silently matches a scope filter — untagged items are excluded and
         # counted separately, so a homework-only session can't quietly serve untagged lecture items
@@ -103,6 +107,8 @@ def export_sqlite(bank, path):
                     "has_official_answer INTEGER, question TEXT)")
         con.execute("CREATE TABLE knowledge_points (question_id TEXT, knowledge_point TEXT)")
         for q in bank:
+            if q.get("gradable") is False:
+                continue
             # official = 教材/老师来源的答案；mixed/unknown/缺 source 都不算（与视觉索引同口径）
             official_src = q.get("source") in ("teacher", "material") and q.get("ai_generated") is not True
 

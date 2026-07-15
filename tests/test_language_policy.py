@@ -163,7 +163,7 @@ class LanguagePolicyTest(unittest.TestCase):
         # the language-default rule now lives in BOTH layers: the root router
         # carries the English default-en dispatch line, the zh pack the zh wording
         router = read("SKILL.md")
-        self.assertIn("default English unless the student opened in Chinese", router,
+        self.assertIn("default english unless the student opened in chinese", router.lower(),
                       "根路由器缺少 default-en 派发行")
         self.assertIn("locales/zh/SKILL.md", router, "根路由器未指向 zh 全量入口包")
         self.assertIn("language-policy", router, "根路由器未指向 docs/language-policy.md")
@@ -191,8 +191,10 @@ class A8bLanguageDispatch(unittest.TestCase):
         t = self._read("skills", "exam-cram", "SKILL.md")
         self.assertIn("ask ONE combined question", t)             # 语言并入 A6 首问，不新增阻塞问题
         self.assertIn("语言 / Language：中文 / English / 双语", t)  # 三语语言行
-        self.assertIn("--language <语言>", t)                      # 一次 set 立三样
-        self.assertIn("NEVER infer `双语`", t)                     # 双语只显式选择
+        self.assertIn("exam_start.py", t)                         # 原子启动门禁
+        self.assertIn("confirm --course <course>", t)             # 一次确认材料/工作区与三项选择
+        self.assertIn("--language <zh|en|bilingual>", t)           # 持久化规范语言码
+        self.assertIn("NEVER infer `bilingual`", t)               # 双语只显式选择，状态使用规范码
         self.assertIn("SINGLE-LANGUAGE PURITY", t)                 # 派发规则（阶段6 单语言纯净）
         self.assertIn("Simplified Chinese", t)                     # 既有钉字存活
 

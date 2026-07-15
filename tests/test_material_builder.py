@@ -100,7 +100,7 @@ class CoreExtraction(unittest.TestCase):
         self.assertEqual(items[0]["source_type"], "lecture_quiz")
         self.assertEqual(items[0]["answer_source_pages"], [2])
 
-    def test_teaching_examples_are_parallel_snapshots_not_a_quiz_bank_filter(self):
+    def test_ungradable_worked_examples_are_teaching_only(self):
         pages = _pages(
             "ch01.pdf",
             "Example 1.1 Problem  Compute the value.",
@@ -112,10 +112,11 @@ class CoreExtraction(unittest.TestCase):
         sections = B.group_sections(pages)
         raw = B.build_raw_input("C", sections, lecture)
 
-        # Compatibility: every extracted lecture item still lands in the canonical bank.
+        # Only assessable problems remain in the canonical bank.  The completed
+        # demonstration has no independent solution/key and is teaching-only.
         self.assertEqual(
             [q["id"] for q in raw["quiz_bank"]],
-            ["lecture_example_1_1", "lecture_example_1_2", "lecture_quiz_1_1"],
+            ["lecture_example_1_1", "lecture_quiz_1_1"],
         )
         # Teaching reachability is an independent snapshot of every Example, including overlap.
         teaching = {e["id"]: e for e in raw["teaching_examples"]}
@@ -124,7 +125,22 @@ class CoreExtraction(unittest.TestCase):
         self.assertEqual(teaching["lecture_example_1_2"]["teaching_role"], "worked_example")
         self.assertEqual(teaching["lecture_example_1_1"]["answer_source_pages"], [2])
         self.assertEqual(teaching["lecture_example_1_2"]["source_pages"], [3])
+        self.assertNotIn("gradable", teaching["lecture_example_1_1"])
+        self.assertIs(teaching["lecture_example_1_2"]["gradable"], False)
         self.assertNotIn("lecture_quiz_1_1", teaching)
+
+    def test_default_worked_example_role_is_also_teaching_only(self):
+        # Compatibility for callers that provide a lecture Example snapshot
+        # without the builder's private _teaching_role marker.
+        item = {
+            "id": "lecture_example_1_8", "chapter": 1, "type": "subjective",
+            "question": "Completed demonstration", "answer_status": "unknown",
+            "source_file": "ch01.pdf", "source_pages": [8],
+        }
+        raw = B.build_raw_input("C", [], [item])
+        self.assertEqual([], raw["quiz_bank"])
+        self.assertEqual("worked_example", raw["teaching_examples"][0]["teaching_role"])
+        self.assertIs(raw["teaching_examples"][0]["gradable"], False)
 
     def test_empty_text_pdf_page_keeps_wiki_anchor_for_visual_repair(self):
         pages = _pages("ch01.pdf", "Chapter 1 prose", "")
@@ -426,6 +442,27 @@ class CoreExtraction(unittest.TestCase):
         pdfs, texts, pruned, _others = B._scan_materials(d)
         names = sorted(os.path.basename(p) for p in texts)
         self.assertEqual(names, ["lecture_notes.md"])   # real notes kept, generated files skipped
+
+    def test_generated_e2e_audit_is_not_ingested_as_course_material(self):
+        d = os.path.join(tempfile.mkdtemp(prefix="mat-"), "materials")
+        os.makedirs(d)
+        names = (
+            "universal-examprep-e2e-audit-2026-07-14.md",
+            "universal-examprep-e2e-audit.md",
+            "audit.md",
+            "lecture_notes.md",
+        )
+        for name in names:
+            with open(os.path.join(d, name), "w", encoding="utf-8") as stream:
+                stream.write("course-like text")
+        _pdfs, texts, pruned, _others = B._scan_materials(d)
+        kept = sorted(os.path.basename(path) for path in texts)
+        self.assertEqual(kept, ["audit.md", "lecture_notes.md"])
+        self.assertEqual(
+            sorted(pruned),
+            ["universal-examprep-e2e-audit-2026-07-14.md",
+             "universal-examprep-e2e-audit.md"],
+        )
 
     # ---- round-8 (P0B r8) hardening ----
     def test_txt_drawing_prompt_not_requires_assets(self):
@@ -790,6 +827,8 @@ class CliAndRun(unittest.TestCase):
         bank = {q["id"]: q for q in raw["quiz_bank"]}
         teaching = {e["id"]: e for e in raw["teaching_examples"]}
         self.assertEqual(set(teaching), {"lecture_example_1_1", "lecture_example_1_2"})
+        self.assertNotIn("lecture_example_1_2", bank)
+        self.assertIs(teaching["lecture_example_1_2"]["gradable"], False)
         self.assertEqual(teaching["lecture_example_1_1"]["assets"],
                          bank["lecture_example_1_1"]["assets"])
         self.assertEqual(report["teaching_examples_detected"], 2)

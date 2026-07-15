@@ -116,6 +116,16 @@ class Selector(unittest.TestCase):
         rc, out = self._run(ws, ["--chapter", "2", "--json"])     # phase 回退
         self.assertEqual([i["id"] for i in json.loads(out)["items"]], ["ex1"])
 
+    def test_selector_excludes_legacy_non_gradable_items(self):
+        ws = _mk_ws(tempfile.mkdtemp(), [{
+            "id": "worked-only", "chapter": 1, "type": "subjective",
+            "question": "Completed demonstration", "gradable": False,
+            "source_type": "example",
+        }])
+        rc, out = self._run(ws, ["--json"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("worked-only", [i["id"] for i in json.loads(out)["items"]])
+
     def test_bad_source_type_filter_exits_2(self):
         ws = _mk_ws(tempfile.mkdtemp())
         r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "select_questions.py"),

@@ -2,8 +2,8 @@
 """Localization ownership and dispatch contracts. Stdlib only.
 
 Behavior remains single-copy in the control layer; locale packs own student wording only.
-Persisted state uses the repository's canonical values, while command aliases are normalized
-before storage. Directory parity is covered by test_language_packs.
+Persisted state uses language-neutral canonical codes, while display strings and command
+aliases are normalized before storage. Directory parity is covered by test_language_packs.
 """
 import os
 import unittest
@@ -18,7 +18,7 @@ REQUIRED_LABELS = [
     # exam-quiz 判分反馈仍用旧措辞
     "这题考什么", "标准答题步骤",
     "现在轮到你", "已记录到错题本", "资料里没有这道题的答案",
-    # AI-supplement reminder uses the canonical marker (single source: docs/language-policy.md)
+    # AI-supplement reminder uses the fixed student-facing marker
     "AI补充，可能与你老师讲的不完全一致",
 ]
 
@@ -41,13 +41,16 @@ class LocalizationBoundaryTest(unittest.TestCase):
         self.assertIn("语言中性路由器", d)
         self.assertIn("不是完整流程副本", d)
 
-    def test_canonical_values_and_aliases_are_distinct(self):
+    def test_neutral_canonical_codes_and_display_aliases_are_distinct(self):
         d = read("docs", "localization.md")
-        for value in ("`中文`", "`English`", "`双语`"):
-            self.assertIn(value, d)
-        for alias in ("`zh`", "`en`", "`bilingual`"):
-            self.assertIn(alias, d)
-        self.assertIn("归一化后保存", d)
+        for code in ("`zh`", "`en`", "`bilingual`", "`from_scratch`",
+                     "`shore_up`", "`fill_gaps`"):
+            self.assertIn(code, d)
+        for display_alias in ("`中文`", "`English`", "`双语`"):
+            self.assertIn(display_alias, d)
+        self.assertIn("语言中性 canonical 代号", d)
+        self.assertIn("归一化为对应代号", d)
+        self.assertIn("不是新状态的 canonical 值", d)
 
     def test_default_student_language_is_english_with_chinese_opener(self):
         # v3+ default: English unless the student opens in Chinese (this doc was stale before)
@@ -69,7 +72,8 @@ class LocalizationBoundaryTest(unittest.TestCase):
     def test_script_logic_stays_single_copy(self):
         d = read("docs", "localization.md")
         self.assertIn("脚本逻辑只有一份", d, "未声明脚本逻辑单份、语言中性")
-        self.assertIn("中文 canonical 值", d, "未声明持久化的真实 canonical 形式")
+        self.assertIn("旧中文显示值仅作为迁移输入和生成视图文案", d,
+                      "未声明旧中文显示值只属于迁移/视图兼容边界")
 
     def test_missing_selected_pack_fails_loud(self):
         d = read("docs", "localization.md")
@@ -83,7 +87,7 @@ class LocalizationBoundaryTest(unittest.TestCase):
             if name.endswith(".md"):
                 d += "\n" + read("locales", "zh", "skills", name)
         for label in REQUIRED_LABELS:
-            self.assertIn(label, d, f"中文 canonical 标签不可达: {label}")
+            self.assertIn(label, d, f"中文学生可见标签不可达: {label}")
 
     def test_source_quote_exception_does_not_exempt_agent_prose(self):
         d = read("docs", "localization.md")
@@ -91,7 +95,7 @@ class LocalizationBoundaryTest(unittest.TestCase):
         self.assertIn("智能体生成的标题、衔接、解释、解答和总结仍按当前语言输出", d)
 
     def test_existing_student_labels_remain_reachable(self):
-        # Until the pack split lands (same PR), the canonical zh labels live in the skill
+        # Until the pack split lands (same PR), the fixed zh display labels live in the skill
         # files; after it they live in locales/zh/skills/. Accept either home so this policy
         # test doesn't fight the split commit-by-commit — but they must exist SOMEWHERE.
         def label_home(label, *fallback_files):

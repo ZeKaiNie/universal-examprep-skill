@@ -39,6 +39,7 @@ from pdf_capabilities import (  # noqa: E402
     PDF_TEXT_CANDIDATES,
     dependency_candidates,
 )
+from readiness import chapter_math_readiness  # noqa: E402
 
 
 # ---- the manifest（唯一事实源；技能文本只指向本工具，不复制清单内容——防两处漂移）----
@@ -285,7 +286,23 @@ def _guard_workspace_file(workspace, path, label, optional=False):
 
 
 def _selected_chapter_has_math(workspace, chapter):
-    """Inspect exactly the persisted sources rendered for one selected chapter."""
+    """Compatibility boolean backed by the validated typed guide.
+
+    Recovery is not equivalent to ``False``: callers that need the tri-state
+    contract must use :func:`_selected_chapter_math_report`.
+    """
+    report = _selected_chapter_math_report(workspace, chapter)
+    if report["status"] == "needs_recovery":
+        raise DependencyProbeError(
+            "第 %d 章公式状态需要恢复：%s" % (
+                int(chapter), ", ".join(report["reason_codes"]) or "unknown"
+            )
+        )
+    return report["status"] == "standard"
+
+
+def _selected_chapter_math_report(workspace, chapter):
+    """Inspect formula/substitution fields from a validated chNN.guide.json."""
     ws = _guard_workspace(workspace)
     if isinstance(chapter, bool):
         raise DependencyProbeError("--chapter 必须是正整数")
@@ -296,63 +313,10 @@ def _selected_chapter_has_math(workspace, chapter):
     if chapter < 1:
         raise DependencyProbeError("--chapter 必须是正整数")
 
-    wiki_dir = os.path.join(ws, "references", "wiki")
-    if not os.path.lexists(wiki_dir):
-        raise DependencyProbeError("缺少安全的 references/wiki 目录")
-    _reject_symlink_components(ws, wiki_dir, "references/wiki")
-    if not os.path.isdir(wiki_dir):
-        raise DependencyProbeError("缺少安全的 references/wiki 目录")
-    real_ws, real_wiki = os.path.realpath(ws), os.path.realpath(wiki_dir)
     try:
-        if os.path.commonpath((real_ws, real_wiki)) != real_ws:
-            raise DependencyProbeError("references/wiki 经路径解析逃出 workspace")
-    except ValueError:
-        raise DependencyProbeError("references/wiki 与 workspace 不在同一文件系统")
-    pattern = re.compile(r"^ch0*%d(?:[^0-9].*)?\.md$" % chapter, re.I)
-    try:
-        names = [name for name in os.listdir(wiki_dir) if pattern.match(name)]
-    except OSError as exc:
-        raise DependencyProbeError("references/wiki 无法读取：%s" % exc)
-    if len(names) != 1:
-        raise DependencyProbeError(
-            "第 %d 章必须恰好对应一个 chNN*.md wiki；当前匹配 %d 个：%s"
-            % (chapter, len(names), ", ".join(sorted(names)) or "无")
-        )
-    wiki_path = _guard_workspace_file(
-        ws, os.path.join(wiki_dir, names[0]), "references/wiki/%s" % names[0]
-    )
-    sources = [_read_utf8(wiki_path, "references/wiki/%s" % names[0])]
-
-    teaching_path = _guard_workspace_file(
-        ws, os.path.join(ws, "references", "teaching_examples.json"),
-        "references/teaching_examples.json", optional=True,
-    )
-    teaching = (_read_json_array(teaching_path, "references/teaching_examples.json")
-                if teaching_path else [])
-    quiz_path = _guard_workspace_file(
-        ws, os.path.join(ws, "references", "quiz_bank.json"),
-        "references/quiz_bank.json",
-    )
-    quizzes = _read_json_array(quiz_path, "references/quiz_bank.json")
-    # Only fields actually rendered as Markdown/answer content are dependency-relevant.
-    for row in teaching:
-        if _chapter_matches(row, chapter):
-            sources.extend(row.get(key) for key in ("question", "answer", "explanation"))
-    for row in quizzes:
-        if _chapter_matches(row, chapter):
-            answer = row.get("answer")
-            sources.extend((row.get("question"), row.get("options"), answer))
-            # Keep exact parity with _render_quizzes: explanation is hidden when no text answer exists,
-            # even if an answer-side image is available.
-            if _has_displayable_answer(answer):
-                sources.append(row.get("explanation"))
-    notebook = _guard_workspace_file(
-        ws, os.path.join(ws, "notebook", "ch%02d.md" % chapter),
-        "notebook/ch%02d.md" % chapter, optional=True,
-    )
-    if notebook:
-        sources.append(_read_utf8(notebook, "notebook/ch%02d.md" % chapter))
-    return any(_contains_standard_math(value) for value in sources)
+        return chapter_math_readiness(ws, chapter)
+    except Exception as exc:
+        raise DependencyProbeError("第 %d 章公式状态探测失败：%s" % (chapter, exc))
 
 
 def build_report(materials=None, artifact_mode="chat", workspace=None, chapter=None,
@@ -371,6 +335,9 @@ def build_report(materials=None, artifact_mode="chat", workspace=None, chapter=N
         materials_probe_error = str(exc)
         probe_errors.append(materials_probe_error)
     chapter_has_math = None
+    chapter_math_status = None
+    chapter_math_reasons = []
+    chapter_math_counts = {}
     chapter_probe_error = None
     if workspace is not None or chapter is not None:
         if workspace is None or chapter is None:
@@ -378,7 +345,20 @@ def build_report(materials=None, artifact_mode="chat", workspace=None, chapter=N
             probe_errors.append(chapter_probe_error)
         else:
             try:
-                chapter_has_math = _selected_chapter_has_math(workspace, chapter)
+                math_report = _selected_chapter_math_report(workspace, chapter)
+                chapter_math_status = math_report["status"]
+                chapter_math_reasons = math_report.get("reason_codes") or []
+                chapter_math_counts = math_report.get("counts") or {}
+                if chapter_math_status == "needs_recovery" and artifact_mode == "visual":
+                    detail = math_report.get("manifest_error")
+                    chapter_probe_error = (
+                        "第 %d 章公式证据需要恢复后才能生成 visual 产物：%s%s"
+                        % (chapter, ", ".join(chapter_math_reasons) or "unknown",
+                           ("；" + detail) if detail else "")
+                    )
+                    probe_errors.append(chapter_probe_error)
+                elif chapter_math_status != "needs_recovery":
+                    chapter_has_math = chapter_math_status == "standard"
             except DependencyProbeError as exc:
                 chapter_probe_error = str(exc)
                 probe_errors.append(chapter_probe_error)
@@ -470,6 +450,9 @@ def build_report(materials=None, artifact_mode="chat", workspace=None, chapter=N
             "workspace_scanned": workspace,
             "chapter_scanned": chapter,
             "chapter_has_standard_math": chapter_has_math,
+            "chapter_math_status": chapter_math_status,
+            "chapter_math_reasons": chapter_math_reasons,
+            "chapter_math_counts": chapter_math_counts,
             "probe_error": "; ".join(probe_errors) if probe_errors else None,
             "materials_have_pdf": has_pdf,
             "missing_needed": [r["id"] for r in missing_needed]}

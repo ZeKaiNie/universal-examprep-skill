@@ -184,6 +184,38 @@ class IngestEndToEndTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("q9", r.stdout)  # 点名缺答案的题
 
+    def test_legacy_non_gradable_bank_item_does_not_add_missing_answer(self):
+        data = {
+            "course_name": "X",
+            "phases": [{"phase_num": 1, "phase_name": "P", "wiki_filename": "a.md",
+                        "wiki_content": "x"}],
+            "quiz_bank": [{
+                "id": "legacy-worked", "chapter": 1, "type": "subjective",
+                "question": "Completed demonstration", "gradable": False,
+                "answer_status": "unknown",
+            }],
+        }
+        r = run_ingest(data, self.tmp)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        report = json.loads(read(self.tmp, "ingest_report.json"))
+        self.assertEqual([], report["missing_answer_ids"])
+        bank = json.loads(read(self.tmp, "references", "quiz_bank.json"))
+        self.assertIs(bank[0]["gradable"], False)
+
+    def test_gradable_must_be_a_real_boolean(self):
+        data = {
+            "course_name": "X",
+            "phases": [{"phase_num": 1, "phase_name": "P", "wiki_filename": "a.md",
+                        "wiki_content": "x"}],
+            "quiz_bank": [{
+                "id": "bad", "type": "subjective", "question": "q",
+                "gradable": "false",
+            }],
+        }
+        r = run_ingest(data, self.tmp)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("gradable", r.stdout + r.stderr)
+
     def test_teaching_examples_persist_independently_and_do_not_add_missing_answers(self):
         example = {
             "id": "lecture_example_1_2", "chapter": 1,
