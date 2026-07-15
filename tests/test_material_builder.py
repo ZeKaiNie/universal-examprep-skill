@@ -164,6 +164,105 @@ class CoreExtraction(unittest.TestCase):
         self.assertEqual(items[0]["source_type"], "lecture_quiz")
         self.assertEqual(items[0]["answer_source_pages"], [2])
 
+    def test_lettered_quiz_solutions_pair_for_all_eec_missing_answer_regressions(self):
+        # EEC 160 uses ``Quiz N.N(A) Solution``.  The parenthesized subpart is
+        # between the numeric marker and role word; it must not turn the answer
+        # page into another bare problem marker.
+        affected = ((5, 6), (5, 8), (6, 4), (7, 2),
+                    (7, 3), (7, 4), (7, 5), (9, 3))
+        for chapter, number in affected:
+            heading = "Quiz %d.%d(A)" % (chapter, number)
+            pages = _pages(
+                "ch%02d.pdf" % chapter,
+                heading + "  Compute the requested quantity.",
+                heading + " Solution  official worked answer.",
+            )
+            item = B.extract_lecture_items(pages)[0]
+            self.assertEqual(item["id"], "lecture_quiz_%d_%d_a" % (chapter, number))
+            self.assertEqual(item["variant"], "a")
+            self.assertEqual(item["source_pages"], [1])
+            self.assertEqual(item["answer_source_pages"], [2])
+            self.assertNotIn("official worked answer", item["question"])
+            self.assertIn("official worked answer", item["answer"])
+
+    def test_lettered_solution_continuations_never_join_the_question(self):
+        pages = _pages(
+            "ch07.pdf",
+            "Quiz 7.3(A)  Find the conditional PMF.",
+            "Quiz 7.3(A) Solution  first answer page.",
+            "Quiz 7.3(A) Solution (Continued 2)  second answer page.",
+        )
+        item = B.extract_lecture_items(pages)[0]
+        self.assertEqual(item["id"], "lecture_quiz_7_3_a")
+        self.assertEqual(item["source_pages"], [1])
+        self.assertEqual(item["answer_source_pages"], [2, 3])
+        self.assertNotIn("answer page", item["question"])
+        self.assertIn("first answer page", item["answer"])
+        self.assertIn("second answer page", item["answer"])
+
+    def test_lettered_variants_are_distinct_and_never_share_answers(self):
+        pages = _pages(
+            "ch05.pdf",
+            "Quiz 5.6(A)  Compute answer A.",
+            "Quiz 5.6(A) Solution  official A only.",
+            "Quiz 5.6(B)  Compute answer B.",
+            "Quiz 5.6(B) Solution  official B only.",
+        )
+        items = {item["id"]: item for item in B.extract_lecture_items(pages)}
+        self.assertEqual(set(items), {"lecture_quiz_5_6_a", "lecture_quiz_5_6_b"})
+
+        part_a = items["lecture_quiz_5_6_a"]
+        self.assertEqual(part_a["source_pages"], [1])
+        self.assertEqual(part_a["answer_source_pages"], [2])
+        self.assertIn("official A only", part_a["answer"])
+        self.assertNotIn("official B only", part_a["answer"])
+
+        part_b = items["lecture_quiz_5_6_b"]
+        self.assertEqual(part_b["source_pages"], [3])
+        self.assertEqual(part_b["answer_source_pages"], [4])
+        self.assertIn("official B only", part_b["answer"])
+        self.assertNotIn("official A only", part_b["answer"])
+
+        markers = B.detect_lecture_markers("\n".join(page["text"] for page in pages))
+        self.assertEqual([marker["variant"] for marker in markers], ["a", "a", "b", "b"])
+
+    def test_lettered_marker_only_title_keeps_variant_in_page_reference(self):
+        item = B.extract_lecture_items(_pages("ch05.pdf", "Quiz 5.6(A)"))[0]
+        self.assertEqual(item["id"], "lecture_quiz_5_6_a")
+        self.assertEqual(item["question_text_status"], "page_reference")
+        self.assertIn("Quiz 5.6(A)", item["question"])
+
+    def test_lettered_orphan_solution_reports_its_variant(self):
+        pages = _pages("ch05.pdf", "Quiz 5.6(B) Solution  answer without prompt.")
+        self.assertEqual(B.orphan_solution_keys(pages), [("quiz", 5, 6, "b")])
+
+    def test_lettered_example_and_problem_titles_keep_adjacent_real_prompts(self):
+        example_markers = B.detect_lecture_markers(
+            "Example 4.2(B) Solution  done.\n"
+            "Example 4.3(B) Problem  prove it.\n"
+            "Example 4.4(B) Calculate the expectation."
+        )
+        self.assertEqual(
+            [(m["num"], m["variant"], m["role"]) for m in example_markers],
+            [(2, "b", "solution"), (3, "b", "problem"), (4, "b", "problem")],
+        )
+        bare = B.extract_lecture_items(
+            _pages("ch04.pdf", "Example 4.4(B) Calculate the expectation."))[0]
+        self.assertEqual(bare["id"], "lecture_example_4_4_b")
+        self.assertEqual(bare["_teaching_title"], "Example 4.4(B)")
+        self.assertEqual(bare["_teaching_role"], "worked_example")
+
+        # Homework Problem numbering already consumes the lettered subpart as
+        # part of its number; keep that neighboring parser behavior intact.
+        homework_markers = B._hw_markers(
+            "Problem 5.6(A)  Determine independence.\n"
+            "Problem 5.6(A) Solution\nThey are dependent."
+        )
+        self.assertEqual(
+            [(m["num"], m["role"]) for m in homework_markers],
+            [("5.6a", "problem"), ("5.6a", "solution")],
+        )
+
     def test_ungradable_worked_examples_are_teaching_only(self):
         pages = _pages(
             "ch01.pdf",

@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from scripts import ingest_review
@@ -106,6 +107,97 @@ class BoundedReviewList(unittest.TestCase):
                     ])
         self.assertEqual(2, raised.exception.code)
         self.assertIn("--evidence-note", stderr.getvalue())
+
+
+class BatchReviewApply(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.workspace = self.temp.name
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    @staticmethod
+    def _patch(index):
+        return SimpleNamespace(
+            patch_id="patch_%03d" % index,
+            issue_id="issue_%03d" % index,
+        )
+
+    @staticmethod
+    def _result(applied=True, replayed=False):
+        return SimpleNamespace(
+            applied=applied,
+            replayed=replayed,
+            changed_operations=1 if applied else 0,
+            issue_status="applied",
+        )
+
+    def test_batch_applies_each_ledger_patch_but_compiles_once(self):
+        patches = [self._patch(1), self._patch(2), self._patch(3)]
+        store = SimpleNamespace(
+            apply_patch=mock.Mock(side_effect=[
+                self._result(), self._result(), self._result(False, True),
+            ])
+        )
+        with mock.patch.object(
+                ingest_review, "_load_patch", side_effect=patches) as loader:
+            with mock.patch.object(
+                    ingest_review, "compile_review_outputs",
+                    return_value={"readiness": "ready"}) as compile_outputs:
+                payload = ingest_review._apply_patch_batch(
+                    self.workspace, store, ["one.json", "two.json", "three.json"]
+                )
+        self.assertEqual(3, loader.call_count)
+        self.assertEqual(patches, [call.args[0] for call in store.apply_patch.call_args_list])
+        compile_outputs.assert_called_once_with(self.workspace)
+        self.assertEqual(3, payload["patch_count"])
+        self.assertEqual(2, payload["applied_count"])
+        self.assertEqual(1, payload["replayed_count"])
+
+    def test_batch_failure_rebuilds_after_partial_ledger_progress(self):
+        patches = [self._patch(1), self._patch(2)]
+        store = SimpleNamespace(
+            apply_patch=mock.Mock(side_effect=[self._result(), RuntimeError("boom")])
+        )
+        stderr = io.StringIO()
+        with mock.patch.object(ingest_review, "_load_patch", side_effect=patches):
+            with mock.patch.object(
+                    ingest_review, "compile_review_outputs",
+                    return_value={"readiness": "usable_with_gaps"}) as compile_outputs:
+                with contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as raised:
+                        ingest_review._apply_patch_batch(
+                            self.workspace, store, ["one.json", "two.json"]
+                        )
+        self.assertEqual(1, raised.exception.code)
+        self.assertEqual(2, store.apply_patch.call_count)
+        compile_outputs.assert_called_once_with(self.workspace)
+        self.assertIn("failed after 1 ledger entries", stderr.getvalue())
+
+    def test_batch_rejects_two_patches_for_the_same_issue(self):
+        patches = [self._patch(1), self._patch(2)]
+        patches[1].issue_id = patches[0].issue_id
+        store = SimpleNamespace(apply_patch=mock.Mock())
+        with mock.patch.object(ingest_review, "_load_patch", side_effect=patches):
+            with self.assertRaises(SystemExit) as raised:
+                ingest_review._apply_patch_batch(
+                    self.workspace, store, ["one.json", "two.json"]
+                )
+        self.assertEqual(2, raised.exception.code)
+        store.apply_patch.assert_not_called()
+
+    def test_patch_list_is_nonempty_json_and_exclusive(self):
+        patch_list = os.path.join(self.workspace, "patches.json")
+        with open(patch_list, "w", encoding="utf-8") as stream:
+            json.dump(["one.json", "two.json"], stream)
+        args = SimpleNamespace(patch_files=[], patch_list=patch_list)
+        self.assertEqual(
+            ["one.json", "two.json"], ingest_review._batch_patch_paths(args)
+        )
+        args.patch_files = ["three.json"]
+        with self.assertRaises(SystemExit):
+            ingest_review._batch_patch_paths(args)
 
 
 if __name__ == "__main__":

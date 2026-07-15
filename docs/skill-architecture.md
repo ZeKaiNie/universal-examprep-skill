@@ -74,7 +74,7 @@ study_guide/chNN.receipt.json    # manifest/HTML/PDF 哈希与 QA 状态
 study_guide/qa/chNN_pNNN.png     # 最新 PDF 的逐页验收证据
 ```
 
-常规材料入口是 `scripts/ingest_course.py`：预检 → 解析 → 结构化编译 → 状态初始化 → 视觉索引 → validator。core route 覆盖 PDF/DOCX/PPTX/XLSX/常见 raster/txt/Markdown；XLSX worksheet、standalone raster 与 DOCX logical segment 都保留各自 location 语义，不能冒充物理页。退出 10 表示程序完成但内容 readiness 被阻断，必须用 `scripts/ingest_review.py` 逐项接管；不能因为 wiki/题库已经出现就开始教学。review patch 绑定来源哈希并写入 append-only ledger，再重编译 wiki、题库和检索索引。
+常规材料入口是 `scripts/ingest_course.py`：预检 → 解析 → 结构化编译 → 状态初始化 → 视觉索引 → validator。core route 覆盖 PDF/DOCX/PPTX/XLSX/常见 raster/txt/Markdown；XLSX worksheet、standalone raster 与 DOCX logical segment 都保留各自 location 语义，不能冒充物理页。退出 10 表示程序完成但内容 readiness 被阻断，必须用 `scripts/ingest_review.py` 逐项接管；不能因为 wiki/题库已经出现就开始教学。review patch 绑定来源哈希并写入 append-only ledger，再重编译 wiki、题库和检索索引。大量独立问题可在每项完成视觉检查、claim、单独 patch 与 `validate-patch` 后使用 `apply-batch`：ledger 身份与事务仍逐项保留，只把派生编译推迟到批次末尾。
 
 ingestion-v2 的 parser receipt 对每个 source 绑定 exact hash/media、adapter/version/config、produced location inventory 和 `network/upload/install=false` policy。`source_id` 由 canonical path 派生，`unit_id` 由 source/location/bbox/kind/ordinal 派生；二者都不是 content revision hash，精确 revision 由 source/full-unit digest 另行绑定。canonical groups/conflicts 是可重建派生事实：保留所有来源 occurrence；near match 不自动成组；priority 不静默裁决；unresolved conflict fail-closed。
 
