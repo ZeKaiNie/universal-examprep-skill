@@ -111,6 +111,78 @@ def _issue_summary(issues):
     }
 
 
+def _load_patch(path):
+    try:
+        return ReviewPatch.from_dict(read_json(path))
+    except Exception as exc:
+        _die("patch validation failed for %s: %s" % (path, exc))
+
+
+def _batch_patch_paths(args):
+    positional = list(args.patch_files or ())
+    if args.patch_list and positional:
+        _die("choose patch files or --patch-list, not both")
+    if args.patch_list:
+        try:
+            listed = read_json(args.patch_list)
+        except Exception as exc:
+            _die("invalid --patch-list: %s" % exc)
+        if (not isinstance(listed, list) or not listed
+                or any(not isinstance(path, str) or not path.strip() for path in listed)):
+            _die("--patch-list must be a non-empty JSON string list")
+        positional = listed
+    if not positional:
+        _die("apply-batch needs at least one patch")
+    if len(set(positional)) != len(positional):
+        _die("patch paths must be unique")
+    return positional
+
+
+def _apply_patch_batch(workspace, store, patch_paths):
+    patches = []
+    patch_ids = set()
+    issue_ids = set()
+    for path in patch_paths:
+        patch = _load_patch(path)
+        if patch.patch_id in patch_ids:
+            _die("duplicate patch_id: %s" % patch.patch_id)
+        if patch.issue_id in issue_ids:
+            _die("duplicate issue_id: %s" % patch.issue_id)
+        patch_ids.add(patch.patch_id)
+        issue_ids.add(patch.issue_id)
+        patches.append((path, patch))
+
+    results = []
+    for index, (path, patch) in enumerate(patches):
+        try:
+            result = store.apply_patch(patch)
+        except Exception as exc:
+            message = "patch %d/%d failed after %d ledger entries: %s" % (
+                index + 1, len(patches), len(results), exc)
+            try:
+                compile_review_outputs(workspace)
+            except Exception as rebuild_exc:
+                message += "; rebuild failed: %s" % rebuild_exc
+            _die(message, code=1)
+        results.append({
+            "patch_file": path,
+            "patch_id": patch.patch_id,
+            "issue_id": patch.issue_id,
+            "applied": result.applied,
+            "replayed": result.replayed,
+            "changed_operations": result.changed_operations,
+            "issue_status": result.issue_status,
+        })
+    compiled = compile_review_outputs(workspace)
+    return {
+        "patch_count": len(results),
+        "applied_count": sum(1 for result in results if result["applied"]),
+        "replayed_count": sum(1 for result in results if result["replayed"]),
+        "results": results,
+        "compiled": compiled,
+    }
+
+
 def run(argv=None):
     parser = argparse.ArgumentParser(
         description="Typed AI/human review queue for .ingest workspaces"
@@ -152,6 +224,18 @@ def run(argv=None):
     validate_parser.add_argument("patch_file")
     apply_parser = sub.add_parser("apply", help="apply a validated patch and rebuild derivatives")
     apply_parser.add_argument("patch_file")
+    batch_parser = sub.add_parser(
+        "apply-batch",
+        help="apply distinct patches and rebuild once",
+    )
+    batch_parser.add_argument(
+        "patch_files", nargs="*",
+        help="patch JSON files for distinct issues",
+    )
+    batch_parser.add_argument(
+        "--patch-list",
+        help="JSON list of patch-file paths",
+    )
     mark_parser = sub.add_parser(
         "mark-unrecoverable", help="close one issue with an evidence-bound terminal patch"
     )
@@ -227,10 +311,7 @@ def run(argv=None):
             _die("claim failed: %s" % exc)
         payload = {"claimed": True, "issue": issue.to_dict()}
     elif args.command in ("validate-patch", "apply"):
-        try:
-            patch = ReviewPatch.from_dict(read_json(args.patch_file))
-        except Exception as exc:
-            _die("patch validation failed: %s" % exc)
+        patch = _load_patch(args.patch_file)
         if args.command == "validate-patch":
             try:
                 store.validate_patch(patch)
@@ -250,6 +331,10 @@ def run(argv=None):
                 "issue_status": result.issue_status,
                 "compiled": compiled,
             }
+    elif args.command == "apply-batch":
+        payload = _apply_patch_batch(
+            workspace, store, _batch_patch_paths(args)
+        )
     elif args.command in ("mark-resolved", "mark-unrecoverable"):
         issue = store.review_queue.get(args.issue_id)
         if issue is None:

@@ -25,7 +25,7 @@ python scripts/ingest_course.py --materials <dir> --workspace <ws> --json
 
 Ingestion-v2 requires one parser receipt per source, binding revision/config/location accounting and `network/upload/install=false`; its exact schema is in [`file-format.md`](file-format.md). Docling/MinerU require an explicitly selected host callable runner; probe/flag alone is insufficient. The adapter itself does not install, network, or upload. Policy values are validated declarations, not runner sandbox/attestation; the host constrains and audits runner internals.
 
-Exit `0` means `ready` or disclosed `usable_with_gaps`; `10` means completed process but blocked content, so teaching/quiz/completion remain forbidden; other nonzero means operation failure, never “no Python.” Typed takeover uses only `ingest_review.py list/show/claim/validate-patch/apply/mark-unrecoverable/rebuild`; never hand-edit ledgers, facts, wiki, or bank. Rebuild and validate after source/patch changes.
+Exit `0` means `ready` or disclosed `usable_with_gaps`; `10` means completed process but blocked content, so teaching/quiz/completion remain forbidden; other nonzero means operation failure, never “no Python.” Typed takeover uses only `ingest_review.py list/show/claim/validate-patch/apply/apply-batch/mark-unrecoverable/rebuild`; batch apply keeps one validated patch per issue. Never hand-edit ledgers, facts, wiki, or bank. Rebuild and validate after source/patch changes.
 
 ## 教材与宿主扩展
 

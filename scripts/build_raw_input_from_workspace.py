@@ -290,17 +290,31 @@ def requires_assets_heuristic(text, renderable=True):
 # otherwise a problem whose text merely contains "solution" ("find the solution set") is misread.
 _ROLE_PROBLEM_RE = re.compile(r"^\s*[\)\.:\-]?\s*\(?\s*problems?\b", re.I)             # incl. plural "Problems"
 _ROLE_SOLUTION_RE = re.compile(r"^\s*[\)\.:\-]?\s*\(?\s*(?:solutions?|answers?)\b", re.I)  # Solution(s)/Answer(s)
+_ROLE_SUBPART_PREFIX_RE = re.compile(r"^\s*[\)\.:\-]?\s*\(\s*([A-Za-z])\s*\)\s*", re.I)
+_ROLE_CONTINUED_PREFIX_RE = re.compile(
+    r"^\s*[\)\.:\-]?\s*\(?\s*continued\b\s*\d*\s*\)?[\s:.\-]*", re.I)
 _EXAMPLE_REFERENCE_TAIL_RE = re.compile(r"^\s*[\)\.:\-]?\s*(?:says|states)\s+that\b", re.I)
 _TOC_RE = re.compile(r"\.{4,}")   # 4+ dot-leaders → a table-of-contents line, not a heading
 
 
+def _normalized_role_tail(tail):
+    tail_role = tail
+    for _ in range(2):
+        before = tail_role
+        tail_role = _ROLE_SUBPART_PREFIX_RE.sub("", tail_role, count=1)
+        tail_role = _ROLE_CONTINUED_PREFIX_RE.sub("", tail_role, count=1)
+        if tail_role == before:
+            break
+    return tail_role
+
+
+def _variant_of_tail(tail):
+    match = _ROLE_SUBPART_PREFIX_RE.match(tail)
+    return match.group(1).lower() if match else None
+
+
 def _role_of_tail(tail):
-    """Role of a marker from the text right after its number. A leading "(Continued)" may precede the
-    role word ("Example 1.1 (Continued) Solution …"); strip it before matching. Used everywhere so
-    detect_lecture_markers and the text-slicers agree."""
-    # strip ONLY a leading "continued" token (+ optional number/parens/separators) — not the words
-    # after it, so "Continued Solution" / "Continued: Solution" (no parens) still leaves "Solution".
-    tail_role = re.sub(r"^\s*\(?\s*continued\b\s*\d*\s*\)?[\s:.\-]*", "", tail, flags=re.I)
+    tail_role = _normalized_role_tail(tail)
     if _ROLE_PROBLEM_RE.match(tail) or _ROLE_PROBLEM_RE.match(tail_role):
         return "problem"
     if _ROLE_SOLUTION_RE.match(tail) or _ROLE_SOLUTION_RE.match(tail_role):
@@ -309,13 +323,8 @@ def _role_of_tail(tail):
 
 
 def _heading_form_of_tail(tail):
-    """Preserve whether a problem marker explicitly said ``Problem``.
-
-    ``role`` intentionally keeps the legacy two-value contract (a bare marker is still a
-    problem), while the teaching-example snapshot needs to distinguish an explicitly posed
-    problem from a bare worked Example whose result may be completed on the same slide.
-    """
-    tail_role = re.sub(r"^\s*\(?\s*continued\b\s*\d*\s*\)?[\s:.\-]*", "", tail, flags=re.I)
+    """Distinguish explicit problems/solutions from bare worked examples."""
+    tail_role = _normalized_role_tail(tail)
     if _ROLE_PROBLEM_RE.match(tail) or _ROLE_PROBLEM_RE.match(tail_role):
         return "explicit_problem"
     if _ROLE_SOLUTION_RE.match(tail) or _ROLE_SOLUTION_RE.match(tail_role):
@@ -324,9 +333,7 @@ def _heading_form_of_tail(tail):
 
 
 def _iter_markers(text):
-    """Every NON-TOC lecture marker in TEXT-POSITION order — the single source of truth shared by
-    detect_lecture_markers AND the text-slicers, so TOC-skip / role / plural never diverge between
-    them. Returns dicts: {start, kind, chapter, num, role, continued}."""
+    """Return non-TOC lecture markers in text order."""
     text = text or ""
     out = []
     for kind, rx in (("example", _EXAMPLE_RE), ("quiz", _QUIZ_RE)):
@@ -336,14 +343,10 @@ def _iter_markers(text):
             if _TOC_RE.search(line):   # dot-leaders anywhere on the line → TOC entry (even long titles), skip
                 continue
             tail = text[m.end():m.end() + 48]
-            # PDF line extraction can put an ordinary cross-reference at column zero inside a
-            # solution, for example ``Example 6.6 says that ...``. Third-person ``says/states
-            # that`` refers to the named example; it is not a new bare worked-example heading.
-            # Keep this Example-only and phrase-specific so genuine bare headings such as
-            # ``Example 6.6 Calculate ...`` retain their teaching-only behavior.
-            if kind == "example" and _EXAMPLE_REFERENCE_TAIL_RE.match(tail):
+            if kind == "example" and _EXAMPLE_REFERENCE_TAIL_RE.match(_normalized_role_tail(tail)):
                 continue
             out.append({"start": m.start(), "kind": kind, "chapter": int(m.group(1)), "num": int(m.group(2)),
+                        "variant": _variant_of_tail(tail),
                         "role": _role_of_tail(tail), "heading_form": _heading_form_of_tail(tail),
                         "continued": bool(re.search(r"\bContinued\b", tail, re.I))})
     out.sort(key=lambda d: d["start"])
@@ -351,46 +354,52 @@ def _iter_markers(text):
 
 
 def detect_lecture_markers(text):
-    """Find lecture Example/Quiz markers on one page (TEXT-POSITION order). Returns a list of
-    {kind: 'example'|'quiz', chapter: int, num: int, role: 'problem'|'solution', continued: bool}."""
-    return [{k: d[k] for k in ("kind", "chapter", "num", "role", "continued")} for d in _iter_markers(text)]
+    out = []
+    for marker in _iter_markers(text):
+        public = {k: marker[k] for k in ("kind", "chapter", "num", "role", "continued")}
+        if marker.get("variant") is not None:
+            public["variant"] = marker["variant"]
+        out.append(public)
+    return out
 
 
 def orphan_solution_keys(pages):
-    """Solution markers whose (kind,chapter,num) never had a detected problem — surfaced as a
-    warning so a mis-detected pair is fail-loud, not silently dropped."""
+    """Return solution markers without a matching problem."""
     marked = _markers_with_pages(pages)
     probs = {_key(mk) for _, mk in marked if mk["role"] == "problem"}
     sols = {_key(mk) for _, mk in marked if mk["role"] == "solution"}
-    return sorted(sols - probs)
+    public = [key if key[3] is not None else key[:3] for key in sols - probs]
+    return sorted(public, key=lambda key: (
+        key[0], key[1], key[2], key[3] if len(key) > 3 else ""))
 
 
 def _markers_with_pages(pages):
     marked = []
     for i, pg in enumerate(pages):
-        # Internal consumers retain heading_form for the parallel teaching snapshot; the public
-        # detect_lecture_markers() result keeps its legacy field set for callers/tests.
         for raw in _iter_markers(pg.get("text", "")):
             mk = {k: raw[k] for k in
-                  ("kind", "chapter", "num", "role", "continued", "heading_form")}
+                  ("kind", "chapter", "num", "variant", "role", "continued", "heading_form")}
             marked.append((i, mk))
     return marked
 
 
 def _key(mk):
-    return (mk["kind"], mk["chapter"], mk["num"])
+    return (mk["kind"], mk["chapter"], mk["num"], mk.get("variant"))
 
 
-def _problem_statement(page_text, kind, chapter, num):
-    """Extract the problem text for `<kind> X.Y` on a page — concatenating EVERY problem-role slice for
-    that key (so a same-page `Problem …` + `Problem (Continued) …` are both captured), each cut at the
-    next marker. Skips TOC lines and `Solution` markers of the same number (solution-before-problem)."""
+_ANY_VARIANT = object()
+
+
+def _problem_statement(page_text, kind, chapter, num, variant=_ANY_VARIANT):
+    """Extract matching problem slices up to the next marker."""
     text = page_text or ""
     mks = _iter_markers(text)
     starts = [d["start"] for d in mks]
     parts = []
     for d in mks:
-        if d["kind"] == kind and d["chapter"] == chapter and d["num"] == num and d["role"] != "solution":
+        variant_matches = variant is _ANY_VARIANT or d.get("variant") == variant
+        if (d["kind"] == kind and d["chapter"] == chapter and d["num"] == num
+                and variant_matches and d["role"] != "solution"):
             after = [st for st in starts if st > d["start"]]
             e = min(after) if after else len(text)
             parts.append(" ".join(text[d["start"]:e].split()).strip())
@@ -398,27 +407,28 @@ def _problem_statement(page_text, kind, chapter, num):
 
 
 def _body_after_marker(stmt, kind, chapter, num):
-    """The text of `stmt` after stripping the leading `<kind> X.Y [Problem]` heading — used to tell a
-    real prompt from a marker-only title (a slide whose prompt is in an image pypdf couldn't read)."""
+    """Strip the leading problem heading."""
     rx = _EXAMPLE_RE if kind == "example" else _QUIZ_RE
     m = rx.search(stmt or "")
     if not m:
         return (stmt or "").strip()
     rest = stmt[m.end():]
+    rest = _normalized_role_tail(rest)
     rest = re.sub(r"^\s*[\):.\-]?\s*\(?\s*problems?\b\)?", "", rest, flags=re.I)  # drop a trailing "Problem(s)"
+    rest = _ROLE_CONTINUED_PREFIX_RE.sub("", rest, count=1)
     return rest.strip(" .:：、)）-—\t\n")
 
 
-def _solution_statement(page_text, kind, chapter, num):
-    """Extract the solution text for `<kind> X.Y` on a page — concatenating EVERY solution slice for
-    that key (so a same-page `Solution …` + `Solution (Continued) …` are both captured), each cut at
-    the next marker. The real `answer` for text-complete items so grading has something to compare to."""
+def _solution_statement(page_text, kind, chapter, num, variant=_ANY_VARIANT):
+    """Extract matching solution slices up to the next marker."""
     text = page_text or ""
     mks = _iter_markers(text)
     starts = [d["start"] for d in mks]
     parts = []
     for d in mks:
-        if d["kind"] == kind and d["chapter"] == chapter and d["num"] == num and d["role"] == "solution":
+        variant_matches = variant is _ANY_VARIANT or d.get("variant") == variant
+        if (d["kind"] == kind and d["chapter"] == chapter and d["num"] == num
+                and variant_matches and d["role"] == "solution"):
             after = [st for st in starts if st > d["start"]]
             e = min(after) if after else len(text)
             parts.append(" ".join(text[d["start"]:e].split()).strip())
@@ -426,22 +436,18 @@ def _solution_statement(page_text, kind, chapter, num):
 
 
 def extract_lecture_items(pages):
-    """Pair each `<kind> X.Y` problem with its matching `Solution` pages (incl. `(Continued)`), assign
-    stable IDs, and flag asset dependence. De-dups problems by (kind, chapter, num, source_file) — a
-    marker reused across files (lecture/ch01.pdf + homework/ch01.pdf both `Quiz 1.1`) yields two
-    distinct, file-namespaced items. Solutions are claimed same-file-first (a continuation in a file
-    with no competing problem still merges), surviving intervening problems and solution-before-problem."""
+    """Pair lecture problems and solutions, preserving source-file identity."""
     marked = _markers_with_pages(pages)
     sol_by_key = {}
     for mj, (pj, mk2) in enumerate(marked):
         if mk2["role"] == "solution":
             sol_by_key.setdefault(_key(mk2), []).append((mj, pj))
-    prob_files = {}    # key -> set of files that contain a PROBLEM marker for it
+    prob_files = {}
     for (pj, mk2) in marked:
         if mk2["role"] == "problem":
             prob_files.setdefault(_key(mk2), set()).add(pages[pj]["file"])
-    ambiguous = {k for k, fs in prob_files.items() if len(fs) > 1}   # same marker in >1 file → namespace id
-    file_idx = {}      # injective per-file index within an ambiguous key (sanitized stems can collide)
+    ambiguous = {k for k, fs in prob_files.items() if len(fs) > 1}
+    file_idx = {}
     for k in ambiguous:
         for n, f in enumerate(sorted(prob_files[k])):
             file_idx[(k, f)] = n
@@ -459,15 +465,11 @@ def extract_lecture_items(pages):
         seen.add((key, pf))
         prob_text = prob_page.get("text", "")
 
-        # a problem may span pages: gather later `Problem (Continued)` pages of the same key+file.
         prob_idxs = sorted({i} | {pj2 for (pj2, mk2) in marked
                                   if _key(mk2) == key and mk2["role"] == "problem"
                                   and pages[pj2]["file"] == pf and mk2.get("continued")})
         q_pages = sorted({(pages[k]["file"], pages[k]["page"]) for k in prob_idxs}, key=lambda fp: (fp[1], fp[0]))
 
-        # take ALL usable solutions (both before AND after the problem). For a key that is a problem in
-        # >1 file (ambiguous), only SAME-FILE solutions are usable — a separate solutions-only file's
-        # `Quiz X.Y Solution` can't be assigned to one of the competing problems, so don't claim it.
         other_prob_files = prob_files.get(key, set()) - {pf}
         ambiguous_key = key in ambiguous
         chosen = [(mj, pj) for (mj, pj) in sol_by_key.get(key, []) if mj not in claimed
@@ -479,16 +481,14 @@ def extract_lecture_items(pages):
 
         kind = mk["kind"]
         label = "Example" if kind == "example" else "Quiz"
-        # scope the asset heuristic to THIS problem's slice on the anchor page; continued pages (which
-        # wholly belong to this problem) are scanned whole.
-        stmt = _problem_statement(prob_text, kind, key[1], key[2])
-        # STRONG figure-shown cues fire on any source (a .txt "shade the Venn at right" is fail-closed);
-        # WEAK figure-noun cues fire only for a renderable PDF (a .txt "draw the graph" stays text-complete).
+        variant = key[3]
+        number_label = "%d.%d%s" % (
+            key[1], key[2], "(%s)" % variant.upper() if variant else "")
+        stmt = _problem_statement(prob_text, kind, key[1], key[2], variant)
         renderable = pf.lower().endswith(".pdf")
-        # scope the heuristic to THIS problem's sliced text on every page (anchor + continued) — a
-        # continued page that also starts the next item must not lend that item's "Venn" to this one.
         needs = (requires_assets_heuristic(stmt or prob_text, renderable) or any(
-            requires_assets_heuristic(_problem_statement(pages[k].get("text", ""), kind, key[1], key[2]),
+            requires_assets_heuristic(_problem_statement(
+                pages[k].get("text", ""), kind, key[1], key[2], variant),
                                       renderable) for k in prob_idxs if k != i))
         # marker-only: extraction yielded just the heading on a single page (real prompt likely in an
         # image) → NOT a standalone question. Detect by ABSENCE of any word/CJK content after the
@@ -504,22 +504,24 @@ def extract_lecture_items(pages):
                        and not re.search(r"[A-Za-z一-鿿=+√∫∑^?×÷<>≤≥]", _mo_body))
         # 完整原始题面（锚页 + 续页切片）——needs/marker_only 的 question 会被替换成指引句，
         # 跨页图线索（见下页图 在续页上）要靠它检查
-        _cont_parts = [_problem_statement(pages[k].get("text", ""), kind, key[1], key[2])
+        _cont_parts = [_problem_statement(
+                           pages[k].get("text", ""), kind, key[1], key[2], variant)
                        or " ".join((pages[k].get("text") or "").split()) for k in prob_idxs if k != i]
         orig_question = " ".join([stmt] + _cont_parts).strip()
         if needs:
             qts = "page_reference"
-            question = ("（%s %d.%d）本题依赖原始讲义 %s 第 %d 页的图/表，须配合所附 asset 作答。"
-                        % (label, key[1], key[2], pf, prob_page["page"]))
+            question = ("（%s %s）本题依赖原始讲义 %s 第 %d 页的图/表，须配合所附 asset 作答。"
+                        % (label, number_label, pf, prob_page["page"]))
         elif marker_only:
             qts = "page_reference"
-            question = ("（%s %d.%d）题面未能从文本提取（可能在图片中），见原始讲义 %s 第 %d 页。"
-                        % (label, key[1], key[2], pf, prob_page["page"]))
+            question = ("（%s %s）题面未能从文本提取（可能在图片中），见原始讲义 %s 第 %d 页。"
+                        % (label, number_label, pf, prob_page["page"]))
         else:
             qts = "full"
             # continued 切片已在 orig_question 内按题裁好（Quiz 1.1 (Continued) 页不吞 Quiz 1.2）
             question = orig_question
-        item_id = "lecture_%s_%d_%d" % (kind, key[1], key[2])
+        item_id = "lecture_%s_%d_%d%s" % (
+            kind, key[1], key[2], "_%s" % variant if variant else "")
         if key in ambiguous:   # readable stem + injective index (so a/b.pdf vs a_b.pdf don't collide)
             item_id += "__%s_%d" % (re.sub(r"[^\w]", "_", os.path.splitext(pf)[0]), file_idx[(key, pf)])
         _qt, _opts = _classify_question_type(question)
@@ -538,11 +540,9 @@ def extract_lecture_items(pages):
             "requires_assets": bool(needs),
             "question_text_status": qts,
         }
+        if variant is not None:
+            item["variant"] = variant
         if kind == "example":
-            # Parallel teaching index metadata.  This does NOT change quiz-bank routing: every
-            # extracted item remains in the canonical bank exactly as before.  A bare Example with
-            # no independent Solution is a worked demonstration; an explicit Problem or any
-            # problem/solution pair is a paired teaching problem.
             item["_teaching_role"] = (
                 "paired_problem"
                 if bool(ans_idx) or any(
@@ -553,7 +553,7 @@ def extract_lecture_items(pages):
                 )
                 else "worked_example"
             )
-            item["_teaching_title"] = "%s %d.%d" % (label, key[1], key[2])
+            item["_teaching_title"] = "%s %s" % (label, number_label)
         if not needs and _qt == "choice" and _opts:
             item["options"] = _opts
         # ``keywords`` is optional for subjective items.  Do not emit an empty
@@ -567,9 +567,8 @@ def extract_lecture_items(pages):
             item["_answer_pages"] = ans
             ref = "见原始讲义 %s 第 %s 页的解答。" % (
                 first_file, "、".join(str(p) for (f, p) in ans if f == first_file))
-            # keep the EXTRACTED solution text whenever there is one (grading needs it) — even for a
-            # figure-dependent item; only fall back to the page-reference when no text was extracted.
-            sol = " ".join(t for t in (_solution_statement(pages[j].get("text", ""), kind, key[1], key[2])
+            sol = " ".join(t for t in (_solution_statement(
+                                           pages[j].get("text", ""), kind, key[1], key[2], variant)
                                        for j in ans_idx) if t).strip()
             if sol:
                 item["answer"] = sol + ("（解答可能依赖图，须看原页/asset）" if needs else "")
@@ -2970,7 +2969,9 @@ def _run_unlocked(args, backend=None, adapter_runner=None):
         }
         # fail-loud: a solution detected with no matching problem (mis-detected pair) → surface it
         for k in orphan_solution_keys(lecture_pages):
-            report["warnings"].append("solution_without_problem: %s %d.%d" % k)
+            variant_label = "(%s)" % k[3].upper() if len(k) > 3 else ""
+            report["warnings"].append(
+                "solution_without_problem: %s %d.%d%s" % (k[0], k[1], k[2], variant_label))
         if hw_related:
             overlap = sum(len(detect_lecture_markers(pg.get("text", "")))
                           for pg in pages if pg["file"] in hw_related)

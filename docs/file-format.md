@@ -103,7 +103,7 @@ attestation；host 负责约束 runner 内部行为。
 
 `base_*` 是确定性基线，compiled units/mappings 是基线 + applied ledger；均不得手改。`ReviewIssue` 绑定稳定 ID、source hash、reason/page/evidence/target/severity/action，状态为 pending/claimed/validated/applied/blocked/resolved/unrecoverable/superseded；blocking issue 未终态即 `blocked`。
 
-`ingest_review.py --workspace <ws> --json <command>` 提供 `list/show/claim/validate-patch/apply/mark-unrecoverable/rebuild`；patch 必须证据绑定，ledger append-only，rebuild 从 baseline + ledger 重编译。`ai_review_manifest.json` 仅为 legacy view。
+`ingest_review.py --workspace <ws> --json <command>` 提供 `list/show/claim/validate-patch/apply/apply-batch/mark-unrecoverable/rebuild`；patch 必须证据绑定且每个 issue 独立，ledger append-only。`apply-batch` 只把派生编译合并到批次末尾。`ai_review_manifest.json` 仅为 legacy view。
 
 ### canonical groups 与 source conflicts（派生事实）
 
