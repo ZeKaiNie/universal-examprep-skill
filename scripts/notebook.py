@@ -5,9 +5,8 @@ a summary + a link. notebook/chNN.md holds the full walkthrough/feedback/confusi
 entries; mistakes/chNN.md mirrors the mistake entries; both index.md files are DERIVED
 views, deterministically rebuilt from the chapter files on every write.
 
-Why: before v4 every seven-step walkthrough and grading feedback evaporated with the chat
-(docs/history/plans/PLAN-v4.md §1.3) — the one thing a student wants to re-read at review time
-lived nowhere.
+Why: before v4 every seven-step walkthrough and grading feedback evaporated with the chat;
+the durable notebook contract is documented in the shipped docs/file-format.md.
 This official tool is the only write path: entry bodies arrive on STDIN (UTF-8), files are
 written atomically (temp + os.replace, same conventions as update_progress.save), and the
 same --id AND --type in the same chapter REPLACES the entry in place, so re-teaching a
@@ -42,6 +41,7 @@ for _s in ("stdin", "stdout", "stderr"):
         pass
 
 import i18n
+from ingestion import workspace_publication_lock
 
 NOTEBOOK_DIR = "notebook"
 MISTAKES_DIR = "mistakes"
@@ -519,11 +519,12 @@ def run(argv=None):
     ws = args.workspace
     if not os.path.isdir(ws):
         _die("workspace 不存在: %s" % ws)
-    if args.cmd == "add-entry":
-        return cmd_add_entry(ws, args)
-    if args.cmd == "rebuild":
+    if args.cmd == "list":
+        return cmd_list(ws, args)
+    with workspace_publication_lock(ws):
+        if args.cmd == "add-entry":
+            return cmd_add_entry(ws, args)
         return cmd_rebuild(ws, args)
-    return cmd_list(ws, args)
 
 
 if __name__ == "__main__":

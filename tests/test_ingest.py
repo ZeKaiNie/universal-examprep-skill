@@ -25,6 +25,8 @@ SCRIPTS = os.path.join(REPO_ROOT, "scripts")
 sys.path.insert(0, SCRIPTS)
 
 from scripts import ingest as ingest_module
+from scripts.ingestion.pipeline import build_payload
+from scripts.ingestion.storage import workspace_publication_lock
 UnsafePathError = ingest_module.UnsafePathError
 
 INGEST = os.path.join(SCRIPTS, "ingest.py")
@@ -67,6 +69,60 @@ class IngestEndToEndTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
+    def structured_input(self):
+        materials = os.path.join(self.tmp, "materials")
+        workspace = os.path.join(self.tmp, "workspace")
+        os.makedirs(materials, exist_ok=True)
+        os.makedirs(workspace, exist_ok=True)
+        source = os.path.join(materials, "ch01.txt")
+        with open(source, "w", encoding="utf-8") as stream:
+            stream.write("Chapter 1\nCore concept\n")
+        question = {
+            "id": "q1",
+            "chapter": 1,
+            "type": "subjective",
+            "question": "Explain the core concept.",
+            "answer": "Official answer.",
+            "source": "material",
+            "source_file": "ch01.txt",
+            "source_pages": [1],
+            "answer_source_pages": [1],
+        }
+        payload = build_payload(
+            materials,
+            [source],
+            [{"file": "ch01.txt", "page": 1,
+              "text": "Chapter 1\nCore concept"}],
+            sections=[{"chapter": 1, "page_keys": [("ch01.txt", 1)]}],
+            quiz_items=[question],
+            report={"warnings": [], "skipped": [], "ai_review": []},
+        )
+        return workspace, {
+            "course_name": "Concurrency 101",
+            "phases": [{
+                "phase_num": 1,
+                "phase_name": "Core",
+                "wiki_filename": "ch1.md",
+                "wiki_content": "# Chapter 1\nCore concept",
+            }],
+            "quiz_bank": [question],
+            "teaching_examples": [],
+            "ingestion": payload,
+        }
+
+    @staticmethod
+    def workspace_snapshot(workspace):
+        snapshot = {}
+        for root, _dirs, files in os.walk(workspace):
+            for name in files:
+                path = os.path.join(root, name)
+                relative = os.path.relpath(path, workspace).replace(os.sep, "/")
+                if relative in (".study_state.lock", ".ingest/mutation.lock"):
+                    continue
+                with open(path, "rb") as stream:
+                    snapshot[relative] = stream.read()
+        return snapshot
+
     # ---------- 正常流程 ----------
     def test_valid_input_generates_all_files(self):
         r = run_ingest(VALID, self.tmp)
@@ -76,6 +132,66 @@ class IngestEndToEndTest(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(self.tmp, rel)), f"缺少 {rel}")
         bank = json.loads(read(self.tmp, "references", "quiz_bank.json"))
         self.assertEqual(len(bank), 2)  # 题库是合法 JSON 数组
+
+    def test_structured_cli_reingest_does_not_reenter_mutation_lock(self):
+        workspace, input_obj = self.structured_input()
+        first = run_ingest(input_obj, workspace)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertTrue(os.path.isfile(os.path.join(
+            workspace, ".ingest", "build_manifest.json")))
+
+        second = run_ingest(input_obj, workspace)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertNotIn("another ingestion mutation", second.stdout + second.stderr)
+
+    def test_cli_publication_lock_conflict_is_no_write(self):
+        workspace, input_obj = self.structured_input()
+        first = run_ingest(input_obj, workspace)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        changed = json.loads(json.dumps(input_obj, ensure_ascii=False))
+        changed["phases"][0]["wiki_content"] = "# Chapter 1\nMUTATED"
+        changed["quiz_bank"][0]["answer"] = "MUTATED"
+
+        with workspace_publication_lock(workspace):
+            before = self.workspace_snapshot(workspace)
+            blocked = run_ingest(changed, workspace, "--force")
+            after = self.workspace_snapshot(workspace)
+
+        self.assertEqual(blocked.returncode, 1, blocked.stdout + blocked.stderr)
+        self.assertIn("工作区发布冲突", blocked.stdout + blocked.stderr)
+        self.assertNotIn("Traceback", blocked.stdout + blocked.stderr)
+        self.assertEqual(before, after)
+
+    def test_cli_reads_replaced_raw_input_inside_publication_lock(self):
+        workspace, input_a = self.structured_input()
+        ingest_dir = os.path.join(workspace, ".ingest")
+        os.makedirs(ingest_dir, exist_ok=True)
+        input_path = os.path.join(ingest_dir, "source_raw_input.json")
+        with open(input_path, "w", encoding="utf-8") as stream:
+            json.dump(input_a, stream, ensure_ascii=False)
+
+        input_b = json.loads(json.dumps(input_a, ensure_ascii=False))
+        input_b["course_name"] = "Replacement generation"
+        input_b["phases"][0]["wiki_content"] = "# Chapter 1\nGENERATION B"
+
+        def replace_before_lock(_args, _output_dir):
+            replacement = input_path + ".next"
+            with open(replacement, "w", encoding="utf-8") as stream:
+                json.dump(input_b, stream, ensure_ascii=False)
+            os.replace(replacement, input_path)
+
+        argv = [INGEST, "-i", input_path, "-o", workspace]
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            ingest_module, "_before_publication_lock", replace_before_lock
+        ), redirect_stdout(output):
+            ingest_module.main()
+
+        wiki = read(workspace, "references", "wiki", "ch1.md")
+        self.assertIn("GENERATION B", wiki)
+        self.assertNotIn("Core concept", wiki)
+        persisted_input = json.loads(read(input_path))
+        self.assertEqual("Replacement generation", persisted_input["course_name"])
 
     def test_path_guard_error_is_reported_without_traceback(self):
         output = io.StringIO()

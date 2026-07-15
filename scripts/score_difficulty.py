@@ -28,6 +28,11 @@ import os
 import re
 import sys
 
+try:
+    from .ingestion import workspace_publication_lock
+except ImportError:
+    from ingestion import workspace_publication_lock
+
 for _s in ("stdout", "stderr"):
     try:
         getattr(sys, _s).reconfigure(encoding="utf-8")
@@ -255,13 +260,17 @@ def _atomic_write_json(path, obj):
 
 # ---------------- main ----------------
 
-def main(argv=None):
+def main(argv=None, _state_locked=False):
     ap = argparse.ArgumentParser(description="Deterministic difficulty scoring (A7): writes back difficulty 1-5 + difficulty_reason")
     ap.add_argument("--workspace", required=True, help="workspace root (contains references/quiz_bank.json)")
     ap.add_argument("--dry-run", action="store_true", help="preview the distribution only; no write")
     ap.add_argument("--force", action="store_true", help="rewrite items even when unchanged")
     ap.add_argument("--json", action="store_true", help="print stats as JSON")
     args = ap.parse_args(argv)
+
+    if not args.dry_run and not _state_locked:
+        with workspace_publication_lock(args.workspace):
+            return main(argv, _state_locked=True)
 
     bank = load_bank(args.workspace)
     items = [q for q in bank if isinstance(q, dict) and q.get("id") is not None]

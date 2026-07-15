@@ -12,6 +12,7 @@ import zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import build_dist  # noqa: E402
+import exam_start  # noqa: E402
 
 PY = sys.executable
 
@@ -34,12 +35,16 @@ class Manifest(unittest.TestCase):
         self.assertEqual(leaked, [], "维护者计划/历史/发布文档泄进运行时包: %s" % leaked)
         self.assertFalse(build_dist.is_runtime_path("docs/plans/example.md"))
         self.assertFalse(build_dist.is_runtime_path("docs\\history\\plans\\example.md"))
+        self.assertFalse(build_dist.is_runtime_path("docs/retrieval-evaluation.md"))
+        self.assertFalse(build_dist.is_runtime_path("docs/skill-architecture.md"))
+        self.assertFalse(build_dist.is_runtime_path("docs/localization.md"))
+        self.assertNotIn("scripts/retrieval_evaluation.py", self.files)
         self.assertTrue(build_dist.is_runtime_path("docs/language-policy.md"))
 
     def test_every_skill_referenced_script_ships(self):
         # every scripts/<name>.py referenced from runtime skill texts must be in the manifest
         refs = set()
-        pat = re.compile(r"scripts/([\w_]+\.py)")
+        pat = re.compile(r"scripts/((?:[\w.-]+/)*[\w.-]+\.py)")
         scan = ["SKILL.md", "AGENTS.md"]
         for d in ("skills", "locales", "prompts", "docs"):
             for dirpath, _dirs, files in os.walk(os.path.join(ROOT, d)):
@@ -72,6 +77,47 @@ class Manifest(unittest.TestCase):
         gone = [f for f in self.files if not os.path.isfile(os.path.join(ROOT, *f.split("/")))]
         self.assertEqual(gone, [], "清单里有磁盘上不存在的文件: %s" % gone)
 
+    def test_runtime_receipt_manifest_exactly_matches_distribution(self):
+        self.assertEqual(
+            self.files,
+            exam_start._runtime_manifest(ROOT),
+            "exam_runtime_receipt 与实际学生分发包不能使用不同文件边界",
+        )
+
+    def test_shipped_markdown_links_stay_inside_built_manifest(self):
+        shipped = set(self.files)
+        broken = []
+        link_re = re.compile(r"(?<!!)\[[^\]]*\]\(([^)]+)\)")
+        for rel in self.files:
+            if not rel.endswith(".md"):
+                continue
+            with open(os.path.join(ROOT, *rel.split("/")), encoding="utf-8") as stream:
+                text = re.sub(r"```.*?```", "", stream.read(), flags=re.DOTALL)
+            for raw in link_re.findall(text):
+                target = raw.strip().split()[0].strip("<>")
+                if (not target or target.startswith(("#", "http://", "https://", "mailto:"))
+                        or any(token in target for token in ("{{", "}}", "<", ">"))):
+                    continue
+                target = target.split("#", 1)[0].split("?", 1)[0]
+                if not target:
+                    continue
+                normalized = os.path.normpath(
+                    os.path.join(os.path.dirname(rel), target)
+                ).replace("\\", "/")
+                absolute = os.path.join(ROOT, *normalized.split("/"))
+                if os.path.isfile(absolute):
+                    if normalized not in shipped:
+                        broken.append("%s -> %s (excluded from package)" % (rel, target))
+                elif os.path.isdir(absolute):
+                    prefix = normalized.rstrip("/") + "/"
+                    if not any(path.startswith(prefix) for path in shipped):
+                        broken.append("%s -> %s (empty/excluded directory)" % (rel, target))
+                # Missing checkout paths can be intentional student-workspace examples
+                # (for example mistakes/ch02.md). Repository dead links are covered by
+                # the broader documentation-consistency test; this guard is specifically
+                # for checkout targets that build_dist silently excludes.
+        self.assertFalse(broken, "运行时 Markdown 含分发包外链接:\n" + "\n".join(broken))
+
 
 class Build(unittest.TestCase):
     def test_zip_builds_and_preserves_layout(self):
@@ -81,7 +127,10 @@ class Build(unittest.TestCase):
                                capture_output=True, text=True, encoding="utf-8")
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertTrue(os.path.isfile(out))
-            self.assertLess(os.path.getsize(out), 600 * 1024, "运行时包应远小于全仓库源码包")
+            self.assertLessEqual(
+                os.path.getsize(out), 595_000,
+                "运行时包必须 ≤595,000 B，为 600 KiB ceiling 留 ≥19 KiB",
+            )
             with zipfile.ZipFile(out) as z:
                 names = set(z.namelist())
                 # ${CLAUDE_SKILL_DIR} layout contract: root entry + two-level skills + root dirs

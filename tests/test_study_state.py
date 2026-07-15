@@ -16,6 +16,7 @@ sys.path.insert(0, SCRIPTS)
 import i18n
 import notebook as notebook_engine
 import study_guide_qa as artifact_qa
+from ingestion import workspace_publication_lock
 
 LEGACY_MD = ("# 🎯 复习进度\n\n## ⏱️ 当前复习断点\n* **当前进行阶段**：阶段 3：树\n\n"
              "## ❌ 错题档案记录\n| 错题ID | 关联章节 | 题目内容简述 | 错误原因分析 | 状态 |\n"
@@ -170,6 +171,10 @@ def _enable_phase_structured(ws):
     """Give phase-gate tests a minimal but genuine current-chapter ingestion IR."""
     ingest_dir = os.path.join(ws, ".ingest")
     os.makedirs(ingest_dir, exist_ok=True)
+    with open(os.path.join(ingest_dir, "build_manifest.json"), "w",
+              encoding="utf-8", newline="\n") as stream:
+        json.dump({"schema_version": 1, "pipeline_version": "ingestion-v1"}, stream)
+        stream.write("\n")
     rows = [{
         "unit_id": "phase-sem-1", "source_file": "course.pdf", "page": 1,
         "kind": "text", "chapter_id": "ch01", "provenance": "material",
@@ -2431,6 +2436,30 @@ class WorkspaceRegistry(unittest.TestCase):
         courses = [w["course"] for w in json.loads(rj.stdout)["workspaces"]]
         self.assertEqual(sorted(courses), ["EEC160", "线性代数"])
         self.assertEqual(courses[0], "线性代数")
+
+    def test_register_conflicts_with_workspace_publication_and_writes_nothing(self):
+        ws = self._mk_dir("ws_locked")
+        with workspace_publication_lock(ws):
+            result = self._run([
+                "workspace-register", "--course", "Locked", "--path", ws,
+            ])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(os.path.exists(self._registry_file()))
+
+    def test_course_move_locks_the_previous_workspace(self):
+        old_ws = self._mk_dir("ws_old_locked")
+        new_ws = self._mk_dir("ws_new_target")
+        first = self._run([
+            "workspace-register", "--course", "MoveMe", "--path", old_ws,
+        ])
+        self.assertEqual(first.returncode, 0, first.stderr)
+        before = open(self._registry_file(), "rb").read()
+        with workspace_publication_lock(old_ws):
+            moved = self._run([
+                "workspace-register", "--course", "MoveMe", "--path", new_ws,
+            ])
+        self.assertNotEqual(moved.returncode, 0)
+        self.assertEqual(open(self._registry_file(), "rb").read(), before)
 
     def test_list_orders_newest_first_by_last_used(self):
         os.makedirs(self.home)

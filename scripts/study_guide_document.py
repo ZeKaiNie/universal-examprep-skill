@@ -35,6 +35,10 @@ PROVENANCE_LABELS = {
                         "🟡 AI-supplemented — may differ from what your teacher taught"),
     "ai_generated": ("⚠️ AI生成答案，非老师/教材提供",
                      "⚠️ AI-generated answer — not from your teacher or textbook"),
+    "ai_translation": ("🟡 AI翻译，原资料为另一种语言",
+                       "🟡 AI translation — source material is in another language"),
+    "ai_supplement": ("🟡 AI补充，可能与你老师讲的不完全一致",
+                      "🟡 AI supplement — may differ from what your teacher taught"),
 }
 
 LABELS = {
@@ -150,6 +154,25 @@ def _answer_blocks(renderer, answer, provenance, language):
             '<p class="provenance">%s</p><div class="localized">%s%s</div></section>'
             % (code, "zh-CN" if code == "zh" else "en", html.escape(label),
                prefix, renderer.render(answer[code]))
+        )
+    return "".join(parts)
+
+
+def _explanation_blocks(renderer, knowledge_point, language):
+    explanation = knowledge_point["explanation"]
+    provenance = knowledge_point.get("explanation_provenance") or {
+        code: "material" for code in explanation
+    }
+    parts = []
+    for code in (("zh", "en") if language == "bilingual" else (language,)):
+        label = PROVENANCE_LABELS[provenance[code]][0 if code == "zh" else 1]
+        prefix = '<span class="en-prefix">EN · </span>' if (
+            code == "en" and language == "bilingual") else ""
+        parts.append(
+            '<section class="explanation-language lang-%s" lang="%s">'
+            '<p class="provenance">%s</p><div class="localized">%s%s</div></section>'
+            % (code, "zh-CN" if code == "zh" else "en", html.escape(label),
+               prefix, renderer.render(explanation[code]))
         )
     return "".join(parts)
 
@@ -458,7 +481,7 @@ def render_manifest(workspace, manifest, math_converter=None, materials_root=Non
                 html.escape(_label(language, "knowledge_point", index=kp_index)),
                 _localized_heading(kp["title"], language)),
             '<h3>%s</h3>%s' % (html.escape(_label(language, "plain_explanation")),
-                                _localized_text(renderer, kp["explanation"], language)),
+                                _explanation_blocks(renderer, kp, language)),
             _knowledge_assets(workspace, kp["source_refs"], language),
             '<h3>%s</h3>%s' % (html.escape(_label(language, "formulas")), formulas),
             '<div class="source-box"><strong>%s</strong>%s</div>' %

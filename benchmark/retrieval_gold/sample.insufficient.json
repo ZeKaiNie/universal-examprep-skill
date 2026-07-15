@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "gold_id": "synthetic-contract-sample",
+  "split": "test",
+  "index_bundle": [
+    {
+      "course_id": "sample-course",
+      "index_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "content_units_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "source_manifest_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+    }
+  ],
+  "queries": [
+    {
+      "query_id": "q001",
+      "course_id": "sample-course",
+      "query": "What is the sample queue invariant?",
+      "language": "en",
+      "answerable": true,
+      "relevant_unit_ids": ["sample-unit-1"],
+      "hard_negative_unit_ids": ["sample-unit-2"],
+      "tags": ["paraphrase"],
+      "evidence": [
+        {
+          "unit_id": "sample-unit-1",
+          "source_id": "sample-source",
+          "source_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "page": 1
+        }
+      ]
+    },
+    {
+      "query_id": "q002",
+      "course_id": "sample-course",
+      "query": "材料有没有给出队列的量子加速参数？",
+      "language": "zh",
+      "answerable": false,
+      "relevant_unit_ids": [],
+      "hard_negative_unit_ids": ["sample-unit-1"],
+      "tags": ["cross_language", "near_miss_oos"],
+      "evidence": []
+    }
+  ]
+}

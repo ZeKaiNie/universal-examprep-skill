@@ -26,6 +26,11 @@ import shutil
 import subprocess
 import sys
 
+try:
+    from .ingestion import workspace_publication_lock
+except ImportError:
+    from ingestion import workspace_publication_lock
+
 for _s in ("stdout", "stderr"):
     try:
         getattr(sys, _s).reconfigure(encoding="utf-8")
@@ -253,7 +258,7 @@ def pdf_page_count(pdf_path):
 
 # ---------------- main ----------------
 
-def main(argv=None):
+def main(argv=None, _state_locked=False):
     ap = argparse.ArgumentParser(description="cheatsheet.md → dense printable HTML/PDF "
                                              "(stdlib; local headless Edge/Chrome for PDF)")
     ap.add_argument("--workspace", required=True)
@@ -269,6 +274,11 @@ def main(argv=None):
         _die("--font-size 须在 %.1f–%.1f pt 之间" % (FONT_MIN, FONT_MAX))
 
     ws = os.path.abspath(args.workspace)
+    if not os.path.isdir(ws) or os.path.islink(ws):
+        _die("--workspace must be an existing non-symlink directory")
+    if not _state_locked:
+        with workspace_publication_lock(ws):
+            return main(argv, _state_locked=True)
     md_path = os.path.join(ws, MD_NAME)
     # 输入不得是符号链接（Codex r4）：isfile 会顺着链接把工作区外的文件当小抄渲染出去——
     # 与 retrieve.py / select_hard_questions.py 同口径：islink 先拒 + realpath 归属校验

@@ -32,6 +32,7 @@ from urllib.parse import unquote, urlsplit
 import xml.etree.ElementTree as ET
 
 import i18n
+from ingestion import workspace_publication_lock
 from check_deps import (LATEX2MATHML_PIN, LATEX2MATHML_VERSION, build_report,
                         installed_distribution_version)
 from validate_workspace import LATEX_COMMAND_RE
@@ -1431,6 +1432,9 @@ def _load_typed_manifest_snapshot(ws, chapter):
         report = content.validate_manifest(ws, chapter, manifest)
     except (ValueError, OSError) as exc:
         raise GuideError("study-guide content manifest is invalid: %s" % exc)
+    snapshot["fact_integrity"] = (
+        (report.get("claim_verification") or {}).get("fact_integrity")
+    )
     report["input_path"] = path
     return manifest, report, snapshot
 
@@ -1508,8 +1512,71 @@ def _verify_start_gate_snapshot(ws, expected):
     return current_gate
 
 
-def _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot):
+def _verify_bound_fact_snapshot_files(ws, expected_facts):
+    """Cheaply recheck every workspace file bound by a validated fact snapshot.
+
+    The initial typed-manifest validation and the final receipt publication still
+    perform the full deterministic derivation, ledger replay, and original-source
+    revision check.  Intermediate render checkpoints only need to prove that none
+    of the already validated manifest/input/sidecar bytes changed; this avoids
+    re-hashing every original PDF at each HTML/PDF conversion checkpoint.
+    """
+    if not isinstance(expected_facts, dict):
+        raise ArtifactDriftError("ingestion fact snapshot is not an object")
+    rows = []
+    build_manifest = expected_facts.get("build_manifest")
+    if not isinstance(build_manifest, dict):
+        raise ArtifactDriftError("ingestion fact snapshot lacks build_manifest")
+    rows.append(("build manifest", build_manifest))
+    for section in ("inputs", "sidecars"):
+        bound = expected_facts.get(section)
+        if not isinstance(bound, dict):
+            raise ArtifactDriftError(
+                "ingestion fact snapshot lacks %s bindings" % section
+            )
+        for label, row in sorted(bound.items()):
+            rows.append(("%s %s" % (section, label), row))
+    for label, row in rows:
+        if not isinstance(row, dict):
+            raise ArtifactDriftError("ingestion fact %s binding is invalid" % label)
+        relative = row.get("path")
+        expected_sha256 = row.get("sha256")
+        if (not isinstance(relative, str) or not relative
+                or not isinstance(expected_sha256, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)):
+            raise ArtifactDriftError("ingestion fact %s binding is incomplete" % label)
+        path = os.path.join(ws, *relative.replace("\\", "/").split("/"))
+        try:
+            current = _capture_regular_file_snapshot(ws, path, "ingestion fact %s" % label)
+        except (GuideError, OSError, TypeError, ValueError) as exc:
+            raise ArtifactDriftError(
+                "ingestion fact %s cannot be revalidated (%s)" % (label, exc)
+            ) from exc
+        if current["sha256"] != expected_sha256:
+            raise ArtifactDriftError(
+                "ingestion fact %s changed during Study Guide rendering" % label
+            )
+
+
+def _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot,
+                               deep_fact_check=True):
     _verify_file_snapshot(ws, manifest_snapshot, "study-guide content manifest")
+    expected_facts = manifest_snapshot.get("fact_integrity")
+    if expected_facts is not None:
+        _verify_bound_fact_snapshot_files(ws, expected_facts)
+        if deep_fact_check:
+            try:
+                from ingestion.dedup import validate_workspace_fact_integrity
+
+                current_facts = validate_workspace_fact_integrity(ws)["snapshot"]
+            except (OSError, TypeError, ValueError) as exc:
+                raise ArtifactDriftError(
+                    "ingestion fact integrity no longer passes (%s)" % exc
+                ) from exc
+            if current_facts != expected_facts:
+                raise ArtifactDriftError(
+                    "ingestion fact inputs changed during Study Guide rendering"
+                )
     _verify_start_gate_snapshot(ws, start_gate_snapshot)
 
 
@@ -1535,7 +1602,8 @@ def _conversion_run_hash(chapter, profile, language, html_sha256, pdf_sha256,
 def _write_guide_receipt(ws, receipt_path, chapter, manifest_snapshot,
                          manifest_report, html_snapshot, pdf_path, backend,
                          preflight, start_gate_snapshot, conversion=None):
-    _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot)
+    _verify_publication_inputs(
+        ws, manifest_snapshot, start_gate_snapshot, deep_fact_check=False)
     _verify_file_snapshot(ws, html_snapshot, "published Study Guide HTML")
     manifest_path = manifest_snapshot["path"]
     html_path = html_snapshot["path"]
@@ -1730,7 +1798,7 @@ def print_pdf(browser, html_path, pdf_path, timeout=120, workspace=None,
             os.remove(tmp_html)
 
 
-def run(argv=None, math_converter=None):
+def run(argv=None, math_converter=None, _state_locked=False):
     parser = argparse.ArgumentParser(
         description="Render one chapter as a validated Study Guide or explicit source packet."
     )
@@ -1746,6 +1814,9 @@ def run(argv=None, math_converter=None):
     if args.chapter < 1:
         raise GuideError("--chapter 必须是正整数")
     ws = _guard_workspace(args.workspace)
+    if not _state_locked:
+        with workspace_publication_lock(ws):
+            return run(argv, math_converter=math_converter, _state_locked=True)
     if args.pdf and args.pdf_backend != "browser":
         raise GuideError("--pdf requires --pdf-backend browser; native adapters run outside this script")
     if args.artifact_type == "source_packet" and args.profile is not None:
@@ -1788,12 +1859,14 @@ def run(argv=None, math_converter=None):
                 raise GuideError("typed manifest profile=%s, not requested %s" %
                                  (manifest_report["profile"], args.profile))
             preflight = _preflight_or_raise(ws, args.chapter, args.pdf_backend, math_converter)
-            _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot)
+            _verify_publication_inputs(
+                ws, manifest_snapshot, start_gate_snapshot, deep_fact_check=False)
             document, rendered_report = render_manifest(
                 ws, manifest, math_converter=math_converter,
                 materials_root=start_gate.get("materials"))
             manifest_report.update(rendered_report)
-            _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot)
+            _verify_publication_inputs(
+                ws, manifest_snapshot, start_gate_snapshot, deep_fact_check=False)
     except GuideError:
         # Never let an older guide masquerade as the result of a failed source/math render.
         _remove_stale(html_path, os.path.basename(html_path))
@@ -1813,11 +1886,13 @@ def run(argv=None, math_converter=None):
 
     def recheck_before_html_publish():
         if typed_guide:
-            _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot)
+            _verify_publication_inputs(
+                ws, manifest_snapshot, start_gate_snapshot, deep_fact_check=False)
 
     try:
         if typed_guide:
-            _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot)
+            _verify_publication_inputs(
+                ws, manifest_snapshot, start_gate_snapshot, deep_fact_check=False)
         _atomic_write(
             html_path, document, before_publish=recheck_before_html_publish)
         html_snapshot = _capture_regular_file_snapshot(
@@ -1826,7 +1901,8 @@ def run(argv=None, math_converter=None):
             raise ArtifactDriftError(
                 "atomically published HTML bytes differ from the rendered payload")
         if typed_guide:
-            _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot)
+            _verify_publication_inputs(
+                ws, manifest_snapshot, start_gate_snapshot, deep_fact_check=False)
     except ArtifactDriftError:
         _remove_stale(html_path, os.path.basename(html_path))
         _remove_stale(pdf_path, os.path.basename(pdf_path))
@@ -1848,7 +1924,9 @@ def run(argv=None, math_converter=None):
     if args.pdf:
         if typed_guide:
             try:
-                _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot)
+                _verify_publication_inputs(
+                    ws, manifest_snapshot, start_gate_snapshot,
+                    deep_fact_check=False)
                 _verify_file_snapshot(ws, html_snapshot, "published Study Guide HTML")
             except ArtifactDriftError:
                 _remove_stale(html_path, os.path.basename(html_path))
@@ -1878,7 +1956,9 @@ def run(argv=None, math_converter=None):
             raise
         if typed_guide:
             try:
-                _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot)
+                _verify_publication_inputs(
+                    ws, manifest_snapshot, start_gate_snapshot,
+                    deep_fact_check=False)
                 _verify_file_snapshot(ws, html_snapshot, "published Study Guide HTML")
             except ArtifactDriftError:
                 _remove_stale(html_path, os.path.basename(html_path))

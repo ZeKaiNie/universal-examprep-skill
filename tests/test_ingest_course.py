@@ -17,6 +17,26 @@ from scripts.ingestion.pipeline import compile_review_outputs
 
 
 class IngestCourseTest(unittest.TestCase):
+    def test_optional_adapter_is_hidden_and_rejected_without_host_injection(self):
+        help_output = io.StringIO()
+        with self.assertRaises(SystemExit) as stopped, \
+                contextlib.redirect_stdout(help_output):
+            ingest_course.run(["--help"])
+        self.assertEqual(0, stopped.exception.code)
+        self.assertNotIn("--ingest-adapter", help_output.getvalue())
+        with tempfile.TemporaryDirectory() as temp:
+            materials = Path(temp) / "materials"
+            workspace = Path(temp) / "workspace"
+            materials.mkdir()
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = ingest_course.run([
+                    "--materials", str(materials), "--workspace", str(workspace),
+                    "--ingest-adapter", "docling", "--json",
+                ])
+            self.assertEqual(2, code)
+            self.assertIn("host-injected adapter_runner", json.loads(output.getvalue())["error"])
+
     def test_validator_protocol_rejects_crash_or_inconsistent_json(self):
         bad_results = [
             SimpleNamespace(returncode=1, stdout="", stderr="traceback"),
@@ -193,6 +213,58 @@ class IngestCourseTest(unittest.TestCase):
             self.assertFalse(payload["start_gate"]["ready_to_ingest"])
             self.assertEqual("blocked", payload["steps"][0]["status"])
             self.assertFalse(workspace.exists())
+
+    def test_publication_conflict_stops_before_any_ingestion_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            materials = root / "materials"
+            workspace = root / "workspace"
+            home = root / ".examprep-home"
+            materials.mkdir()
+            (materials / "ch01_lecture.txt").write_text(
+                "Chapter 1\nA source-backed explanation.", encoding="utf-8"
+            )
+            identity = exam_start._capture_runtime_identity()
+            with mock.patch.dict(os.environ, {"EXAMPREP_HOME": str(home)}), \
+                    mock.patch.object(
+                        exam_start, "_capture_runtime_identity", return_value=identity
+                    ):
+                confirmation_output = io.StringIO()
+                with contextlib.redirect_stdout(confirmation_output):
+                    confirmation_code = exam_start.run([
+                        "confirm", "--course", "test-course",
+                        "--materials", str(materials),
+                        "--workspace", str(workspace),
+                        "--mode", "from_scratch", "--time-budget", "le1d",
+                        "--language", "en", "--json",
+                    ])
+                self.assertEqual(0, confirmation_code, confirmation_output.getvalue())
+                state_before = (workspace / "study_state.json").read_bytes()
+                receipt_before = (
+                    workspace / exam_start.RUNTIME_RECEIPT_NAME
+                ).read_bytes()
+
+                output = io.StringIO()
+                with ingest_course.workspace_publication_lock(str(workspace)), \
+                        contextlib.redirect_stdout(output):
+                    code = ingest_course.run([
+                        "--materials", str(materials),
+                        "--workspace", str(workspace),
+                        "--render-pages", "never",
+                        "--visual-index", "never",
+                        "--json",
+                    ])
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(1, code)
+            self.assertEqual("publication_conflict", payload["steps"][-1]["operation_error"])
+            self.assertFalse((workspace / ".ingest").exists())
+            self.assertFalse((workspace / "references").exists())
+            self.assertEqual(state_before, (workspace / "study_state.json").read_bytes())
+            self.assertEqual(
+                receipt_before,
+                (workspace / exam_start.RUNTIME_RECEIPT_NAME).read_bytes(),
+            )
 
     def test_runtime_receipt_drift_blocks_before_ingestion_outputs(self):
         with tempfile.TemporaryDirectory() as temp:

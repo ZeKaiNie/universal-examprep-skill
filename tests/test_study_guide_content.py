@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
+import contextlib
 import copy
+import io
 import json
 import os
 import re
@@ -144,6 +146,10 @@ class StudyGuideContentTest(unittest.TestCase):
     def _enable_structured(self, units=None):
         rows = copy.deepcopy(units if units is not None else self._structured_units())
         self._write_jsonl(".ingest/content_units.jsonl", rows)
+        self._write_json(
+            ".ingest/build_manifest.json",
+            {"schema_version": 1, "pipeline_version": "ingestion-v1"},
+        )
         with open(os.path.join(self.ws, "notebook", "ch01.md"), "a",
                   encoding="utf-8") as stream:
             stream.write(
@@ -364,6 +370,28 @@ class StudyGuideContentTest(unittest.TestCase):
             "unit-only": "homework",
         }, sgc.expected_item_source_types(self.ws, 1))
         self.assertTrue(report["structured_workspace"])
+
+    def test_ingestion_v2_fails_closed_without_claim_sidecar_and_receipt(self):
+        manifest = self._structured_manifest()
+        self._write_json(
+            ".ingest/build_manifest.json",
+            {"schema_version": 1, "pipeline_version": "ingestion-v2"},
+        )
+        self._write_json(
+            ".ingest/source_manifest.json",
+            {"schema_version": 1, "sources": []},
+        )
+        self._write_jsonl(".ingest/canonical_groups.jsonl", [])
+        self._write_jsonl(".ingest/source_conflicts.jsonl", [])
+        self.assertInvalid(manifest, ".ingest/claim_records.jsonl")
+
+    def test_structured_pipeline_version_cannot_be_deleted_to_bypass_claims(self):
+        manifest = self._structured_manifest()
+        build_manifest = os.path.join(self.ws, ".ingest", "build_manifest.json")
+        os.remove(build_manifest)
+        self.assertInvalid(manifest, "explicit pipeline_version")
+        self._write_json(".ingest/build_manifest.json", {"schema_version": 1})
+        self.assertInvalid(manifest, "pipeline_version is unsupported")
 
     def test_structured_question_units_require_unique_valid_external_ids(self):
         manifest = self._structured_manifest()
@@ -950,6 +978,25 @@ class StudyGuideContentTest(unittest.TestCase):
                 mutate(manifest)
                 self.assertInvalid(manifest, "must contain")
 
+    def test_explanation_provenance_exactly_labels_authored_languages(self):
+        missing = self._manifest()
+        missing["knowledge_points"][0]["explanation_provenance"] = {
+            "en": "material"
+        }
+        self.assertInvalid(missing, "must label every authored explanation language")
+
+        unknown = self._manifest()
+        unknown["knowledge_points"][0]["explanation_provenance"] = {
+            "zh": "ai_generated", "en": "material"
+        }
+        self.assertInvalid(unknown, "explanation_provenance.zh must be one of")
+
+        labelled = self._manifest()
+        labelled["knowledge_points"][0]["explanation_provenance"] = {
+            "zh": "ai_translation", "en": "material"
+        }
+        self.assertTrue(sgc.validate_manifest(self.ws, 1, labelled)["ok"])
+
     def test_answer_provenance_is_required_and_material_needs_answer_evidence(self):
         missing = self._manifest()
         del missing["walkthroughs"][0]["answer_provenance"]
@@ -1038,6 +1085,57 @@ class StudyGuideContentTest(unittest.TestCase):
         self.assertEqual({"zh": "求条件概率。"},
                          restored["walkthroughs"][0]["translation"])
 
+    def test_ingestion_v2_relocalize_prepares_unsigned_staging_draft(self):
+        manifest = self._structured_manifest()
+        self._write_json("notebook/ch01.guide.json", manifest)
+        self._write_json("study_state.json", {"language": "en"})
+        self._write_json(
+            ".ingest/build_manifest.json",
+            {"schema_version": 1, "pipeline_version": "ingestion-v2"},
+        )
+
+        with self.assertRaisesRegex(sgc.ContentError, "requires --output staging JSON"):
+            sgc.relocalize_manifest(self.ws, 1, "en")
+        for protected in (
+            "study_state.json",
+            ".ingest/source_manifest.json",
+            "notebook/ch02.en.draft.json",
+            "notebook/ch01.guide.json",
+        ):
+            with self.subTest(output=protected), self.assertRaisesRegex(
+                    sgc.ContentError, "must match"):
+                sgc.relocalize_manifest(self.ws, 1, "en", protected)
+        report = sgc.relocalize_manifest(
+            self.ws, 1, "en", "notebook/ch01.en.draft.json"
+        )
+        self.assertTrue(report["prepared"])
+        self.assertFalse(report["imported"])
+        self.assertFalse(report["artifact_ready"])
+        self.assertEqual("pending", report["claim_verification"]["status"])
+        self.assertEqual(
+            "location_only", report["claim_verification"]["verification_scope"]
+        )
+        with open(report["staging_path"], encoding="utf-8") as stream:
+            staged = json.load(stream)
+        with open(os.path.join(self.ws, "notebook", "ch01.guide.json"),
+                  encoding="utf-8") as stream:
+            canonical = json.load(stream)
+        self.assertEqual("en", staged["language"])
+        self.assertEqual("bilingual", canonical["language"])
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(
+                0,
+                sgc.run([
+                    "--workspace", self.ws, "relocalize", "--chapter", "1",
+                    "--language", "en", "--output", "notebook/ch01.cli.draft.json",
+                ]),
+            )
+        self.assertIn("unsigned staging prepared", stdout.getvalue())
+        self.assertIn("claim verification pending", stdout.getvalue())
+        self.assertNotIn("content valid", stdout.getvalue())
+
     def test_single_language_matching_original_needs_no_translation(self):
         self._write_json("study_state.json", {"language": "en"})
         manifest = self._manifest()
@@ -1123,13 +1221,17 @@ class StudyGuideContentTest(unittest.TestCase):
         self.assertInvalid(drifted, "does not match study_state")
 
     def test_import_updates_one_bounded_notebook_block_then_writes_json(self):
-        draft = self._draft()
+        manifest = self._manifest()
+        manifest["knowledge_points"][0]["explanation_provenance"] = {
+            "zh": "ai_translation", "en": "material"
+        }
+        draft = self._draft(manifest)
         calls = []
         original = sgc._atomic_write_text
 
-        def recording_write(path, text):
+        def recording_write(path, text, before_publish=None):
             calls.append(path)
-            return original(path, text)
+            return original(path, text, before_publish=before_publish)
 
         with mock.patch.object(sgc, "_atomic_write_text", side_effect=recording_write):
             report = sgc.import_manifest(self.ws, 1, draft)
@@ -1148,6 +1250,8 @@ class StudyGuideContentTest(unittest.TestCase):
             "**答案来源性质 / Answer provenance (中文):** `ai_supplemented`", notebook)
         self.assertIn(
             "**答案来源性质 / Answer provenance (English):** `material`", notebook)
+        self.assertIn("AI翻译", notebook)
+        self.assertIn("From your materials", notebook)
         self.assertIn("**例题来源类型 / Source type:** `quiz`", notebook)
         self.assertEqual(1, notebook.count(header))
         self.assertEqual(1, notebook.count(begin))
@@ -1189,6 +1293,24 @@ class StudyGuideContentTest(unittest.TestCase):
                 sgc.import_manifest(self.ws, 1, draft)
         self.assertEqual(1, writer.call_count)
         self.assertFalse(os.path.exists(os.path.join(self.ws, "notebook", "ch01.guide.json")))
+
+    def test_v2_fact_snapshot_is_rechecked_at_manifest_publication(self):
+        manifest = self._manifest()
+        expected = {"schema_version": 1, "token": "bound"}
+        report = {
+            "claim_verification": {"fact_integrity": expected},
+        }
+        with mock.patch.object(
+                sgc,
+                "validate_workspace_fact_integrity",
+                return_value={
+                    "snapshot": {"schema_version": 1, "token": "drifted"},
+                },
+        ), self.assertRaisesRegex(sgc.ContentError, "fact inputs changed"):
+            sgc._publish_manifest(self.ws, 1, manifest, report)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.ws, "notebook", "ch01.guide.json")
+        ))
 
     def test_malformed_marker_blocks_import_without_publishing_json(self):
         begin, _end, header = sgc._markers(1)

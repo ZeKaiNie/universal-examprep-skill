@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/universal-examprep/retrieval-gold-v1.schema.json",
+  "title": "Universal Exam Prep retrieval gold v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "gold_id", "split", "index_bundle", "queries"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "gold_id": {"type": "string", "minLength": 1},
+    "split": {"enum": ["dev", "test"]},
+    "index_bundle": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "course_id", "index_sha256", "content_units_sha256",
+          "source_manifest_sha256"
+        ],
+        "properties": {
+          "course_id": {"type": "string", "minLength": 1},
+          "index_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "content_units_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "source_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "queries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "query_id", "course_id", "query", "language", "answerable",
+          "relevant_unit_ids", "hard_negative_unit_ids", "tags", "evidence"
+        ],
+        "properties": {
+          "query_id": {"type": "string", "minLength": 1},
+          "course_id": {"type": "string", "minLength": 1},
+          "query": {"type": "string", "minLength": 1},
+          "language": {"enum": ["zh", "en", "bilingual"]},
+          "answerable": {"type": "boolean"},
+          "relevant_unit_ids": {
+            "type": "array", "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1}
+          },
+          "hard_negative_unit_ids": {
+            "type": "array", "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1}
+          },
+          "tags": {
+            "type": "array", "minItems": 1, "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1}
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["unit_id", "source_id", "source_sha256", "page"],
+              "properties": {
+                "unit_id": {"type": "string", "minLength": 1},
+                "source_id": {"type": "string", "minLength": 1},
+                "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "page": {"type": "integer", "minimum": 1}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

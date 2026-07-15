@@ -7,13 +7,13 @@ markers; OOXML does not contain a portable rendered-page layout.
 """
 
 import hashlib
+import contextlib
 import os
 import posixpath
 import re
 import struct
 import tempfile
 import urllib.parse
-import zlib
 import zipfile
 from xml.etree import ElementTree as ET
 
@@ -21,9 +21,18 @@ from .identifiers import is_link_or_reparse
 
 
 MAX_ZIP_ENTRIES = 4096
+MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+MAX_CENTRAL_DIRECTORY_BYTES = 32 * 1024 * 1024
+MAX_TOTAL_COMPRESSED = 512 * 1024 * 1024
 MAX_TOTAL_UNCOMPRESSED = 512 * 1024 * 1024
 MAX_SINGLE_UNCOMPRESSED = 64 * 1024 * 1024
+MAX_ZIP_COMPRESSION_RATIO = 1000
 MAX_XML_BYTES = 32 * 1024 * 1024
+MAX_XML_ELEMENTS = 250000
+MAX_XML_DEPTH = 256
+MAX_XML_ATTRIBUTES = 1000000
+MAX_XML_TEXT_CHARS = 32 * 1024 * 1024
+_SNAPSHOT_MEMORY_BYTES = 8 * 1024 * 1024
 
 _OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 _SAFE_ASSET_EXTENSIONS = frozenset(
@@ -130,6 +139,298 @@ def _resolve_internal_target(source_part, target):
     return _safe_member_name(normalized)
 
 
+def _stat_identity(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _expected_digest(value):
+    if value is None:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise OOXMLExtractionError("expected_sha256 must be a lowercase SHA-256 digest")
+    return value
+
+
+class _SeekableSpooledTemporaryFile(tempfile.SpooledTemporaryFile):
+    """Expose the complete seekable binary-file protocol on Python 3.8.
+
+    ``SpooledTemporaryFile`` did not provide ``seekable()``, ``readable()``,
+    or ``writable()`` until newer Python releases.  Python 3.8's
+    ``zipfile._SharedFile`` accesses ``seekable`` directly, so an otherwise
+    valid bounded snapshot fails as soon as a member is read.  This adapter
+    preserves the in-memory threshold and automatic disk rollover while
+    making the protocol explicit on every supported Python version.
+    """
+
+    def seekable(self):
+        return True
+
+    def readable(self):
+        return True
+
+    def writable(self):
+        return True
+
+
+def _copy_stable_source(path, expected_sha256=None):
+    """Copy one bounded regular source to an immutable seekable snapshot."""
+
+    expected_sha256 = _expected_digest(expected_sha256)
+    try:
+        before = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise OOXMLExtractionError("cannot stat OOXML source: %s" % exc) from exc
+    if before.st_size < 1:
+        raise OOXMLCorruptError("OOXML source is empty")
+    if before.st_size > MAX_ARCHIVE_BYTES:
+        raise OOXMLBombError(
+            "OOXML source is %d bytes (physical limit %d)"
+            % (before.st_size, MAX_ARCHIVE_BYTES)
+        )
+
+    snapshot = _SeekableSpooledTemporaryFile(
+        max_size=_SNAPSHOT_MEMORY_BYTES, mode="w+b"
+    )
+    digest = hashlib.sha256()
+    copied = 0
+    try:
+        with open(path, "rb") as stream:
+            while True:
+                block = stream.read(1024 * 1024)
+                if not block:
+                    break
+                copied += len(block)
+                if copied > MAX_ARCHIVE_BYTES:
+                    raise OOXMLBombError(
+                        "OOXML source grew beyond the %d-byte physical limit"
+                        % MAX_ARCHIVE_BYTES
+                    )
+                digest.update(block)
+                snapshot.write(block)
+        after = os.stat(path, follow_symlinks=False)
+    except OOXMLExtractionError:
+        snapshot.close()
+        raise
+    except OSError as exc:
+        snapshot.close()
+        raise OOXMLExtractionError("cannot snapshot OOXML source: %s" % exc) from exc
+
+    actual_digest = digest.hexdigest()
+    if copied != before.st_size or _stat_identity(before) != _stat_identity(after):
+        snapshot.close()
+        raise OOXMLSecurityError("OOXML source changed while its snapshot was being copied")
+    if expected_sha256 is not None and actual_digest != expected_sha256:
+        snapshot.close()
+        raise OOXMLSecurityError(
+            "OOXML source revision does not match expected_sha256"
+        )
+    snapshot.seek(0)
+    return snapshot, actual_digest, _stat_identity(after)
+
+
+def _read_exact(stream, size, label):
+    payload = stream.read(size)
+    if len(payload) != size:
+        raise OOXMLCorruptError("truncated ZIP %s" % label)
+    return payload
+
+
+def _preflight_zip(stream):
+    """Bound the ZIP central directory before ``zipfile.ZipFile`` allocates it."""
+
+    stream.seek(0, os.SEEK_END)
+    archive_size = stream.tell()
+    tail_size = min(archive_size, 22 + 65535)
+    stream.seek(archive_size - tail_size)
+    tail = _read_exact(stream, tail_size, "end record")
+    relative_eocd = tail.rfind(b"PK\x05\x06")
+    if relative_eocd < 0 or relative_eocd + 22 > len(tail):
+        raise OOXMLCorruptError("ZIP end-of-central-directory record is missing")
+    eocd_offset = archive_size - tail_size + relative_eocd
+    fields = struct.unpack("<4s4H2LH", tail[relative_eocd:relative_eocd + 22])
+    (
+        unused_signature, disk_number, central_disk, disk_entries, total_entries,
+        central_size, central_offset, comment_size,
+    ) = fields
+    if relative_eocd + 22 + comment_size != len(tail):
+        raise OOXMLCorruptError("ZIP end record/comment length is inconsistent")
+    if disk_number or central_disk or disk_entries != total_entries:
+        raise OOXMLUnsupportedError("multi-disk ZIP packages are not supported")
+    if total_entries == 0xFFFF or central_size == 0xFFFFFFFF or central_offset == 0xFFFFFFFF:
+        raise OOXMLUnsupportedError("ZIP64 OOXML packages are not supported")
+    if total_entries > MAX_ZIP_ENTRIES:
+        raise OOXMLBombError(
+            "OOXML package has %d entries (limit %d)" % (total_entries, MAX_ZIP_ENTRIES)
+        )
+    if central_size > MAX_CENTRAL_DIRECTORY_BYTES:
+        raise OOXMLBombError(
+            "OOXML central directory is %d bytes (limit %d)"
+            % (central_size, MAX_CENTRAL_DIRECTORY_BYTES)
+        )
+    central_end = central_offset + central_size
+    if central_offset < 0 or central_end != eocd_offset:
+        raise OOXMLCorruptError("ZIP central-directory bounds are inconsistent")
+
+    stream.seek(central_offset)
+    total_compressed = 0
+    total_uncompressed = 0
+    names = set()
+    for index in range(total_entries):
+        fixed = _read_exact(stream, 46, "central-directory header")
+        values = struct.unpack("<4s6H3L5H2L", fixed)
+        if values[0] != b"PK\x01\x02":
+            raise OOXMLCorruptError(
+                "ZIP central-directory entry %d has an invalid signature" % index
+            )
+        (
+            unused_signature, unused_made_by, unused_needed, flags, unused_method,
+            unused_time, unused_date, unused_crc, compressed_size, uncompressed_size,
+            filename_size, extra_size, member_comment_size, start_disk,
+            unused_internal, unused_external, local_offset,
+        ) = values
+        variable_size = filename_size + extra_size + member_comment_size
+        if stream.tell() + variable_size > central_end:
+            raise OOXMLCorruptError("ZIP central-directory entry is truncated")
+        filename_bytes = _read_exact(stream, filename_size, "member name")
+        _read_exact(stream, extra_size + member_comment_size, "member metadata")
+        if start_disk:
+            raise OOXMLUnsupportedError("multi-disk ZIP member is not supported")
+        if compressed_size == 0xFFFFFFFF or uncompressed_size == 0xFFFFFFFF:
+            raise OOXMLUnsupportedError("ZIP64 member sizes are not supported")
+        if local_offset == 0xFFFFFFFF or local_offset >= central_offset:
+            raise OOXMLCorruptError("ZIP member local-header offset is invalid")
+        if flags & 0x1:
+            raise OOXMLEncryptedError("OOXML ZIP member is encrypted")
+        try:
+            encoding = "utf-8" if flags & 0x800 else "cp437"
+            member_name = filename_bytes.decode(encoding, errors="strict")
+        except UnicodeError as exc:
+            raise OOXMLCorruptError("ZIP member name has invalid encoding") from exc
+        safe_name = _safe_member_name(member_name)
+        folded = safe_name.casefold()
+        if folded in names:
+            raise OOXMLCorruptError(
+                "OOXML package contains duplicate member: %s" % safe_name
+            )
+        names.add(folded)
+        if uncompressed_size > MAX_SINGLE_UNCOMPRESSED:
+            raise OOXMLBombError(
+                "OOXML member %s expands to %d bytes (limit %d)"
+                % (safe_name, uncompressed_size, MAX_SINGLE_UNCOMPRESSED)
+            )
+        total_compressed += compressed_size
+        total_uncompressed += uncompressed_size
+        if total_compressed > MAX_TOTAL_COMPRESSED:
+            raise OOXMLBombError(
+                "OOXML package declares more than %d compressed bytes"
+                % MAX_TOTAL_COMPRESSED
+            )
+        if total_uncompressed > MAX_TOTAL_UNCOMPRESSED:
+            raise OOXMLBombError(
+                "OOXML package expands to more than %d bytes" % MAX_TOTAL_UNCOMPRESSED
+            )
+        if (uncompressed_size >= 1024 * 1024
+                and uncompressed_size > max(1, compressed_size) * MAX_ZIP_COMPRESSION_RATIO):
+            raise OOXMLBombError(
+                "OOXML member %s exceeds the compression-ratio limit" % safe_name
+            )
+    if stream.tell() != central_end:
+        raise OOXMLCorruptError("ZIP central-directory size does not match its entries")
+
+
+def _verify_source_revision(path, expected_digest, expected_identity):
+    try:
+        current = os.stat(path, follow_symlinks=False)
+        current_digest = _file_digest(path)
+        after = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise OOXMLSecurityError("OOXML source changed or disappeared: %s" % exc) from exc
+    if (_stat_identity(current) != _stat_identity(after)
+            or _stat_identity(after) != expected_identity
+            or current_digest != expected_digest):
+        raise OOXMLSecurityError("OOXML source changed during extraction")
+
+
+@contextlib.contextmanager
+def _open_stable_zip(path, expected_sha256=None):
+    snapshot, digest, identity = _copy_stable_source(path, expected_sha256)
+    try:
+        snapshot.seek(0)
+        if snapshot.read(8) == _OLE_MAGIC:
+            raise OOXMLEncryptedError(
+                "source is an encrypted OOXML/legacy OLE container; decrypt or re-save it first"
+            )
+        snapshot.seek(0)
+        _preflight_zip(snapshot)
+        snapshot.seek(0)
+        try:
+            with zipfile.ZipFile(snapshot, "r") as archive:
+                yield archive
+        except zipfile.BadZipFile as exc:
+            raise OOXMLCorruptError("damaged OOXML ZIP package: %s" % exc) from exc
+        _verify_source_revision(path, digest, identity)
+    finally:
+        snapshot.close()
+
+
+class _BoundedTreeBuilder(object):
+    """ElementTree target that aborts before an XML tree can exceed budgets."""
+
+    def __init__(self):
+        self.builder = ET.TreeBuilder()
+        self.elements = 0
+        self.depth = 0
+        self.attributes = 0
+        self.text_chars = 0
+
+    def start(self, tag, attributes):
+        self.elements += 1
+        self.depth += 1
+        self.attributes += len(attributes)
+        if self.elements > MAX_XML_ELEMENTS:
+            raise OOXMLBombError("OOXML XML element count exceeds the safety limit")
+        if self.depth > MAX_XML_DEPTH:
+            raise OOXMLBombError("OOXML XML nesting depth exceeds the safety limit")
+        if self.attributes > MAX_XML_ATTRIBUTES:
+            raise OOXMLBombError("OOXML XML attribute count exceeds the safety limit")
+        return self.builder.start(tag, attributes)
+
+    def data(self, data):
+        self.text_chars += len(data)
+        if self.text_chars > MAX_XML_TEXT_CHARS:
+            raise OOXMLBombError("OOXML XML text size exceeds the safety limit")
+        return self.builder.data(data)
+
+    def end(self, tag):
+        result = self.builder.end(tag)
+        self.depth -= 1
+        return result
+
+    def close(self):
+        return self.builder.close()
+
+    def doctype(self, name, public_id, system_id):
+        raise OOXMLSecurityError("DTD declarations are not allowed in OOXML")
+
+
+def _has_forbidden_xml_declaration(payload):
+    carry = b""
+    for offset in range(0, len(payload), 64 * 1024):
+        chunk = carry + payload[offset:offset + 64 * 1024]
+        normalized = chunk.upper().replace(b"\x00", b"")
+        if b"<!DOCTYPE" in normalized or b"<!ENTITY" in normalized:
+            return True
+        carry = chunk[-64:]
+    return False
+
+
 class _Package(object):
     def __init__(self, archive):
         self.archive = archive
@@ -162,6 +463,7 @@ class _Package(object):
             if not info.is_dir():
                 by_name[name] = info
         self.by_name = by_name
+        self.binary_cache = {}
         if "[Content_Types].xml" not in self.by_name:
             raise OOXMLCorruptError("OOXML package is missing [Content_Types].xml")
         self.xml("[Content_Types].xml")
@@ -190,17 +492,29 @@ class _Package(object):
             raise OOXMLBombError("OOXML member size changed while reading: %s" % safe_name)
         return payload
 
+    def read_cached(self, name):
+        """Read one binary part at most once, bounding repeated references."""
+
+        safe_name = _safe_member_name(name)
+        if safe_name not in self.binary_cache:
+            self.binary_cache[safe_name] = self.read(safe_name)
+        return self.binary_cache[safe_name]
+
     def xml(self, name):
         payload = self.read(name)
         if len(payload) > MAX_XML_BYTES:
             raise OOXMLBombError("OOXML XML part exceeds %d bytes: %s" % (MAX_XML_BYTES, name))
-        # Removing NULs also catches UTF-16 encoded declaration tokens before handing data to
-        # ElementTree; no DTD/entity variant is allowed to reach the parser.
-        upper = payload.upper().replace(b"\x00", b"")
-        if b"<!DOCTYPE" in upper or b"<!ENTITY" in upper:
+        # Removing NULs catches UTF-16 declaration tokens; scan in bounded
+        # windows so the security check does not duplicate a 32 MiB XML part.
+        if _has_forbidden_xml_declaration(payload):
             raise OOXMLSecurityError("DTD/entity declarations are not allowed in OOXML: %s" % name)
         try:
-            return ET.fromstring(payload)
+            parser = ET.XMLParser(target=_BoundedTreeBuilder())
+            for offset in range(0, len(payload), 64 * 1024):
+                parser.feed(payload[offset:offset + 64 * 1024])
+            return parser.close()
+        except OOXMLExtractionError:
+            raise
         except ET.ParseError as exc:
             raise OOXMLCorruptError("malformed OOXML XML part %s: %s" % (name, exc)) from exc
 
@@ -279,58 +593,15 @@ def _file_digest(path):
 
 
 def _validate_raster_payload(extension, payload):
-    signatures = {
-        ".png": (b"\x89PNG\r\n\x1a\n",),
-        ".jpg": (b"\xff\xd8\xff",),
-        ".jpeg": (b"\xff\xd8\xff",),
-        ".gif": (b"GIF87a", b"GIF89a"),
-        ".bmp": (b"BM",),
-        ".tif": (b"II*\x00", b"MM\x00*"),
-        ".tiff": (b"II*\x00", b"MM\x00*"),
-        ".webp": (b"RIFF",),
-    }
-    if extension not in signatures:
-        raise OOXMLUnsupportedError(
-            "embedded vector/active/unknown image format requires safe rasterization: %s"
-            % (extension or "(none)")
-        )
-    if not any(payload.startswith(prefix) for prefix in signatures[extension]):
-        raise OOXMLUnsupportedError(
-            "embedded image bytes do not match the declared raster extension %s" % extension
-        )
-    if extension == ".webp" and (len(payload) < 12 or payload[8:12] != b"WEBP"):
-        raise OOXMLUnsupportedError("embedded .webp payload has an invalid RIFF/WEBP signature")
-    if extension == ".png":
-        if len(payload) < 45:
-            raise OOXMLUnsupportedError("embedded PNG is truncated")
-        offset = 8
-        saw_header = False
-        saw_end = False
-        while offset + 12 <= len(payload):
-            length = struct.unpack(">I", payload[offset:offset + 4])[0]
-            chunk_type = payload[offset + 4:offset + 8]
-            end = offset + 12 + length
-            if end > len(payload):
-                raise OOXMLUnsupportedError("embedded PNG has a truncated chunk")
-            chunk_data = payload[offset + 8:offset + 8 + length]
-            expected_crc = struct.unpack(">I", payload[offset + 8 + length:end])[0]
-            if zlib.crc32(chunk_type + chunk_data) & 0xffffffff != expected_crc:
-                raise OOXMLUnsupportedError("embedded PNG has an invalid chunk checksum")
-            if not saw_header:
-                if chunk_type != b"IHDR" or length != 13:
-                    raise OOXMLUnsupportedError("embedded PNG is missing a valid IHDR chunk")
-                width, height = struct.unpack(">II", chunk_data[:8])
-                if width < 1 or height < 1:
-                    raise OOXMLUnsupportedError("embedded PNG has invalid dimensions")
-                saw_header = True
-            if chunk_type == b"IEND":
-                if length != 0 or end != len(payload):
-                    raise OOXMLUnsupportedError("embedded PNG has an invalid IEND chunk")
-                saw_end = True
-                break
-            offset = end
-        if not saw_header or not saw_end:
-            raise OOXMLUnsupportedError("embedded PNG is incomplete")
+    try:
+        # Local import avoids a module-import cycle: standalone raster extraction
+        # reuses this module's atomic asset writer.
+        from .raster import RasterExtractionError, inspect_raster_payload
+        inspect_raster_payload(payload, extension=extension)
+    except (RasterExtractionError, TypeError, ValueError) as exc:
+        raise OOXMLUnsupportedError("unsafe embedded raster %s: %s" % (
+            extension or "(none)", exc,
+        )) from exc
 
 
 class _AssetWriter(object):
@@ -347,6 +618,8 @@ class _AssetWriter(object):
             self.root = os.path.abspath(raw_root)
         self.source_file = source_file
         self.cache = {}
+        self.part_cache = {}
+        self.part_failures = {}
         self.hashes = {}
         self.created = []
         self._ready = False
@@ -377,9 +650,22 @@ class _AssetWriter(object):
         self._ready = True
 
     def save(self, archive_part, payload):
+        if archive_part in self.part_cache:
+            return self.part_cache[archive_part]
+        if archive_part in self.part_failures:
+            raise OOXMLUnsupportedError(self.part_failures[archive_part])
         key = (archive_part, hashlib.sha256(payload).hexdigest())
         if key in self.cache:
-            return self.cache[key]
+            result = self.cache[key]
+            self.part_cache[archive_part] = result
+            return result
+        extension = posixpath.splitext(archive_part)[1].lower()
+        # Probe before creating the output directory or any temporary file.
+        try:
+            _validate_raster_payload(extension, payload)
+        except OOXMLUnsupportedError as exc:
+            self.part_failures[archive_part] = str(exc)
+            raise
         self._ensure_root()
         source_stem = os.path.splitext(os.path.basename(self.source_file))[0]
         source_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", source_stem).strip("._-") or "source"
@@ -387,9 +673,8 @@ class _AssetWriter(object):
         source_hash = hashlib.sha256(self.source_file.encode("utf-8")).hexdigest()[:10]
         part_hash = hashlib.sha256(archive_part.encode("utf-8")).hexdigest()[:10]
         content_hash = key[1][:16]
-        extension = posixpath.splitext(archive_part)[1].lower()
-        _validate_raster_payload(extension, payload)
         if self.root is None:
+            self.part_cache[archive_part] = None
             return None
         filename = "%s_%s_%s_%s%s" % (
             source_stem,
@@ -413,6 +698,7 @@ class _AssetWriter(object):
             except OSError as exc:
                 raise OOXMLAssetError("cannot verify existing asset %s: %s" % (target, exc)) from exc
             self.cache[key] = filename
+            self.part_cache[archive_part] = filename
             self.hashes[filename] = key[1]
             return filename
 
@@ -443,6 +729,7 @@ class _AssetWriter(object):
                 except OSError:
                     pass
         self.cache[key] = filename
+        self.part_cache[archive_part] = filename
         self.hashes[filename] = key[1]
         return filename
 
@@ -661,7 +948,7 @@ def _append_image_references(
 ):
     for relationship_id, alt in references:
         archive_part = _resolved_relationship(relationships, relationship_id, "/image")
-        payload = package.read(archive_part)
+        payload = package.read_cached(archive_part)
         try:
             asset = writer.save(archive_part, payload)
         except OOXMLUnsupportedError as exc:
@@ -1124,7 +1411,7 @@ def _extract_pptx(package, source_file, writer):
     return records
 
 
-def extract_ooxml(path, source_file, asset_root=None):
+def extract_ooxml(path, source_file, asset_root=None, expected_sha256=None):
     """Extract a DOCX/PPTX into ordered page/slide records.
 
     Each record contains ``file``, ``page``, ``text``, ``elements`` and
@@ -1144,21 +1431,11 @@ def extract_ooxml(path, source_file, asset_root=None):
         raise OOXMLUnsupportedError("unsupported OOXML extension: %s" % (extension or "(none)"))
     if not os.path.isfile(filesystem_path):
         raise OOXMLExtractionError("OOXML source is not a regular file: %s" % filesystem_path)
-    try:
-        with open(filesystem_path, "rb") as stream:
-            header = stream.read(8)
-    except OSError as exc:
-        raise OOXMLExtractionError("cannot read OOXML source: %s" % exc) from exc
-    if header == _OLE_MAGIC:
-        raise OOXMLEncryptedError(
-            "source is an encrypted OOXML/legacy OLE container; decrypt or re-save it first"
-        )
-    if not zipfile.is_zipfile(filesystem_path):
-        raise OOXMLCorruptError("OOXML source is not a valid ZIP package")
-
+    if is_link_or_reparse(filesystem_path):
+        raise OOXMLSecurityError("OOXML source must not be a link/junction/reparse point")
     writer = _AssetWriter(asset_root, source_file)
     try:
-        with zipfile.ZipFile(filesystem_path, "r") as archive:
+        with _open_stable_zip(filesystem_path, expected_sha256=expected_sha256) as archive:
             package = _Package(archive)
             if extension == ".docx":
                 return _extract_docx(package, source_file, writer)
@@ -1182,8 +1459,16 @@ def extract_ooxml(path, source_file, asset_root=None):
 
 __all__ = [
     "MAX_SINGLE_UNCOMPRESSED",
+    "MAX_ARCHIVE_BYTES",
+    "MAX_CENTRAL_DIRECTORY_BYTES",
+    "MAX_TOTAL_COMPRESSED",
     "MAX_TOTAL_UNCOMPRESSED",
+    "MAX_ZIP_COMPRESSION_RATIO",
     "MAX_XML_BYTES",
+    "MAX_XML_ELEMENTS",
+    "MAX_XML_DEPTH",
+    "MAX_XML_ATTRIBUTES",
+    "MAX_XML_TEXT_CHARS",
     "MAX_ZIP_ENTRIES",
     "OOXMLAssetError",
     "OOXMLBombError",

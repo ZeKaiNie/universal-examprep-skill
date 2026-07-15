@@ -142,6 +142,15 @@ def _pptx_parts():
 
 
 class OOXMLAdapter(unittest.TestCase):
+    def test_stable_snapshot_exposes_py38_zipfile_protocol(self):
+        with O._SeekableSpooledTemporaryFile(max_size=1, mode="w+b") as snapshot:
+            snapshot.write(b"abc")
+            snapshot.seek(0)
+            self.assertTrue(snapshot.seekable())
+            self.assertTrue(snapshot.readable())
+            self.assertTrue(snapshot.writable())
+            self.assertEqual(snapshot.read(), b"abc")
+
     def test_docx_extracts_heading_paragraph_table_pages_and_image_atomically(self):
         with tempfile.TemporaryDirectory() as temp:
             path = os.path.join(temp, "course.docx")
@@ -178,6 +187,41 @@ class OOXMLAdapter(unittest.TestCase):
             again = O.extract_ooxml(path, "materials/course.docx", assets)
             self.assertEqual(again, records)
             self.assertFalse(any(name.startswith(".ooxml-") for name in os.listdir(assets)))
+
+    def test_repeated_image_relationship_reads_and_materializes_binary_part_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = os.path.join(temp, "repeated.docx")
+            assets = os.path.join(temp, "assets")
+            parts = _docx_parts()
+            image_paragraph = (
+                b'<w:p><w:r><w:drawing><wp:docPr id="1" name="Diagram" '
+                b'descr="Course diagram"/><a:blip r:embed="rIdImage"/>'
+                b'</w:drawing></w:r></w:p>'
+            )
+            parts["word/document.xml"] = parts["word/document.xml"].replace(
+                image_paragraph, image_paragraph + image_paragraph
+            )
+            _write_package(path, parts)
+
+            original_read = O._Package.read
+            read_counts = {}
+
+            def counted_read(package, name):
+                read_counts[name] = read_counts.get(name, 0) + 1
+                return original_read(package, name)
+
+            with mock.patch.object(O._Package, "read", counted_read):
+                records = O.extract_ooxml(path, "repeated.docx", assets)
+
+            self.assertEqual(1, read_counts.get("word/media/image1.png"))
+            figures = [
+                element for record in records for element in record["elements"]
+                if element["kind"] == "figure"
+            ]
+            self.assertEqual(2, len(figures))
+            self.assertEqual(figures[0]["asset"], figures[1]["asset"])
+            self.assertEqual(1, len(records[0]["embedded_assets"]))
+            self.assertEqual([records[0]["embedded_assets"][0]], os.listdir(assets))
 
     def test_pptx_honors_presentation_order_notes_and_slide_image_relationship(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -373,6 +417,48 @@ class OOXMLAdapter(unittest.TestCase):
                 with self.subTest(limit=constant), mock.patch.object(O, constant, limit):
                     with self.assertRaises(O.OOXMLBombError):
                         O.extract_ooxml(path, "course.docx")
+
+    def test_zip_resource_preflight_runs_before_zipfile_allocates_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = os.path.join(temp, "course.docx")
+            _write_package(path, _docx_parts())
+            with mock.patch.object(O, "MAX_CENTRAL_DIRECTORY_BYTES", 1), mock.patch.object(
+                O.zipfile, "ZipFile", side_effect=AssertionError("ZipFile must not run")
+            ):
+                with self.assertRaises(O.OOXMLBombError):
+                    O.extract_ooxml(path, "course.docx")
+
+            ratio_path = os.path.join(temp, "ratio.docx")
+            parts = _docx_parts(extra_parts={"word/media/padding.bin": b"0" * (2 * 1024 * 1024)})
+            _write_package(ratio_path, parts)
+            with mock.patch.object(O, "MAX_ZIP_COMPRESSION_RATIO", 2), mock.patch.object(
+                O.zipfile, "ZipFile", side_effect=AssertionError("ZipFile must not run")
+            ):
+                with self.assertRaises(O.OOXMLBombError):
+                    O.extract_ooxml(ratio_path, "ratio.docx")
+
+    def test_xml_tree_budgets_abort_during_streaming_parse(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = os.path.join(temp, "course.docx")
+            _write_package(path, _docx_parts())
+            for constant, limit in (("MAX_XML_ELEMENTS", 1), ("MAX_XML_DEPTH", 1)):
+                with self.subTest(constant=constant), mock.patch.object(O, constant, limit):
+                    with self.assertRaises(O.OOXMLBombError):
+                        O.extract_ooxml(path, "course.docx")
+
+    def test_expected_source_revision_rejects_swapped_package(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = os.path.join(temp, "course.docx")
+            _write_package(path, _docx_parts())
+            with open(path, "rb") as stream:
+                expected = hashlib.sha256(stream.read()).hexdigest()
+            parts = _docx_parts()
+            parts["word/document.xml"] = parts["word/document.xml"].replace(
+                b"Plain paragraph.", b"Replacement paragraph."
+            )
+            _write_package(path, parts)
+            with self.assertRaises(O.OOXMLSecurityError):
+                O.extract_ooxml(path, "course.docx", expected_sha256=expected)
 
     def test_corrupt_encrypted_and_unsupported_inputs_fail_loud(self):
         with tempfile.TemporaryDirectory() as temp:

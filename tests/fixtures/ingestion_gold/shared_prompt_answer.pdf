@@ -1,0 +1,42 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 406 >>
+stream
+BT /F1 17 Tf 72 720 Td (Question 1: Find the missing value.) Tj ET
+BT /F1 12 Tf 72 690 Td (Use the project-authored diagram below.) Tj ET
+1 w 120 520 120 90 re S
+120 565 m 240 565 l S
+BT /F1 11 Tf 145 580 Td (six groups) Tj ET
+BT /F1 11 Tf 152 540 Td (seven each) Tj ET
+0.5 w 54 396 m 558 396 l S
+BT /F1 17 Tf 72 280 Td (Answer: 42 units.) Tj ET
+BT /F1 12 Tf 72 250 Td (Reason: six groups of seven.) Tj ET
+
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000247 00000 n 
+0000000704 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+774
+%%EOF

@@ -768,6 +768,61 @@ class TypedManifestPublicationTOCTOU(WorkspaceMixin, unittest.TestCase):
         finally:
             shutil.rmtree(ws, ignore_errors=True)
 
+    def test_fact_integrity_snapshot_is_rechecked_before_publication(self):
+        ws = self.make_ws(language="en")
+        manifest_path, _payload = self._write_manifest(ws)
+        manifest_snapshot = sgr._capture_regular_file_snapshot(
+            ws, manifest_path, "study-guide content manifest"
+        )
+        os.makedirs(os.path.join(ws, ".ingest"), exist_ok=True)
+        fact_manifest_path = os.path.join(ws, ".ingest", "build_manifest.json")
+        fact_manifest_bytes = b'{"schema_version":1}'
+        with open(fact_manifest_path, "wb") as stream:
+            stream.write(fact_manifest_bytes)
+        expected = {
+            "schema_version": 1,
+            "build_manifest": {
+                "path": ".ingest/build_manifest.json",
+                "sha256": hashlib.sha256(fact_manifest_bytes).hexdigest(),
+            },
+            "inputs": {},
+            "sidecars": {},
+        }
+        manifest_snapshot["fact_integrity"] = expected
+        start_gate_snapshot = sgr._start_gate_snapshot(self._gate(ws))
+        try:
+            with mock.patch(
+                    "ingestion.dedup.validate_workspace_fact_integrity",
+                    return_value={"snapshot": expected},
+            ), mock.patch.object(sgr, "_verify_start_gate_snapshot"):
+                sgr._verify_publication_inputs(
+                    ws, manifest_snapshot, start_gate_snapshot
+                )
+            with mock.patch(
+                    "ingestion.dedup.validate_workspace_fact_integrity",
+                    return_value={
+                        "snapshot": {"schema_version": 1, "token": "drifted"},
+                    },
+            ), mock.patch.object(sgr, "_verify_start_gate_snapshot"), \
+                    self.assertRaisesRegex(
+                        sgr.ArtifactDriftError, "fact inputs changed"
+                    ):
+                sgr._verify_publication_inputs(
+                    ws, manifest_snapshot, start_gate_snapshot
+                )
+            with open(fact_manifest_path, "wb") as stream:
+                stream.write(b'{"schema_version":2}')
+            with mock.patch.object(sgr, "_verify_start_gate_snapshot"), \
+                    self.assertRaisesRegex(
+                        sgr.ArtifactDriftError, "build manifest changed"
+                    ):
+                sgr._verify_publication_inputs(
+                    ws, manifest_snapshot, start_gate_snapshot,
+                    deep_fact_check=False,
+                )
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
     def test_concurrent_same_bytes_path_replacement_is_rejected_by_identity(self):
         ws = self.make_ws(language="en")
         manifest_path, payload = self._write_manifest(ws)

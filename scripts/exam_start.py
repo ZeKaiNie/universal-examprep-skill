@@ -29,11 +29,21 @@ import i18n  # noqa: E402
 import update_progress  # noqa: E402
 
 try:  # noqa: E402
-    from ingestion import is_link_or_reparse, safe_workspace_entry
+    from ingestion import (
+        ConflictError,
+        is_link_or_reparse,
+        safe_workspace_entry,
+        workspace_publication_lock,
+    )
     from ingestion.identifiers import canonical_json, file_sha256, normalize_workspace_path
     from ingestion.storage import atomic_write_json, read_json
 except ImportError:  # pragma: no cover - package import fallback
-    from scripts.ingestion import is_link_or_reparse, safe_workspace_entry
+    from scripts.ingestion import (
+        ConflictError,
+        is_link_or_reparse,
+        safe_workspace_entry,
+        workspace_publication_lock,
+    )
     from scripts.ingestion.identifiers import (
         canonical_json,
         file_sha256,
@@ -46,7 +56,7 @@ CHOICE_FIELDS = ("mode", "time_budget", "language")
 PACKAGE_ROOT = os.path.dirname(SCRIPT_DIR)
 RUNTIME_RECEIPT_NAME = "exam_runtime_receipt.json"
 RUNTIME_RECEIPT_SCHEMA = 1
-RUNTIME_ROOT_FILES = ("SKILL.md", "AGENTS.md")
+RUNTIME_ROOT_FILES = ("SKILL.md", "AGENTS.md", "LICENSE")
 RUNTIME_TREE_RULES = (
     ("skills", (".md",)),
     ("locales", (".md", ".json")),
@@ -59,7 +69,14 @@ RUNTIME_PATH_EXCLUDES = (
     "docs/plans/",
     "docs/releases/",
 )
-RUNTIME_FILE_EXCLUDES = frozenset(("scripts/build_dist.py",))
+RUNTIME_FILE_EXCLUDES = frozenset((
+    "scripts/build_dist.py",
+    "scripts/retrieval_evaluation.py",
+    "scripts/ingestion/evaluation.py",
+    "docs/localization.md",
+    "docs/retrieval-evaluation.md",
+    "docs/skill-architecture.md",
+))
 RUNTIME_DIFF_LIMIT = 20
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _GIT_OBJECT_ID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
@@ -332,6 +349,11 @@ def _validate_runtime_receipt_schema(receipt):
 
 
 def _write_runtime_receipt(workspace):
+    # Runtime hashing can be comparatively expensive and touches only the
+    # installed package.  Keep it outside the workspace critical section, then
+    # serialize only the validator-visible atomic publication.  In particular,
+    # _confirm must never hold this lock while its update_progress subprocesses
+    # run: those commands acquire the same state->ingestion lock themselves.
     identity = _capture_runtime_identity()
     receipt = dict(identity)
     receipt.update({
@@ -340,10 +362,11 @@ def _write_runtime_receipt(workspace):
         "created_at": _utc_now(),
     })
     _validate_runtime_receipt_schema(receipt)
-    destination = safe_workspace_entry(workspace, RUNTIME_RECEIPT_NAME)
-    atomic_write_json(destination, receipt)
-    if is_link_or_reparse(destination) or not os.path.isfile(destination):
-        raise RuntimeReceiptError("runtime receipt write did not produce a regular file")
+    with workspace_publication_lock(workspace):
+        destination = safe_workspace_entry(workspace, RUNTIME_RECEIPT_NAME)
+        atomic_write_json(destination, receipt)
+        if is_link_or_reparse(destination) or not os.path.isfile(destination):
+            raise RuntimeReceiptError("runtime receipt write did not produce a regular file")
     return receipt
 
 
@@ -378,7 +401,7 @@ def _runtime_receipt_status(workspace):
         return result
     try:
         current = _capture_runtime_identity()
-    except (OSError, RuntimeReceiptError, UnicodeDecodeError, ValueError) as exc:
+    except (ConflictError, OSError, RuntimeReceiptError, UnicodeDecodeError, ValueError) as exc:
         result["reason"] = "runtime_snapshot_failed"
         result["snapshot_error"] = _bounded_text(exc)
         result["receipt"] = _runtime_receipt_summary(recorded)

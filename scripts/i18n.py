@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """i18n.py — the SINGLE vocabulary source for the whole engine (v4 P1). Stdlib only.
 
-Why this module exists (v4 language layering, see docs/history/plans/PLAN-v4.md §2.2):
+Why this module exists (language layering; see shipped docs/language-policy.md):
   * Persisted files (study_state.json etc.) store LANGUAGE-NEUTRAL canonical codes —
     Chinese display strings are no longer the schema. Before v4 the enum vocabulary was
     hardcoded independently in three scripts (update_progress / select_hard_questions /

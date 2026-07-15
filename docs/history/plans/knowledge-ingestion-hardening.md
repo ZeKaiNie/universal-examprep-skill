@@ -13,7 +13,7 @@ Source brief: *Course Knowledge Base Project Plan* (18-page DOCX supplied by the
 Replace the current "extract page text, concatenate Markdown, then hope an agent fixes warnings" path with a lightweight and recoverable ingestion core:
 
 ```text
-immutable course files
+course source files + observed revision hashes
   -> source manifest and capability routing
   -> provenance-preserving content units
   -> deterministic candidates plus confidence
@@ -54,13 +54,13 @@ The external brief describes a production course knowledge system with a structu
 
 | Brief requirement | Lightweight implementation here |
 | --- | --- |
-| Document revisions and immutable sources | SHA-256 source manifest plus parser/config version; compiled outputs are always rebuildable. |
+| Document revisions and source identity | Path-derived source identity plus SHA-256 revision binding and ingestion-v2 parser/config receipts; the pipeline never mutates input files, but does not claim the filesystem makes them immutable. |
 | Rich document elements | Small stdlib JSON/JSONL content-unit schema with page, optional bbox, kind, text/LaTeX/asset, section path, method, confidence, and provenance. |
 | Material-aware parsing | Course profiles and deterministic candidate extractors for lecture, textbook, homework, exam, and solution files. |
 | Parent-child chunks | Explicit chapter/section parent IDs, source-unit IDs, and context prefixes; tables/formulas/questions are not blindly split. |
 | Human/AI review for low confidence | Typed review queue, validated append-only patch log, explicit `pending/applied/blocked` lifecycle. |
-| Dense plus sparse retrieval and reranking | Keep zero-dependency BM25 as the default; define an optional retriever interface and RRF extension point only. |
-| Verified citations and abstention | Stable source spans, index integrity hashes, answer-leakage checks, unresolved-gap status, and retrieval abstention. |
+| Dense plus sparse retrieval and reranking | Keep zero-dependency BM25 as the default. Candidate/RRF/reranker experiment helpers remain non-production until a sufficient frozen real multi-course recall Gold Set passes the optional-backend gate. |
+| Location-verified citations and abstention | Exact Unicode quote spans, unit/source revision and guide-hash binding, index integrity hashes, answer-leakage checks, unresolved-gap status, and retrieval abstention. Location verification deliberately does not prove semantic entailment/support. |
 | Evaluation and release gates | Deterministic ingestion gold set, retrieval Recall@k/MRR, page accounting, problem/answer pairing, and visual leakage tests. |
 
 The following service-oriented parts are intentionally out of scope for the default skill: Postgres, Qdrant, Redis/Celery, S3/MinIO, Kubernetes, multi-tenant ACLs, always-on APIs, mandatory embeddings/rerankers, and cloud parsing.
@@ -104,7 +104,7 @@ No external framework becomes a runtime dependency in this PR. No GPL implementa
 }
 ```
 
-Paths are workspace-relative and normalized. A source is always accounted for as `discovered`, `parsed`, `review_required`, `unsupported`, `failed`, or `unrecoverable`; no source silently disappears. Pipeline identity and parser/config-dependent input hashes live in `.ingest/build_manifest.json` (`pipeline_version=ingestion-v1`) so the immutable source inventory stays minimal.
+Paths are workspace-relative and normalized. A source is always accounted for as `discovered`, `parsed`, `review_required`, `unsupported`, `failed`, or `unrecoverable`; no source silently disappears. Path-derived identity stays in the source manifest. Exact parser/version/config/policy/output-location facts live in `.ingest/parser_receipts.json`, and `.ingest/build_manifest.json` names `pipeline_version=ingestion-v2`; readable v1 payloads remain a legacy compatibility path and do not claim v2 receipts.
 
 ### 4.2 Content-unit IR
 
@@ -125,7 +125,7 @@ Paths are workspace-relative and normalized. A source is always accounted for as
   "asset_role": null,
   "section_path": ["Chapter 5", "5.2 Fourier Transform"],
   "chapter_id": "ch05",
-  "method": "pypdf|pymupdf|pdfium|agent_vision|manual",
+  "method": "native|heuristic|ocr|vision|manual|ai_recovered",
   "confidence": 0.91,
   "provenance": "material|ai_recovered"
 }
@@ -133,9 +133,9 @@ Paths are workspace-relative and normalized. A source is always accounted for as
 
 Rules:
 
-1. IDs derive from source hash, location, normalized content, and schema version.
-2. Every page has a `page_anchor`, even when it has no extracted text.
-3. Raw files are immutable; patches modify the normalized view, not source files.
+1. `source_id` derives from canonical relative path. `unit_id` derives from source ID, location/page, bbox, kind, and ordinal; it is intentionally not content- or revision-derived. Exact source/full-unit hashes bind revisions separately.
+2. Every adapter-enumerated location has a `page_anchor`, even when it has no extracted text. PDF uses pages, PPTX slides, XLSX worksheets, and standalone raster one page-equivalent; DOCX uses logical segments split only at explicit page breaks and does not expose physical rendered pages.
+3. The pipeline never modifies raw source files; source-hash drift proves a new observed revision and invalidates old bindings. Patches modify the normalized view, not source files.
 4. Unknown bbox or structure is `null`, never fabricated.
 5. Question-side and answer-side asset roles remain separate downstream.
 
@@ -237,7 +237,7 @@ Exit gate: legacy commands work, non-contiguous chapters are correct, and unreso
 - [x] Enforce index freshness during validation and retrieval using the runtime loader as the validation oracle.
 - [x] Add strict gold-query evaluation with Recall@1, Recall@5, and MRR, plus formula/question/source-page and hard-negative coverage tests.
 
-Exit gate: source-to-chunk-to-answer trace is complete and stale indexes fail closed.
+Exit gate: every represented/labeled source unit has a revision-bound chunk trace, the committed gold labels are measurable, and stale indexes fail closed. This is not a claim that heuristics recovered every semantic fact in arbitrary source material.
 
 ### Phase D - skill and language contract repair
 
@@ -271,7 +271,7 @@ Exit gate: the root contains only active entry/release files, generated outputs 
 ### Phase F - realistic evaluation and release evidence
 
 - [x] Add real stdlib-generated DOCX/PPTX packages plus valid, truncated, and rollback-triggering raster fixtures; cover formulas, tables, notes, controls, hidden content, and question/answer leakage in the deterministic gold set.
-- [ ] Add a redistribution-safe real PDF layout fixture pack (text, image-only, multicolumn, and shared prompt/answer crop). Deferred because the default CI intentionally has no mandatory PDF parser/render dependency; tracked as a follow-up rather than weakening the stdlib test floor.
+- [x] Add a redistribution-safe, project-authored PDF layout fixture pack (text, image-only, multicolumn stream order, and shared prompt/answer crop) with stdlib generation sources and optional-parser skips that preserve the stdlib CI floor.
 - [x] Test parser capability combinations against the exact registry used by preflight and runtime detection.
 - [x] Add a gold manifest for page accounting, chapter assignment, concept/formula/example/question/answer recall, answer pairing, visual dependency, provenance, source/page precision, and answer leakage.
 - [x] Test unchanged reruns, source changes, source-hash drift, process crashes, automatic transaction recovery, and patch idempotence.
@@ -285,16 +285,13 @@ Exit gate: test evidence covers real adapters and semantic invariants, not only 
 
 Default core: Python standard library plus whichever already-supported PDF backend passed preflight.
 
-Optional adapters are selected page-by-page or file-by-file after capability probing:
+Implemented routes are explicit and local:
 
-1. native text path (`pypdf` where appropriate);
-2. local layout/render path (PyMuPDF or PDFium according to actual capability);
-3. optional LiteParse adapter for local spatial text/OCR/screenshot work;
-4. optional Docling adapter for high-fidelity tables, formulas, reading order, and mixed formats;
-5. host-agent vision for unresolved pages;
-6. cloud adapters only after explicit privacy, price, and upload-scope consent.
+1. the default core parser, using the already-supported PDF backend that passed preflight plus stdlib DOCX/PPTX/XLSX/raster/text parsing;
+2. dedicated stdlib XLSX and standalone-raster routes, with worksheet/image page-equivalent anchors and typed review rather than fake OCR success;
+3. optional Docling or MinerU **host-runner identities** selected explicitly for eligible PDF/OOXML files. Package metadata probing alone is not extraction: the host must supply a callable local runner whose normalized output passes the same contract.
 
-No adapter is installed silently. A missing optional adapter creates a specific route/consent decision, not a mid-operation crash. The project must remain useful with the core BM25 path and no vector database.
+No adapter installs packages/models, enables network access, or uploads material. A missing/invalid optional runner is an explicit operation failure, then the host returns to core/typed review; it is not silently installed or relabeled as success. LiteParse and cloud parser integrations remain prior-art/future candidates, not implemented routes. The project remains useful with the core BM25 path and no vector database.
 
 ## 7. Deletion safety
 
@@ -322,7 +319,7 @@ Local ignored/untracked material, student workspaces, and generated reports are 
 | No quiz bank in web client | Teaching may continue as `covered_unverified`; no quiz is invented. |
 | `<=1 day` student starts in Chinese | No opening/template preference question; canonical language route is Chinese. |
 | Script fails due to invalid input | Failure is reported; manual fallback is not used unless Python itself is unavailable. |
-| Unchanged rerun | Stable IDs and manifests remain deterministic; expensive review work is not repeated. |
+| Unchanged rerun | Path/location-derived IDs, exact revision receipts, and manifests remain deterministic; expensive review work is not repeated. A changed payload can retain a location ID but must change its revision binding. |
 
 ## 9. Pull-request delivery checklist
 
@@ -345,5 +342,5 @@ This section is updated while executing the plan. A checked item without a linke
 | 2026-07-14 | A-B | Added exact-schema source/content/review/patch stores, strict JSON, crash journal/rollback, one-command orchestration, shared PDF capability registry, and fail-closed readiness validation. | complete |
 | 2026-07-14 | C | Added structure-aware chunks, typed quiz preservation, concept postings, stale-index rejection, integrity hashes, and deterministic Recall@1/5 + MRR evaluation. | complete |
 | 2026-07-14 | D-E | Repaired language/bank/state contracts; reduced locale duplication; retired duplicate indexes, caption gallery, old spike, and root-level historical plans/releases. | complete |
-| 2026-07-14 | F | 1,508 repository tests passed (27 skipped); root and all 10 executable skill folders passed `quick_validate.py` under Python UTF-8 mode. | complete with real-PDF fixture follow-up |
+| 2026-07-14 | F | 1,508 repository tests passed (27 skipped); root and all 10 executable skill folders passed `quick_validate.py` under Python UTF-8 mode. The redistribution-safe PDF fixture follow-up was subsequently implemented in the high-fidelity ingestion work. | complete |
 | 2026-07-14 | Forward test | Independent cold-reader checked urgent Chinese teaching, missing-bank quiz, warning-bearing ingest, one-shot PDF in chat mode, and English missing-visual handling; no blocking ambiguity, wording boundaries tightened. | complete |

@@ -41,6 +41,7 @@ class ExamStartTest(unittest.TestCase):
             encoding="utf-8",
         )
         (package / "AGENTS.md").write_text("runtime contract\n", encoding="utf-8")
+        (package / "LICENSE").write_text("test runtime license\n", encoding="utf-8")
         (package / "scripts" / "entry.py").write_text("VALUE = 1\n", encoding="utf-8")
         return package
 
@@ -333,6 +334,59 @@ class ExamStartTest(unittest.TestCase):
                 tampered["runtime_provenance"]["reason"],
             )
             self.assertEqual(tampered_bytes, receipt_path.read_bytes())
+
+    def test_runtime_receipt_publication_conflict_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp) / "workspace"
+            workspace.mkdir()
+            identity = exam_start._capture_runtime_identity()
+            receipt_path = workspace / exam_start.RUNTIME_RECEIPT_NAME
+
+            with mock.patch.object(
+                    exam_start, "_capture_runtime_identity", return_value=identity):
+                with exam_start.workspace_publication_lock(str(workspace)):
+                    with self.assertRaises(exam_start.ConflictError):
+                        exam_start._write_runtime_receipt(str(workspace))
+
+            self.assertFalse(receipt_path.exists())
+
+    def test_reconfirm_conflict_does_not_deadlock_or_partially_write(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "registry"
+            materials = root / "materials"
+            workspace = root / "workspace"
+            materials.mkdir()
+            arguments = [
+                "confirm", "--course", "EEC160",
+                "--materials", str(materials), "--workspace", str(workspace),
+                "--mode", "from_scratch", "--time-budget", "le1d",
+                "--language", "en",
+            ]
+            code, first = self._run(home, arguments)
+            self.assertEqual(0, code)
+            self.assertTrue(first["ready_to_ingest"])
+            state_path = workspace / "study_state.json"
+            receipt_path = workspace / exam_start.RUNTIME_RECEIPT_NAME
+            registry_path = home / "workspaces.json"
+            before = {
+                "state": state_path.read_bytes(),
+                "receipt": receipt_path.read_bytes(),
+                "registry": registry_path.read_bytes(),
+            }
+
+            # update_progress owns the same publication lock.  confirm must not
+            # hold an outer lock across that subprocess; under a real conflict
+            # the child fails promptly and no later publication step runs.
+            with exam_start.workspace_publication_lock(str(workspace)):
+                conflict_code, conflict = self._run(home, arguments)
+
+            self.assertNotEqual(0, conflict_code)
+            self.assertEqual("learning_choices", conflict["failed_step"])
+            self.assertIn("mutation", conflict["error"])
+            self.assertEqual(before["state"], state_path.read_bytes())
+            self.assertEqual(before["receipt"], receipt_path.read_bytes())
+            self.assertEqual(before["registry"], registry_path.read_bytes())
 
     def test_runtime_identity_drift_is_bounded_and_blocks_ingestion_gate(self):
         with tempfile.TemporaryDirectory() as temp:

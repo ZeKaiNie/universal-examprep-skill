@@ -28,6 +28,11 @@ import retrieve as _retrieve
 import strict_json as _strict_json
 import readiness as _readiness_matrix
 from ingestion.identifiers import is_link_or_reparse
+from host_adapters.command_core import (
+    CommandCoreError as _SnapshotError,
+    collect_dependency_snapshot as _collect_dependency_snapshot,
+    dependency_snapshot_receipt as _dependency_snapshot_receipt,
+)
 
 SIX_TYPES = {"choice", "subjective", "diagram", "fill_blank", "true_false", "code"}
 MATERIAL_SOURCES = {"teacher", "material"}
@@ -296,10 +301,18 @@ def validate(ws):
         else:
             try:
                 from ingestion import IngestionStore, read_json
+                from ingestion.pipeline import (
+                    _validate_parser_review_consistency,
+                    _validated_parser_receipts,
+                )
+                from ingestion.dedup import validate_workspace_fact_integrity
             except ImportError as exc:
                 err(f"无法加载结构化 ingestion 校验器: {exc}", level="fatal")
                 IngestionStore = None
                 read_json = None
+                validate_workspace_fact_integrity = None
+                _validate_parser_review_consistency = None
+                _validated_parser_receipts = None
 
             build_path = os.path.join(ingest_dir, "build_manifest.json")
             if not os.path.isfile(build_path) or _is_symlink(build_path):
@@ -313,7 +326,8 @@ def validate(ws):
                     build_manifest = None
 
             if isinstance(build_manifest, dict) and IngestionStore is not None:
-                if build_manifest.get("pipeline_version") != "ingestion-v1":
+                pipeline_version = build_manifest.get("pipeline_version")
+                if pipeline_version not in ("ingestion-v1", "ingestion-v2"):
                     err(
                         ".ingest/build_manifest.json 的 pipeline_version 缺失或不受支持；"
                         "请用当前 ingest 重建"
@@ -368,11 +382,21 @@ def validate(ws):
                                 ".ingest/build_manifest.json 的 %s=%r 与事实源 %d 不一致"
                                 % (count_key, build_manifest.get(count_key), actual_count)
                             )
-                    for source in sources:
-                        try:
-                            store.manifest.verify_current(source.source_id, source.sha256)
-                        except Exception as exc:
-                            err(f"原材料版本漂移，review patch/索引不可再信任: {source.path}（{exc}）")
+                    # ingestion-v2 performs a before/after source-revision check inside
+                    # the shared deterministic fact-integrity gate below.  Avoid a third
+                    # full hash pass over large course PDFs here; legacy v1 still needs
+                    # this direct check.
+                    if pipeline_version != "ingestion-v2":
+                        for source in sources:
+                            try:
+                                store.manifest.verify_current(
+                                    source.source_id, source.sha256
+                                )
+                            except Exception as exc:
+                                err(
+                                    "原材料版本漂移，review patch/索引不可再信任: "
+                                    f"{source.path}（{exc}）"
+                                )
 
                     for unit in units.values():
                         if not unit.asset_path:
@@ -442,6 +466,94 @@ def validate(ws):
                                 + "、".join("%s p.%s" % key for key in sorted(missing_pages)[:20])
                             )
                         stats["ingestion_pages"] = len(expected_pages)
+
+                    if pipeline_version == "ingestion-v2":
+                        parser_receipts_path = os.path.join(
+                            ingest_dir, "parser_receipts.json"
+                        )
+                        try:
+                            parser_receipt_document = read_json(parser_receipts_path)
+                        except Exception as exc:
+                            err(f".ingest/parser_receipts.json 无法严格读取: {exc}")
+                            parser_receipt_document = None
+                        receipts = (
+                            parser_receipt_document.get("receipts")
+                            if isinstance(parser_receipt_document, dict)
+                            and parser_receipt_document.get("schema_version") == 1
+                            else None
+                        )
+                        if not isinstance(receipts, list):
+                            err(".ingest/parser_receipts.json 缺少 v1 receipts 数组")
+                        elif (_validated_parser_receipts is None
+                              or _validate_parser_review_consistency is None):
+                            err("无法加载 parser receipt 校验器", level="fatal")
+                        else:
+                            try:
+                                validated_receipts = _validated_parser_receipts(
+                                    {"schema_version": 2, "parser_receipts": receipts},
+                                    list(sources),
+                                    page_quality if isinstance(page_quality, list) else [],
+                                )
+                                _validate_parser_review_consistency(
+                                    validated_receipts,
+                                    list(sources),
+                                    page_quality if isinstance(page_quality, list) else [],
+                                    issues,
+                                    ledger_entries,
+                                )
+                            except Exception as exc:
+                                err(f"parser receipt 与来源/页面事实不一致: {exc}")
+                            else:
+                                stats["ingestion_parser_receipts"] = len(receipts)
+
+                        source_conflicts = ()
+                        if validate_workspace_fact_integrity is None:
+                            err("无法加载共享 fact integrity 校验器", level="fatal")
+                        else:
+                            try:
+                                fact_integrity = validate_workspace_fact_integrity(ws)
+                            except Exception as exc:
+                                err(
+                                    "dedup/conflict sidecars 与 manifest/live units/"
+                                    "sources/ledger 的确定性完整性校验失败: %s" % exc
+                                )
+                            else:
+                                source_conflicts = fact_integrity["conflicts"]
+                                stats.update({
+                                    "ingestion_duplicate_candidates": fact_integrity[
+                                        "candidate_count"],
+                                    "ingestion_canonical_groups": fact_integrity[
+                                        "canonical_group_count"],
+                                    "ingestion_source_conflicts": fact_integrity[
+                                        "conflict_count"],
+                                })
+                                if "near_candidate_comparison_cap_reached" in fact_integrity[
+                                        "warnings"]:
+                                    warn(
+                                        "近重复比较达到显式上限；未比较候选仍需人工抽查，"
+                                        "不能声称 near-duplicate recall 完整"
+                                    )
+                            for conflict in source_conflicts:
+                                if conflict.status != "unresolved":
+                                    continue
+                                message = (
+                                    "未解决来源冲突 %s: %s（%s）"
+                                    % (
+                                        conflict.conflict_id,
+                                        conflict.conflict_kind,
+                                        ",".join(conflict.reason_codes),
+                                    )
+                                )
+                                # Every unresolved source conflict is a missing
+                                # evidence decision.  Visual/context variants may
+                                # be lower-risk than disagreeing answer keys, but
+                                # neither is safe to silently pass as a usable
+                                # knowledge base.  The typed review queue must
+                                # explicitly keep both, correct the source-backed
+                                # unit, or mark the conflict unrecoverable first.
+                                err(message + "；必须先通过 typed review 明确裁决")
+                    else:
+                        stats["ingestion_parser_receipts"] = 0
 
                     unbound_path = os.path.join(ingest_dir, "unbound_review.json")
                     try:
@@ -1427,11 +1539,38 @@ def _atomic_json(path, payload):
             os.remove(temporary)
 
 
+def _snapshot_blocked_capabilities(chapter, reason_code):
+    chapter = chapter if type(chapter) is int and chapter > 0 else 1
+    return {
+        "chapter": chapter,
+        "workspace_structural": {
+            "status": "blocked", "ready": False,
+            "reason_codes": [reason_code], "counts": {},
+        },
+        "teaching_ready": {
+            "status": "blocked", "ready": False,
+            "reason_codes": [reason_code], "counts": {"chapter": chapter},
+        },
+        "quiz_ready": {
+            "status": "blocked", "ready": False,
+            "reason_codes": [reason_code], "counts": {"chapter": chapter},
+        },
+        "artifact_ready": {
+            "status": "blocked", "ready": False,
+            "reason_codes": [reason_code], "counts": {"chapter": chapter},
+        },
+    }
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Validate a cram workspace against docs/file-format.md")
     ap.add_argument("workspace", help="workspace directory")
     ap.add_argument("--json", action="store_true", help="output errors/warnings/stats as JSON")
     ap.add_argument("--chapter", type=int, help="capability readiness chapter; default current phase")
+    ap.add_argument(
+        "--dependency-snapshot", action="store_true",
+        help="bind validation and capability reads to a bounded dependency-tree digest",
+    )
     ap.add_argument(
         "--max-items", type=int, default=25,
         help="maximum errors and warnings returned inline (1-200; default 25)",
@@ -1449,12 +1588,56 @@ def main(argv=None):
 
     if args.max_items < 1 or args.max_items > 200:
         ap.error("--max-items 必须在 1 到 200 之间")
-    errors, warnings, stats = validate(args.workspace)
+    if args.dependency_snapshot and args.details_file:
+        ap.error("--dependency-snapshot cannot be combined with --details-file")
+
+    dependency_snapshot = None
+    snapshot_before = None
+    snapshot_failure = None
+    snapshot_workspace = os.path.abspath(args.workspace)
+    if args.dependency_snapshot:
+        try:
+            snapshot_before = _collect_dependency_snapshot(snapshot_workspace)
+        except _SnapshotError as exc:
+            snapshot_failure = str(exc)
+
+    if snapshot_failure is None:
+        errors, warnings, stats = validate(args.workspace)
+        capabilities = _readiness_matrix.capability_readiness(
+            args.workspace, errors, warnings, stats, chapter=args.chapter
+        )
+    else:
+        errors = [{
+            "level": "fatal",
+            "msg": "dependency_snapshot_failed before validation: %s" % snapshot_failure,
+        }]
+        warnings = []
+        stats = {}
+        capabilities = _snapshot_blocked_capabilities(
+            args.chapter, "dependency_snapshot_failed")
+
+    if args.dependency_snapshot and snapshot_failure is None:
+        try:
+            snapshot_after = _collect_dependency_snapshot(snapshot_workspace)
+        except _SnapshotError as exc:
+            snapshot_failure = str(exc)
+        else:
+            before_receipt = _dependency_snapshot_receipt(snapshot_before)
+            after_receipt = _dependency_snapshot_receipt(snapshot_after)
+            if before_receipt != after_receipt:
+                snapshot_failure = "dependencies changed across validator reads"
+            else:
+                dependency_snapshot = after_receipt
+        if snapshot_failure is not None:
+            errors.append({
+                "level": "fatal",
+                "msg": "dependency_snapshot_drift: %s" % snapshot_failure,
+            })
+            capabilities = _snapshot_blocked_capabilities(
+                capabilities.get("chapter"), "dependency_snapshot_drift")
+
     code = _exit_code(errors)
     readiness = _readiness(errors, warnings)
-    capabilities = _readiness_matrix.capability_readiness(
-        args.workspace, errors, warnings, stats, chapter=args.chapter
-    )
     limit = max(len(errors), len(warnings)) if args.full else args.max_items
     shown_errors = errors[:limit]
     shown_warnings = warnings[:limit]
@@ -1474,18 +1657,22 @@ def main(argv=None):
         return 2
 
     if args.json:
-        print(json.dumps({"exit_code": code, "ok": code == 0, "workspace": args.workspace,
-                          "readiness": readiness, "capabilities": capabilities,
-                          "error_count": len(errors), "warning_count": len(warnings),
-                          "error_summary": _readiness_matrix.summarize_messages(errors),
-                          "warning_summary": _readiness_matrix.summarize_messages(warnings),
-                          "truncated": {
-                              "errors": max(0, len(errors) - len(shown_errors)),
-                              "warnings": max(0, len(warnings) - len(shown_warnings)),
-                          },
-                          "details_file": details_path,
-                          "errors": shown_errors, "warnings": shown_warnings, "stats": stats},
-                         ensure_ascii=False, indent=2))
+        document = {
+            "exit_code": code, "ok": code == 0, "workspace": args.workspace,
+            "readiness": readiness, "capabilities": capabilities,
+            "error_count": len(errors), "warning_count": len(warnings),
+            "error_summary": _readiness_matrix.summarize_messages(errors),
+            "warning_summary": _readiness_matrix.summarize_messages(warnings),
+            "truncated": {
+                "errors": max(0, len(errors) - len(shown_errors)),
+                "warnings": max(0, len(warnings) - len(shown_warnings)),
+            },
+            "details_file": details_path,
+            "errors": shown_errors, "warnings": shown_warnings, "stats": stats,
+        }
+        if args.dependency_snapshot:
+            document["dependency_snapshot"] = dependency_snapshot
+        print(json.dumps(document, ensure_ascii=False, indent=2))
     else:
         print(f"工作区: {args.workspace}")
         if stats:

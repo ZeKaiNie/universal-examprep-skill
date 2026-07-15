@@ -247,12 +247,19 @@ def chunk_units(content_units, target=TARGET, hard_max=HARD_MAX):
             first.get("chapter_id") or "unassigned",
             str(first.get("unit_id") or "")[-12:],
         )
+        occurrence_unit_ids = []
+        for unit in group:
+            aliases = unit.get("retrieval_occurrence_unit_ids")
+            values = aliases if isinstance(aliases, list) else [unit.get("unit_id")]
+            for value in values:
+                if isinstance(value, str) and value and value not in occurrence_unit_ids:
+                    occurrence_unit_ids.append(value)
         for part_number, part_text in enumerate(parts, 1):
             chunks.append({
                 "id": base_id + (":p%02d" % part_number if len(parts) > 1 else ""),
                 "title": title_for(first),
                 "text": part_text,
-                "unit_ids": [unit.get("unit_id") for unit in group],
+                "unit_ids": occurrence_unit_ids,
                 "source_file": first.get("source_file"),
                 "pages": sorted(set(int(unit.get("page")) for unit in group if unit.get("page"))),
                 "chapter_id": first.get("chapter_id"),

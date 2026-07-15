@@ -46,9 +46,16 @@ skills/
 ```text
 <workspace>/.ingest/               # 建库/接管事实源；不得手改
   source_manifest.json             # 原材料版本、哈希与解析状态
+  parser_receipts.json             # ingestion-v2 逐来源 parser/revision/config/location receipt
   base_content_units.jsonl         # 确定性解析基线
   content_units.jsonl              # 基线 + 已应用 patch 的编译视图
   chapter_phase_mappings.jsonl     # 真实章节与学习阶段显式映射
+  duplicate_candidates.jsonl       # exact/near 派生候选
+  canonical_groups.jsonl           # 保留所有 occurrence 的 display/retrieval 折叠事实
+  source_conflicts.jsonl           # 显式冲突；unresolved fail-closed
+  source_priorities.jsonl          # revision-bound 审查证据，不是静默 winner
+  claim_records.jsonl              # ingestion-v2 typed Guide 的 exact-location claims
+  claim_verification_receipts/     # v2 Guide 强制 location-only + guide/fact hash binding
   review_queue.jsonl               # typed AI/人工接管生命周期
   review_patches.jsonl             # append-only、可回放补丁 ledger
   build_manifest.json              # page accounting 与完整性哈希
@@ -67,7 +74,11 @@ study_guide/chNN.receipt.json    # manifest/HTML/PDF 哈希与 QA 状态
 study_guide/qa/chNN_pNNN.png     # 最新 PDF 的逐页验收证据
 ```
 
-常规材料入口是 `scripts/ingest_course.py`：预检 → 解析 → 结构化编译 → 状态初始化 → 视觉索引 → validator。退出 10 表示程序完成但内容 readiness 被阻断，必须用 `scripts/ingest_review.py` 逐项接管；不能因为 wiki/题库已经出现就开始教学。review patch 绑定来源哈希并写入 append-only ledger，再重编译 wiki、题库和检索索引。
+常规材料入口是 `scripts/ingest_course.py`：预检 → 解析 → 结构化编译 → 状态初始化 → 视觉索引 → validator。core route 覆盖 PDF/DOCX/PPTX/XLSX/常见 raster/txt/Markdown；XLSX worksheet、standalone raster 与 DOCX logical segment 都保留各自 location 语义，不能冒充物理页。退出 10 表示程序完成但内容 readiness 被阻断，必须用 `scripts/ingest_review.py` 逐项接管；不能因为 wiki/题库已经出现就开始教学。review patch 绑定来源哈希并写入 append-only ledger，再重编译 wiki、题库和检索索引。
+
+ingestion-v2 的 parser receipt 对每个 source 绑定 exact hash/media、adapter/version/config、produced location inventory 和 `network/upload/install=false` policy。`source_id` 由 canonical path 派生，`unit_id` 由 source/location/bbox/kind/ordinal 派生；二者都不是 content revision hash，精确 revision 由 source/full-unit digest 另行绑定。canonical groups/conflicts 是可重建派生事实：保留所有来源 occurrence；near match 不自动成组；priority 不静默裁决；unresolved conflict fail-closed。
+
+Docling/MinerU 只提供给显式 host integration 的可选 runner contract；package probe 不能代替 host-supplied callable runner。适配器自身不安装、联网或上传，receipt policy 是受校验的配置声明而非 runner sandbox/attestation；host 负责约束 runner 内部行为。生产检索仍为 stdlib BM25；Dense + Sparse/RRF/reranker 只有在充分的 frozen 真实多课程 recall Gold Set 通过 gate 后才可作为 opt-in，当前 synthetic sample 明确不足。ingestion-v2 typed Guide 强制 claim sidecar + chapter receipt：validator 现场重算 canonical strict-JSON guide/fact hashes，要求显式 claim 的 authored subject/text、same-ref unit/role 与 source location/revision 均匹配，并覆盖直接 material KP explanation、formula、printed prompt 和 material answer；v1 保持兼容。`location_only` 从不证明语义蕴含。
 
 状态存在时只能经 `scripts/update_progress.py` 修改；无状态但 Python 可用时先 `init`。`study_progress.md`、wiki/题库、检索索引、HTML 和 PDF 都是面向不同用途的编译/派生视图，不能反向覆盖 `.ingest/` 或 `study_state.json` 的事实源。
 
@@ -91,9 +102,10 @@ study_guide/qa/chNN_pNNN.png     # 最新 PDF 的逐页验收证据
 - 教学、判分、疑难和复盘先写 notebook，再返回对话摘要。
 - 结构化工作区在阶段完成前必须验证当前章 `profile=full` typed manifest；`artifact_mode=chat` 到此停止，不要求 HTML/PDF。
 - `visual` 或一次性请求才进入视觉产物流程；`visual` 只有在 receipt 哈希匹配、逐页全部验收、零未解决缺陷且 `artifact_ready=ready` 后才能交付和完成阶段，不能把“请求生成”写成“已经成功”。
-- 修改 `study_state.json.language` 会使旧语言 manifest/HTML/PDF/QA stale；先 relocalize/补齐语言块，再重新渲染和验收。
+- 修改 `study_state.json.language` 会使旧语言 manifest/HTML/PDF/QA stale；v2 先用 `relocalize --output` 生成未签名 staging manifest，再刷新 claims/receipt 并 import（锁内复验、发布、失效旧产物）；v1 才保留无 `--output` 的一键 relocalize。之后重新渲染和验收。
 - 建库程序的 warnings、skipped、人工审阅项和缺答案项必须逐条接管。
 - 结构化工作区 `readiness=blocked` 时禁止进入授课、测验或阶段完成。
+- 可选 LangGraph host adapter 只编排同一组命令；checkpoint/resume flag 是 routing hint，不是事实源。每个门禁仍从 `study_state.json`、`.ingest/`、runtime/guide/QA receipts 重新验证，详见 [`langgraph-host-adapter.md`](langgraph-host-adapter.md)。
 
 ## 7. 验证层
 

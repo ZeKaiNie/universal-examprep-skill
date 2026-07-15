@@ -42,6 +42,11 @@ import re
 import sys
 import tempfile
 
+try:
+    from .ingestion import workspace_publication_lock
+except ImportError:
+    from ingestion import workspace_publication_lock
+
 for _s in ("stdout", "stderr"):
     try:
         getattr(sys, _s).reconfigure(encoding="utf-8")
@@ -1488,7 +1493,7 @@ def apply_wiki_visuals(ws, materials, coverage, backend, asset_root, warnings, p
     return inserted, reasons, removed_answer_blocks
 
 
-def run(argv=None, backend=None):
+def run(argv=None, backend=None, _state_locked=False):
     ap = argparse.ArgumentParser(description="Build the generic dual visual index (recall-first; pure stdlib + optional PDF backend; no LLM/network).")
     ap.add_argument("--workspace", required=True, help="cram workspace (contains references/quiz_bank.json)")
     ap.add_argument("--materials", default=None, help="course materials folder (scan PDFs to build figure_page_index)")
@@ -1508,6 +1513,9 @@ def run(argv=None, backend=None):
     ws = os.path.abspath(args.workspace)
     if not os.path.isdir(ws) or os.path.islink(ws):
         _die("--workspace 必须是现有的非符号链接目录: %s" % ws)
+    if not _state_locked:
+        with workspace_publication_lock(ws):
+            return run(argv, backend=backend, _state_locked=True)
     references_dir = _safe_workspace_dir(ws, os.path.join(ws, "references"),
                                           "references", create=False)
     bank_path = _safe_workspace_file(

@@ -34,10 +34,12 @@ import tempfile
 
 try:  # package imports in readiness; script-directory imports in the CLI/tests
     from . import exam_start, i18n, study_guide_content
+    from .ingestion import workspace_publication_lock
 except ImportError:  # pragma: no cover - standalone entrypoint path
     import exam_start
     import i18n
     import study_guide_content
+    from ingestion import workspace_publication_lock
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -1329,11 +1331,14 @@ def _parser():
     return parser
 
 
-def run(argv=None, backend=None, now=None):
+def run(argv=None, backend=None, now=None, _state_locked=False):
     args = _parser().parse_args(argv)
     if args.chapter < 1:
         raise QAError("--chapter must be a positive integer", 2)
     workspace = _guard_workspace(args.workspace)
+    if not _state_locked:
+        with workspace_publication_lock(workspace):
+            return run(argv, backend=backend, now=now, _state_locked=True)
     if args.command == "render":
         code, payload = render(workspace, args.chapter, backend=backend, now=now)
     else:

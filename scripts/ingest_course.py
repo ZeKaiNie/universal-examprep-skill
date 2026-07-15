@@ -14,11 +14,21 @@ import sys
 
 try:
     import exam_start
-    from ingestion import safe_workspace_entry
+    from ingestion import (
+        ConflictError,
+        IngestionStore,
+        safe_workspace_entry,
+        workspace_publication_lock,
+    )
     from ingestion.storage import atomic_write_json
 except ImportError:
     from scripts import exam_start
-    from scripts.ingestion import safe_workspace_entry
+    from scripts.ingestion import (
+        ConflictError,
+        IngestionStore,
+        safe_workspace_entry,
+        workspace_publication_lock,
+    )
     from scripts.ingestion.storage import atomic_write_json
 
 
@@ -80,7 +90,7 @@ def _validated_workspace_payload(result):
     return payload
 
 
-def run(argv=None, backend=None):
+def run(argv=None, backend=None, adapter_runner=None):
     parser = argparse.ArgumentParser(
         description="Official lightweight course ingestion orchestrator"
     )
@@ -94,6 +104,10 @@ def run(argv=None, backend=None):
     )
     parser.add_argument("--render-pages", choices=("never", "auto", "required"), default="auto")
     parser.add_argument("--visual-index", choices=("never", "auto", "required"), default="auto")
+    parser.add_argument(
+        "--ingest-adapter", choices=("core", "docling", "mineru"), default="core",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args(argv)
 
@@ -107,6 +121,13 @@ def run(argv=None, backend=None):
         "workspace": workspace,
         "steps": steps,
     }
+    if args.ingest_adapter != "core" and adapter_runner is None:
+        payload["error"] = (
+            "optional ingest adapters require a programmatic host-injected adapter_runner; "
+            "the ordinary CLI does not provide a trusted runner registry"
+        )
+        _emit(payload, args.as_json)
+        return 2
     if not os.path.isdir(materials):
         payload["error"] = "materials directory does not exist"
         _emit(payload, args.as_json)
@@ -223,13 +244,75 @@ def run(argv=None, backend=None):
         "--render-pages", args.render_pages,
         "--extract-lecture-questions", "auto",
         "--extract-homework", "auto",
+        "--ingest-adapter", args.ingest_adapter,
     ] + (["--course-name", args.course_name] if args.course_name else []))
-    code, raw_input, report = builder.run(build_args, backend=backend)
-    if not runtime_ok("material_build_publish"):
+    try:
+        code, raw_input, report = builder.run(
+            build_args,
+            backend=backend,
+            adapter_runner=adapter_runner,
+            publication_workspace=workspace,
+        )
+    except ConflictError as exc:
+        steps.append({
+            "name": "material_build",
+            "status": "failed",
+            "exit_code": 1,
+            "operation_error": "publication_conflict",
+        })
+        payload["error"] = "material build publication conflict: %s" % exc
+        _emit(payload, args.as_json)
+        return 1
+
+    def publish_builder_json():
+        os.makedirs(os.path.dirname(report_path), exist_ok=True)
+        if report is not None:
+            atomic_write_json(report_path, report)
+        if code == 0:
+            atomic_write_json(raw_path, raw_input)
+            atomic_write_json(
+                os.path.join(workspace, ".ingest", "ai_review_manifest.json"),
+                {
+                    "note": (
+                        "Legacy view only; canonical lifecycle is "
+                        ".ingest/review_queue.jsonl."
+                    ),
+                    "entries": (report or {}).get("ai_review", []),
+                },
+            )
+
+    publish_ready = False
+    ingest_path = os.path.join(workspace, ".ingest")
+    ingest_preexisting = os.path.lexists(ingest_path)
+    try:
+        # The builder serialized asset publication.  Recheck the start/runtime
+        # gate while owning the same state->ingestion lock, then atomically
+        # publish its validator-visible JSON as one short critical section.
+        with workspace_publication_lock(workspace):
+            if ingest_preexisting and not os.path.lexists(ingest_path):
+                raise ConflictError(".ingest changed while acquiring the publication lock")
+            publish_ready = runtime_ok("material_build_publish")
+            if publish_ready:
+                if ingest_preexisting:
+                    publish_builder_json()
+                else:
+                    # publication_lock owns state, but a brand-new .ingest had
+                    # no mutation lock yet.  Create and hold it before writing.
+                    with IngestionStore(workspace).mutation_lock():
+                        publish_builder_json()
+    except ConflictError as exc:
+        steps.append({
+            "name": "material_build",
+            "status": "failed",
+            "exit_code": 1,
+            "operation_error": "publication_conflict",
+        })
+        payload["error"] = "material build JSON publication conflict: %s" % exc
+        _emit(payload, args.as_json)
+        return 1
+    if not publish_ready:
         _emit(payload, args.as_json)
         return 2
-    os.makedirs(os.path.dirname(report_path), exist_ok=True)
-    atomic_write_json(report_path, report or {})
     steps.append({
         "name": "material_build",
         "status": "passed" if code == 0 else "failed",
@@ -241,18 +324,6 @@ def run(argv=None, backend=None):
         payload["error"] = (raw_input or {}).get("error", "material build failed")
         _emit(payload, args.as_json)
         return code
-    atomic_write_json(raw_path, raw_input)
-    atomic_write_json(
-        os.path.join(workspace, ".ingest", "ai_review_manifest.json"),
-        {
-            "note": "Legacy view only; canonical lifecycle is .ingest/review_queue.jsonl.",
-            "entries": report.get("ai_review", []),
-        },
-    )
-
-    if not runtime_ok("workspace_compile"):
-        _emit(payload, args.as_json)
-        return 2
 
     ingest_command = [
         sys.executable,
@@ -262,6 +333,13 @@ def run(argv=None, backend=None):
     ]
     if args.lang:
         ingest_command.extend(("--lang", args.lang))
+    # Do not hold a parent lock across a subprocess.  ingest.py owns the full
+    # state->ingestion publication lock; an outer state lock would make its
+    # non-reentrant acquisition fail.  Bound the child with gate checks on both
+    # sides and trust only its explicit exit status.
+    if not runtime_ok("workspace_compile"):
+        _emit(payload, args.as_json)
+        return 2
     ingested = _run(ingest_command)
     steps.append({
         "name": "workspace_compile",
@@ -272,6 +350,9 @@ def run(argv=None, backend=None):
         payload["error"] = (ingested.stderr or ingested.stdout).strip()
         _emit(payload, args.as_json)
         return ingested.returncode
+    if not runtime_ok("workspace_compile_exit"):
+        _emit(payload, args.as_json)
+        return 2
 
     state_path = os.path.join(workspace, "study_state.json")
     if not os.path.isfile(state_path):
@@ -333,12 +414,18 @@ def run(argv=None, backend=None):
             ),
             "exit_code": visual.returncode,
         })
+        if not runtime_ok("post_visual_recompile"):
+            _emit(payload, args.as_json)
+            return 2
         recompiled = _run([
             sys.executable,
             os.path.join(SCRIPT_DIR, "ingest_review.py"),
             "--workspace", workspace,
             "rebuild",
         ])
+        if not runtime_ok("post_visual_recompile_exit"):
+            _emit(payload, args.as_json)
+            return 2
         steps.append({
             "name": "post_visual_recompile",
             "status": "passed" if recompiled.returncode == 0 else "failed",
