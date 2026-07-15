@@ -121,20 +121,20 @@ def _load_patch(path):
 def _batch_patch_paths(args):
     positional = list(args.patch_files or ())
     if args.patch_list and positional:
-        _die("apply-batch accepts either positional patch files or --patch-list, not both")
+        _die("choose patch files or --patch-list, not both")
     if args.patch_list:
         try:
             listed = read_json(args.patch_list)
         except Exception as exc:
-            _die("cannot read --patch-list: %s" % exc)
+            _die("invalid --patch-list: %s" % exc)
         if (not isinstance(listed, list) or not listed
                 or any(not isinstance(path, str) or not path.strip() for path in listed)):
-            _die("--patch-list must be a non-empty JSON list of patch-file paths")
+            _die("--patch-list must be a non-empty JSON string list")
         positional = listed
     if not positional:
-        _die("apply-batch requires patch files or --patch-list")
+        _die("apply-batch needs at least one patch")
     if len(set(positional)) != len(positional):
-        _die("apply-batch patch-file paths must be unique")
+        _die("patch paths must be unique")
     return positional
 
 
@@ -145,9 +145,9 @@ def _apply_patch_batch(workspace, store, patch_paths):
     for path in patch_paths:
         patch = _load_patch(path)
         if patch.patch_id in patch_ids:
-            _die("apply-batch contains duplicate patch_id: %s" % patch.patch_id)
+            _die("duplicate patch_id: %s" % patch.patch_id)
         if patch.issue_id in issue_ids:
-            _die("apply-batch requires one patch per issue_id: %s" % patch.issue_id)
+            _die("duplicate issue_id: %s" % patch.issue_id)
         patch_ids.add(patch.patch_id)
         issue_ids.add(patch.issue_id)
         patches.append((path, patch))
@@ -157,20 +157,13 @@ def _apply_patch_batch(workspace, store, patch_paths):
         try:
             result = store.apply_patch(patch)
         except Exception as exc:
+            message = "patch %d/%d failed after %d ledger entries: %s" % (
+                index + 1, len(patches), len(results), exc)
             try:
                 compile_review_outputs(workspace)
             except Exception as rebuild_exc:
-                _die(
-                    "batch patch %d/%d failed after %d ledger entries: %s; "
-                    "rebuild also failed: %s"
-                    % (index + 1, len(patches), len(results), exc, rebuild_exc),
-                    code=1,
-                )
-            _die(
-                "batch patch %d/%d failed after %d ledger entries: %s"
-                % (index + 1, len(patches), len(results), exc),
-                code=1,
-            )
+                message += "; rebuild failed: %s" % rebuild_exc
+            _die(message, code=1)
         results.append({
             "patch_file": path,
             "patch_id": patch.patch_id,
@@ -233,15 +226,15 @@ def run(argv=None):
     apply_parser.add_argument("patch_file")
     batch_parser = sub.add_parser(
         "apply-batch",
-        help="apply separate validated patches and rebuild expensive derivatives once",
+        help="apply distinct patches and rebuild once",
     )
     batch_parser.add_argument(
         "patch_files", nargs="*",
-        help="validated patch JSON files (each patch must target a distinct issue)",
+        help="patch JSON files for distinct issues",
     )
     batch_parser.add_argument(
         "--patch-list",
-        help="JSON file containing a non-empty list of validated patch-file paths",
+        help="JSON list of patch-file paths",
     )
     mark_parser = sub.add_parser(
         "mark-unrecoverable", help="close one issue with an evidence-bound terminal patch"
