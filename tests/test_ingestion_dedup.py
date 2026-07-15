@@ -134,6 +134,54 @@ class IngestionDedupTest(unittest.TestCase):
         self.assertIn("numeric_mismatch", facts["conflicts"][0].reason_codes)
         self.assertTrue(all(member.priority_rank == 0 for member in facts["conflicts"][0].members))
 
+    def test_structural_theorem_numbers_do_not_create_false_numeric_conflict(self):
+        left = unit(
+            "Theorem 7.8\n"
+            "For discrete random variables X and Y with joint PMF PX,Y(x, y), and x\n"
+            "and y such that PX(x) > 0 and PY(y) > 0,\n"
+            "PX|Y (x|y) = PX,Y (x, y)\n"
+            "PY (y)\n"
+            ",\n"
+            "PY |X(y|x) = PX,Y (x, y)\n"
+            "PX(x)\n"
+            ".\n",
+            1,
+        )
+        right = unit(
+            "Theorem 7.9\n"
+            "For discrete random variables X and Y with joint PMF PX,Y(x, y), and x\n"
+            "and y such that PX(x) > 0 and PY(y) > 0,\n"
+            "PX,Y (x, y) = PY |X(y|x) PX(x) = PX|Y (x|y) PY (y) .\n",
+            2,
+            SOURCE_B,
+            "materials/b.txt",
+        )
+        facts = build_dedup_facts(
+            (left, right),
+            (SOURCE_A, SOURCE_B),
+            config=DedupConfig(),
+        )
+        near = [row for row in facts["candidates"] if row.match_kind == "near"]
+        self.assertEqual(1, len(near))
+        self.assertNotIn("numeric_mismatch", near[0].conflict_signals)
+        self.assertEqual(0, len(facts["conflicts"]))
+
+    def test_structural_locator_strip_preserves_body_numeric_conflicts(self):
+        left = unit("Theorem 7.8\nThe final value is 10 after the recurrence.", 1)
+        right = unit(
+            "Theorem 7.9\nThe final value is 11 after the recurrence.",
+            2,
+            SOURCE_B,
+            "materials/b.txt",
+        )
+        facts = build_dedup_facts(
+            (left, right),
+            (SOURCE_A, SOURCE_B),
+            config=DedupConfig(threshold_ppm=800_000),
+        )
+        self.assertEqual(1, len(facts["conflicts"]))
+        self.assertIn("numeric_mismatch", facts["conflicts"][0].reason_codes)
+
     def test_equal_question_prompts_with_conflicting_answers_never_fold(self):
         answer_a = unit(
             "The official answer is 10 after applying the recurrence relation.",

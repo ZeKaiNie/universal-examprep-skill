@@ -290,6 +290,7 @@ def requires_assets_heuristic(text, renderable=True):
 # otherwise a problem whose text merely contains "solution" ("find the solution set") is misread.
 _ROLE_PROBLEM_RE = re.compile(r"^\s*[\)\.:\-]?\s*\(?\s*problems?\b", re.I)             # incl. plural "Problems"
 _ROLE_SOLUTION_RE = re.compile(r"^\s*[\)\.:\-]?\s*\(?\s*(?:solutions?|answers?)\b", re.I)  # Solution(s)/Answer(s)
+_EXAMPLE_REFERENCE_TAIL_RE = re.compile(r"^\s*[\)\.:\-]?\s*(?:says|states)\s+that\b", re.I)
 _TOC_RE = re.compile(r"\.{4,}")   # 4+ dot-leaders → a table-of-contents line, not a heading
 
 
@@ -335,6 +336,13 @@ def _iter_markers(text):
             if _TOC_RE.search(line):   # dot-leaders anywhere on the line → TOC entry (even long titles), skip
                 continue
             tail = text[m.end():m.end() + 48]
+            # PDF line extraction can put an ordinary cross-reference at column zero inside a
+            # solution, for example ``Example 6.6 says that ...``. Third-person ``says/states
+            # that`` refers to the named example; it is not a new bare worked-example heading.
+            # Keep this Example-only and phrase-specific so genuine bare headings such as
+            # ``Example 6.6 Calculate ...`` retain their teaching-only behavior.
+            if kind == "example" and _EXAMPLE_REFERENCE_TAIL_RE.match(tail):
+                continue
             out.append({"start": m.start(), "kind": kind, "chapter": int(m.group(1)), "num": int(m.group(2)),
                         "role": _role_of_tail(tail), "heading_form": _heading_form_of_tail(tail),
                         "continued": bool(re.search(r"\bContinued\b", tail, re.I))})

@@ -319,6 +319,37 @@ class CoreExtraction(unittest.TestCase):
         pages = _pages("ch01.pdf", "Please review the proof. See Example 1.1 in the textbook for details.")
         self.assertEqual(B.extract_lecture_items(pages), [])
 
+    def test_line_start_example_reference_inside_solution_is_not_bare_example(self):
+        text = (
+            "Example 6.13 Solution\n"
+            "function x=uniformrv(a,b,m)\n"
+            "x=a+(b-a)*rand(m,1);\n"
+            "Example 6.6 says that Y = a + (b - a)U is a uniform random variable.\n"
+            "Example 6.14 Problem\n"
+            "Write a function that generates samples of Y."
+        )
+        markers = B.detect_lecture_markers(text)
+        self.assertEqual(
+            [(m["chapter"], m["num"], m["role"]) for m in markers],
+            [(6, 13, "solution"), (6, 14, "problem")],
+        )
+        ids = [it["id"] for it in B.extract_lecture_items(_pages("ch06.pdf", text))]
+        self.assertEqual(ids, ["lecture_example_6_14"])
+
+    def test_genuine_bare_example_after_solution_is_still_detected(self):
+        text = (
+            "Example 6.13 Solution  The previous result.\n"
+            "Example 6.14 Calculate the expected value of Y."
+        )
+        markers = B.detect_lecture_markers(text)
+        self.assertEqual(
+            [(m["chapter"], m["num"], m["role"]) for m in markers],
+            [(6, 13, "solution"), (6, 14, "problem")],
+        )
+        item = B.extract_lecture_items(_pages("ch06.pdf", text))[0]
+        self.assertEqual(item["id"], "lecture_example_6_14")
+        self.assertEqual(item["_teaching_role"], "worked_example")
+
     def test_problem_statement_picks_problem_not_solution(self):
         # round-4 P2: solution-before-problem on one page → slice the PROBLEM, not the earlier solution
         text = "Example 1.1 Solution  the answer is 42.\nExample 1.1 Problem  what is the answer?"

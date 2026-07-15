@@ -82,6 +82,11 @@ _BOOL_RE = re.compile(
     re.IGNORECASE,
 )
 _FORMULA_TOKEN_RE = re.compile(r"\\[A-Za-z]+|[A-Za-z]+|\d+(?:\.\d+)?|[^\s]", re.UNICODE)
+_STRUCTURAL_LABEL_RE = re.compile(
+    r"^\s*(?:theorem|lemma|proposition|corollary|definition|example|quiz|section|"
+    r"figure|fig\.?|table|equation)\s+\d+(?:\s*\.\s*\d+)*(?:\s*[:.\-])?\s*",
+    re.IGNORECASE,
+)
 
 
 def _sha_text(value):
@@ -326,6 +331,20 @@ def _numeric_tokens(value):
     return tuple(_NUMBER_RE.findall(normalize_near(value)))
 
 
+def _numeric_claim_tokens(value):
+    """Return numeric tokens after removing a leading structural locator.
+
+    Theorem/section/example numbers identify where a claim appears; they are
+    not numeric values asserted by that claim.  Keeping them in conflict
+    detection turns two nearby but distinct statements such as Theorem 7.8
+    and Theorem 7.9 into a blocking ``numeric_mismatch`` even when neither
+    body asserts a different number.  Only the first leading locator is
+    removed, so numeric differences in the actual body still fail closed.
+    """
+
+    return _numeric_tokens(_STRUCTURAL_LABEL_RE.sub("", value, count=1))
+
+
 def _boolean_tokens(value):
     return tuple(token.casefold() for token in _BOOL_RE.findall(normalize_near(value)))
 
@@ -344,7 +363,7 @@ def _conflict_signals(left, right, unit_index):
     right_content = _content_payload(right)
     if compatibility_key(left).kind_family == "formula" and _formula_tokens(left_content) != _formula_tokens(right_content):
         signals.add("formula_mismatch")
-    if _numeric_tokens(left_content) != _numeric_tokens(right_content):
+    if _numeric_claim_tokens(left_content) != _numeric_claim_tokens(right_content):
         signals.add("numeric_mismatch")
     if _boolean_tokens(left_content) != _boolean_tokens(right_content):
         signals.add("boolean_mismatch")
