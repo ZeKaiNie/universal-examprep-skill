@@ -28,6 +28,7 @@ import re
 import shutil
 import stat
 import struct
+from pathlib import Path
 import sys
 import tempfile
 
@@ -192,7 +193,7 @@ def _guard_workspace(raw):
     # From this point onward containment checks compare real child paths.  Canonicalize the
     # accepted trust root too, otherwise a host-owned ancestor junction puts root and children
     # in different path namespaces and every legitimate child appears to escape.
-    return os.path.realpath(absolute)
+    return str(Path(absolute).resolve(strict=True))
 
 
 def _guard_existing(root, path, label):
@@ -513,7 +514,7 @@ def _validate_start_gate_snapshot(value, workspace):
     for field in ("workspace", "materials", "registered_course", "skill_version",
                   "python_executable"):
         _safe_single_line(value.get(field), "start_gate.%s" % field)
-    if os.path.normcase(os.path.abspath(value["workspace"])) != os.path.normcase(workspace):
+    if not exam_start.update_progress._same_canonical_path(value["workspace"], workspace):
         raise QAError("receipt start_gate belongs to another workspace")
     if not isinstance(value.get("runtime_digest"), str) or not HASH_RE.fullmatch(
             value["runtime_digest"]):

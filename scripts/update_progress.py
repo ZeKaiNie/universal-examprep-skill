@@ -33,6 +33,7 @@ import os
 import re
 import stat
 import sys
+from pathlib import Path
 from urllib.parse import unquote
 
 for _s in ("stdout", "stderr"):
@@ -1969,7 +1970,10 @@ def _registry_path():
 
 def _canonical_path(path):
     """Return the comparison form used by workspace confirmation receipts."""
-    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+    # ``realpath`` can preserve a Windows 8.3 spelling (RUNNER~1) while pathlib and
+    # user-facing receipts expose the long spelling (runneradmin).  Resolve once through
+    # pathlib so both spellings have one stable comparison form.
+    return os.path.normcase(str(Path(os.path.abspath(path)).resolve(strict=False)))
 
 
 def _is_link_or_reparse(path):
@@ -2173,15 +2177,20 @@ def cmd_workspace_register(args):
     if not os.path.isdir(args.path):
         _die("--path 不存在或不是目录: %s——workspace-register 只登记已存在的工作区（建区必确认，"
              "本命令不代建目录）" % args.path)
-    path = os.path.abspath(args.path)           # 存绝对+归一化路径：换目录/新会话都能找回
-    materials = None
+    path_lexical = os.path.abspath(args.path)
+    materials_lexical = None
     if args.materials is not None:
         if not os.path.isdir(args.materials):
             _die("--materials 不存在或不是目录: %s" % args.materials)
-        materials = os.path.abspath(args.materials)
-    if confirmed and (_path_has_link_or_reparse(path)
-                      or _path_has_link_or_reparse(materials)):
+        materials_lexical = os.path.abspath(args.materials)
+    # Inspect the caller's lexical chain before resolving it so a user-controlled link cannot
+    # disappear from the security check.  Store the resolved long spelling only afterwards.
+    if confirmed and (_path_has_link_or_reparse(path_lexical)
+                      or _path_has_link_or_reparse(materials_lexical)):
         _die("--confirmed paths must not contain a symlink/junction/reparse component")
+    path = str(Path(path_lexical).resolve(strict=False))
+    materials = (str(Path(materials_lexical).resolve(strict=False))
+                 if materials_lexical is not None else None)
     reg = load_registry()
     rows = reg["workspaces"]
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")

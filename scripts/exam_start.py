@@ -18,6 +18,7 @@ import platform
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -77,6 +78,11 @@ def _utc_now():
 def _bounded_text(value, limit=240):
     text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
     return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def _resolved_path(value):
+    """Return one absolute, long-form path spelling for receipts and comparisons."""
+    return str(Path(os.path.abspath(value)).resolve(strict=False))
 
 
 def _runtime_manifest(package_root):
@@ -229,13 +235,13 @@ def _capture_runtime_identity(package_root=None):
         files.append({"path": relative, "sha256": file_sha256(absolute)})
     digest = hashlib.sha256(canonical_json(files).encode("utf-8")).hexdigest()
     return {
-        "package_root": os.path.realpath(root),
+        "package_root": _resolved_path(root),
         "skill": _skill_metadata(os.path.join(root, "SKILL.md")),
         "runtime_files": files,
         "runtime_digest": digest,
         "git": _git_snapshot(root),
         "python": {
-            "executable": os.path.realpath(sys.executable),
+            "executable": _resolved_path(sys.executable),
             "version": platform.python_version(),
         },
     }
@@ -525,29 +531,31 @@ def _load_state_status(workspace):
 
 def check_start_gate(workspace, materials):
     """Return a bounded, machine-readable decision without writing anything."""
-    workspace = os.path.abspath(workspace)
-    materials = os.path.abspath(materials)
+    workspace_lexical = os.path.abspath(workspace)
+    materials_lexical = os.path.abspath(materials)
     try:
         registry = update_progress.load_registry()
         confirmation = update_progress.workspace_confirmation_status(
-            workspace, materials, registry=registry
+            workspace_lexical, materials_lexical, registry=registry
         )
     except SystemExit as exc:
         confirmation = {
             "confirmed": False,
             "reason": "registry_unreadable",
-            "workspace": workspace,
-            "materials": materials,
+            "workspace": workspace_lexical,
+            "materials": materials_lexical,
             "exit_code": int(exc.code or 1),
         }
     except (OSError, TypeError, ValueError) as exc:
         confirmation = {
             "confirmed": False,
             "reason": "registry_unreadable",
-            "workspace": workspace,
-            "materials": materials,
+            "workspace": workspace_lexical,
+            "materials": materials_lexical,
             "error": str(exc),
         }
+    workspace = _resolved_path(workspace_lexical)
+    materials = _resolved_path(materials_lexical)
     choices = _load_state_status(workspace)
     runtime = _runtime_receipt_status(workspace)
     workspace_location = {
@@ -599,7 +607,8 @@ def check_registered_workspace_gate(workspace):
     registry and rechecked, including learning choices and runtime provenance.
     The response is bounded even if a damaged registry contains duplicate rows.
     """
-    workspace = os.path.abspath(workspace)
+    workspace_lexical = os.path.abspath(workspace)
+    workspace = _resolved_path(workspace_lexical)
     blocked = {
         "process_success": True,
         "workspace": workspace,
@@ -635,7 +644,7 @@ def check_registered_workspace_gate(workspace):
         return blocked
     attempts = []
     for row in rows[:RUNTIME_DIFF_LIMIT]:
-        gate = check_start_gate(workspace, row["materials"])
+        gate = check_start_gate(workspace_lexical, row["materials"])
         if gate.get("ready_to_ingest"):
             gate = dict(gate)
             gate["ready_to_use"] = True
@@ -720,13 +729,13 @@ def _run_progress(arguments):
 
 
 def _confirm(args):
-    workspace = os.path.abspath(args.workspace)
-    materials = os.path.abspath(args.materials)
+    workspace_lexical = os.path.abspath(args.workspace)
+    materials_lexical = os.path.abspath(args.materials)
     base = {
         "process_success": False,
         "ready_to_ingest": False,
-        "workspace": workspace,
-        "materials": materials,
+        "workspace": workspace_lexical,
+        "materials": materials_lexical,
         "course": (args.course or "").strip(),
         "urgent": bool(args.urgent),
     }
@@ -743,32 +752,37 @@ def _confirm(args):
     if not base["course"]:
         base["error"] = "course must not be empty"
         return 2, base
-    if not os.path.isdir(materials):
+    if not os.path.isdir(materials_lexical):
         base["error"] = "materials directory does not exist"
         return 2, base
-    if _path_has_link_or_reparse(materials):
+    if _path_has_link_or_reparse(materials_lexical):
         base["error"] = "materials path must not contain a symbolic link, junction, or reparse point"
         return 2, base
-    if _inside_materials(materials, workspace):
+    if _inside_materials(materials_lexical, workspace_lexical):
         base["error"] = "workspace must not equal or live inside materials"
         return 2, base
-    if _path_is_same_or_inside(PACKAGE_ROOT, workspace):
+    if _path_is_same_or_inside(PACKAGE_ROOT, workspace_lexical):
         base["error"] = "workspace must not equal or live inside the installed runtime package"
         return 2, base
-    if os.path.lexists(workspace) and not os.path.isdir(workspace):
+    if os.path.lexists(workspace_lexical) and not os.path.isdir(workspace_lexical):
         base["error"] = "workspace exists and is not a directory"
         return 2, base
-    if _path_has_link_or_reparse(workspace):
+    if _path_has_link_or_reparse(workspace_lexical):
         base["error"] = "workspace path must not contain a symbolic link, junction, or reparse point"
         return 2, base
     try:
-        os.makedirs(workspace, exist_ok=True)
+        os.makedirs(workspace_lexical, exist_ok=True)
     except OSError as exc:
         base["error"] = "workspace creation failed: %s" % exc
         return 1, base
-    if _path_has_link_or_reparse(workspace):
+    if _path_has_link_or_reparse(workspace_lexical):
         base["error"] = "workspace path became link-backed during creation"
         return 1, base
+
+    workspace = _resolved_path(workspace_lexical)
+    materials = _resolved_path(materials_lexical)
+    base["workspace"] = workspace
+    base["materials"] = materials
 
     state_path = os.path.join(workspace, update_progress.STATE_NAME)
     if not os.path.isfile(state_path):
