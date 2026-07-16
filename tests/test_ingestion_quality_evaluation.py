@@ -397,6 +397,24 @@ class IngestionEvaluationTest(unittest.TestCase):
         self.assertEqual(1.0, result["retrieval"]["recall_at_5"])
         self.assertEqual(1.0, result["retrieval"]["mrr"])
 
+    def test_student_attempt_is_leakage_and_not_visual_recovery(self):
+        gold = gold_fixture()
+        prediction = prediction_fixture()
+        formula = next(unit for unit in prediction["units"] if unit["unit_id"] == "f1")
+        formula.update({
+            "kind": "formula",
+            "chapter_id": "ch01",
+            "asset_role": "student_attempt",
+            "asset_path": "references/assets/student-attempt.png",
+            "asset_sha256": asset_digest("student-attempt"),
+            "exposed_in_question": True,
+        })
+
+        result = evaluate(gold, prediction)
+
+        self.assertEqual(0, result["visual_dependency"]["recovered"])
+        self.assertIn("f1", result["answer_side_leakage"]["unit_ids"])
+
     def test_empty_gold_and_prediction_use_explicit_zero_metrics(self):
         gold = {
             "schema_version": 1,

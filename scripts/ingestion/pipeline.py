@@ -13,6 +13,29 @@ import os
 import re
 from pathlib import Path
 
+try:
+    from asset_policy import (
+        STUDENT_ATTEMPT,
+        audit_asset_policy,
+        collect_asset_roles,
+        has_tainted_official_asset,
+        is_student_attempt_tainted,
+        iter_asset_declarations,
+        physical_asset_key,
+        student_attempt_tainted_keys,
+    )
+except ImportError:  # imported as ``scripts.ingestion.pipeline``
+    from scripts.asset_policy import (
+        STUDENT_ATTEMPT,
+        audit_asset_policy,
+        collect_asset_roles,
+        has_tainted_official_asset,
+        is_student_attempt_tainted,
+        iter_asset_declarations,
+        physical_asset_key,
+        student_attempt_tainted_keys,
+    )
+
 from .identifiers import (
     canonical_json,
     file_sha256,
@@ -75,6 +98,22 @@ _FORMULA_RE = re.compile(
 )
 _REASON_SAFE_RE = re.compile(r"[^a-z0-9_.-]+")
 _ACTIVE_REVIEW_STATUSES = frozenset(("pending", "claimed", "validated", "blocked"))
+_PROMPT_ASSET_ROLES = frozenset(("question_context", "figure", "diagram", "table"))
+_ANSWER_ASSET_ROLES = frozenset(("answer_context", "worked_solution"))
+
+
+def _require_asset_policy(*, quiz=(), teaching=(), units=()):
+    """Return current taint only after the complete supplied evidence set is safe."""
+
+    audit = audit_asset_policy(
+        quiz_rows=quiz,
+        teaching_rows=teaching,
+        content_units=units,
+    )
+    problems = audit["invalid_declarations"] + audit["conflicts"]
+    if problems:
+        raise ValueError("asset policy failed: %s" % "; ".join(problems))
+    return audit["tainted_keys"]
 
 
 def _structured_multi_column_hint(elements):
@@ -1522,10 +1561,52 @@ def _reconcile_conflict_review_snapshot(store, conflict_issues):
     store.review_queue.reconcile(existing_non_conflicts + list(conflict_issues))
 
 
+def _existing_source_asset_layers(workspace):
+    """Load existing source-side asset declarations without creating state.
+
+    Both files are optional at the first structured-ingestion boundary.  Once a
+    layer exists, however, it must already be a safe regular JSON array before
+    its declarations can participate in the cross-layer policy gate.
+    """
+
+    workspace_root = _workspace_root(workspace)
+    layers = []
+    for relative in (
+        "references/quiz_bank.json", "references/teaching_examples.json"
+    ):
+        path = safe_workspace_entry(workspace_root, relative)
+        if not path.exists():
+            layers.append([])
+            continue
+        if not path.is_file() or path.is_symlink():
+            raise ValueError("%s is not a safe regular file" % relative)
+        value = read_json(path)
+        if not isinstance(value, list):
+            raise ValueError("%s must be an array" % relative)
+        layers.append(value)
+    return tuple(layers)
+
+
+def _audit_payload_with_existing_source_layers(workspace, payload):
+    """Fail closed on existing source rows plus the proposed raw unit slice."""
+
+    quiz_bank, teaching_items = _existing_source_asset_layers(workspace)
+    return _require_asset_policy(
+        quiz=quiz_bank,
+        teaching=teaching_items,
+        units=payload["content_units"],
+    )
+
+
 def _persist_payload_unlocked(workspace, payload):
     """Persist and reconcile a validated envelope into ``workspace/.ingest``."""
 
     _strict_payload(payload)
+    # The caller owns the mutation/publication lock.  Re-read both existing
+    # source layers while that lock is held and combine them with the proposed
+    # unit slice before constructing IngestionStore or mutating any artifact.
+    # Missing layers are normal for a brand-new workspace.
+    _audit_payload_with_existing_source_layers(workspace, payload)
     workspace = os.path.abspath(workspace)
     source_root = os.path.abspath(payload["source_root"])
     store = IngestionStore(workspace, source_root=source_root)
@@ -1768,6 +1849,12 @@ def persist_payload(workspace, payload):
     """Persist one envelope while excluding concurrent review/build mutations."""
 
     _strict_payload(payload)
+    # Keep rejection genuinely no-write: a seeded quiz/teaching layer can taint
+    # an otherwise safe proposed unit slice, so inspect the complete available
+    # evidence before IngestionStore.mutation_lock creates `.ingest` for a new
+    # workspace.  The locked implementation repeats the read to close the
+    # time-of-check/time-of-use window.
+    _audit_payload_with_existing_source_layers(workspace, payload)
     store = IngestionStore(workspace, source_root=payload["source_root"])
     with store.mutation_lock():
         return _persist_payload_unlocked(workspace, payload)
@@ -1869,7 +1956,11 @@ def _replace_visual_block(text, rendered):
     return base + "\n\n" + _VISUAL_START + "\n" + rendered.rstrip() + "\n" + _VISUAL_END + "\n"
 
 
-def _compile_structured_visuals(workspace_path, units, phases):
+def _compile_structured_visuals(
+        workspace_path, units, phases, tainted_keys=None):
+    tainted_keys = set(
+        tainted_keys or student_attempt_tainted_keys(units.values())
+    )
     wiki_by_chapter = {
         row.get("chapter_id"): row.get("wiki_file")
         for row in phases if row.get("chapter_id") and row.get("wiki_file")
@@ -1884,7 +1975,10 @@ def _compile_structured_visuals(workspace_path, units, phases):
             if unit.chapter_id == chapter_id
             and unit.kind in ("figure", "diagram")
             and unit.asset_path
-            and unit.asset_role not in ("answer_context", "worked_solution", "source_page")
+            and not is_student_attempt_tainted(unit.asset_path, tainted_keys)
+            and unit.asset_role not in (
+                "answer_context", "worked_solution", "student_attempt", "source_page"
+            )
         ]
         visuals.sort(key=lambda unit: (unit.source_file, unit.page, unit.ordinal, unit.unit_id))
         blocks = []
@@ -1988,18 +2082,98 @@ def _effective_quiz_keywords(question, answer):
     return None
 
 
-def _metadata_assets(*units):
-    by_path = {}
+def _asset_policy_error(label, values, tainted_keys):
+    """Return a fail-closed error for a direct leak or attempt laundering."""
+
+    roles_by_key = collect_asset_roles(values)
+    for roles in roles_by_key.values():
+        if roles & _PROMPT_ASSET_ROLES and roles & _ANSWER_ASSET_ROLES:
+            return "%s reuses one physical asset on both prompt and answer sides" % label
+    if any(has_tainted_official_asset(value, tainted_keys) for value in values):
+        return "%s uses a globally student-attempt-tainted asset as official evidence" % label
+    return None
+
+
+def _assert_publishable_qa(question, answer, tainted_keys):
+    for label, unit in (("question", question), ("paired answer", answer)):
+        if unit is not None and unit.asset_role == STUDENT_ATTEMPT:
+            raise ValueError(
+                "%s unit %s is student_attempt evidence and cannot enter quiz_bank"
+                % (label, unit.unit_id)
+            )
+    values = tuple(unit for unit in (question, answer) if unit is not None)
+    problem = _asset_policy_error(
+        "question %s" % question.unit_id, values, tainted_keys
+    )
+    if problem:
+        raise ValueError(problem)
+
+
+def _assert_publishable_replay_questions(units, tainted_keys):
+    """Validate every replayed question and its optional paired answer."""
+
+    for question in sorted(units.values(), key=lambda unit: unit.unit_id):
+        if question.kind != "question":
+            continue
+        answer = units.get(question.paired_unit_id) if question.paired_unit_id else None
+        if answer is not None and answer.kind != "answer":
+            raise ValueError("question paired_unit_id must refer to an answer unit")
+        _assert_publishable_qa(question, answer, tainted_keys)
+
+
+def _assert_source_items_asset_policy(label, items, tainted_keys):
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        problem = _asset_policy_error(
+            "%s[%d]" % (label, index), (item,), tainted_keys
+        )
+        if problem:
+            raise ValueError(problem)
+
+
+def _metadata_assets(*units, tainted_keys=None):
+    tainted_keys = set(tainted_keys or student_attempt_tainted_keys(units))
+    records = []
     for unit in units:
         if unit is None:
             continue
         for asset in unit.metadata.get("assets") or ():
-            by_path[asset["path"]] = dict(asset)
+            records.append(dict(asset))
         if unit.asset_path and unit.asset_role:
-            current = dict(by_path.get(unit.asset_path, {"path": unit.asset_path}))
-            current["role"] = unit.asset_role
-            by_path[unit.asset_path] = current
-    return [by_path[path] for path in sorted(by_path)]
+            records.append({"path": unit.asset_path, "role": unit.asset_role})
+
+    grouped = {}
+    for record in sorted(records, key=canonical_json):
+        key = physical_asset_key(record.get("path"))
+        if key is None:
+            raise ValueError("quiz asset path is unsafe: %r" % record.get("path"))
+        grouped.setdefault(key, []).append(record)
+
+    output = []
+    for key in sorted(grouped):
+        group = grouped[key]
+        roles = {record.get("role") for record in group}
+        if any(not isinstance(role, str) or not role for role in roles):
+            raise ValueError("quiz asset role is missing or invalid")
+        current = {}
+        fields = set().union(*(record.keys() for record in group))
+        for field in sorted(fields - {"path", "role"}):
+            values = [record[field] for record in group if field in record]
+            distinct = {canonical_json(value) for value in values}
+            if len(distinct) > 1:
+                raise ValueError(
+                    "conflicting %s metadata for one physical quiz asset" % field
+                )
+            if values:
+                current[field] = values[0]
+        current["path"] = normalize_workspace_path(group[0]["path"])
+        if key in tainted_keys or STUDENT_ATTEMPT in roles:
+            current["role"] = STUDENT_ATTEMPT
+        else:
+            current["role"] = sorted(roles)[0]
+        output.append(current)
+    return output
 
 
 def _chapter_number(chapter_id):
@@ -2007,7 +2181,13 @@ def _chapter_number(chapter_id):
     return int(match.group(1)) if match else None
 
 
-def _new_quiz_item(question, answer):
+def _new_quiz_item(question, answer, tainted_keys=None):
+    tainted_keys = set(
+        tainted_keys or student_attempt_tainted_keys(
+            tuple(unit for unit in (question, answer) if unit is not None)
+        )
+    )
+    _assert_publishable_qa(question, answer, tainted_keys)
     metadata = question.metadata
     quiz_type = metadata.get("quiz_type")
     if not quiz_type:
@@ -2046,7 +2226,7 @@ def _new_quiz_item(question, answer):
         item["keywords"] = effective_keywords
     if "source_language" in metadata:
         item["source_language"] = metadata["source_language"]
-    assets = _metadata_assets(question, answer)
+    assets = _metadata_assets(question, answer, tainted_keys=tainted_keys)
     if assets:
         item["assets"] = assets
     if answer is not None:
@@ -2065,7 +2245,14 @@ def _new_quiz_item(question, answer):
     return item
 
 
-def _update_quiz_item_from_units(item, question, answer, patched_unit_ids):
+def _update_quiz_item_from_units(
+        item, question, answer, patched_unit_ids, tainted_keys=None):
+    tainted_keys = set(
+        tainted_keys or student_attempt_tainted_keys(
+            tuple(unit for unit in (question, answer) if unit is not None)
+        )
+    )
+    _assert_publishable_qa(question, answer, tainted_keys)
     updates = 0
     question_touched = question.unit_id in patched_unit_ids
     answer_touched = answer is not None and answer.unit_id in patched_unit_ids
@@ -2160,7 +2347,7 @@ def _update_quiz_item_from_units(item, question, answer, patched_unit_ids):
         elif "keywords" in item:
             item.pop("keywords")
             updates += 1
-        assets = _metadata_assets(question, answer)
+        assets = _metadata_assets(question, answer, tainted_keys=tainted_keys)
         if assets:
             if item.get("assets") != assets:
                 item["assets"] = assets
@@ -2171,6 +2358,26 @@ def _update_quiz_item_from_units(item, question, answer, patched_unit_ids):
     return updates
 
 
+def _workspace_asset_items(workspace_path):
+    layers = []
+    for relative in (
+        "references/quiz_bank.json", "references/teaching_examples.json"
+    ):
+        path = safe_workspace_entry(workspace_path, relative)
+        if not path.exists():
+            if relative.endswith("teaching_examples.json"):
+                layers.append([])
+                continue
+            raise ValueError("%s is missing" % relative)
+        if not path.is_file() or path.is_symlink():
+            raise ValueError("%s is not a safe regular file" % relative)
+        value = read_json(path)
+        if not isinstance(value, list):
+            raise ValueError("%s must be an array" % relative)
+        layers.append(value)
+    return tuple(layers)
+
+
 def compile_structured_visuals(workspace):
     """Compile safe source-side IR figures into their chapter wiki files."""
 
@@ -2178,9 +2385,18 @@ def compile_structured_visuals(workspace):
     manifest = read_json(workspace_path.joinpath(*BUILD_MANIFEST_PATH.split("/")))
     store = IngestionStore(workspace_path, source_root=manifest.get("source_root"))
     with store.mutation_lock():
+        expected_units, _expected_mappings = store._expected_compiled_state()
+        quiz_bank, teaching_items = _workspace_asset_items(workspace_path)
+        tainted_keys = _require_asset_policy(
+            quiz=quiz_bank,
+            teaching=teaching_items,
+            units=expected_units.values(),
+        )
+        # Rebuild caches only after the read-only policy gate succeeds.
         units, _mappings = store.rebuild_compiled_from_ledger()
         return _compile_structured_visuals(
-            workspace_path, units, _phase_inventory(workspace_path)
+            workspace_path, units, _phase_inventory(workspace_path),
+            tainted_keys=tainted_keys,
         )
 
 
@@ -2194,6 +2410,22 @@ def _compile_review_outputs_unlocked(workspace):
     # The compiled JSONL files are caches, never authority.  Rebuild them from
     # immutable parser output + the verified append-only ledger before consuming
     # anything, so hand edits cannot be "washed clean" by refreshing hashes.
+    expected_units, _expected_mappings = store._expected_compiled_state()
+    quiz_bank, teaching_items = _workspace_asset_items(workspace_path)
+    tainted_keys = _require_asset_policy(
+        quiz=quiz_bank,
+        teaching=teaching_items,
+        units=expected_units.values(),
+    )
+    # The global declaration audit intentionally permits a question to carry a
+    # student-attempt asset as student work.  Such a unit must nevertheless
+    # never be compiled into the official bank/retrieval surface.  Validate the
+    # complete replay state before rebuilding caches, facts, wiki, bank, or the
+    # retrieval index; the per-item check in the write loop remains a defense in
+    # depth against later refactors.
+    _assert_publishable_replay_questions(expected_units, tainted_keys)
+    # Do not mutate the compiled caches or any derivative until the complete
+    # cross-layer policy has passed against the replayed ledger state.
     units, _mappings = store.rebuild_compiled_from_ledger()
     fact_summary = None
     retrieval_units = list(units.values())
@@ -2233,7 +2465,9 @@ def _compile_review_outputs_unlocked(workspace):
         for row in phases if row.get("chapter_id") and row.get("wiki_file")
     }
 
-    visual_counts = _compile_structured_visuals(workspace_path, units, phases)
+    visual_counts = _compile_structured_visuals(
+        workspace_path, units, phases, tainted_keys=tainted_keys
+    )
     recovery_counts = {}
     for chapter_id, relative in sorted(wiki_by_chapter.items()):
         path = safe_workspace_entry(workspace_path, relative)
@@ -2243,6 +2477,11 @@ def _compile_review_outputs_unlocked(workspace):
             unit for unit in units.values()
             if unit.chapter_id == chapter_id
             and unit.unit_id in patched_unit_ids
+            and unit.asset_role != STUDENT_ATTEMPT
+            and not (
+                unit.asset_path
+                and is_student_attempt_tainted(unit.asset_path, tainted_keys)
+            )
             and unit.kind not in ("page_anchor", "figure", "diagram", "question", "answer")
         ]
         recovered.sort(key=lambda unit: (unit.source_file, unit.page, unit.ordinal, unit.unit_id))
@@ -2277,9 +2516,6 @@ def _compile_review_outputs_unlocked(workspace):
         recovery_counts[chapter_id] = len(blocks)
 
     quiz_path = workspace_path / "references" / "quiz_bank.json"
-    quiz_bank = read_json(quiz_path)
-    if not isinstance(quiz_bank, list):
-        raise ValueError("references/quiz_bank.json must be an array")
     quiz_by_id = {
         str(item.get("id")): item for item in quiz_bank
         if isinstance(item, dict) and item.get("id") is not None
@@ -2292,16 +2528,18 @@ def _compile_review_outputs_unlocked(workspace):
         answer = units.get(question.paired_unit_id) if question.paired_unit_id else None
         if answer is not None and answer.kind != "answer":
             raise ValueError("question paired_unit_id must refer to an answer unit")
+        _assert_publishable_qa(question, answer, tainted_keys)
         if item is None:
             if question.unit_id not in patched_unit_ids:
                 continue
-            item = _new_quiz_item(question, answer)
+            item = _new_quiz_item(question, answer, tainted_keys=tainted_keys)
             quiz_bank.append(item)
             quiz_by_id[question.external_id] = item
             quiz_updates += 1
             continue
         quiz_updates += _update_quiz_item_from_units(
-            item, question, answer, patched_unit_ids
+            item, question, answer, patched_unit_ids,
+            tainted_keys=tainted_keys,
         )
     atomic_write_json(quiz_path, quiz_bank)
 
@@ -2325,7 +2563,12 @@ def _compile_review_outputs_unlocked(workspace):
         from scripts import retrieve as retrieve_module
 
     chunks = []
-    for current in chunk_module.chunk_units(retrieval_units):
+    # The public chunk boundary re-reads quiz + teaching + compiled units from
+    # this locked workspace.  A plain taint set is intentionally insufficient:
+    # it cannot prove that no foreign teaching/quiz row taints an official
+    # content-unit asset.
+    for current in chunk_module.chunk_units(
+            retrieval_units, workspace=workspace_path):
         chapter_id = current.get("chapter_id")
         if chapter_id not in wiki_by_chapter:
             continue
@@ -2340,7 +2583,9 @@ def _compile_review_outputs_unlocked(workspace):
 
     question_unit_ids = {}
     for unit in units.values():
-        if unit.kind == "question" and unit.external_id:
+        if (unit.kind == "question" and unit.external_id
+                and unit.asset_role != STUDENT_ATTEMPT
+                and not has_tainted_official_asset(unit, tainted_keys)):
             question_unit_ids.setdefault(unit.external_id, []).append(unit.unit_id)
 
     for item in quiz_bank:
@@ -2406,6 +2651,17 @@ def _compile_review_outputs_unlocked(workspace):
             "sha256": file_sha256(quiz_path),
         },
     }
+    teaching_path = safe_workspace_entry(
+        workspace_path, "references/teaching_examples.json"
+    )
+    if teaching_path.exists():
+        # `_workspace_asset_items` already established that this is a safe
+        # regular JSON array.  Bind its fixed canonical identity and exact bytes
+        # so any later teaching-layer mutation makes the index stale.
+        integrity["teaching_examples"] = {
+            "file": "references/teaching_examples.json",
+            "sha256": file_sha256(teaching_path),
+        }
     integrity = {key: value for key, value in integrity.items() if value is not None}
     index = retrieve_module.build_index(chunks, integrity=integrity)
     retrieval_path = workspace_path / "references" / "retrieval_index.json"

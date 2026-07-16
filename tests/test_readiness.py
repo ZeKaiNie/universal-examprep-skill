@@ -6,10 +6,25 @@ import os
 import struct
 import tempfile
 import unittest
+import zlib
 from unittest import mock
 
 from scripts import readiness
 from scripts import validate_workspace
+
+
+def _png_payload(width, height):
+    def chunk(kind, payload):
+        return (struct.pack(">I", len(payload)) + kind + payload
+                + struct.pack(">I", zlib.crc32(kind + payload) & 0xffffffff))
+
+    row = b"\x00" + (b"\x00" * ((width + 7) // 8))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 1, 0, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(row * height))
+        + chunk(b"IEND", b"")
+    )
 
 
 class CapabilityMatrix(unittest.TestCase):
@@ -22,6 +37,11 @@ class CapabilityMatrix(unittest.TestCase):
             f.write("# Chapter 1\n\nA source-backed concept.\n")
         with open(os.path.join(self.ws, "study_state.json"), "w", encoding="utf-8") as f:
             json.dump({"current_phase": 1, "language": "bilingual"}, f)
+        # The shared asset-policy snapshot treats the bank as a required
+        # workspace layer. Individual tests overwrite this benign baseline.
+        with open(os.path.join(self.ws, "references", "quiz_bank.json"),
+                  "w", encoding="utf-8") as f:
+            json.dump([], f)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -98,6 +118,27 @@ class CapabilityMatrix(unittest.TestCase):
         self.assertEqual(1, matrix["quiz_ready"]["counts"]["candidate_items"])
         self.assertEqual("ready", matrix["artifact_ready"]["status"])
         self.assertEqual("none", matrix["artifact_ready"]["counts"]["math_status"])
+
+    def test_foreign_chapter_attempt_taint_blocks_direct_readiness(self):
+        self._json("references/quiz_bank.json", [{
+            "id": "q1", "chapter": 1, "type": "subjective", "gradable": True,
+            "question": "Use the figure", "answer": "A", "keywords": ["A"],
+            "requires_assets": True,
+            "assets": [{"path": "references/assets/shared.png",
+                        "role": "question_context", "type": "crop_image"}],
+        }])
+        self._jsonl(".ingest/content_units.jsonl", [{
+            "unit_id": "foreign-attempt", "chapter_id": "ch02", "kind": "figure",
+            "asset_path": "references\\assets\\shared.png",
+            "asset_role": "student_attempt", "metadata": {},
+        }])
+        matrix = readiness.capability_readiness(self.ws, [], [], {}, chapter=1)
+        self.assertEqual("blocked", matrix["workspace_structural"]["status"])
+        self.assertIs(False, matrix["workspace_structural"]["ready"])
+        self.assertIn("student_attempt_asset_conflict",
+                      matrix["workspace_structural"]["reason_codes"])
+        self.assertEqual("blocked", matrix["quiz_ready"]["status"])
+        self.assertEqual("blocked", matrix["artifact_ready"]["status"])
 
     def test_control_text_and_current_chapter_formula_review_block_artifact(self):
         with open(os.path.join(self.ws, "references", "wiki", "ch01.md"), "w",
@@ -459,8 +500,7 @@ class CapabilityMatrix(unittest.TestCase):
             name = "fixture-renderer"
 
             def render_pages(self, unused_path):
-                png = (artifact_qa.PNG_SIGNATURE + b"\x00\x00\x00\x0dIHDR"
-                       + struct.pack(">II", 1200, 1800) + b"page-one")
+                png = _png_payload(1200, 1800)
                 return [{
                     "png": png,
                     "text": "Readable study guide content.\nPage 1 of 1",

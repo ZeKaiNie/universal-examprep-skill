@@ -65,6 +65,7 @@ ASSET_ROLES = frozenset(
         "question_context",
         "answer_context",
         "worked_solution",
+        "student_attempt",
         "figure",
         "diagram",
         "table",

@@ -22,10 +22,12 @@ downloads models, enables network access, or uploads course material.
 
 Usage:
   python scripts/build_raw_input_from_workspace.py \\
-      --materials ./course_materials --out raw_input.json \\
+      --materials ./course_materials \\
+      --out skill_workspace/.ingest/source_raw_input.json \\
       --asset-root skill_workspace/references/assets \\
-      --render-pages auto --extract-lecture-questions auto --report parse_report.json
-  python scripts/ingest.py -i raw_input.json -o skill_workspace
+      --render-pages auto --extract-lecture-questions auto \\
+      --report skill_workspace/.ingest/parse_report.json
+  python scripts/ingest.py -i skill_workspace/.ingest/source_raw_input.json -o skill_workspace
   python scripts/validate_workspace.py skill_workspace
 """
 import argparse
@@ -36,6 +38,7 @@ import zlib
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 
@@ -45,7 +48,6 @@ try:
         IngestionStore,
         MATERIAL_TEXT_LANGUAGE_CODES,
         SOURCE_UNIT_LANGUAGE_CODES,
-        atomic_write_json,
         is_language_neutral_formula,
         is_link_or_reparse,
         source_language_evidence,
@@ -58,13 +60,24 @@ try:
     from ingestion.raster import RasterExtractionError, extract_raster
     from ingestion.xlsx import XLSXExtractionError, extract_xlsx
     from ingestion.pipeline import build_payload as build_ingestion_payload
+    from asset_policy import (
+        ANSWER_ASSET_ROLES,
+        PROMPT_ASSET_ROLES,
+        STUDENT_ATTEMPT,
+        audit_asset_policy,
+        iter_asset_declarations,
+        physical_asset_key,
+        workspace_asset_identity_key,
+        workspace_asset_is_student_attempt,
+    )
+    from validate_workspace import workspace_asset_policy_snapshot
+    from image_validation import ImageValidationError, png_dimensions
 except ImportError:  # imported as scripts.build_raw_input_from_workspace in unit tests
     from scripts.ingestion import (
         ConflictError,
         IngestionStore,
         MATERIAL_TEXT_LANGUAGE_CODES,
         SOURCE_UNIT_LANGUAGE_CODES,
-        atomic_write_json,
         is_language_neutral_formula,
         is_link_or_reparse,
         source_language_evidence,
@@ -77,6 +90,18 @@ except ImportError:  # imported as scripts.build_raw_input_from_workspace in uni
     from scripts.ingestion.raster import RasterExtractionError, extract_raster
     from scripts.ingestion.xlsx import XLSXExtractionError, extract_xlsx
     from scripts.ingestion.pipeline import build_payload as build_ingestion_payload
+    from scripts.asset_policy import (
+        ANSWER_ASSET_ROLES,
+        PROMPT_ASSET_ROLES,
+        STUDENT_ATTEMPT,
+        audit_asset_policy,
+        iter_asset_declarations,
+        physical_asset_key,
+        workspace_asset_identity_key,
+        workspace_asset_is_student_attempt,
+    )
+    from scripts.validate_workspace import workspace_asset_policy_snapshot
+    from scripts.image_validation import ImageValidationError, png_dimensions
 
 try:
     from pdf_capabilities import PDF_RENDER_CANDIDATES, PDF_TEXT_CANDIDATES
@@ -1940,13 +1965,20 @@ def extract_homework_items(pages, root_name="", exclude=frozenset(), backend=Non
                             q_text = stream[mk["start"]:nxt_q].strip()
                     else:
                         ans = _nonblank_slice(s_start, s_end)
-            if ans is None:
-                ans = inline_keys.get(mk["num"])       # 同文件 answer-key 段（不相邻也配）
-            if ans is None:
-                ans = tail_answers.get(mk["num"])      # 同文件尾部「解答区」重复标题段
-            if ans is None:
-                got = sol_answers.get((hf, mk["num"]))
-                ans = got[:3] if got else None
+            paired_official = sol_answers.get((hf, mk["num"]))
+            if visual_plan is not None:
+                # A roster/submission route proves that this file contains student work.  OCR
+                # from its inline/tail ``Answer`` blocks is therefore never material-answer
+                # evidence.  A separately paired solution wins unconditionally; without one,
+                # keep the attempt visuals but leave the answer missing for typed review.
+                ans = paired_official[:3] if paired_official else None
+            else:
+                if ans is None:
+                    ans = inline_keys.get(mk["num"])   # same-file answer-key section
+                if ans is None:
+                    ans = tail_answers.get(mk["num"])  # titled same-file tail solution section
+                if ans is None:
+                    ans = paired_official[:3] if paired_official else None
             q_pages = (list(visual_plan["source_pages"])
                        if visual_plan is not None
                        else _pages_for_span(bounds, mk["start"], nxt_q))
@@ -2010,6 +2042,12 @@ def extract_homework_items(pages, root_name="", exclude=frozenset(), backend=Non
                 item["_prompt_text"] = q_text
                 item["_question_crops"] = list(visual_plan["question_crops"])
                 item["_answer_crops"] = list(visual_plan["answer_crops"])
+                if (ans and requires_assets_heuristic(
+                        ans[1], renderable=is_pdf.get(ans[0], False))):
+                    # Student-work crops and official solution visuals are distinct evidence.
+                    # Keep both in the render plan; role assignment later prevents the former
+                    # from satisfying official-answer or Study Guide coverage.
+                    item["_answer_pages"] = [(ans[0], p) for p in (ans[2] or [])]
                 items.append(item)
                 report["homework_problems"] += 1
                 continue
@@ -2136,10 +2174,23 @@ def _sha256_path(path, cache):
 
 
 def _write_png_atomic(asset_root, name, payload):
-    if not isinstance(payload, (bytes, bytearray)) or not payload.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise ValueError("render backend returned bytes without a PNG signature")
+    try:
+        png_dimensions(payload)
+    except ImageValidationError as exc:
+        raise ValueError(
+            "render backend returned an invalid or undecodable PNG: %s" % exc
+        )
     os.makedirs(asset_root, exist_ok=True)
     destination = os.path.join(asset_root, name)
+    if os.path.lexists(destination):
+        if (_path_has_link_or_reparse(destination)
+                or not os.path.isfile(destination)):
+            raise ValueError("refusing to reuse a non-regular or link-backed asset target")
+        with open(destination, "rb") as stream:
+            current = stream.read()
+        if current == bytes(payload):
+            return hashlib.sha256(bytes(payload)).hexdigest()
+        raise ValueError("refusing to overwrite an existing asset target with different bytes")
     descriptor, temporary = tempfile.mkstemp(
         prefix=".%s." % name, suffix=".tmp", dir=asset_root
     )
@@ -2153,6 +2204,29 @@ def _write_png_atomic(asset_root, name, payload):
         if os.path.exists(temporary):
             os.unlink(temporary)
     return hashlib.sha256(bytes(payload)).hexdigest()
+
+
+def _write_new_asset_atomic(asset_root, name, payload):
+    """Publish one already-validated staged asset without replacing a target."""
+
+    os.makedirs(asset_root, exist_ok=True)
+    destination = os.path.join(asset_root, name)
+    if os.path.lexists(destination):
+        raise ValueError("asset target appeared after publication preflight")
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".%s." % name, suffix=".tmp", dir=asset_root
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if os.path.lexists(destination):
+            raise ValueError("asset target appeared during atomic publication")
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def build_raw_input(course_name, sections, lecture_items, homework_items=None):
@@ -2224,6 +2298,29 @@ def build_raw_input(course_name, sections, lecture_items, homework_items=None):
         teaching_examples.append(snap)
     return {"course_name": course_name, "phases": phases, "quiz_bank": bank,
             "teaching_examples": teaching_examples}   # optional parallel teaching layer
+
+
+def _structured_question_union(quiz_bank, teaching_examples):
+    """Return every typed question exactly once, keeping canonical-bank precedence.
+
+    ``teaching_examples`` is a parallel reachability layer, not a second bank.  Paired
+    examples overlap the bank by stable ID, while non-gradable worked examples exist only
+    in the teaching layer.  The ingestion IR needs the union so Guide completeness can
+    account for every authored teaching item without manufacturing a quiz.
+    """
+    result = []
+    seen = set()
+    for item in list(quiz_bank or ()) + list(teaching_examples or ()):
+        if not isinstance(item, dict):
+            continue
+        raw_id = item.get("id")
+        identity = str(raw_id) if raw_id not in (None, "") else None
+        if identity is not None and identity in seen:
+            continue
+        result.append(item)
+        if identity is not None:
+            seen.add(identity)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2770,12 +2867,18 @@ def _annotate_source_languages(items, report):
     for item in items:
         if not isinstance(item, dict):
             continue
+        original_prompt = item.get("_prompt_text")
+        question_payload = (
+            original_prompt
+            if isinstance(original_prompt, str) and original_prompt.strip()
+            else item.get("question")
+        )
         explicit_question = item.get("source_language")
         if (explicit_question not in SOURCE_UNIT_LANGUAGE_CODES
                 or (explicit_question == "zxx" and not is_language_neutral_formula(
-                    item.get("question"), kind="question"))):
+                    question_payload, kind="question"))):
             item.pop("source_language", None)
-            detected = _classify_source_language(item.get("question"), kind="question")
+            detected = _classify_source_language(question_payload, kind="question")
             if detected:
                 item["source_language"] = detected
                 inferred += 1
@@ -3107,8 +3210,16 @@ def build_arg_parser():
                "(.txt/.md materials need none.)")
     p.add_argument("--materials", required=True,
                    help="course materials folder (PDF / DOCX / PPTX / XLSX / images / txt / md)")
-    p.add_argument("--out", default="raw_input.json", help="output raw_input.json path")
-    p.add_argument("--report", default="parse_report.json", help="parse report JSON path")
+    p.add_argument(
+        "--out", default="raw_input.json",
+        help=("output raw_input.json path; with --asset-root workspace mode this must be "
+              "<workspace>/.ingest/source_raw_input.json"),
+    )
+    p.add_argument(
+        "--report", default="parse_report.json",
+        help=("parse report JSON path; with --asset-root workspace mode this must be "
+              "<workspace>/.ingest/parse_report.json"),
+    )
     p.add_argument("--asset-root", default=None,
                    help="directory for rendered page images; should point at <workspace>/references/assets. "
                         "with rendering on but unset: auto skips with a warning, required errors out")
@@ -3126,6 +3237,41 @@ def build_arg_parser():
     return p
 
 
+def _publication_targets_alias(left, right):
+    """Return whether two output spellings can address the same filesystem entry."""
+    left = os.path.abspath(str(left))
+    right = os.path.abspath(str(right))
+    if os.path.normcase(os.path.normpath(left)) == os.path.normcase(os.path.normpath(right)):
+        return True
+    try:
+        if os.path.lexists(left) and os.path.lexists(right) and os.path.samefile(left, right):
+            return True
+    except OSError:
+        pass
+    return (
+        os.path.normcase(os.path.normpath(os.path.realpath(left)))
+        == os.path.normcase(os.path.normpath(os.path.realpath(right)))
+    )
+
+
+def _validate_distinct_publication_targets(args):
+    out = getattr(args, "out", None)
+    report = getattr(args, "report", None)
+    if not out or not report:
+        raise ValueError("--out and --report must both be non-empty paths")
+    manifest = os.path.join(
+        os.path.dirname(os.path.abspath(report)), "ai_review_manifest.json"
+    )
+    pairs = (
+        (out, report, "--out and --report"),
+        (out, manifest, "--out and ai_review_manifest.json"),
+        (report, manifest, "--report and ai_review_manifest.json"),
+    )
+    for left, right, label in pairs:
+        if _publication_targets_alias(left, right):
+            raise ValueError("%s must be distinct physical publication targets" % label)
+
+
 def _publication_workspace(args, explicit=None):
     """Resolve the workspace whose validator-visible outputs this run publishes.
 
@@ -3135,6 +3281,7 @@ def _publication_workspace(args, explicit=None):
     while writing another.
     """
 
+    _validate_distinct_publication_targets(args)
     candidates = []
     if explicit is not None:
         candidates.append(os.path.abspath(str(explicit)))
@@ -3142,21 +3289,46 @@ def _publication_workspace(args, explicit=None):
         if not value:
             continue
         parent = os.path.dirname(os.path.abspath(value))
-        if os.path.basename(parent).lower() == ".ingest":
+        if os.path.basename(parent) == ".ingest":
             candidates.append(os.path.dirname(parent))
+        elif os.path.basename(parent).casefold() == ".ingest":
+            raise ValueError(
+                "workspace ingestion outputs must use the canonical .ingest directory spelling"
+            )
     asset_root = getattr(args, "asset_root", None)
     if asset_root:
         asset_root = os.path.abspath(asset_root)
         references = os.path.dirname(asset_root)
-        if (os.path.basename(asset_root).lower() == "assets"
-                and os.path.basename(references).lower() == "references"):
-            candidates.append(os.path.dirname(references))
+        if not (os.path.basename(asset_root) == "assets"
+                and os.path.basename(references) == "references"):
+            raise ValueError(
+                "--asset-root must be exactly <workspace>/references/assets"
+            )
+        candidates.append(os.path.dirname(references))
     if not candidates:
         return None
     canonical = {os.path.normcase(os.path.normpath(path)) for path in candidates}
     if len(canonical) != 1:
         raise ValueError("validator-visible builder outputs target different workspaces")
     workspace = candidates[0]
+    expected_out = os.path.join(workspace, ".ingest", "source_raw_input.json")
+    expected_report = os.path.join(workspace, ".ingest", "parse_report.json")
+    supplied_out = os.path.abspath(str(getattr(args, "out", "")))
+    supplied_report = os.path.abspath(str(getattr(args, "report", "")))
+    if (os.path.basename(os.path.dirname(supplied_out)) != ".ingest"
+            or os.path.basename(supplied_out) != "source_raw_input.json"
+            or os.path.normcase(os.path.normpath(supplied_out))
+            != os.path.normcase(os.path.normpath(expected_out))):
+        raise ValueError(
+            "workspace mode requires --out exactly <workspace>/.ingest/source_raw_input.json"
+        )
+    if (os.path.basename(os.path.dirname(supplied_report)) != ".ingest"
+            or os.path.basename(supplied_report) != "parse_report.json"
+            or os.path.normcase(os.path.normpath(supplied_report))
+            != os.path.normcase(os.path.normpath(expected_report))):
+        raise ValueError(
+            "workspace mode requires --report exactly <workspace>/.ingest/parse_report.json"
+        )
     if _path_has_link_or_reparse(workspace):
         raise ValueError("builder publication workspace is link/reparse-backed")
     os.makedirs(workspace, exist_ok=True)
@@ -3175,7 +3347,7 @@ def _writes_ingestion_files(args, workspace):
     )
 
 
-def _run_unlocked(args, backend=None, adapter_runner=None):
+def _run_unlocked_core(args, backend=None, adapter_runner=None):
     """Core run. `backend` injectable for tests (a fake with page_texts/render_page_png)."""
     backend = backend or detect_backend()
     report = {"materials": args.materials, "backend": getattr(backend, "name", "none"),
@@ -3767,14 +3939,30 @@ def _run_unlocked(args, backend=None, adapter_runner=None):
         # Crop plans are structurally distinct from legacy page plans: a proven
         # question crop must never degrade to render_page_png(), because the
         # rest of that homework page can contain the student's answer.
+        submission_sources = {
+            str(value).replace("\\", "/")
+            for value in report.get("homework_files") or ()
+        }
+        official_solution_sources = {
+            str(value).replace("\\", "/")
+            for value in report.get("homework_solution_files") or ()
+        }
+
+        def _answer_visual_role(source_file):
+            normalized = str(source_file).replace("\\", "/")
+            if (normalized in submission_sources
+                    and normalized not in official_solution_sources):
+                return "student_attempt"
+            return "answer_context"
+
         plan = ([("question_context", f, p, "_qcrop%d" % index, bbox, "crop_image")
                  for index, (f, p, bbox) in enumerate(it.get("_question_crops", []), 1)]
                 + [("question_context", f, p, "", None, "page_image")
                    for (f, p) in it.get("_question_pages", [])]
                 + [("question_context", f, p, "_adj", None, "page_image") for (f, p) in _adj]
-                + [("answer_context", f, p, "_acrop%d" % index, bbox, "crop_image")
+                + [(_answer_visual_role(f), f, p, "_acrop%d" % index, bbox, "crop_image")
                    for index, (f, p, bbox) in enumerate(it.get("_answer_crops", []), 1)]
-                + [("answer_context", f, p, "_sol", None, "page_image")
+                + [(_answer_visual_role(f), f, p, "_sol", None, "page_image")
                    for (f, p) in it.get("_answer_pages", [])])
         for role, file, page, suffix, bbox, asset_type in plan:
             wrote = False
@@ -3818,7 +4006,7 @@ def _run_unlocked(args, backend=None, adapter_runner=None):
                                 "file": file,
                                 "why": "PNG 写入/格式校验失败 p.%d: %s" % (page, exc),
                             })
-            if not wrote and role == "answer_context":
+            if not wrote and role in ("answer_context", "student_attempt"):
                 # don't DECLARE a missing answer-side asset — it would fail-close an otherwise-valid
                 # question whose own figure rendered fine (the text `answer` already covers it).
                 report["warnings"].append("answer_image_unavailable: %s (p.%d)" % (it["id"], page))
@@ -3965,13 +4153,16 @@ def _run_unlocked(args, backend=None, adapter_runner=None):
         }, report
     _annotate_ingestion_languages(ingestion_pages, report)
     raw_input = build_raw_input(course, sections, lecture_items, homework_items)
+    structured_questions = _structured_question_union(
+        raw_input["quiz_bank"], raw_input.get("teaching_examples") or ()
+    )
     try:
         raw_input["ingestion"] = build_ingestion_payload(
             materials,
             all_source_paths,
             ingestion_pages,
             sections=sections,
-            quiz_items=raw_input["quiz_bank"],
+            quiz_items=structured_questions,
             report=report,
             parser_receipts=_merge_parser_receipts(
                 _core_parser_receipts(
@@ -3993,50 +4184,753 @@ def _run_unlocked(args, backend=None, adapter_runner=None):
     return 0, raw_input, report
 
 
+def _asset_role_map(*collections, workspace=None):
+    roles = {}
+    for rows in collections:
+        for path, role in iter_asset_declarations(rows or ()):
+            key = (workspace_asset_identity_key(path, workspace)
+                   if workspace is not None else physical_asset_key(path))
+            if key is not None and isinstance(role, str):
+                roles.setdefault(key, set()).add(role)
+    return roles
+
+
+def _existing_workspace_asset_policy(workspace):
+    """Load every durable asset layer, while permitting a genuinely new workspace."""
+
+    empty = {"quiz_rows": [], "teaching_rows": [], "content_units": [],
+             "tainted_keys": set(), "tainted_identity_keys": set(),
+             "conflicts": [], "unsafe_paths": []}
+    if not workspace:
+        return empty
+    quiz_path = os.path.join(workspace, "references", "quiz_bank.json")
+    teaching_path = os.path.join(workspace, "references", "teaching_examples.json")
+    ingest_path = os.path.join(workspace, ".ingest")
+    content_path = os.path.join(ingest_path, "content_units.jsonl")
+    if not any(os.path.lexists(path) for path in (
+            quiz_path, teaching_path, content_path)):
+        # IngestionStore creates locks before the first publication, and a failed/retried
+        # builder may already have its three compatibility outputs.  None of those files is
+        # compiled asset-policy truth.  Every other .ingest entry still proves this is not a
+        # genuinely new evidence layer and must fail closed when content_units.jsonl is absent.
+        pre_ingestion_names = {
+            "mutation.lock", "publication.lock", "source_raw_input.json",
+            "parse_report.json", "ai_review_manifest.json",
+        }
+        extra_ingest = []
+        if os.path.isdir(ingest_path) and not _path_has_link_or_reparse(ingest_path):
+            extra_ingest = [name for name in os.listdir(ingest_path)
+                            if name not in pre_ingestion_names]
+        if extra_ingest:
+            raise ValueError(
+                "existing .ingest is missing content_units.jsonl"
+            )
+        return empty
+    if not os.path.isfile(quiz_path) or _path_has_link_or_reparse(quiz_path):
+        raise ValueError(
+            "existing workspace asset policy is incomplete or link-backed: "
+            "references/quiz_bank.json"
+        )
+    return workspace_asset_policy_snapshot(workspace)
+
+
+def _staged_asset_files(stage_root):
+    output = []
+    for base, dirs, files in os.walk(stage_root):
+        dirs.sort()
+        files.sort()
+        for filename in files:
+            path = os.path.join(base, filename)
+            if _path_has_link_or_reparse(path) or not os.path.isfile(path):
+                raise ValueError("staged asset is non-regular or link-backed: %s" % path)
+            relative = os.path.relpath(path, stage_root).replace(os.sep, "/")
+            workspace_relative = "references/assets/" + relative
+            key = physical_asset_key(workspace_relative)
+            if key is None:
+                raise ValueError("staged asset has an unsafe workspace path: %r" % relative)
+            with open(path, "rb") as stream:
+                payload = stream.read()
+            output.append({
+                "stage_path": path,
+                "relative": relative,
+                "workspace_path": workspace_relative,
+                "key": key,
+                "payload": payload,
+            })
+    return output
+
+
+def _plan_staged_assets(stage_root, destination_root, raw_input, workspace):
+    """Audit and freeze a staged asset publication without mutating the workspace.
+
+    All parser/render writers target ``stage_root``.  Consequently an ingestion
+    envelope or ownership-policy rejection cannot have already replaced a
+    deterministic workspace file.  The returned plan owns immutable payload
+    bytes, so callers may remove the staging directory before committing the
+    complete JSON+asset transaction.  Different bytes never replace an existing
+    target.
+    """
+
+    quiz_rows = list((raw_input or {}).get("quiz_bank") or ())
+    teaching_rows = list((raw_input or {}).get("teaching_examples") or ())
+    content_units = list(((raw_input or {}).get("ingestion") or {}).get(
+        "content_units") or ())
+    # Audit every candidate layer before looking at or publishing staged files.  Compatibility
+    # quiz/teaching rows may deliberately remain chapter-unassigned while a typed review routes
+    # their compiled unit, so waive only that one identity warning.  Path/role/schema errors,
+    # student-attempt laundering, duplicate identities, and same-item prompt/answer collisions
+    # remain hard failures across the complete candidate batch.  In particular, an empty existing
+    # workspace must not make conflicts *within* the new batch invisible.
+    identity_workspace = (
+        workspace if workspace and os.path.isdir(workspace) else None
+    )
+    candidate_audit = audit_asset_policy(
+        quiz_rows=quiz_rows,
+        teaching_rows=teaching_rows,
+        content_units=content_units,
+        workspace=identity_workspace,
+        allow_missing_workspace_assets=True,
+    )
+
+    def compatibility_unassigned_warning(message):
+        return (
+            isinstance(message, str)
+            and message.startswith((
+                "references/quiz_bank.json[",
+                "references/teaching_examples.json[",
+            ))
+            and "has asset evidence but no stable chapter/phase locator" in message
+        )
+
+    problems = list(candidate_audit["invalid_declarations"])
+    problems.extend(
+        message for message in candidate_audit["conflicts"]
+        if not compatibility_unassigned_warning(message)
+    )
+    if problems:
+        raise ValueError("generated candidate asset policy is invalid: %s" % problems[0])
+
+    existing = _existing_workspace_asset_policy(workspace)
+    problems = list(existing.get("unsafe_paths") or ()) + list(
+        existing.get("conflicts") or ())
+    if problems:
+        raise ValueError("existing workspace asset policy is invalid: %s" % problems[0])
+
+    # Different lexical paths can be hard links to the same physical file.  The
+    # exact-path ownership map below remains useful for all role transitions,
+    # but it must not let a new official-looking declaration rename an existing
+    # student submission and thereby shed its workspace-wide taint.
+    if workspace:
+        for rows in (quiz_rows, teaching_rows, content_units):
+            for path, role in iter_asset_declarations(rows):
+                if role == STUDENT_ATTEMPT:
+                    continue
+                try:
+                    tainted_alias = workspace_asset_is_student_attempt(
+                        path, workspace, existing
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "cannot verify candidate asset physical identity: %s" % exc
+                    )
+                if tainted_alias:
+                    raise ValueError(
+                        "generated candidate asset %r is a hardlink alias of existing "
+                        "student_attempt evidence" % path
+                    )
+
+    staged = _staged_asset_files(stage_root)
+    candidate_roles = _asset_role_map(
+        quiz_rows, teaching_rows, content_units,
+        workspace=identity_workspace,
+    )
+    existing_roles = _asset_role_map(
+        existing.get("quiz_rows"), existing.get("teaching_rows"),
+        existing.get("content_units"),
+        workspace=identity_workspace,
+    )
+    staged_keys = {
+        (workspace_asset_identity_key(record["workspace_path"], identity_workspace)
+         if identity_workspace is not None else record["key"])
+        for record in staged
+    }
+    undeclared = [record["workspace_path"] for record in staged
+                  if (workspace_asset_identity_key(
+                          record["workspace_path"], identity_workspace)
+                      if identity_workspace is not None else record["key"])
+                  not in candidate_roles]
+    if undeclared:
+        raise ValueError("staged writer produced an undeclared asset: %s" % undeclared[0])
+    declared_but_unstaged = [key for key in candidate_roles if key not in staged_keys]
+    if declared_but_unstaged:
+        raise ValueError(
+            "generated candidate declares an asset that is absent from the safe staging area"
+        )
+
+    destination_root = os.path.abspath(destination_root)
+    if _path_has_link_or_reparse(destination_root):
+        raise ValueError("destination asset root is link/reparse-backed")
+    publication = []
+    for record in staged:
+        comparison_key = (
+            workspace_asset_identity_key(
+                record["workspace_path"], identity_workspace
+            ) if identity_workspace is not None else record["key"]
+        )
+        old_roles = existing_roles.get(comparison_key, set())
+        new_roles = candidate_roles.get(comparison_key, set())
+        if old_roles:
+            # The policy audits above decide whether a role combination is legal.
+            # Publication only permits an idempotent rebuild of the exact same
+            # physical asset ownership; any role-set change is rejected.
+            if old_roles != new_roles:
+                raise ValueError(
+                    "staged target conflicts with existing workspace ownership: %s "
+                    "(%s -> %s)" % (
+                        record["workspace_path"], sorted(old_roles), sorted(new_roles)
+                    )
+                )
+        destination = os.path.abspath(os.path.join(
+            destination_root, *record["relative"].split("/")
+        ))
+        if not _under(destination_root, destination):
+            raise ValueError("staged asset escapes destination root")
+        if os.path.lexists(destination):
+            if (_path_has_link_or_reparse(destination)
+                    or not os.path.isfile(destination)):
+                raise ValueError(
+                    "existing asset target is non-regular or link-backed: %s"
+                    % record["workspace_path"]
+                )
+            with open(destination, "rb") as stream:
+                current = stream.read()
+            if current != record["payload"]:
+                raise ValueError(
+                    "refusing to overwrite an existing asset target with different bytes: %s"
+                    % record["workspace_path"]
+                )
+            publication.append((record, destination, False))
+        else:
+            if old_roles:
+                raise ValueError(
+                    "refusing to materialize a stale target already owned by the workspace: %s"
+                    % record["workspace_path"]
+                )
+            publication.append((record, destination, True))
+
+    return {
+        "destination_root": destination_root,
+        "publication": tuple(publication),
+    }
+
+
+def _publish_asset_plan(plan, journal=None):
+    """Publish one fully preflighted asset plan and return an exact rollback journal."""
+
+    destination_root = plan["destination_root"]
+    publication = plan["publication"]
+    if journal is None:
+        journal = {"created_files": [], "created_dirs": []}
+    if (not isinstance(journal, dict)
+            or not isinstance(journal.get("created_files"), list)
+            or not isinstance(journal.get("created_dirs"), list)
+            or journal["created_files"] or journal["created_dirs"]):
+        raise ValueError("asset publication journal must be a fresh mutable journal")
+    created_files = journal["created_files"]
+    created_dirs = journal["created_dirs"]
+    try:
+        if _path_has_link_or_reparse(destination_root):
+            raise ValueError("destination asset root changed after publication preflight")
+        missing_root_dirs = []
+        cursor = destination_root
+        while cursor and not os.path.exists(cursor):
+            missing_root_dirs.append(cursor)
+            next_cursor = os.path.dirname(cursor)
+            if next_cursor == cursor:
+                break
+            cursor = next_cursor
+        # Register every absent directory before recursive creation.  If the
+        # host creates only an ancestor and then raises, rollback still owns it.
+        created_dirs.extend(reversed(missing_root_dirs))
+        os.makedirs(destination_root, exist_ok=True)
+        if (_path_has_link_or_reparse(destination_root)
+                or not os.path.isdir(destination_root)):
+            raise ValueError("destination asset root became unsafe during publication")
+        for record, destination, should_write in publication:
+            if not should_write:
+                if (_path_has_link_or_reparse(destination)
+                        or not os.path.isfile(destination)):
+                    raise ValueError(
+                        "preflighted byte-identical asset target became unsafe"
+                    )
+                with open(destination, "rb") as stream:
+                    if stream.read() != record["payload"]:
+                        raise ValueError(
+                            "preflighted byte-identical asset target drifted"
+                        )
+                continue
+            parent = os.path.dirname(destination)
+            missing = []
+            cursor = parent
+            while cursor and not os.path.exists(cursor):
+                missing.append(cursor)
+                next_cursor = os.path.dirname(cursor)
+                if next_cursor == cursor:
+                    break
+                cursor = next_cursor
+            created_dirs.extend(reversed(missing))
+            os.makedirs(parent, exist_ok=True)
+            # Record the rollback intent before the replace boundary.  A wrapped
+            # publisher may complete the replace and then raise; appending only
+            # after return would leak that newly public asset from the journal.
+            created_files.append({
+                "path": destination,
+                "sha256": hashlib.sha256(record["payload"]).hexdigest(),
+            })
+            _write_new_asset_atomic(
+                parent, os.path.basename(destination), record["payload"]
+            )
+    except BaseException as exc:
+        rollback_failures = []
+        for entry in reversed(created_files):
+            try:
+                if not os.path.lexists(entry["path"]):
+                    continue
+                if (_path_has_link_or_reparse(entry["path"])
+                        or not os.path.isfile(entry["path"])):
+                    raise OSError("created asset became unsafe")
+                with open(entry["path"], "rb") as stream:
+                    digest = hashlib.sha256(stream.read()).hexdigest()
+                if digest != entry["sha256"]:
+                    raise OSError("created asset drifted before rollback")
+                os.unlink(entry["path"])
+            except OSError as rollback_exc:
+                rollback_failures.append(
+                    "%s: %s" % (entry["path"], rollback_exc)
+                )
+        rollback_failures.extend(_remove_created_directories(created_dirs))
+        if rollback_failures:
+            raise OSError(
+                "asset publication rollback failed: %s"
+                % "; ".join(rollback_failures)
+            ) from exc
+        raise
+    return journal
+
+
+def _publish_staged_assets(stage_root, destination_root, raw_input, workspace):
+    """Backward-compatible one-shot staged asset publication."""
+
+    plan = _plan_staged_assets(stage_root, destination_root, raw_input, workspace)
+    return _publish_asset_plan(plan)
+
+
+def _publication_json_bytes(value):
+    """Serialize one builder control document before any public mutation."""
+
+    try:
+        return (
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+                allow_nan=False,
+            ) + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ValueError("builder publication JSON is not serializable: %s" % exc)
+
+
+def _publication_target_states(publications):
+    """Preflight exact JSON targets and snapshot their byte/existence state."""
+
+    states = {}
+    paths = [os.path.abspath(str(path)) for path, _value in publications]
+    for left_index, left in enumerate(paths):
+        for right in paths[left_index + 1:]:
+            if _publication_targets_alias(left, right):
+                raise ValueError("builder JSON publication targets must be physically distinct")
+    for path in paths:
+        if _path_has_link_or_reparse(path):
+            raise ValueError(
+                "builder JSON publication target is link/reparse-backed: %s" % path
+            )
+        if os.path.lexists(path):
+            if not os.path.isfile(path):
+                raise ValueError(
+                    "builder JSON publication target is not a regular file: %s" % path
+                )
+            with open(path, "rb") as stream:
+                payload = stream.read()
+            states[path] = {"existed": True, "payload": payload}
+        else:
+            states[path] = {"existed": False, "payload": None}
+    return states
+
+
+def _missing_parent_directories(path):
+    missing = []
+    cursor = os.path.dirname(os.path.abspath(path))
+    while cursor and not os.path.exists(cursor):
+        missing.append(cursor)
+        parent = os.path.dirname(cursor)
+        if parent == cursor:
+            break
+        cursor = parent
+    return list(reversed(missing))
+
+
+def _cleanup_staged_json(entries):
+    failures = []
+    for entry in entries:
+        temporary = entry.get("temporary")
+        if not temporary or not os.path.exists(temporary):
+            continue
+        try:
+            os.unlink(temporary)
+        except OSError as exc:
+            failures.append("%s: %s" % (temporary, exc))
+    return failures
+
+
+def _remove_created_directories(paths):
+    failures = []
+    for path in sorted(set(paths), key=len, reverse=True):
+        if not os.path.lexists(path):
+            continue
+        try:
+            if _path_has_link_or_reparse(path) or not os.path.isdir(path):
+                raise OSError("created directory became link-backed or non-directory")
+            os.rmdir(path)
+        except OSError as exc:
+            failures.append("%s: %s" % (path, exc))
+    return failures
+
+
+def _stage_json_publications(publications, journal=None):
+    """Create durable same-directory temp files for the complete JSON set."""
+
+    normalized = [
+        (os.path.abspath(str(path)), _publication_json_bytes(value))
+        for path, value in publications
+    ]
+    states = _publication_target_states(normalized)
+    if journal is None:
+        journal = {"entries": [], "states": states, "created_dirs": []}
+    if (not isinstance(journal, dict)
+            or not isinstance(journal.get("entries"), list)
+            or not isinstance(journal.get("created_dirs"), list)
+            or journal["entries"] or journal["created_dirs"]):
+        raise ValueError("JSON publication journal must be a fresh mutable journal")
+    journal["states"] = states
+    entries = journal["entries"]
+    created_dirs = journal["created_dirs"]
+    try:
+        for path, payload in normalized:
+            missing = _missing_parent_directories(path)
+            parent = os.path.dirname(path)
+            created_dirs.extend(missing)
+            os.makedirs(parent, exist_ok=True)
+            if (_path_has_link_or_reparse(parent)
+                    or not os.path.isdir(parent)):
+                raise ValueError(
+                    "builder JSON publication parent became unsafe: %s" % parent
+                )
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=".%s.builder-publication." % os.path.basename(path),
+                suffix=".tmp",
+                dir=parent,
+            )
+            entry = {
+                "path": path,
+                "payload": payload,
+                "temporary": temporary,
+            }
+            try:
+                # Register the cleanup intent before writing any bytes.  If a
+                # hostile/custom list cannot accept the entry, clean the one
+                # still-local resource explicitly so no temp escapes the
+                # transaction journal.
+                entries.append(entry)
+            except BaseException as exc:
+                failures = []
+                try:
+                    os.close(descriptor)
+                except OSError as close_exc:
+                    failures.append("%s: %s" % (temporary, close_exc))
+                try:
+                    os.unlink(temporary)
+                except OSError as unlink_exc:
+                    failures.append("%s: %s" % (temporary, unlink_exc))
+                if failures:
+                    raise OSError(
+                        "builder JSON staging registration rollback failed: %s"
+                        % "; ".join(failures)
+                    ) from exc
+                raise
+            try:
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except BaseException:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+                raise
+    except BaseException as exc:
+        cleanup_failures = _cleanup_staged_json(entries)
+        cleanup_failures.extend(_remove_created_directories(created_dirs))
+        if cleanup_failures:
+            raise OSError(
+                "builder JSON staging rollback failed: %s"
+                % "; ".join(cleanup_failures)
+            ) from exc
+        raise
+    return journal
+
+
+def _revalidate_publication_target(path, state):
+    if state["existed"]:
+        if (_path_has_link_or_reparse(path) or not os.path.isfile(path)):
+            raise ValueError("builder JSON publication target became unsafe: %s" % path)
+        with open(path, "rb") as stream:
+            current = stream.read()
+        if current != state["payload"]:
+            raise ValueError("builder JSON publication target drifted: %s" % path)
+    elif os.path.lexists(path):
+        raise ValueError("builder JSON publication target appeared: %s" % path)
+
+
+def _replace_publication_stage(temporary, destination):
+    """Replace one JSON target; split out for deterministic failure injection."""
+
+    if (_path_has_link_or_reparse(temporary)
+            or not os.path.isfile(temporary)):
+        raise OSError("builder publication stage is no longer a regular file")
+    os.replace(temporary, destination)
+
+
+def _atomic_restore_publication_bytes(path, payload):
+    """Restore exact bytes without sharing the injectable forward replace hook."""
+
+    parent = os.path.dirname(path)
+    if _path_has_link_or_reparse(parent) or not os.path.isdir(parent):
+        raise OSError("builder rollback parent is unsafe: %s" % parent)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".%s.builder-rollback." % os.path.basename(path),
+        suffix=".tmp",
+        dir=parent,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _restore_publication_targets(states, attempted_paths):
+    failures = []
+    for path in reversed(attempted_paths):
+        state = states[path]
+        try:
+            if state["existed"]:
+                _atomic_restore_publication_bytes(path, state["payload"])
+            elif os.path.lexists(path):
+                if (_path_has_link_or_reparse(path)
+                        or not os.path.isfile(path)):
+                    raise OSError("new publication target became unsafe")
+                os.unlink(path)
+        except OSError as exc:
+            failures.append("%s: %s" % (path, exc))
+    return failures
+
+
+def _rollback_asset_journal(journal):
+    failures = []
+    for entry in reversed(journal.get("created_files") or ()):
+        path = entry["path"]
+        try:
+            if not os.path.lexists(path):
+                continue
+            if (_path_has_link_or_reparse(path)
+                    or not os.path.isfile(path)):
+                raise OSError("created asset became unsafe")
+            with open(path, "rb") as stream:
+                digest = hashlib.sha256(stream.read()).hexdigest()
+            if digest != entry["sha256"]:
+                raise OSError("created asset drifted before rollback")
+            os.unlink(path)
+        except OSError as exc:
+            failures.append("%s: %s" % (path, exc))
+    failures.extend(_remove_created_directories(journal.get("created_dirs") or ()))
+    return failures
+
+
+def _publish_builder_transaction(json_publications, asset_plans=()):
+    """Commit every builder JSON and asset as one rollback-protected batch."""
+
+    stage_journal = {"entries": [], "states": {}, "created_dirs": []}
+    entries = stage_journal["entries"]
+    states = stage_journal["states"]
+    json_created_dirs = stage_journal["created_dirs"]
+    asset_journals = []
+    attempted = []
+    try:
+        _stage_json_publications(json_publications, journal=stage_journal)
+        states = stage_journal["states"]
+        for plan in asset_plans or ():
+            # Register the journal with the outer transaction before the first
+            # asset mutation, so even a failure after the inner publisher's
+            # replace/return boundary remains rollback-visible.
+            journal = {"created_files": [], "created_dirs": []}
+            asset_journals.append(journal)
+            _publish_asset_plan(plan, journal=journal)
+        for entry in entries:
+            path = entry["path"]
+            _revalidate_publication_target(path, states[path])
+            attempted.append(path)
+            _replace_publication_stage(entry["temporary"], path)
+            entry["temporary"] = None
+    except BaseException as exc:
+        rollback_failures = _cleanup_staged_json(entries)
+        for journal in reversed(asset_journals):
+            rollback_failures.extend(_rollback_asset_journal(journal))
+        rollback_failures.extend(_restore_publication_targets(states, attempted))
+        rollback_failures.extend(_remove_created_directories(json_created_dirs))
+        if rollback_failures:
+            raise OSError(
+                "builder publication rollback failed: %s"
+                % "; ".join(rollback_failures)
+            ) from exc
+        raise
+    finally:
+        _cleanup_staged_json(entries)
+
+
+def _run_unlocked(
+        args, backend=None, adapter_runner=None, deferred_asset_plans=None):
+    """Build every asset in an isolated staging area before workspace publication."""
+
+    original_root = getattr(args, "asset_root", None)
+    if not original_root:
+        return _run_unlocked_core(
+            args, backend=backend, adapter_runner=adapter_runner
+        )
+    workspace = _publication_workspace(args)
+    stage_base = tempfile.mkdtemp(prefix="exam-cram-asset-stage-")
+    stage_root = os.path.join(stage_base, "references", "assets")
+    try:
+        # Enter the cleanup boundary immediately after mkdtemp.  A partially
+        # successful recursive mkdir must not strand the staging root.
+        os.makedirs(stage_root)
+        args.asset_root = stage_root
+        code, raw_input, report = _run_unlocked_core(
+            args, backend=backend, adapter_runner=adapter_runner
+        )
+        if code != 0:
+            return code, raw_input, report
+        try:
+            plan = _plan_staged_assets(
+                stage_root, original_root, raw_input, workspace
+            )
+            if deferred_asset_plans is None:
+                _publish_asset_plan(plan)
+            else:
+                deferred_asset_plans.append(plan)
+        except (OSError, ValueError) as exc:
+            if report is None:
+                report = {"warnings": []}
+            report.setdefault("warnings", []).append(
+                "asset_publication_rejected: %s" % exc
+            )
+            report["_no_publish_on_failure"] = True
+            return 5, {
+                "error": "asset publication rejected before workspace mutation: %s" % exc
+            }, report
+        return code, raw_input, report
+    finally:
+        args.asset_root = original_root
+        try:
+            shutil.rmtree(stage_base)
+        except OSError as exc:
+            raise OSError(
+                "cannot securely remove staged course assets at %s: %s"
+                % (stage_base, exc)
+            ) from exc
+
+
 def run(args, backend=None, adapter_runner=None, *, _publication_locked=False,
-        publication_workspace=None):
+        publication_workspace=None, _deferred_asset_plans=None):
     """Build in memory while serializing every validator-visible asset write."""
 
     workspace = _publication_workspace(args, explicit=publication_workspace)
+    if _deferred_asset_plans is not None and not _publication_locked:
+        raise ValueError(
+            "deferred asset publication requires the caller-held workspace lock"
+        )
     if workspace is not None and not _publication_locked:
         with workspace_publication_lock(workspace):
             return _run_unlocked(
                 args, backend=backend, adapter_runner=adapter_runner
             )
-    return _run_unlocked(args, backend=backend, adapter_runner=adapter_runner)
+    return _run_unlocked(
+        args,
+        backend=backend,
+        adapter_runner=adapter_runner,
+        deferred_asset_plans=_deferred_asset_plans,
+    )
 
 
 def _main_locked(args, backend=None, publication_workspace=None):
     """Run and publish while the caller owns the workspace publication lock."""
 
+    asset_plans = []
     code, raw_input, report = run(
         args,
         backend=backend,
         _publication_locked=True,
         publication_workspace=publication_workspace,
+        _deferred_asset_plans=asset_plans,
     )
     if code != 0:
         sys.stderr.write((raw_input or {}).get("error", "失败") + "\n")
-        if report is not None:
-            atomic_write_json(args.report, report)
+        if report is not None and not report.get("_no_publish_on_failure"):
+            publications = [(args.report, report)]
             if report.get("ai_review"):
                 # 失败退出同样要留接管清单——exit 4（全是扫描件）正是最需要 AI 接管的场景
                 mp = os.path.join(os.path.dirname(os.path.abspath(args.report)), "ai_review_manifest.json")
-                atomic_write_json(
+                publications.append((
                     mp,
                     {"note": "程序无法处理/不确定的材料清单——AI 必须逐条处理，绝不静默略过",
                      "entries": report["ai_review"]},
-                )
+                ))
+            _publish_builder_transaction(publications)
+            if report.get("ai_review"):
                 print("[!] AI 接管清单：%d 条未能自动处理的材料 → %s（请逐条处理）"
                       % (len(report["ai_review"]), mp))
         return code
-    atomic_write_json(args.out, raw_input)
-    atomic_write_json(args.report, report)
     manifest_path = os.path.join(os.path.dirname(os.path.abspath(args.report)), "ai_review_manifest.json")
-    atomic_write_json(
-        manifest_path,
-        {"note": "程序无法处理/不确定的材料清单——AI 必须逐条处理，绝不静默略过",
-         "entries": report.get("ai_review", [])},
+    _publish_builder_transaction(
+        (
+            (args.out, raw_input),
+            (args.report, report),
+            (manifest_path, {
+                "note": "程序无法处理/不确定的材料清单——AI 必须逐条处理，绝不静默略过",
+                "entries": report.get("ai_review", []),
+            }),
+        ),
+        asset_plans=asset_plans,
     )
     if report.get("ai_review"):
         print("[!] AI 接管清单：%d 条未能自动处理的材料 → %s（请逐条处理）"

@@ -47,6 +47,10 @@ import i18n
 import notebook as _notebook
 from ingestion import workspace_publication_lock
 from ingestion.storage import _exclusive_file_lock
+try:
+    from asset_policy import physical_asset_key
+except ImportError:  # package import from repository root
+    from scripts.asset_policy import physical_asset_key
 
 STATE_NAME = "study_state.json"
 MD_NAME = "study_progress.md"
@@ -580,6 +584,8 @@ def _visual_integrity_problems(ws, figure, image, wiki_names):
         problems.append("视觉索引 integrity.inputs 不是对象")
         return problems
     required = {"references/quiz_bank.json", "references/teaching_examples.json"}
+    if os.path.lexists(os.path.join(ws, ".ingest")):
+        required.add(".ingest/content_units.jsonl")
     required.update("references/wiki/" + name for name in wiki_names)
     for optional_rel in ("references/teaching_baseline.json", "ingest_report.json"):
         if os.path.lexists(os.path.join(ws, *optional_rel.split("/"))):
@@ -1062,8 +1068,56 @@ def _structured_study_guide_problems(ws, state, chapter_keys):
     return problems
 
 
-def phase_evidence_ref_error(ws, field, ref):
+_COMPLETION_ASSET_POLICY_UNSET = object()
+
+
+def _completion_asset_policy(ws):
+    try:
+        # Lazy import avoids validate_workspace -> update_progress -> validate_workspace at module
+        # import time while keeping every runtime consumer on one three-layer policy snapshot.
+        try:
+            from . import validate_workspace as validator
+        except ImportError:  # standalone scripts directory import
+            import validate_workspace as validator
+        snapshot = validator.workspace_asset_policy_snapshot(ws)
+    except (OSError, UnicodeError, ValueError) as exc:
+        return None, "student-attempt 资产策略快照不完整：%s" % exc
+    if snapshot["unsafe_paths"]:
+        return snapshot, "student-attempt 资产策略含不安全路径：%s" % snapshot["unsafe_paths"][0]
+    if snapshot["conflicts"]:
+        return snapshot, "student-attempt 资产角色冲突：%s" % snapshot["conflicts"][0]
+    return snapshot, None
+
+
+def _item_completion_asset_error(item, tainted_keys):
+    if not isinstance(item, dict):
+        return None
+    visual = (
+        item.get("requires_assets") is True
+        or item.get("maybe_requires_assets") is True
+        or item.get("question_text_status") in ("stub", "page_reference")
+    )
+    if not visual:
+        return None
+    prompt_ok = any(
+        isinstance(asset, dict)
+        and asset.get("role") in ("question_context", "figure", "diagram", "table")
+        and physical_asset_key(asset.get("path")) not in tainted_keys
+        for asset in (item.get("assets") or [])
+    )
+    if not prompt_ok:
+        return "视觉依赖 item 只有 student_attempt/无可用题面资产，不能计入完成证据"
+    return None
+
+
+def phase_evidence_ref_error(ws, field, ref, asset_policy=_COMPLETION_ASSET_POLICY_UNSET,
+                             asset_policy_error=None):
     """Validate one evidence reference; return a human-readable error or None."""
+    if asset_policy is _COMPLETION_ASSET_POLICY_UNSET:
+        asset_policy, asset_policy_error = _completion_asset_policy(ws)
+    if asset_policy_error:
+        return asset_policy_error
+    tainted_keys = asset_policy["tainted_keys"]
     if field in ("wiki", "visual", "notebook"):
         rel, fragment, full, error = _local_evidence_ref(ws, ref)
         if error:
@@ -1075,6 +1129,8 @@ def phase_evidence_ref_error(ws, field, ref):
             visual_asset = rel.startswith("references/assets/")
             if not (visual_manifest or visual_asset):
                 return "visual 证据必须是视觉 manifest 或 references/assets/ 下的本地资产"
+            if visual_asset and physical_asset_key(rel) in tainted_keys:
+                return "visual 证据指向 student_attempt 污染资产，不能计入完成证据"
         if field == "notebook":
             if not (rel.startswith("notebook/") and rel.endswith(".md")):
                 return "notebook 证据必须位于 notebook/*.md"
@@ -1109,6 +1165,14 @@ def phase_evidence_ref_error(ws, field, ref):
             return error
         if ident not in ids:
             return "教学例题 ID 不在 teaching_examples/legacy example bank 中: %s" % ident
+        candidates = [
+            row for row in asset_policy["teaching_rows"] + asset_policy["quiz_rows"]
+            if isinstance(row, dict) and str(row.get("id")) == ident
+        ]
+        for item in candidates:
+            problem = _item_completion_asset_error(item, tainted_keys)
+            if problem:
+                return problem
         return None
     if field == "checkpoint":
         ids, error = _json_ids(os.path.join(ws, "references", "quiz_bank.json"))
@@ -1116,6 +1180,11 @@ def phase_evidence_ref_error(ws, field, ref):
             return error
         if ident not in ids:
             return "checkpoint ID 不在 references/quiz_bank.json 中: %s" % ident
+        for item in asset_policy["quiz_rows"]:
+            if isinstance(item, dict) and str(item.get("id")) == ident:
+                problem = _item_completion_asset_error(item, tainted_keys)
+                if problem:
+                    return problem
         return None
     return "未知 phase evidence 字段: %s" % field
 
@@ -1158,6 +1227,7 @@ def phase_evidence_errors(ws, state, enforce_manifest_gate=True):
     if manifest_state == "broken":
         errors.append("v4.1 manifest 处于 partial/broken 状态，阶段门禁拒绝 fail-open：" + manifest_reason)
     evidence = state.get("phase_evidence") or {}
+    asset_policy, asset_policy_error = _completion_asset_policy(ws)
     for phase, record in evidence.items():
         status = record.get("status")
         if status:
@@ -1166,7 +1236,8 @@ def phase_evidence_errors(ws, state, enforce_manifest_gate=True):
         else:
             for field in PHASE_EVIDENCE_FIELDS:
                 for ref in record.get(field) or []:
-                    problem = phase_evidence_ref_error(ws, field, ref)
+                    problem = phase_evidence_ref_error(
+                        ws, field, ref, asset_policy, asset_policy_error)
                     if problem:
                         errors.append("phase_evidence[%s].%s 引用无效：%s" % (phase, field, problem))
     if enforce_manifest_gate and manifest_state == "ready":
@@ -1790,12 +1861,14 @@ def _phase_record_problems(ws, state, phase, status):
     if not isinstance(record, dict):
         return ["缺 phase_evidence[%d]；先逐项运行 record-phase-evidence" % phase]
     problems = []
+    asset_policy, asset_policy_error = _completion_asset_policy(ws)
     manifest_state, manifest_reason = phase_manifest_status(ws)
     if manifest_state == "broken":
         problems.append("v4.1 manifest 处于 partial/broken 状态：%s" % manifest_reason)
     for field in PHASE_EVIDENCE_FIELDS:
         for ref in record.get(field) or []:
-            problem = phase_evidence_ref_error(ws, field, ref)
+            problem = phase_evidence_ref_error(
+                ws, field, ref, asset_policy, asset_policy_error)
             if problem:
                 problems.append("%s 引用无效：%s" % (field, problem))
     content_problems, teaching_required, chapter_keys = _phase_manifest_content(ws, record, phase)

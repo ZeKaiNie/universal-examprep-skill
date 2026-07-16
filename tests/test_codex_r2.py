@@ -16,6 +16,10 @@ import cheatsheet_render  # noqa: E402
 import gen                # noqa: E402
 import retrieve           # noqa: E402
 PY = sys.executable
+PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+    "0000000c49444154789c63f8ffff3f0005fe02fe0def46b80000000049454e44ae426082"
+)
 
 RAW_OK = {
     "course_name": "数据结构",
@@ -116,13 +120,22 @@ class GrepPatternNotAFile(unittest.TestCase):
 
 class ImageSurvivesRendering(unittest.TestCase):
     def test_image_md_becomes_img_tag(self):
-        body = cheatsheet_render.md_to_html_body(
-            "## 例题\n\n![题面图](references/assets/ch02_p3_fig.png)\n\n- 要点（[→](references/wiki/ch1.md)）\n")
-        self.assertIn('<img src="references/assets/ch02_p3_fig.png"', body,
-                      "打印页必须保留题面图，不得被链接压平规则吃掉")
-        self.assertIn('alt="题面图"', body)
-        self.assertIn('<span class="lnk">→</span>', body, "普通链接仍应压平为纯文本")
-        self.assertNotIn("<img src=\"references/wiki", body)
+        with tempfile.TemporaryDirectory() as ws:
+            assets = os.path.join(ws, "references", "assets")
+            os.makedirs(assets)
+            with open(os.path.join(assets, "ch02_p3_fig.png"), "wb") as stream:
+                stream.write(PNG)
+            with open(os.path.join(ws, "references", "quiz_bank.json"),
+                      "w", encoding="utf-8") as stream:
+                json.dump([], stream)
+            body = cheatsheet_render.md_to_html_body(
+                "## 例题\n\n![题面图](references/assets/ch02_p3_fig.png)\n\n"
+                "- 要点（[→](references/wiki/ch1.md)）\n", ws)
+            self.assertIn('<img src="data:image/png;base64,', body,
+                          "打印页必须自包含题面图，不得被链接压平规则吃掉")
+            self.assertIn('alt="题面图"', body)
+            self.assertIn('<span class="lnk">→</span>', body, "普通链接仍应压平为纯文本")
+            self.assertNotIn("<img src=\"references/wiki", body)
 
 
 if __name__ == "__main__":

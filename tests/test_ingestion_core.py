@@ -235,6 +235,14 @@ class IngestionCoreTest(unittest.TestCase):
             "materials//notes.pdf",
             "materials/./notes.pdf",
             " materials/notes.pdf",
+            "materials./notes.pdf",
+            "materials/notes.pdf.",
+            "materials/dir /notes.pdf",
+            "materials/NUL.txt",
+            "materials/com1",
+            "materials/LPT\u00b9.log",
+            "materials/bad?.pdf",
+            "materials/line\nbreak.pdf",
         )
         for value in invalid:
             with self.subTest(value=value):

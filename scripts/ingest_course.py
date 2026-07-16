@@ -7,6 +7,7 @@ completed but content readiness is blocked by explicit review/validation work.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -20,7 +21,6 @@ try:
         safe_workspace_entry,
         workspace_publication_lock,
     )
-    from ingestion.storage import atomic_write_json
 except ImportError:
     from scripts import exam_start
     from scripts.ingestion import (
@@ -29,7 +29,6 @@ except ImportError:
         safe_workspace_entry,
         workspace_publication_lock,
     )
-    from scripts.ingestion.storage import atomic_write_json
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -246,60 +245,70 @@ def run(argv=None, backend=None, adapter_runner=None):
         "--extract-homework", "auto",
         "--ingest-adapter", args.ingest_adapter,
     ] + (["--course-name", args.course_name] if args.course_name else []))
-    try:
-        code, raw_input, report = builder.run(
-            build_args,
-            backend=backend,
-            adapter_runner=adapter_runner,
-            publication_workspace=workspace,
-        )
-    except ConflictError as exc:
-        steps.append({
-            "name": "material_build",
-            "status": "failed",
-            "exit_code": 1,
-            "operation_error": "publication_conflict",
-        })
-        payload["error"] = "material build publication conflict: %s" % exc
-        _emit(payload, args.as_json)
-        return 1
-
-    def publish_builder_json():
-        os.makedirs(os.path.dirname(report_path), exist_ok=True)
-        if report is not None:
-            atomic_write_json(report_path, report)
-        if code == 0:
-            atomic_write_json(raw_path, raw_input)
-            atomic_write_json(
-                os.path.join(workspace, ".ingest", "ai_review_manifest.json"),
-                {
-                    "note": (
-                        "Legacy view only; canonical lifecycle is "
-                        ".ingest/review_queue.jsonl."
-                    ),
-                    "entries": (report or {}).get("ai_review", []),
-                },
-            )
-
     publish_ready = False
+    code = raw_input = report = None
+    raw_input_sha256 = None
+    asset_plans = []
     ingest_path = os.path.join(workspace, ".ingest")
     ingest_preexisting = os.path.lexists(ingest_path)
     try:
-        # The builder serialized asset publication.  Recheck the start/runtime
-        # gate while owning the same state->ingestion lock, then atomically
-        # publish its validator-visible JSON as one short critical section.
+        # Build immutable asset plans, recheck the runtime gate, then commit the
+        # exact JSON+asset set under one state->ingestion lock.  No asset becomes
+        # public before every JSON document has serialized and staged safely.
         with workspace_publication_lock(workspace):
             if ingest_preexisting and not os.path.lexists(ingest_path):
                 raise ConflictError(".ingest changed while acquiring the publication lock")
+            code, raw_input, report = builder.run(
+                build_args,
+                backend=backend,
+                adapter_runner=adapter_runner,
+                publication_workspace=workspace,
+                _publication_locked=True,
+                _deferred_asset_plans=asset_plans,
+            )
             publish_ready = runtime_ok("material_build_publish")
             if publish_ready:
+                publications = []
+                pending_raw_input_sha256 = None
+                if report is not None:
+                    publications.append((report_path, report))
+                if code == 0:
+                    # Pin the deterministic byte generation about to be published.
+                    # ingest.py verifies it after acquiring its own publication
+                    # lock, closing the parent/child inter-lock replacement gap.
+                    pending_raw_input_sha256 = hashlib.sha256(
+                        builder._publication_json_bytes(raw_input)
+                    ).hexdigest()
+                    publications.extend((
+                        (raw_path, raw_input),
+                        (
+                            os.path.join(
+                                workspace, ".ingest", "ai_review_manifest.json"
+                            ),
+                            {
+                                "note": (
+                                    "Legacy view only; canonical lifecycle is "
+                                    ".ingest/review_queue.jsonl."
+                                ),
+                                "entries": (report or {}).get("ai_review", []),
+                            },
+                        ),
+                    ))
+
+                def publish_builder_batch():
+                    builder._publish_builder_transaction(
+                        publications,
+                        asset_plans=asset_plans if code == 0 else (),
+                    )
+
                 if ingest_preexisting:
-                    publish_builder_json()
+                    publish_builder_batch()
                 else:
                     # publication_lock owns state, but a brand-new .ingest had
                     # no mutation lock yet.  Create and hold it before writing.
                     with IngestionStore(workspace).mutation_lock():
-                        publish_builder_json()
+                        publish_builder_batch()
+                raw_input_sha256 = pending_raw_input_sha256
     except ConflictError as exc:
         steps.append({
             "name": "material_build",
@@ -310,6 +319,16 @@ def run(argv=None, backend=None, adapter_runner=None):
         payload["error"] = "material build JSON publication conflict: %s" % exc
         _emit(payload, args.as_json)
         return 1
+    except (OSError, ValueError) as exc:
+        steps.append({
+            "name": "material_build",
+            "status": "failed",
+            "exit_code": 2,
+            "operation_error": "publication_failed",
+        })
+        payload["error"] = "material build publication failed: %s" % exc
+        _emit(payload, args.as_json)
+        return 2
     if not publish_ready:
         _emit(payload, args.as_json)
         return 2
@@ -330,6 +349,7 @@ def run(argv=None, backend=None, adapter_runner=None):
         os.path.join(SCRIPT_DIR, "ingest.py"),
         "--input", raw_path,
         "--output-dir", workspace,
+        "--expected-input-sha256", raw_input_sha256,
     ]
     if args.lang:
         ingest_command.extend(("--lang", args.lang))

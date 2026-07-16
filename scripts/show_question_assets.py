@@ -14,7 +14,6 @@ Answer-side assets are only printed with --with-answer, AFTER a separator — ne
 Exit codes: 0 printed · 1 fail-closed (visual item without a displayable prompt asset) · 2 bad input.
 """
 import argparse
-import json
 import os
 import sys
 
@@ -28,6 +27,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import validate_workspace as V   # noqa: E402 — reuse the validator's safety rules verbatim
+from asset_policy import is_student_attempt_tainted  # noqa: E402
 
 QUESTION_SIDE = V.QUESTION_SIDE_ROLES
 ANSWER_SIDE = {"answer_context", "worked_solution"}
@@ -40,7 +40,13 @@ def _die(msg, code=2):
 
 def _usable(ws, a):
     full, unsafe = V._asset_safety(ws, a.get("path"))
-    return (not unsafe) and full and os.path.isfile(full) and os.access(full, os.R_OK)
+    if unsafe or not full or not os.path.isfile(full) or not os.access(full, os.R_OK):
+        return False
+    return V._raster_file_validation_error(
+        full,
+        a.get("path"),
+        a.get("media_type") or a.get("mime_type"),
+    ) is None
 
 
 def run(argv=None):
@@ -64,13 +70,16 @@ def run(argv=None):
     q_label = "题面图" if lang == "zh" else "Question-side asset"
     a_label = "答案图" if lang == "zh" else "Answer-side asset"
 
-    bank_path = os.path.join(args.workspace, "references", "quiz_bank.json")
-    if not os.path.isfile(bank_path):
-        _die("找不到 quiz_bank.json: %s" % bank_path)
     try:
-        bank = json.load(open(bank_path, encoding="utf-8"))
-    except ValueError as e:
-        _die("quiz_bank.json 不是合法 JSON: %s" % e)
+        policy = V.workspace_asset_policy_snapshot(args.workspace)
+    except ValueError as exc:
+        _die("无法建立完整 student-attempt 资产策略快照: %s" % exc, 1)
+    if policy["unsafe_paths"]:
+        _die("工作区含不安全资产声明，拒绝显示: %s" % policy["unsafe_paths"][0], 1)
+    if policy["conflicts"]:
+        _die("工作区含 student-attempt/题面/答案资产角色冲突，拒绝显示: %s"
+             % policy["conflicts"][0], 1)
+    bank = policy["quiz_rows"]
     q = next((x for x in bank if isinstance(x, dict) and str(x.get("id")) == args.id), None)
     if q is None:
         _die("题库里没有 id=%s 的题" % args.id)
@@ -82,7 +91,11 @@ def run(argv=None):
            else "maybe" if q.get("maybe_requires_assets") is True
            else qts if qts in ("stub", "page_reference") else None)
     visual = why is not None
-    assets = [a for a in (q.get("assets") or []) if isinstance(a, dict)]
+    assets = [
+        a for a in (q.get("assets") or [])
+        if (isinstance(a, dict) and a.get("role") != "student_attempt"
+            and not is_student_attempt_tainted(a.get("path"), policy["tainted_keys"]))
+    ]
     prompt_all = [a for a in assets if a.get("role") in QUESTION_SIDE]
     prompt = [a for a in prompt_all if _usable(args.workspace, a)]
     broken = [a for a in prompt_all if not _usable(args.workspace, a)]

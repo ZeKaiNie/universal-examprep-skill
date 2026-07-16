@@ -97,6 +97,23 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as stream:
             json.dump(value, stream, ensure_ascii=False)
 
+    def _declare_foreign_student_attempt(self):
+        relative = "references/assets/foreign-attempt.png"
+        shutil.copyfile(
+            os.path.join(self.ws, "references", "assets", "prompt.png"),
+            os.path.join(self.ws, *relative.split("/")),
+        )
+        self._json("references/quiz_bank.json", [{
+            "id": "foreign-attempt", "chapter": 2, "type": "subjective",
+            "question": "A student's unrelated submission.",
+            "answer": "Not course evidence.", "source": "material",
+            "source_type": "other",
+            "assets": [{
+                "path": relative, "role": "student_attempt", "type": "page_image",
+            }],
+        }])
+        return relative
+
     def _source(self, role):
         return {"source_file": "lecture/ch01.pdf", "pages": [4],
                 "source_unit_id": "unit-p4", "role": role}
@@ -332,6 +349,35 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertEqual(1, match.group(1).count("<img "))
         self.assertIn("Knowledge-point source asset", match.group(1))
+
+    def test_markdown_body_rejects_foreign_chapter_student_attempt_asset(self):
+        attempt = self._declare_foreign_student_attempt()
+        manifest = self.manifest()
+        manifest["knowledge_points"][0]["explanation"]["en"] += (
+            "\n\n![student submission](%s)" % attempt
+        )
+
+        with self.assertRaisesRegex(GuideError, "student_attempt"):
+            self._render(manifest)
+
+    def test_direct_concept_asset_rejects_foreign_chapter_student_attempt(self):
+        attempt = self._declare_foreign_student_attempt()
+        manifest = self.manifest()
+        manifest["knowledge_points"][0]["source_refs"][0]["asset_path"] = attempt
+
+        with self.assertRaisesRegex(GuideError, "student_attempt"):
+            self._render(manifest)
+
+    def test_asset_policy_drift_during_typed_render_fails_closed(self):
+        initial = sgd.workspace_asset_policy_snapshot(self.ws)
+        changed = dict(initial)
+        changed["tainted_keys"] = set(initial["tainted_keys"]) | {"late-taint"}
+
+        with mock.patch.object(
+                sgd, "workspace_asset_policy_snapshot",
+                side_effect=[initial, changed]):
+            with self.assertRaisesRegex(sgd.ArtifactDriftError, "asset policy changed"):
+                self._render()
 
     def test_typed_source_pages_fail_if_material_file_is_missing_or_misbound(self):
         source = os.path.join(self.materials, "lecture", "ch01.pdf")

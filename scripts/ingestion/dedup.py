@@ -76,6 +76,7 @@ _KIND_FAMILY = {
 }
 _ANSWER_ASSET_ROLES = frozenset(("answer_context", "worked_solution"))
 _PROMPT_ASSET_ROLES = frozenset(("question_context",))
+_ATTEMPT_ASSET_ROLES = frozenset(("student_attempt",))
 _NUMBER_RE = re.compile(r"(?<![\w.])[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?(?![\w.])")
 _BOOL_RE = re.compile(
     r"(?:\btrue\b|\bfalse\b|\byes\b|\bno\b|\bnot\b|\bnever\b|\balways\b|"
@@ -207,7 +208,9 @@ def compatibility_key(unit):
     if family is None:
         raise FactValidationError("unsupported unit kind for dedup: %r" % row["kind"])
     role = row.get("asset_role")
-    if row["kind"] == "question" or role in _PROMPT_ASSET_ROLES:
+    if role in _ATTEMPT_ASSET_ROLES:
+        source_side = "attempt"
+    elif row["kind"] == "question" or role in _PROMPT_ASSET_ROLES:
         source_side = "prompt"
     elif row["kind"] == "answer" or role in _ANSWER_ASSET_ROLES:
         source_side = "answer"

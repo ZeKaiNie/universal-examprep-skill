@@ -16,7 +16,9 @@ Exit codes: 0 valid/imported; 1 unsafe IO or invalid content; 2 argparse usage e
 
 import argparse
 import copy
+import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -24,7 +26,6 @@ import sys
 import tempfile
 import unicodedata
 from contextlib import contextmanager
-from pathlib import PurePosixPath
 
 try:
     from ingestion.claims import (
@@ -38,8 +39,20 @@ try:
         verify_claim_records,
     )
     from ingestion.dedup import validate_workspace_fact_integrity
-    from ingestion.identifiers import file_sha256
-    from ingestion.models import ContentUnit, SchemaValidationError, SourceRecord
+    from ingestion.identifiers import file_sha256, normalize_workspace_path
+    from ingestion.language import SOURCE_UNIT_LANGUAGE_CODES
+    from ingestion.models import (
+        ContentUnit,
+        EXTRACTION_METHODS,
+        PROVENANCE_VALUES,
+        QUESTION_TEXT_STATUSES,
+        QUIZ_SOURCES,
+        QUIZ_SOURCE_TYPES,
+        QUIZ_TYPES,
+        SchemaValidationError,
+        SourceRecord,
+        UNIT_KINDS,
+    )
     from ingestion.storage import ConflictError, workspace_publication_lock
 except ImportError:  # imported as ``scripts.study_guide_content`` from the repo root
     from scripts.ingestion.claims import (
@@ -53,9 +66,32 @@ except ImportError:  # imported as ``scripts.study_guide_content`` from the repo
         verify_claim_records,
     )
     from scripts.ingestion.dedup import validate_workspace_fact_integrity
-    from scripts.ingestion.identifiers import file_sha256
-    from scripts.ingestion.models import ContentUnit, SchemaValidationError, SourceRecord
+    from scripts.ingestion.identifiers import file_sha256, normalize_workspace_path
+    from scripts.ingestion.language import SOURCE_UNIT_LANGUAGE_CODES
+    from scripts.ingestion.models import (
+        ContentUnit,
+        EXTRACTION_METHODS,
+        PROVENANCE_VALUES,
+        QUESTION_TEXT_STATUSES,
+        QUIZ_SOURCES,
+        QUIZ_SOURCE_TYPES,
+        QUIZ_TYPES,
+        SchemaValidationError,
+        SourceRecord,
+        UNIT_KINDS,
+    )
     from scripts.ingestion.storage import ConflictError, workspace_publication_lock
+
+try:
+    from asset_policy import (
+        audit_asset_policy,
+        physical_asset_key,
+    )
+except ImportError:  # package import from the repository root
+    from scripts.asset_policy import (
+        audit_asset_policy,
+        physical_asset_key,
+    )
 
 
 SCHEMA_VERSION = 1
@@ -87,6 +123,20 @@ SEMANTIC_EXCLUSION_REASON_CODES = {
 }
 PROMPT_ASSET_ROLES = {"question_context", "figure", "diagram", "table"}
 ANSWER_ASSET_ROLES = {"answer_context", "worked_solution"}
+# Concept/formula refs may point only at neutral course-material visuals.  Treating
+# question_context as concept evidence would blur a typed question into the semantic layer, while
+# answer-side roles would let an official solution masquerade as a concept or formula source.
+SEMANTIC_ASSET_ROLES = {"figure", "diagram", "table"}
+SOURCE_REF_ASSET_ROLE_POLICY = {
+    "concept": (SEMANTIC_ASSET_ROLES, "concept"),
+    "formula": (SEMANTIC_ASSET_ROLES, "formula"),
+    "question": (PROMPT_ASSET_ROLES, "prompt"),
+    "answer": (ANSWER_ASSET_ROLES, "answer"),
+    "solution": (ANSWER_ASSET_ROLES, "answer"),
+}
+SOURCE_ITEM_ASSET_ROLES = PROMPT_ASSET_ROLES | ANSWER_ASSET_ROLES | {"student_attempt"}
+CONTENT_UNIT_ASSET_ROLES = SOURCE_ITEM_ASSET_ROLES | {"source_page", "other"}
+ASSET_TYPES = {"page_image", "crop_image", "diagram", "table_image", "other_image"}
 CONCEPT_SOURCE_KINDS = {
     "title", "heading", "text", "list", "table", "figure", "diagram", "caption",
     "code", "speaker_notes", "other",
@@ -99,6 +149,15 @@ SOURCE_TYPE_ALIASES = {
     "practice_exam": "mock_exam",
     "exam": "past_exam",
 }
+# ``content_units.jsonl`` exists in both ingestion-v1 and ingestion-v2 workspaces.  v1 stored
+# the student-facing Study Guide vocabulary directly (for example ``lecture``/``quiz``), while
+# v2 writes the canonical ingestion vocabulary above and is additionally checked by the typed
+# fact-integrity gate.  Whole-file control validation must therefore accept both closed sets;
+# accepting the legacy aliases here does not weaken v2 because its ContentUnit validation still
+# rejects non-canonical v2 metadata.
+CONTENT_UNIT_SOURCE_TYPES = frozenset(QUIZ_SOURCE_TYPES) | frozenset(SOURCE_TYPES)
+TEACHING_ROLES = frozenset(("paired_problem", "worked_example"))
+ANSWER_STATUSES = frozenset(("unknown",))
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_JSONL_BYTES = 128 * 1024 * 1024
 MAX_NOTEBOOK_BLOCK_CHARS = 8 * 1024 * 1024
@@ -217,7 +276,7 @@ def _check_controls(value, path="$", seen=None, allow_reserved_marker=False):
         seen.remove(ident)
 
 
-def _read_json(path, label):
+def _read_json(path, label, check_controls=True):
     if _is_link_or_reparse(path):
         raise ContentError("%s is a symlink/reparse point: %s" % (label, path))
     if not os.path.isfile(path):
@@ -237,7 +296,8 @@ def _read_json(path, label):
             )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ContentError("%s is not strict UTF-8 JSON: %s" % (label, exc))
-    _check_controls(value, label)
+    if check_controls:
+        _check_controls(value, label)
     return value
 
 
@@ -248,10 +308,11 @@ def _safe_relative_path(value, path, asset=False):
         raise ContentError("%s must use canonical forward-slash path syntax" % path)
     if _DRIVE_RE.match(value) or _SCHEME_RE.match(value) or value.startswith(("/", "//")):
         raise ContentError("%s must not be absolute, a drive path, or a URL" % path)
-    pure = PurePosixPath(value)
-    if any(part in ("", ".", "..") for part in pure.parts):
-        raise ContentError("%s contains an unsafe path component" % path)
-    normalized = "/".join(pure.parts)
+    try:
+        normalized = normalize_workspace_path(value)
+    except ValueError as exc:
+        raise ContentError("%s contains an unsafe path component or non-portable alias: %s"
+                           % (path, exc))
     if normalized != value:
         raise ContentError("%s is not a canonical relative POSIX path" % path)
     if asset and not normalized.startswith("references/assets/"):
@@ -331,7 +392,240 @@ def _content_unit_chapter(value):
     return int(match.group(1)) if match else None
 
 
-def _read_content_units(ws):
+def _check_container_keys(value, path):
+    """Reject control data in JSON object keys without inspecting authored values."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            _check_controls(key, "%s.<key>" % path)
+            _check_container_keys(child, "%s.%s" % (path, key))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _check_container_keys(child, "%s[%d]" % (path, index))
+
+
+def _check_content_unit_controls(row, label, chapter):
+    """Apply whole-file structural controls and target-chapter authored controls.
+
+    A Study Guide is chapter-scoped.  Foreign-chapter prose must not make the requested
+    chapter unauthorable, but the JSONL remains one trust boundary: identifiers, source/path
+    anchors, lifecycle fields, and every object key are still checked for every row.  Only the
+    authored payload (``text``/``html``/``latex`` and semantic metadata values) is deferred for
+    rows outside the requested chapter.
+    """
+    _check_content_unit_asset_structure(row, label)
+    _validate_content_unit_routing_controls(row, label)
+    metadata = row.get("metadata")
+    _validate_content_unit_metadata_controls(metadata, label + ".metadata")
+    if _content_unit_chapter(row.get("chapter_id")) == chapter:
+        _check_controls(row, label)
+        return
+    authored_fields = {"text", "html", "latex", "metadata"}
+    structural = {key: value for key, value in row.items() if key not in authored_fields}
+    _check_controls(structural, label)
+    _check_container_keys(metadata, label + ".metadata")
+
+
+def _sha256(value, path):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ContentError("%s must be a lowercase SHA-256 digest" % path)
+    return value
+
+
+def _positive_integer(value, path):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ContentError("%s must be a positive integer" % path)
+    return value
+
+
+def _nonnegative_integer(value, path):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ContentError("%s must be a non-negative integer" % path)
+    return value
+
+
+def _finite_number(value, path, *, minimum=None, positive=False):
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))):
+        raise ContentError("%s must be a finite number" % path)
+    number = float(value)
+    if positive and number <= 0:
+        raise ContentError("%s must be positive" % path)
+    if minimum is not None and number < minimum:
+        raise ContentError("%s must be at least %s" % (path, minimum))
+    return number
+
+
+def _bbox(value, path):
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise ContentError("%s must contain four finite numbers" % path)
+    x0, y0, x1, y1 = [
+        _finite_number(number, "%s[%d]" % (path, index), minimum=0)
+        for index, number in enumerate(value)
+    ]
+    if x1 < x0 or y1 < y0:
+        raise ContentError("%s must be ordered [x0,y0,x1,y1]" % path)
+    return value
+
+
+def _validate_content_unit_routing_controls(row, path):
+    """Validate non-authored ContentUnit controls for every chapter.
+
+    Legacy ingestion-v1 rows may omit the newer typed fields, but any field they do carry is
+    still routing/revision data.  Foreign-chapter prose is intentionally not interpreted here;
+    accepting a foreign body must never make its source identity, location, pairing, or lifecycle
+    controls untyped.
+    """
+    kind = row.get("kind")
+    if not isinstance(kind, str) or kind not in UNIT_KINDS:
+        raise ContentError("%s.kind must be one of %s" % (path, sorted(UNIT_KINDS)))
+    provenance = row.get("provenance")
+    if not isinstance(provenance, str) or provenance not in PROVENANCE_VALUES:
+        raise ContentError(
+            "%s.provenance must be one of %s" % (path, sorted(PROVENANCE_VALUES))
+        )
+    if "schema_version" in row and row["schema_version"] != SCHEMA_VERSION:
+        raise ContentError("%s.schema_version must be %d" % (path, SCHEMA_VERSION))
+    source_id = row.get("source_id")
+    if source_id is not None and (
+            not isinstance(source_id, str)
+            or not re.fullmatch(r"src_[0-9a-f]{64}", source_id)):
+        raise ContentError("%s.source_id must be a canonical src_ SHA-256 identifier" % path)
+    if row.get("source_sha256") is not None:
+        _sha256(row["source_sha256"], path + ".source_sha256")
+    if row.get("ordinal") is not None:
+        _nonnegative_integer(row["ordinal"], path + ".ordinal")
+    if row.get("bbox") is not None:
+        _bbox(row["bbox"], path + ".bbox")
+    unit_id = row.get("unit_id")
+    for field in ("parent_unit_id", "paired_unit_id"):
+        value = row.get(field)
+        if value is None:
+            continue
+        _identifier(value, "%s.%s" % (path, field))
+        if value == unit_id:
+            raise ContentError("%s.%s cannot reference the unit itself" % (path, field))
+    section_path = row.get("section_path")
+    if section_path is not None:
+        if not isinstance(section_path, list):
+            raise ContentError("%s.section_path must be an array" % path)
+        for index, value in enumerate(section_path):
+            _text(value, "%s.section_path[%d]" % (path, index))
+            _check_controls(value, "%s.section_path[%d]" % (path, index))
+    if row.get("phase_id") is not None:
+        _identifier(row["phase_id"], path + ".phase_id")
+    method = row.get("method")
+    if method is not None and (
+            not isinstance(method, str) or method not in EXTRACTION_METHODS):
+        raise ContentError("%s.method must be one of %s" % (path, sorted(EXTRACTION_METHODS)))
+    confidence = row.get("confidence")
+    if confidence is not None:
+        confidence = _finite_number(confidence, path + ".confidence", minimum=0)
+        if confidence > 1:
+            raise ContentError("%s.confidence must be at most 1" % path)
+
+
+def _validate_content_unit_metadata_controls(metadata, path):
+    """Validate known control-plane metadata for every chapter, not authored prose."""
+    if metadata is None:
+        return
+    if not isinstance(metadata, dict):
+        raise ContentError("%s must be an object" % path)
+    if metadata.get("answer_source_file") is not None:
+        _safe_relative_path(metadata["answer_source_file"], path + ".answer_source_file")
+    for field in ("source_pages", "answer_source_pages"):
+        if metadata.get(field) is not None:
+            _positive_pages(metadata[field], "%s.%s" % (path, field))
+    if metadata.get("asset_sha256") is not None:
+        _sha256(metadata["asset_sha256"], path + ".asset_sha256")
+    for field in ("requires_assets", "maybe_requires_assets", "gradable"):
+        if field in metadata and metadata[field] is not None and type(metadata[field]) is not bool:
+            raise ContentError("%s.%s must be true or false" % (path, field))
+    enum_fields = {
+        "quiz_type": QUIZ_TYPES,
+        "source_type": CONTENT_UNIT_SOURCE_TYPES,
+        "source": QUIZ_SOURCES,
+        "source_language": SOURCE_UNIT_LANGUAGE_CODES,
+        "question_text_status": QUESTION_TEXT_STATUSES,
+    }
+    for field, allowed in enum_fields.items():
+        value = metadata.get(field)
+        if value is not None and (not isinstance(value, str) or value not in allowed):
+            raise ContentError(
+                "%s.%s must be one of %s" % (path, field, sorted(allowed))
+            )
+    for field in ("language", "diagram_type", "expected_behavior"):
+        value = metadata.get(field)
+        if value is None:
+            continue
+        if (not isinstance(value, str) or not value or value != value.strip()):
+            raise ContentError("%s.%s must be a non-empty trimmed string" % (path, field))
+        _check_controls(value, "%s.%s" % (path, field))
+
+
+def _validate_asset_control_record(asset, path, allowed_roles, *, workspace_asset=True,
+                                   require_role=False):
+    """Validate only stable asset control fields; leave unknown authored fields untouched."""
+    if not isinstance(asset, dict):
+        raise ContentError("%s must be an object" % path)
+    if "path" not in asset:
+        raise ContentError("%s.path is required" % path)
+    _safe_relative_path(asset["path"], path + ".path", asset=workspace_asset)
+    if asset.get("source_file") is not None:
+        _safe_relative_path(asset["source_file"], path + ".source_file")
+    for field in ("sha256", "source_sha256"):
+        if asset.get(field) is not None:
+            _sha256(asset[field], "%s.%s" % (path, field))
+    if require_role and "role" not in asset:
+        raise ContentError("%s.role is required" % path)
+    if "role" in asset:
+        role = asset["role"]
+        if not isinstance(role, str) or role not in allowed_roles:
+            raise ContentError("%s.role must be one of %s" % (path, sorted(allowed_roles)))
+    if "type" in asset:
+        asset_type = asset["type"]
+        if not isinstance(asset_type, str) or asset_type not in ASSET_TYPES:
+            raise ContentError("%s.type must be one of %s" % (path, sorted(ASSET_TYPES)))
+    if "contains_full_prompt" in asset and type(asset["contains_full_prompt"]) is not bool:
+        raise ContentError("%s.contains_full_prompt must be true or false" % path)
+    for field in ("page", "source_page"):
+        if asset.get(field) is not None:
+            _positive_integer(asset[field], "%s.%s" % (path, field))
+    if asset.get("source_pages") is not None:
+        _positive_pages(asset["source_pages"], path + ".source_pages")
+    if asset.get("bbox") is not None:
+        _bbox(asset["bbox"], path + ".bbox")
+    for field in ("width", "height", "w", "h"):
+        if asset.get(field) is not None:
+            _finite_number(asset[field], "%s.%s" % (path, field), positive=True)
+    for field in ("x", "y"):
+        if asset.get(field) is not None:
+            _finite_number(asset[field], "%s.%s" % (path, field), minimum=0)
+
+
+def _check_content_unit_asset_structure(row, label):
+    if row.get("asset_path") is not None:
+        _safe_relative_path(row["asset_path"], label + ".asset_path")
+    if row.get("asset_role") is not None:
+        if row.get("asset_path") is None:
+            raise ContentError("%s.asset_role requires asset_path" % label)
+        role = row["asset_role"]
+        if not isinstance(role, str) or role not in CONTENT_UNIT_ASSET_ROLES:
+            raise ContentError("%s.asset_role must be one of %s"
+                               % (label, sorted(CONTENT_UNIT_ASSET_ROLES)))
+    metadata = row.get("metadata")
+    if not isinstance(metadata, dict) or "assets" not in metadata:
+        return
+    assets = metadata["assets"]
+    if not isinstance(assets, list):
+        raise ContentError("%s.metadata.assets must be an array" % label)
+    for index, asset in enumerate(assets):
+        _validate_asset_control_record(
+            asset, "%s.metadata.assets[%d]" % (label, index), CONTENT_UNIT_ASSET_ROLES,
+            workspace_asset=False, require_role=True,
+        )
+
+
+def _read_content_units(ws, chapter):
     """Return ``(structured, rows, by_id)`` for the immutable ingestion IR.
 
     The presence of ``.ingest`` selects the structured contract.  A partial or unsafe
@@ -366,7 +660,6 @@ def _read_content_units(ws):
             )
         except (json.JSONDecodeError, ContentError) as exc:
             raise ContentError("%s is not strict JSON: %s" % (label, exc))
-        _check_controls(row, label)
         if not isinstance(row, dict):
             raise ContentError("%s must be an object" % label)
         required = ("unit_id", "source_file", "page", "kind", "chapter_id", "provenance")
@@ -385,14 +678,26 @@ def _read_content_units(ws):
         if row.get("chapter_id") is not None and _content_unit_chapter(row["chapter_id"]) is None:
             raise ContentError("%s.chapter_id must be canonical chNN or null" % label)
         _text(row["provenance"], label + ".provenance")
+        metadata = row.get("metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ContentError("%s.metadata must be an object when present" % label)
         external_id = row.get("external_id")
         if external_id is not None:
             if not isinstance(external_id, str):
                 raise ContentError("%s.external_id must be a string when present" % label)
             row = dict(row)
             row["external_id"] = _identifier(external_id, label + ".external_id")
+        _check_content_unit_controls(row, label, chapter)
         by_id[unit_id] = row
         rows.append(row)
+    for index, row in enumerate(rows, 1):
+        label = ".ingest/content_units.jsonl:%d" % index
+        for field in ("parent_unit_id", "paired_unit_id"):
+            target = row.get(field)
+            if target is not None and target not in by_id:
+                raise ContentError(
+                    "%s.%s references unknown content unit %r" % (label, field, target)
+                )
     return True, rows, by_id
 
 
@@ -404,7 +709,8 @@ def _semantic_unit_ids(rows, chapter):
             continue
         kind = row.get("kind")
         if (kind not in SEMANTIC_UNIT_KINDS
-                or row.get("provenance") not in ("material", "ai_recovered")):
+                or row.get("provenance") not in ("material", "ai_recovered")
+                or row.get("asset_role") == "student_attempt"):
             continue
         output.append(row["unit_id"])
         by_kind[kind] = by_kind.get(kind, 0) + 1
@@ -491,6 +797,9 @@ def _unit_asset_records(unit):
         direct = {"path": unit["asset_path"]}
         if isinstance(unit.get("asset_role"), str):
             direct["role"] = unit["asset_role"]
+        if (isinstance(metadata, dict)
+                and isinstance(metadata.get("asset_sha256"), str)):
+            direct["sha256"] = metadata["asset_sha256"]
         records.append(direct)
     return records
 
@@ -505,7 +814,8 @@ def _unit_declared_sides(unit):
     roles = []
     if isinstance(unit.get("asset_role"), str):
         roles.append(unit["asset_role"])
-    roles.extend(record.get("role") for record in _unit_asset_records(unit))
+    roles.extend(record.get("role") for record in _unit_asset_records(unit)
+                 if isinstance(record.get("role"), str))
     for role in roles:
         if role == "question_context":
             sides.add("question")
@@ -514,7 +824,90 @@ def _unit_declared_sides(unit):
     return sides
 
 
-def _source_role_matches_unit(unit, role):
+def _bound_asset_records(unit, asset_path):
+    """Return every real asset record bound to one exact workspace-relative path."""
+    wanted = physical_asset_key(asset_path)
+    if wanted is None:
+        return []
+    return [record for record in _unit_asset_records(unit or {})
+            if physical_asset_key(record.get("path")) == wanted]
+
+
+def _validate_ref_asset_roles(records, ref_role, path, unit_id):
+    """Fail closed when an explicit source asset is not typed for the requested side."""
+    roles = [record.get("role") for record in records]
+    if any(role is not None and not isinstance(role, str) for role in roles):
+        raise ContentError(
+            "%s.asset_path has a non-string real asset role in source unit %s"
+            % (path, unit_id)
+        )
+    if "student_attempt" in roles:
+        raise ContentError(
+            "%s.asset_path is bound to student_attempt evidence in source unit %s; "
+            "student work cannot support a Guide source ref" % (path, unit_id)
+        )
+    # Legacy refs may omit role; the structured-workspace gate below emits the canonical
+    # "role is required" error.  Once a role is present, every supported role has an explicit
+    # asset policy and none may fall through permissively.
+    if ref_role is None:
+        return
+    policy = SOURCE_REF_ASSET_ROLE_POLICY.get(ref_role)
+    if policy is None:
+        raise ContentError("%s has no explicit asset-role policy for ref role %r"
+                           % (path, ref_role))
+    expected, side = policy
+    if not any(role in expected for role in roles):
+        raise ContentError(
+            "%s.asset_path has no real %s-side asset role in source unit %s; roles=%s"
+            % (path, side, unit_id, roles)
+        )
+    conflicts = sorted({
+        "<missing>" if role is None else str(role)
+        for role in roles if role not in expected
+    })
+    if conflicts:
+        raise ContentError(
+            "%s.asset_path has conflicting real asset roles in source unit %s; "
+            "expected=%s conflicts=%s"
+            % (path, unit_id, sorted(expected), conflicts)
+        )
+
+
+def _require_revision_bound_asset(records, path):
+    """Require an exact current-byte digest for structured visual evidence."""
+
+    if not any(
+            isinstance(record.get("sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", record["sha256"])
+            for record in records):
+        raise ContentError(
+            "%s must be bound to an asset record with an exact sha256 revision "
+            "in a structured workspace" % path
+        )
+
+
+def _validate_asset_side_conflicts(records, path):
+    """Reject a shared path whose accumulated records disagree about evidence side."""
+    raw_roles = [record.get("role") for record in records]
+    if any(role is not None and not isinstance(role, str) for role in raw_roles):
+        raise ContentError("%s has a non-string asset role" % path)
+    roles = set(raw_roles)
+    display_roles = sorted("<missing>" if role is None else role for role in roles)
+    prompt = roles & PROMPT_ASSET_ROLES
+    answer = roles & ANSWER_ASSET_ROLES
+    if "student_attempt" in roles and (prompt or answer):
+        raise ContentError(
+            "%s has conflicting asset-side classification: student_attempt cannot share "
+            "a path with prompt/official-answer roles; roles=%s" % (path, display_roles)
+        )
+    if prompt and answer:
+        raise ContentError(
+            "%s has conflicting asset-side classification across prompt and official-answer "
+            "roles; roles=%s" % (path, display_roles)
+        )
+
+
+def _source_role_matches_unit(unit, role, asset_path_bound=False):
     """Bind a manifest source role to the ingestion unit's kind/typed side.
 
     ``page_anchor`` is the sole kind-neutral escape hatch.  It is accepted here only so the
@@ -522,7 +915,24 @@ def _source_role_matches_unit(unit, role):
     never sufficient evidence.  Typed visual units may stand in for an old prompt/solution page
     only when their ingestion asset side says so.
     """
+    # Student work is retained as audit evidence only.  A manifest must not launder a top-level
+    # attempt unit into concept/formula/question/answer evidence merely by omitting asset_path.
+    if unit.get("asset_role") == "student_attempt":
+        return False
     kind = unit.get("kind")
+    # Without an exact asset_path binding, a semantic ref would otherwise inherit every visual
+    # attached to the unit.  Fail closed when that aggregate includes prompt, answer, solution, or
+    # student-work evidence.  An explicit asset_path is checked record-by-record in _source_ref,
+    # so a neutral concept figure may still be selected from a unit that also carries an unrelated
+    # answer asset.
+    if not asset_path_bound and role in ("concept", "formula"):
+        aggregate_roles = {
+            record.get("role") for record in _unit_asset_records(unit)
+            if isinstance(record.get("role"), str)
+        }
+        disallowed = {"question_context", "student_attempt"} | ANSWER_ASSET_ROLES
+        if aggregate_roles & disallowed:
+            return False
     sides = _unit_declared_sides(unit)
     if role == "concept":
         return kind in CONCEPT_SOURCE_KINDS
@@ -530,13 +940,16 @@ def _source_role_matches_unit(unit, role):
         return kind == "formula"
     if role == "question":
         if kind == "question":
-            return "answer" not in sides
+            # Pipeline units intentionally retain every item asset in metadata.  The text kind,
+            # not unrelated nested assets, identifies the question.  Explicit ref assets are
+            # checked path-by-path above this role-only compatibility layer.
+            return True
         return kind == "page_anchor" or (
             kind in {"figure", "diagram", "table"} and "question" in sides
         )
     if role in ("answer", "solution"):
         if kind == "answer":
-            return "question" not in sides
+            return True
         return kind == "page_anchor" or (
             kind in {"figure", "diagram", "table"} and "answer" in sides
         )
@@ -580,20 +993,27 @@ def _source_ref(ws, value, path, unit_index=None, structured=False):
         claim_id = value["claim_id"]
         if not isinstance(claim_id, str) or not _CLAIM_ID_RE.fullmatch(claim_id):
             raise ContentError("%s.claim_id must be claim_<sha256>" % path)
+    if "role" in value:
+        role = value["role"]
+        if not isinstance(role, str) or role not in SOURCE_ROLES:
+            raise ContentError("%s.role must be one of %s" % (path, sorted(SOURCE_ROLES)))
     if "asset_path" in value:
         asset_path = _workspace_asset(ws, value["asset_path"], path + ".asset_path")
         if source_unit is not None:
-            bound = {record.get("path") for record in _unit_asset_records(source_unit)}
-            if asset_path not in bound:
+            bound = _bound_asset_records(source_unit, asset_path)
+            if not bound:
                 raise ContentError("%s.asset_path is not bound to source unit %s"
                                    % (path, unit))
-    if "role" in value and value["role"] not in SOURCE_ROLES:
-        raise ContentError("%s.role must be one of %s" % (path, sorted(SOURCE_ROLES)))
+            _validate_ref_asset_roles(bound, value.get("role"), path, unit)
+            if (structured
+                    and _ingestion_pipeline_version(ws) == "ingestion-v2"):
+                _require_revision_bound_asset(bound, path + ".asset_path")
     if structured:
         role = value.get("role")
         if role is None:
             raise ContentError("%s.role is required in a structured workspace" % path)
-        if not _source_role_matches_unit(source_unit, role):
+        if not _source_role_matches_unit(
+                source_unit, role, asset_path_bound="asset_path" in value):
             raise ContentError(
                 "%s.role=%s is incompatible with content unit %s kind=%s/metadata side"
                 % (path, role, unit, source_unit.get("kind"))
@@ -650,14 +1070,130 @@ def _source_item_id(item, path):
     return _identifier(str(value), path + ".id")
 
 
-def _workspace_array(ws, relative, optional=False):
+def _source_item_chapters(value, path):
+    chapters = []
+    for key in ("chapter", "phase"):
+        if value.get(key) is None:
+            continue
+        raw = value[key]
+        if isinstance(raw, bool):
+            raise ContentError("%s.%s must be a positive chapter integer" % (path, key))
+        if isinstance(raw, int):
+            number = raw
+        elif isinstance(raw, str) and re.fullmatch(r"[1-9]\d*", raw):
+            number = int(raw)
+        else:
+            raise ContentError("%s.%s must be a positive chapter integer" % (path, key))
+        if number < 1:
+            raise ContentError("%s.%s must be a positive chapter integer" % (path, key))
+        chapters.append(number)
+    if len(set(chapters)) > 1:
+        raise ContentError("%s chapter and phase locators disagree" % path)
+    return set(chapters)
+
+
+_SOURCE_ITEM_CONTROL_FIELDS = {
+    "id", "chapter", "phase", "type", "source_type", "source", "status",
+    "answer_status", "question_text_status", "teaching_role", "role", "language",
+    "source_language", "answer_source_language", "diagram_type", "difficulty", "gradable",
+    "ai_generated",
+    "requires_assets", "maybe_requires_assets", "source_file", "answer_source_file",
+    "source_pages", "answer_source_pages",
+}
+
+_SOURCE_ASSET_CONTROL_FIELDS = {
+    "path", "source_file", "sha256", "source_sha256", "role", "type", "bbox",
+    "contains_full_prompt", "page", "source_page", "source_pages", "width", "height",
+    "x", "y", "w", "h",
+}
+
+
+def _source_item_structure(value, path):
+    # Future producer versions may add authored prose, translations, OCR, or annotations under
+    # names unknown to this version.  Foreign-chapter rows are therefore checked through a
+    # control-plane allowlist, not an authored-field denylist.  Object keys remain part of the
+    # trust boundary everywhere; target-chapter rows receive a whole-row check in
+    # ``_workspace_array`` below.
+    _check_container_keys(value, path)
+    control_plane = {
+        key: value[key] for key in _SOURCE_ITEM_CONTROL_FIELDS if key in value
+    }
+    _check_controls(control_plane, path)
+    enum_fields = {
+        "type": QUIZ_TYPES,
+        "source": QUIZ_SOURCES,
+        "question_text_status": QUESTION_TEXT_STATUSES,
+        "teaching_role": TEACHING_ROLES,
+        "source_language": SOURCE_UNIT_LANGUAGE_CODES,
+        "answer_source_language": SOURCE_UNIT_LANGUAGE_CODES,
+        "answer_status": ANSWER_STATUSES,
+    }
+    for key, allowed in enum_fields.items():
+        current = value.get(key)
+        if current is not None and (
+                not isinstance(current, str) or current not in allowed):
+            raise ContentError(
+                "%s.%s must be one of %s" % (path, key, sorted(allowed))
+            )
+    if value.get("source_type") is not None:
+        _canonical_source_type(value["source_type"], path + ".source_type")
+    for key in ("status", "role", "language", "diagram_type"):
+        current = value.get(key)
+        if current is None:
+            continue
+        if not isinstance(current, str) or not current or current != current.strip():
+            raise ContentError("%s.%s must be a non-empty trimmed string" % (path, key))
+    difficulty = value.get("difficulty")
+    if difficulty is not None and (
+            isinstance(difficulty, bool) or not isinstance(difficulty, int)
+            or not 1 <= difficulty <= 5):
+        raise ContentError("%s.difficulty must be an integer from 1 to 5" % path)
+    for key in ("source_file", "answer_source_file"):
+        if value.get(key) is not None:
+            _safe_relative_path(value[key], "%s.%s" % (path, key))
+    for key in ("source_pages", "answer_source_pages"):
+        if value.get(key) is not None:
+            _positive_pages(value[key], "%s.%s" % (path, key))
+    for key in ("gradable", "ai_generated", "requires_assets", "maybe_requires_assets"):
+        if key in value and type(value[key]) is not bool:
+            raise ContentError("%s.%s must be true or false" % (path, key))
+    assets = value.get("assets")
+    if assets is None:
+        return
+    if not isinstance(assets, list):
+        raise ContentError("%s.assets must be an array" % path)
+    for index, asset in enumerate(assets):
+        asset_path = "%s.assets[%d]" % (path, index)
+        if not isinstance(asset, dict):
+            raise ContentError("%s must be an object" % asset_path)
+        asset_controls = {
+            key: asset[key] for key in _SOURCE_ASSET_CONTROL_FIELDS if key in asset
+        }
+        _check_controls(asset_controls, asset_path)
+        _validate_asset_control_record(asset, asset_path, SOURCE_ITEM_ASSET_ROLES)
+
+
+def _workspace_array(ws, relative, chapter, optional=False):
     full = os.path.join(ws, *relative.split("/"))
     if optional and not os.path.exists(full):
         return []
     _guard_workspace_child(ws, full, relative, require_file=True)
-    value = _read_json(full, relative)
+    value = _read_json(full, relative, check_controls=False)
     if not isinstance(value, list):
         raise ContentError("%s must contain a JSON array" % relative)
+    seen = set()
+    for index, row in enumerate(value):
+        row_path = "%s[%d]" % (relative, index)
+        if not isinstance(row, dict):
+            raise ContentError("%s must be an object" % row_path)
+        item_id = _source_item_id(row, row_path)
+        if item_id in seen:
+            raise ContentError("%s has duplicate id %r" % (relative, item_id))
+        seen.add(item_id)
+        chapters = _source_item_chapters(row, row_path)
+        _source_item_structure(row, row_path)
+        if chapter in chapters:
+            _check_controls(row, row_path)
     return value
 
 
@@ -682,6 +1218,8 @@ def _record_item_asset(item_assets, item_id, asset, path):
         "type": asset_type,
         "contains_full_prompt": contains,
     }
+    if asset.get("sha256") is not None:
+        record["sha256"] = asset["sha256"]
     item_assets.setdefault(item_id, {}).setdefault(relative, []).append(record)
 
 
@@ -722,15 +1260,52 @@ def _item_evidence_bucket(item_evidence, item_id):
     })
 
 
+def _asset_policy_snapshot_from_rows(teaching, quizzes, units, *, workspace=None):
+    """Validate and bind the complete, unfiltered workspace asset-policy inputs."""
+
+    audit = audit_asset_policy(
+        quiz_rows=quizzes,
+        teaching_rows=teaching,
+        content_units=units,
+        workspace=workspace,
+    )
+    problems = audit["invalid_declarations"] + audit["conflicts"]
+    if problems:
+        raise ContentError("global asset policy failed: %s" % "; ".join(problems))
+    canonical = json.dumps(
+        {
+            "quiz_rows": quizzes,
+            "teaching_rows": teaching,
+            "content_units": units,
+            "tainted_keys": sorted(audit["tainted_keys"]),
+            "tainted_identity_keys": sorted(audit["tainted_identity_keys"]),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return audit["tainted_keys"], hashlib.sha256(canonical).hexdigest()
+
+
+def _validate_global_asset_policy(teaching, quizzes, units):
+    """Apply attempt taint and same-item side rules before chapter filtering."""
+
+    return _asset_policy_snapshot_from_rows(teaching, quizzes, units)[0]
+
+
 def _source_inventory(workspace, chapter):
     """Build the exact item denominator plus typed source/asset evidence."""
     ws = _guard_workspace(workspace)
     if isinstance(chapter, bool) or not isinstance(chapter, int) or chapter < 1:
         raise ContentError("chapter must be an integer >= 1")
-    structured, units, unit_index = _read_content_units(ws)
+    structured, units, unit_index = _read_content_units(ws, chapter)
     teaching = _workspace_array(
-        ws, "references/teaching_examples.json", optional=not structured)
-    quizzes = _workspace_array(ws, "references/quiz_bank.json")
+        ws, "references/teaching_examples.json", chapter, optional=not structured)
+    quizzes = _workspace_array(ws, "references/quiz_bank.json", chapter)
+    tainted_asset_keys, asset_policy_sha256 = _asset_policy_snapshot_from_rows(
+        teaching, quizzes, units, workspace=ws
+    )
     output = []
     all_seen = set()
     source_types = {}
@@ -790,7 +1365,8 @@ def _source_inventory(workspace, chapter):
         unit_layer_seen = set()
         for index, unit in enumerate(units):
             if (_content_unit_chapter(unit.get("chapter_id")) != chapter
-                    or unit.get("kind") != "question"):
+                    or unit.get("kind") != "question"
+                    or unit.get("asset_role") == "student_attempt"):
                 continue
             if "external_id" not in unit or unit.get("external_id") is None:
                 raise ContentError(
@@ -822,12 +1398,15 @@ def _source_inventory(workspace, chapter):
                 )
         for unit in units:
             if (_content_unit_chapter(unit.get("chapter_id")) != chapter
-                    or unit.get("kind") != "answer" or not unit.get("external_id")):
+                    or unit.get("kind") != "answer" or not unit.get("external_id")
+                    or unit.get("asset_role") == "student_attempt"):
                 continue
             _item_evidence_bucket(item_evidence, unit["external_id"])[
                 "answer_unit_ids"].add(unit["unit_id"])
         # Bind assets from both question and answer units sharing the source external ID.
         for index, unit in enumerate(units):
+            if _content_unit_chapter(unit.get("chapter_id")) != chapter:
+                continue
             item_id = unit.get("external_id")
             if item_id not in all_seen:
                 continue
@@ -847,6 +1426,14 @@ def _source_inventory(workspace, chapter):
         normalized.setdefault(item_id, None)
         item_assets.setdefault(item_id, {})
         item_asset_requirements.setdefault(item_id, set())
+        physical_records = {}
+        for relative, records in item_assets[item_id].items():
+            key = physical_asset_key(relative)
+            if key is None:
+                raise ContentError("item %s has an unsafe asset path: %s" % (item_id, relative))
+            physical_records.setdefault(key, []).extend(records)
+        for records in physical_records.values():
+            _validate_asset_side_conflicts(records, "item %s physical asset" % item_id)
     counts["unique"] = len(output)
     return {
         "structured": structured,
@@ -857,6 +1444,8 @@ def _source_inventory(workspace, chapter):
         "item_assets": item_assets,
         "item_asset_requirements": item_asset_requirements,
         "item_evidence": item_evidence,
+        "tainted_asset_keys": tainted_asset_keys,
+        "asset_policy_sha256": asset_policy_sha256,
         "counts": counts,
     }
 
@@ -953,6 +1542,22 @@ def _knowledge_ref_unit_ids(refs, expected_role, chapter, unit_index, path):
         if unit.get("kind") in SEMANTIC_UNIT_KINDS:
             semantic_ids.add(unit["unit_id"])
     return semantic_ids
+
+
+def _require_current_chapter_refs(refs, chapter, unit_index, path):
+    """Apply the chapter/provenance gate to any structured Guide evidence layer."""
+    for index, ref in enumerate(refs):
+        ref_path = "%s[%d]" % (path, index)
+        unit = (unit_index or {}).get(ref.get("source_unit_id")) or {}
+        if _content_unit_chapter(unit.get("chapter_id")) != chapter:
+            raise ContentError(
+                "%s must reference a current-chapter content unit (chapter %d)"
+                % (ref_path, chapter)
+            )
+        if unit.get("provenance") not in ("material", "ai_recovered"):
+            raise ContentError(
+                "%s must reference material or ai_recovered evidence" % ref_path
+            )
 
 
 def _validate_knowledge_point(ws, value, language, path, formula_ids, formula_symbols,
@@ -1075,21 +1680,12 @@ def _trace_asset_records(source_trace, unit_index):
         asset_path = ref.get("asset_path")
         if not asset_path:
             continue
-        side_role = (
-            "question_context" if ref.get("role") == "question"
-            else "answer_context" if ref.get("role") in ("answer", "solution")
-            else None
-        )
-        if side_role is None:
+        if ref.get("role") not in ("question", "answer", "solution"):
             continue
         source_unit = (unit_index or {}).get(ref.get("source_unit_id"))
-        bound = [record for record in _unit_asset_records(source_unit or {})
-                 if record.get("path") == asset_path]
-        if not bound:
-            bound = [{"path": asset_path}]
+        bound = _bound_asset_records(source_unit, asset_path)
         for record in bound:
             merged = dict(record)
-            merged["role"] = side_role
             merged["contains_full_prompt"] = bool(
                 merged.get("contains_full_prompt") or ref.get("contains_full_prompt"))
             output.setdefault(asset_path, []).append(merged)
@@ -1288,7 +1884,7 @@ def _validate_walkthrough_source_evidence(source_trace, item_id, answer_provenan
 
 def _validate_walkthrough(ws, value, language, path, item_assets=None,
                           unit_index=None, structured=False, item_evidence=None,
-                          profile=None, item_asset_requirements=None):
+                          profile=None, item_asset_requirements=None, chapter=None):
     required = [
         "item_id", "source_type", "answer_provenance", "knowledge_point_ids", "title",
         "original_language", "prompt_asset_mode", "prompt_asset_paths", "answer_asset_paths",
@@ -1336,17 +1932,42 @@ def _validate_walkthrough(ws, value, language, path, item_assets=None,
     source_trace = _source_refs(
         ws, value["source_trace"], path + ".source_trace",
         unit_index=unit_index, structured=structured)
+    if structured:
+        if chapter is None:
+            raise ContentError("%s requires the active chapter in a structured workspace" % path)
+        # Question/answer evidence receives stricter item binding below, but extra
+        # concept/formula/page refs are still authoritative Guide evidence.  Gate
+        # the entire trace so a foreign or AI-supplemented unit cannot ride along
+        # unexamined (or later acquire a current-chapter ClaimSubject).
+        _require_current_chapter_refs(
+            source_trace, chapter, unit_index, path + ".source_trace")
     trace_assets = _trace_asset_records(source_trace, unit_index)
     source_assets = item_assets or {}
     for index, asset in enumerate(prompt_assets):
         _workspace_asset(ws, asset, "%s.prompt_asset_paths[%d]" % (path, index))
         records = list(source_assets.get(asset) or []) + list(trace_assets.get(asset) or [])
+        _validate_asset_side_conflicts(
+            records, "%s.prompt_asset_paths[%d]" % (path, index)
+        )
+        if (structured
+                and _ingestion_pipeline_version(ws) == "ingestion-v2"):
+            _require_revision_bound_asset(
+                records, "%s.prompt_asset_paths[%d]" % (path, index)
+            )
         if not any(record.get("role") in PROMPT_ASSET_ROLES for record in records):
             raise ContentError("%s.prompt_asset_paths[%d] is not bound to a prompt-side source asset"
                                % (path, index))
     for index, asset in enumerate(answer_assets):
         _workspace_asset(ws, asset, "%s.answer_asset_paths[%d]" % (path, index))
         records = list(source_assets.get(asset) or []) + list(trace_assets.get(asset) or [])
+        _validate_asset_side_conflicts(
+            records, "%s.answer_asset_paths[%d]" % (path, index)
+        )
+        if (structured
+                and _ingestion_pipeline_version(ws) == "ingestion-v2"):
+            _require_revision_bound_asset(
+                records, "%s.answer_asset_paths[%d]" % (path, index)
+            )
         if not any(record.get("role") in ANSWER_ASSET_ROLES for record in records):
             raise ContentError("%s.answer_asset_paths[%d] is not bound to an answer-side source asset"
                                % (path, index))
@@ -1465,14 +2086,19 @@ def _validate_walkthrough(ws, value, language, path, item_assets=None,
     }
 
 
-def _validate_omission(ws, value, language, path, unit_index=None, structured=False):
+def _validate_omission(ws, value, language, path, chapter=None, unit_index=None,
+                       structured=False):
     _shape(value, path, ("item_id", "knowledge_point_ids", "reason", "source_refs"))
     item_id = _identifier(value["item_id"], path + ".item_id")
     kp_ids = _unique_strings(value["knowledge_point_ids"], path + ".knowledge_point_ids",
                              nonempty=True, identifiers=True)
     _localized(value["reason"], language, path + ".reason")
-    _source_refs(ws, value["source_refs"], path + ".source_refs",
-                 unit_index=unit_index, structured=structured)
+    refs = _source_refs(ws, value["source_refs"], path + ".source_refs",
+                        unit_index=unit_index, structured=structured)
+    if structured:
+        _require_current_chapter_refs(
+            refs, chapter, unit_index, path + ".source_refs"
+        )
     return item_id, kp_ids
 
 
@@ -1523,9 +2149,14 @@ def _validate_semantic_exclusions(ws, value, language, path, profile, unit_index
             raise ContentError("%s.reason_code must be one of %s"
                                % (row_path, sorted(SEMANTIC_EXCLUSION_REASON_CODES)))
         if profile != "full" and "source_refs" in row:
-            _source_refs(
+            refs = _source_refs(
                 ws, row["source_refs"], row_path + ".source_refs", nonempty=True,
-                unit_index=unit_index, structured=structured)
+                unit_index=unit_index, structured=structured,
+                expected_role="concept" if structured else None)
+            if structured:
+                _knowledge_ref_unit_ids(
+                    refs, "concept", chapter, unit_index, row_path + ".source_refs"
+                )
         output.append(unit_id)
     return output
 
@@ -1663,6 +2294,7 @@ def _validate_v2_claim_gate(ws, chapter, manifest, inventory):
             fact_snapshot_sha256=canonical_fact_snapshot_sha256(
                 fact_integrity["snapshot"]
             ),
+            workspace=ws,
         )
         if receipt.to_dict() != expected.to_dict():
             raise ContentError(
@@ -1771,7 +2403,8 @@ def validate_manifest(workspace, chapter, manifest, _enforce_v2_claims=True):
             ws, row, language, "$.walkthroughs[%d]" % index,
             inventory["item_assets"].get(row.get("item_id"), {}),
             inventory["unit_index"], structured, inventory["item_evidence"], profile,
-            inventory["item_asset_requirements"].get(row.get("item_id"), set()))
+            inventory["item_asset_requirements"].get(row.get("item_id"), set()),
+            chapter=chapter)
         item_id = result["item_id"]
         source_type = result["source_type"]
         linked_kps = result["knowledge_point_ids"]
@@ -1825,7 +2458,7 @@ def validate_manifest(workspace, chapter, manifest, _enforce_v2_claims=True):
     for index, row in enumerate(omission_rows):
         item_id, linked_kps = _validate_omission(
             ws, row, language, "$.omissions[%d]" % index,
-            inventory["unit_index"], structured)
+            chapter, inventory["unit_index"], structured)
         if item_id in omission_ids:
             raise ContentError("omission item_id %r is not unique" % item_id)
         omission_ids.add(item_id)
@@ -1878,6 +2511,7 @@ def validate_manifest(workspace, chapter, manifest, _enforce_v2_claims=True):
             "by_kind": semantic_by_kind,
         },
         "notebook_anchor_count": notebook_anchor_count,
+        "asset_policy_sha256": inventory["asset_policy_sha256"],
     }
     if claim_verification is not None:
         report["claim_verification"] = claim_verification
@@ -2174,14 +2808,9 @@ def _merge_notebook(existing, chapter, rendered):
 
 def _guard_notebook_targets(ws, chapter):
     directory = os.path.join(ws, "notebook")
-    if os.path.lexists(directory):
-        if _is_link_or_reparse(directory) or not os.path.isdir(directory):
-            raise ContentError("notebook must be a real directory inside the workspace")
-    else:
-        try:
-            os.mkdir(directory)
-        except OSError as exc:
-            raise ContentError("cannot create notebook directory: %s" % exc)
+    if (not os.path.lexists(directory) or _is_link_or_reparse(directory)
+            or not os.path.isdir(directory)):
+        raise ContentError("notebook must be a real directory inside the workspace")
     md_path = os.path.join(directory, "ch%02d.md" % chapter)
     json_path = os.path.join(directory, "ch%02d.guide.json" % chapter)
     for path in (md_path, json_path):
@@ -2230,67 +2859,105 @@ def _atomic_write_text(path, text, before_publish=None):
             os.unlink(temporary)
 
 
-def _publish_manifest(ws, chapter, manifest, report):
-    md_path, json_path = _guard_notebook_targets(ws, chapter)
-    existing = _read_optional_text(md_path)
-    rendered = render_notebook_block(manifest)
-    updated_notebook = _merge_notebook(existing, chapter, rendered)
-    canonical_json = json.dumps(
-        manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
-    expected_facts = (
-        (report.get("claim_verification") or {}).get("fact_integrity")
-    )
+def _stage_bytes(path, data):
+    """Durably stage bytes next to their target without publishing them."""
 
-    def recheck_before_manifest_publish():
-        if expected_facts is None:
-            return
-        try:
-            current = validate_workspace_fact_integrity(ws)["snapshot"]
-        except (OSError, TypeError, ValueError) as exc:
-            raise ContentError(
-                "ingestion fact integrity changed before Study Guide import publication: %s"
-                % exc
-            ) from exc
-        if current != expected_facts:
-            raise ContentError(
-                "ingestion fact inputs changed before Study Guide import publication"
-            )
-    # Ordering is intentional: a failed notebook update must never publish a manifest that claims
-    # durable tutor evidence.  Both individual replacements are atomic and fail loud.
+    directory = os.path.dirname(path)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".%s." % os.path.basename(path), suffix=".tmp", dir=directory)
     try:
-        _atomic_write_text(md_path, updated_notebook)
-        _atomic_write_text(
-            json_path,
-            canonical_json,
-            before_publish=recheck_before_manifest_publish,
-        )
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+        raise
+    return temporary
+
+
+def _stage_text(path, text):
+    """Durably stage UTF-8 text next to its target without publishing it."""
+
+    return _stage_bytes(path, text.encode("utf-8"))
+
+
+def _snapshot_public_file(path, label):
+    """Capture byte/existence state after the target has passed path preflight."""
+
+    if not os.path.lexists(path):
+        return {"path": path, "exists": False, "bytes": None, "label": label}
+    if _is_link_or_reparse(path) or not os.path.isfile(path):
+        raise ContentError("%s is not a safe regular file: %s" % (label, path))
+    try:
+        with open(path, "rb") as stream:
+            data = stream.read()
     except OSError as exc:
-        raise ContentError("cannot atomically publish study-guide content: %s" % exc)
-    report.update({
-        "imported": True,
-        "notebook_path": md_path,
-        "manifest_path": json_path,
-    })
-    return report
+        raise ContentError("cannot snapshot %s: %s" % (label, exc))
+    return {"path": path, "exists": True, "bytes": data, "label": label}
 
 
-def import_manifest(workspace, chapter, input_path):
-    """Validate, update the notebook marker first, then atomically publish canonical JSON."""
-    ws = _guard_workspace(workspace)
-    with _study_guide_mutation_lock(ws):
-        manifest, report = load_and_validate_manifest(ws, chapter, input_path)
-        report["notebook_anchor_count"] = _validate_walkthrough_notebook_anchors(
-            ws, chapter, manifest["walkthroughs"], require_all=True)
-        report["invalidated_artifacts"] = _invalidate_chapter_artifacts(ws, chapter)
-        return _publish_manifest(ws, chapter, manifest, report)
+def _snapshot_is_current(snapshot):
+    path = snapshot["path"]
+    if not snapshot["exists"]:
+        return not os.path.lexists(path)
+    if (_is_link_or_reparse(path) or not os.path.isfile(path)):
+        return False
+    try:
+        with open(path, "rb") as stream:
+            return stream.read() == snapshot["bytes"]
+    except OSError:
+        return False
 
 
-def _invalidate_chapter_artifacts(ws, chapter):
+def _restore_snapshot(snapshot):
+    """Restore one public file to its captured bytes/existence using atomic replacement."""
+
+    path = snapshot["path"]
+    if not snapshot["exists"]:
+        if os.path.lexists(path):
+            if _is_link_or_reparse(path) or not os.path.isfile(path):
+                raise OSError("rollback target became unsafe: %s" % path)
+            os.remove(path)
+        return
+    temporary = _stage_bytes(path, snapshot["bytes"])
+    try:
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _restore_snapshots(snapshots):
+    failures = []
+    for snapshot in reversed(snapshots):
+        try:
+            _restore_snapshot(snapshot)
+        except BaseException as exc:
+            failures.append("%s: %s" % (snapshot["label"], exc))
+    if failures:
+        raise OSError("; ".join(failures))
+
+
+def _live_asset_policy_sha256(ws, chapter):
+    structured, units, _unit_index = _read_content_units(ws, chapter)
+    teaching = _workspace_array(
+        ws, "references/teaching_examples.json", chapter, optional=not structured)
+    quizzes = _workspace_array(ws, "references/quiz_bank.json", chapter)
+    return _asset_policy_snapshot_from_rows(
+        teaching, quizzes, units, workspace=ws
+    )[1]
+
+
+def _chapter_artifact_targets(ws, chapter):
+    """Preflight and return every derived file invalidated by a successful import."""
+
     guide_dir = os.path.join(ws, "study_guide")
     if not os.path.lexists(guide_dir):
         return []
     if _is_link_or_reparse(guide_dir) or not os.path.isdir(guide_dir):
-        raise ContentError("study_guide must be a real directory before relocalization")
+        raise ContentError("study_guide must be a real directory before guide import")
     names = [
         "ch%02d.receipt.json" % chapter,
         "ch%02d.pdf" % chapter,
@@ -2302,29 +2969,157 @@ def _invalidate_chapter_artifacts(ws, chapter):
         if not os.path.lexists(path):
             continue
         if _is_link_or_reparse(path) or not os.path.isfile(path):
-            raise ContentError("unsafe derived chapter artifact blocks relocalization: %s" % name)
+            raise ContentError("unsafe derived chapter artifact blocks guide import: %s" % name)
         targets.append(path)
     qa_dir = os.path.join(guide_dir, "qa")
     if os.path.lexists(qa_dir):
         if _is_link_or_reparse(qa_dir) or not os.path.isdir(qa_dir):
-            raise ContentError("study_guide/qa must be a real directory before relocalization")
+            raise ContentError("study_guide/qa must be a real directory before guide import")
         pattern = re.compile(r"^ch%02d_p\d+\.png$" % chapter)
         for name in sorted(os.listdir(qa_dir)):
             if not pattern.fullmatch(name):
                 continue
             path = os.path.join(qa_dir, name)
             if _is_link_or_reparse(path) or not os.path.isfile(path):
-                raise ContentError("unsafe QA page blocks relocalization: %s" % name)
+                raise ContentError("unsafe QA page blocks guide import: %s" % name)
             targets.append(path)
-    invalidated = []
-    for path in targets:
+    return targets
+
+
+def _publish_manifest(ws, chapter, manifest, report):
+    """Publish notebook+manifest as one rollback-protected logical transaction."""
+
+    # Complete every deterministic/content/path preflight before creating even a private stage.
+    md_path, json_path = _guard_notebook_targets(ws, chapter)
+    existing = _read_optional_text(md_path)
+    rendered = render_notebook_block(manifest)
+    updated_notebook = _merge_notebook(existing, chapter, rendered)
+    canonical_json = json.dumps(
+        manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    expected_facts = (
+        (report.get("claim_verification") or {}).get("fact_integrity")
+    )
+    expected_asset_policy = report.get("asset_policy_sha256")
+    if expected_asset_policy is None:
+        expected_asset_policy = _live_asset_policy_sha256(ws, chapter)
+    derived_targets = _chapter_artifact_targets(ws, chapter)
+    authoritative = [
+        _snapshot_public_file(md_path, "notebook chapter"),
+        _snapshot_public_file(json_path, "canonical guide manifest"),
+    ]
+    derived = [
+        _snapshot_public_file(path, "derived chapter artifact")
+        for path in derived_targets
+    ]
+
+    stages = []
+    try:
         try:
-            os.remove(path)
+            stages.append(_stage_text(md_path, updated_notebook))
+            stages.append(_stage_text(json_path, canonical_json))
         except OSError as exc:
-            raise ContentError("cannot invalidate stale localized artifact %s: %s"
-                               % (os.path.basename(path), exc))
-        invalidated.append(os.path.relpath(path, ws).replace("\\", "/"))
-    return invalidated
+            raise ContentError(
+                "cannot stage study-guide content for atomic publication: %s" % exc
+            ) from exc
+
+        # This is the last gate before the first public replacement.  It binds the validated
+        # ingestion facts, every global asset-policy layer, and the exact public state that will
+        # either be committed or restored.
+        if expected_facts is not None:
+            try:
+                current_facts = validate_workspace_fact_integrity(ws)["snapshot"]
+            except (OSError, TypeError, ValueError) as exc:
+                raise ContentError(
+                    "ingestion fact integrity changed before Study Guide import publication: %s"
+                    % exc
+                ) from exc
+            if current_facts != expected_facts:
+                raise ContentError(
+                    "ingestion fact inputs changed before Study Guide import publication"
+                )
+        try:
+            current_asset_policy = _live_asset_policy_sha256(ws, chapter)
+        except (OSError, TypeError, ValueError, ContentError) as exc:
+            raise ContentError(
+                "asset policy changed before Study Guide import publication: %s" % exc
+            ) from exc
+        if current_asset_policy != expected_asset_policy:
+            raise ContentError(
+                "asset policy inputs changed before Study Guide import publication"
+            )
+        current_derived = _chapter_artifact_targets(ws, chapter)
+        if current_derived != derived_targets or not all(
+                _snapshot_is_current(snapshot) for snapshot in authoritative + derived):
+            raise ContentError(
+                "Study Guide public targets changed before import publication"
+            )
+
+        try:
+            os.replace(stages[0], md_path)
+            stages[0] = None
+            os.replace(stages[1], json_path)
+            stages[1] = None
+        except BaseException as exc:
+            try:
+                _restore_snapshots(authoritative)
+            except BaseException as rollback_exc:
+                raise ContentError(
+                    "cannot atomically publish study-guide content (%s); rollback failed: %s"
+                    % (exc, rollback_exc)
+                ) from exc
+            raise ContentError(
+                "cannot atomically publish study-guide content: %s" % exc
+            ) from exc
+
+        invalidated = []
+        try:
+            for snapshot in derived:
+                os.remove(snapshot["path"])
+                invalidated.append(
+                    os.path.relpath(snapshot["path"], ws).replace("\\", "/")
+                )
+        except BaseException as exc:
+            rollback_failures = []
+            try:
+                _restore_snapshots(derived)
+            except BaseException as rollback_exc:
+                rollback_failures.append("derived artifacts: %s" % rollback_exc)
+            try:
+                _restore_snapshots(authoritative)
+            except BaseException as rollback_exc:
+                rollback_failures.append("authoritative pair: %s" % rollback_exc)
+            if rollback_failures:
+                raise ContentError(
+                    "cannot invalidate stale localized artifact %s; rollback failed: %s"
+                    % (exc, "; ".join(rollback_failures))
+                ) from exc
+            raise ContentError(
+                "cannot invalidate stale localized artifact: %s" % exc
+            ) from exc
+    finally:
+        for temporary in stages:
+            if temporary and os.path.exists(temporary):
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+    report.update({
+        "imported": True,
+        "notebook_path": md_path,
+        "manifest_path": json_path,
+        "invalidated_artifacts": invalidated,
+    })
+    return report
+
+
+def import_manifest(workspace, chapter, input_path):
+    """Validate and transactionally publish canonical notebook/JSON content."""
+    ws = _guard_workspace(workspace)
+    with _study_guide_mutation_lock(ws):
+        manifest, report = load_and_validate_manifest(ws, chapter, input_path)
+        report["notebook_anchor_count"] = _validate_walkthrough_notebook_anchors(
+            ws, chapter, manifest["walkthroughs"], require_all=True)
+        return _publish_manifest(ws, chapter, manifest, report)
 
 
 def relocalize_manifest(workspace, chapter, language, output_path=None):
@@ -2429,7 +3224,6 @@ def relocalize_manifest(workspace, chapter, language, output_path=None):
         report = validate_manifest(ws, chapter, manifest)
         report["relocalized_from"] = original["language"]
         report["relocalized_to"] = language
-        report["invalidated_artifacts"] = _invalidate_chapter_artifacts(ws, chapter)
         return _publish_manifest(ws, chapter, manifest, report)
 
 

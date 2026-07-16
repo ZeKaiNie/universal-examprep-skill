@@ -25,6 +25,20 @@ for _stream in ("stdout", "stderr"):
 
 import i18n
 try:
+    from asset_policy import (
+        STUDENT_ATTEMPT,
+        audit_asset_policy,
+        has_tainted_official_asset,
+        student_attempt_tainted_keys,
+    )
+except ImportError:  # imported as scripts.ingest in unit tests
+    from scripts.asset_policy import (
+        STUDENT_ATTEMPT,
+        audit_asset_policy,
+        has_tainted_official_asset,
+        student_attempt_tainted_keys,
+    )
+try:
     import strict_json
 except ImportError:  # imported as scripts.ingest in unit tests
     from scripts import strict_json
@@ -558,6 +572,11 @@ def _argument_parser():
                              "missing en template files fall back to the zh pack). When given "
                              "EXPLICITLY it is also seeded into the progress file so "
                              "update_progress init migrates it into study_state.language")
+    parser.add_argument(
+        "--expected-input-sha256",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -587,8 +606,19 @@ def _prepare_cli_input(args):
         sys.exit(1)
 
     print(f"[+] 正在读取输入数据: {args.input} ...")
+    expected_input_sha256 = getattr(args, "expected_input_sha256", None)
+    if (expected_input_sha256 is not None
+            and not re.fullmatch(r"[0-9a-f]{64}", expected_input_sha256)):
+        fail(["--expected-input-sha256 must be a lowercase 64-character SHA-256"])
+
     try:
-        payload, _snapshot = stable_read_bytes(args.input)
+        payload, snapshot = stable_read_bytes(args.input)
+        if (expected_input_sha256 is not None
+                and snapshot.get("sha256") != expected_input_sha256):
+            fail([
+                "input generation drifted before compilation: expected SHA-256 %s, found %s"
+                % (expected_input_sha256, snapshot.get("sha256")),
+            ])
         data = strict_json.loads(payload.decode("utf-8"))
     except Exception as e:
         fail([f"JSON 解析失败：{e}"])
@@ -618,15 +648,27 @@ def _ensure_workspace_root(output_dir):
     return root
 
 
-def _compile_visuals_unlocked(workspace):
+def _compile_visuals_unlocked(workspace, source_items=()):
     """Run the structured-visual core while the caller holds the ingestion lock."""
 
     workspace_path = Path(workspace).resolve()
     manifest = read_json(workspace_path / ".ingest" / "build_manifest.json")
     store = IngestionStore(workspace_path, source_root=manifest.get("source_root"))
+    expected_units, _expected_mappings = store._expected_compiled_state()
+    quiz = source_items[0] if len(source_items) > 0 else ()
+    teaching = source_items[1] if len(source_items) > 1 else ()
+    audit = audit_asset_policy(
+        quiz_rows=quiz,
+        teaching_rows=teaching,
+        content_units=expected_units.values(),
+    )
+    problems = audit["invalid_declarations"] + audit["conflicts"]
+    if problems:
+        raise ValueError("asset policy failed: %s" % "; ".join(problems))
     units, _mappings = store.rebuild_compiled_from_ledger()
     return _compile_structured_visuals_core(
-        workspace_path, units, _phase_inventory(workspace_path)
+        workspace_path, units, _phase_inventory(workspace_path),
+        tainted_keys=audit["tainted_keys"],
     )
 
 
@@ -636,6 +678,10 @@ def _before_publication_lock(_args, _output_dir):
 
 def _main_unlocked(args, prepared):
     """Publish one validated input while the caller holds the required workspace locks."""
+
+    import hashlib
+    import chunk as _chunk
+    import retrieve as _retrieve
 
     data, lang_explicit, lang, validated = prepared
     course_name, phases, quiz_bank, teaching_examples, missing_answer_ids = validated
@@ -675,6 +721,24 @@ def _main_unlocked(args, prepared):
         if q.get("gradable") is not False and is_blank(q.get("answer"))
     ]
 
+    # Cross-layer, pair-aware policy must pass before `_safe_output_tree`,
+    # `_persist_payload_unlocked`, or any student-facing derivative is written.
+    ingestion_payload = data.get("ingestion")
+    try:
+        # This is an in-memory producer boundary: all three source layers are
+        # present before any workspace path is created or ingestion payload is
+        # persisted.  The opaque capability cannot be replaced by a raw set.
+        _chunk._verified_asset_policy_from_layers(
+            quiz_rows=quiz_bank,
+            teaching_rows=teaching_examples or (),
+            content_units=(
+                ingestion_payload.get("content_units", ())
+                if isinstance(ingestion_payload, dict) else ()
+            ),
+        )
+    except (TypeError, ValueError) as exc:
+        fail(["asset policy failed before publication: %s" % exc])
+
     print(f"[+] 识别到科目: {course_name}")
     print(f"[+] 阶段数量: {len(phases)} 个")
     print(f"[+] 题目数量: {len(quiz_bank)} 道")
@@ -692,7 +756,6 @@ def _main_unlocked(args, prepared):
     real_wiki_dir = os.path.realpath(wiki_dir)
     print(f"[+] 创建 Wiki 目录: {wiki_dir}")
 
-    ingestion_payload = data.get("ingestion")
     if ingestion_payload is not None:
         try:
             ingestion_build_manifest = _persist_payload_unlocked(
@@ -725,7 +788,9 @@ def _main_unlocked(args, prepared):
 
     if ingestion_payload is not None:
         try:
-            visual_counts = _compile_visuals_unlocked(output_dir)
+            visual_counts = _compile_visuals_unlocked(
+                output_dir, (quiz_bank, teaching_examples or [])
+            )
         except Exception as exc:
             fail([f"结构化图片编译进章节 wiki 失败：{exc}"])
         if sum(visual_counts.values()):
@@ -736,9 +801,6 @@ def _main_unlocked(args, prepared):
 
     # 1b. 结构化内容单元优先切块；legacy raw input 继续使用 Markdown 小节切块。
     #     检索索引携带 wiki/source-IR 哈希，任何派生产物漂移都 fail closed。
-    import hashlib
-    import chunk as _chunk
-    import retrieve as _retrieve
     try:
         from ingestion.dedup import (
             CANONICAL_GROUPS_PATH as _CANONICAL_GROUPS_PATH,
@@ -759,6 +821,14 @@ def _main_unlocked(args, prepared):
         for p in phases
     }
     structured_rows = ingestion_payload.get("content_units", []) if ingestion_payload else []
+    tainted_keys = student_attempt_tainted_keys(
+        structured_rows, quiz_bank, teaching_examples or []
+    )
+    if any(
+            isinstance(item, dict)
+            and has_tainted_official_asset(item, tainted_keys)
+            for item in quiz_bank + (teaching_examples or [])):
+        fail(["student_attempt 污染路径不能编译为题库、教学例题或检索概念"])
     if structured_rows:
         # Read the compiled store so applied review patches survive a deterministic rebuild.
         compiled_units_path = os.path.join(output_dir, ".ingest", "content_units.jsonl")
@@ -767,18 +837,36 @@ def _main_unlocked(args, prepared):
                 structured_rows = [strict_json.loads(line) for line in stream if line.strip()]
         except (OSError, ValueError) as exc:
             fail([f"结构化内容单元无法读取，拒绝构建检索索引：{exc}"])
+        tainted_keys = student_attempt_tainted_keys(
+            structured_rows, quiz_bank, teaching_examples or []
+        )
+        if any(
+                isinstance(item, dict)
+                and has_tainted_official_asset(item, tainted_keys)
+                for item in quiz_bank + (teaching_examples or [])):
+            fail(["student_attempt 污染路径不能编译为题库、教学例题或检索概念"])
         try:
             canonical_group_path = os.path.join(
                 output_dir, *_CANONICAL_GROUPS_PATH.split("/")
             )
+            canonical_groups = (
+                _load_canonical_groups(output_dir)
+                if os.path.isfile(canonical_group_path) else ()
+            )
+            chunk_policy = _chunk._verified_asset_policy_from_layers(
+                quiz_rows=quiz_bank,
+                teaching_rows=teaching_examples or [],
+                content_units=structured_rows,
+                canonical_groups=canonical_groups,
+            )
             structured_rows = _fold_units(
                 structured_rows,
-                _load_canonical_groups(output_dir)
-                if os.path.isfile(canonical_group_path) else (),
+                canonical_groups,
             )
         except Exception as exc:
             fail([f"canonical_group 检索折叠失败：{exc}"])
-        for structured in _chunk.chunk_units(structured_rows):
+        for structured in _chunk.chunk_units(
+                structured_rows, tainted_keys=chunk_policy):
             chapter_id = structured.get("chapter_id")
             if not chapter_id or chapter_id not in wiki_by_chapter:
                 continue
@@ -808,7 +896,9 @@ def _main_unlocked(args, prepared):
     question_unit_ids = {}
     for unit in structured_rows:
         if (isinstance(unit, dict) and unit.get("kind") == "question"
-                and unit.get("external_id")):
+                and unit.get("external_id")
+                and unit.get("asset_role") != STUDENT_ATTEMPT
+                and not has_tainted_official_asset(unit, tainted_keys)):
             question_unit_ids.setdefault(str(unit["external_id"]), []).extend(
                 unit.get("retrieval_occurrence_unit_ids") or [unit.get("unit_id")]
             )
@@ -839,6 +929,31 @@ def _main_unlocked(args, prepared):
             "unit_ids": sorted(set(question_unit_ids.get(str(item.get("id")), ()))),
         })
 
+    # Bind the exact teaching layer that will exist after this invocation.  An
+    # explicit snapshot has not been published yet, so hash the byte-identical
+    # `_atomic_json` representation; a legacy rerun instead binds the existing
+    # preserved file.  Resolve this before publishing the index so an unsafe
+    # existing target cannot leave a newly written but unusable index behind.
+    teaching_path = os.path.join(output_dir, "references", "teaching_examples.json")
+    teaching_integrity = None
+    if os.path.lexists(teaching_path) and (
+            is_link_or_reparse(teaching_path) or not os.path.isfile(teaching_path)):
+        fail([f"教学例题索引目标是符号链接或特殊文件，拒绝读取/覆盖：{teaching_path}"])
+    if teaching_examples is not None:
+        teaching_payload = (
+            json.dumps(teaching_examples, indent=2, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+        teaching_integrity = {
+            "file": "references/teaching_examples.json",
+            "sha256": hashlib.sha256(teaching_payload).hexdigest(),
+        }
+    elif os.path.isfile(teaching_path):
+        with open(teaching_path, "rb") as stream:
+            teaching_integrity = {
+                "file": "references/teaching_examples.json",
+                "sha256": hashlib.sha256(stream.read()).hexdigest(),
+            }
+
     integrity = {
         "wiki": [
             {
@@ -867,6 +982,8 @@ def _main_unlocked(args, prepared):
             ).hexdigest(),
         },
     }
+    if teaching_integrity is not None:
+        integrity["teaching_examples"] = teaching_integrity
     for key, relative in (
         ("source_manifest", ".ingest/source_manifest.json"),
         ("content_units", ".ingest/content_units.jsonl"),
@@ -906,10 +1023,6 @@ def _main_unlocked(args, prepared):
     # 2b. Optional teaching-example snapshot.  Absence of the top-level raw-input field is the
     # legacy compatibility signal: do not create or overwrite a manifest that the caller did not
     # explicitly provide.  The official material builder always emits the field (including []).
-    teaching_path = os.path.join(output_dir, "references", "teaching_examples.json")
-    if os.path.lexists(teaching_path) and (is_link_or_reparse(teaching_path)
-                                          or not os.path.isfile(teaching_path)):
-        fail([f"教学例题索引目标是符号链接或特殊文件，拒绝读取/覆盖：{teaching_path}"])
     if teaching_examples is not None:
         _atomic_json(teaching_path, teaching_examples, "教学例题索引")
         print("[+] 已写入教学例题索引: references/teaching_examples.json")

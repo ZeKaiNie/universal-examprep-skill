@@ -36,7 +36,7 @@ _ELEMENT_KINDS = frozenset((
     "diagram", "caption", "code", "speaker_notes", "question", "answer", "other",
 ))
 _ASSET_ROLES = frozenset((
-    "question_context", "answer_context", "worked_solution", "figure", "diagram",
+    "question_context", "answer_context", "worked_solution", "student_attempt", "figure", "diagram",
     "table", "source_page", "other",
 ))
 _POLICY_KEYS = frozenset((

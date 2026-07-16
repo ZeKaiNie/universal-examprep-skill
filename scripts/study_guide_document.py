@@ -12,7 +12,10 @@ import stat
 from pathlib import Path
 
 from study_guide_content import validate_manifest
-from study_guide_render import GuideError, MarkdownRenderer, _resolve_asset, validate_generated_html
+from study_guide_render import (ArtifactDriftError, GuideError, MarkdownRenderer,
+                                _resolve_asset, _workspace_tainted_asset_keys,
+                                validate_generated_html)
+from validate_workspace import workspace_asset_policy_snapshot
 
 
 SOURCE_TYPE_LABELS = {
@@ -199,15 +202,23 @@ def _explanation_blocks(renderer, knowledge_point, language):
     return "".join(parts)
 
 
-def _asset_figure(workspace, relative, label, language, index):
-    data_uri = _resolve_asset(workspace, relative, "%s %d" % (label, index))
+def _asset_figure(workspace, relative, label, language, index,
+                  student_attempt_tainted_keys=None):
+    data_uri = _resolve_asset(
+        workspace, relative, "%s %d" % (label, index),
+        student_attempt_tainted_keys=student_attempt_tainted_keys,
+        taint_message=(
+            "%s asset is bound to student_attempt evidence and cannot be rendered: %%s"
+            % label
+        ),
+    )
     caption = "%s %d · %s" % (_label(language, label), index, relative)
     return ('<figure class="source-asset"><img src="%s" alt="%s">'
             '<figcaption>%s</figcaption></figure>') % (
                 data_uri, html.escape(caption, quote=True), html.escape(caption))
 
 
-def _knowledge_assets(workspace, refs, language):
+def _knowledge_assets(workspace, refs, language, student_attempt_tainted_keys=None):
     paths = []
     seen = set()
     for ref in refs:
@@ -218,7 +229,10 @@ def _knowledge_assets(workspace, refs, language):
     if not paths:
         return ""
     return '<div class="knowledge-assets">%s</div>' % "".join(
-        _asset_figure(workspace, path, "concept_asset", language, index)
+        _asset_figure(
+            workspace, path, "concept_asset", language, index,
+            student_attempt_tainted_keys=student_attempt_tainted_keys,
+        )
         for index, path in enumerate(paths, 1)
     )
 
@@ -356,13 +370,19 @@ def _formula_use(renderer, use, language, formula_lookup):
 
 
 def _walkthrough(renderer, workspace, walk, index, language, formula_lookup, kp_lookup,
-                 materials_root=None):
+                 materials_root=None, student_attempt_tainted_keys=None):
     prompt_assets = "".join(
-        _asset_figure(workspace, path, "prompt_asset", language, asset_index)
+        _asset_figure(
+            workspace, path, "prompt_asset", language, asset_index,
+            student_attempt_tainted_keys=student_attempt_tainted_keys,
+        )
         for asset_index, path in enumerate(walk["prompt_asset_paths"], 1)
     )
     answer_assets = "".join(
-        _asset_figure(workspace, path, "answer_asset", language, asset_index)
+        _asset_figure(
+            workspace, path, "answer_asset", language, asset_index,
+            student_attempt_tainted_keys=student_attempt_tainted_keys,
+        )
         for asset_index, path in enumerate(walk["answer_asset_paths"], 1)
     )
     prompt = ""
@@ -458,9 +478,33 @@ def render_manifest(workspace, manifest, math_converter=None, materials_root=Non
     """Validate and render one typed chapter manifest."""
     chapter = manifest.get("chapter") if isinstance(manifest, dict) else None
     report = validate_manifest(workspace, chapter, manifest)
+    try:
+        asset_policy = workspace_asset_policy_snapshot(workspace)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise GuideError(
+            "typed Study Guide cannot build the complete workspace asset policy: %s" % exc,
+            2,
+        )
+    if asset_policy["unsafe_paths"]:
+        raise GuideError(
+            "typed Study Guide workspace contains an unsafe asset declaration: %s"
+            % asset_policy["unsafe_paths"][0],
+            2,
+        )
+    if asset_policy["conflicts"]:
+        raise GuideError(
+            "typed Study Guide workspace contains a student-attempt/asset-role conflict: %s"
+            % asset_policy["conflicts"][0],
+            2,
+        )
+    tainted_asset_keys = _workspace_tainted_asset_keys(
+        workspace, "typed Study Guide renderer")
     language = report["language"]
     renderer_language = {"zh": "中文", "en": "English", "bilingual": "双语"}[language]
-    renderer = MarkdownRenderer(workspace, math_converter, language=renderer_language)
+    renderer = MarkdownRenderer(
+        workspace, math_converter, language=renderer_language,
+        student_attempt_tainted_keys=tainted_asset_keys,
+    )
     kp_lookup = {row["id"]: row for row in manifest["knowledge_points"]}
     formula_lookup = {
         formula["id"]: formula
@@ -479,7 +523,8 @@ def render_manifest(workspace, manifest, math_converter=None, materials_root=Non
             formulas = '<p class="notice">%s</p>' % html.escape(_label(language, "no_formula"))
         cards = "".join(
             _walkthrough(renderer, workspace, walkthrough_lookup[item_id], index_by_id[item_id],
-                         language, formula_lookup, kp_lookup, materials_root)
+                         language, formula_lookup, kp_lookup, materials_root,
+                         student_attempt_tainted_keys=tainted_asset_keys)
             for item_id in kp["example_ids"]
             if item_id in walkthrough_lookup and primary[item_id] == kp["id"]
         )
@@ -504,7 +549,10 @@ def render_manifest(workspace, manifest, math_converter=None, materials_root=Non
                 _localized_heading(kp["title"], language)),
             '<h3>%s</h3>%s' % (html.escape(_label(language, "plain_explanation")),
                                 _explanation_blocks(renderer, kp, language)),
-            _knowledge_assets(workspace, kp["source_refs"], language),
+            _knowledge_assets(
+                workspace, kp["source_refs"], language,
+                student_attempt_tainted_keys=tainted_asset_keys,
+            ),
             '<h3>%s</h3>%s' % (html.escape(_label(language, "formulas")), formulas),
             '<div class="source-box"><strong>%s</strong>%s</div>' %
             (html.escape(_label(language, "source_evidence")),
@@ -564,6 +612,16 @@ h1{font-size:2.2rem;line-height:1.18;margin:.2em 0}h2{font-size:1.65rem;line-hei
     validate_guide_document(
         document, report["walkthrough_item_ids"], workspace=workspace,
         materials_root=materials_root)
+    try:
+        final_asset_policy = workspace_asset_policy_snapshot(workspace)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ArtifactDriftError(
+            "workspace asset policy became unreadable during typed Guide rendering: %s" % exc
+        )
+    if final_asset_policy != asset_policy:
+        raise ArtifactDriftError(
+            "workspace asset policy changed during typed Guide rendering"
+        )
     return document, report
 
 

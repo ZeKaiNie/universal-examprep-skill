@@ -30,6 +30,24 @@ MINIMAL_PNG = base64.b64decode(
     "AAAADUlEQVR4nGNgYGBgAAAABQABpfZFQAAAAABJRU5ErkJggg=="
 )
 
+# Produced by Pillow from Image.new("RGB", (1, 1), "white").save(..., "JPEG").
+VALID_JPEG = base64.b64decode(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkS"
+    "Ew8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJ"
+    "CQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIy"
+    "MjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAA"
+    "AAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEG"
+    "E1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RF"
+    "RkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKj"
+    "pKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP0"
+    "9fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgEC"
+    "BAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLR"
+    "ChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0"
+    "dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbH"
+    "yMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD3+iii"
+    "gD//2Q=="
+)
+
 
 def run(name):
     """Validate a fixture; return (errors, warnings, stats, exit_code)."""
@@ -217,7 +235,8 @@ class TestValidateWorkspace(unittest.TestCase):
         d = self.make_ws([])
         os.makedirs(os.path.join(d, "references", "assets"))
         asset_path = os.path.join(d, "references", "assets", "answer.png")
-        open(asset_path, "wb").write(b"png")
+        with open(asset_path, "wb") as stream:
+            stream.write(MINIMAL_PNG)
         example = self.teaching_example(
             requires_assets=True,
             assets=[{"path": "references/assets/answer.png", "role": "answer_context",
@@ -226,6 +245,24 @@ class TestValidateWorkspace(unittest.TestCase):
         errors, _, _ = V.validate(d)
         self.assertEqual(V._exit_code(errors), 1)
         self.assertIn("题面侧", err_text(errors))
+
+    def test_teaching_visual_gate_rejects_corrupt_jpeg(self):
+        d = self.make_ws([])
+        relative = "references/assets/prompt.jpg"
+        full = os.path.join(d, *relative.split("/"))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as stream:
+            stream.write(b"\xff\xd8\xff\xd9")
+        example = self.teaching_example(
+            requires_assets=True,
+            assets=[{
+                "path": relative, "role": "question_context", "type": "page_image",
+            }],
+        )
+        self.write_teaching_examples(d, [example])
+        errors, _, _ = V.validate(d)
+        self.assertEqual(V._exit_code(errors), 1)
+        self.assertIn("光栅图像损坏", err_text(errors))
 
     def test_teaching_asset_without_role_is_rejected_before_renderer(self):
         d = self.make_ws([])
@@ -591,6 +628,59 @@ class TestValidateWorkspace(unittest.TestCase):
         errors, _, _ = V.validate(self._ws_asset(self._asset_item()))
         self.assertEqual(V._exit_code(errors), 0, err_text(errors))
 
+    def test_p0a_valid_jpeg_asset_passes_shared_raster_gate(self):
+        relative = "references/assets/a.jpg"
+        item = self._asset_item(assets=[{
+            "path": relative, "role": "question_context", "type": "page_image",
+        }])
+        d = self.make_ws([item])
+        full = os.path.join(d, *relative.split("/"))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as stream:
+            stream.write(VALID_JPEG)
+        errors, _, _ = V.validate(d)
+        self.assertEqual(V._exit_code(errors), 0, err_text(errors))
+
+    def test_p0a_corrupt_jpeg_asset_fails_shared_raster_gate(self):
+        relative = "references/assets/a.jpg"
+        item = self._asset_item(assets=[{
+            "path": relative, "role": "question_context", "type": "page_image",
+        }])
+        d = self.make_ws([item])
+        full = os.path.join(d, *relative.split("/"))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as stream:
+            stream.write(b"\xff\xd8\xff\xd9")
+        errors, _, _ = V.validate(d)
+        self.assertEqual(V._exit_code(errors), 1)
+        self.assertIn("光栅图像损坏", err_text(errors))
+
+    def test_all_advertised_raster_extensions_route_to_shared_gate(self):
+        d = tempfile.mkdtemp(prefix="raster-gate-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        malformed = {
+            ".png": b"\x89PNG\r\n\x1a\nnot-a-png",
+            ".jpg": b"\xff\xd8\xff\xd9",
+            ".jpeg": b"\xff\xd8\xff\xd9",
+            ".gif": b"GIF89a\x01\x00\x01\x00\x00\x00\x00;",
+            ".webp": b"RIFF\x0c\x00\x00\x00WEBPVP8 \x04\x00\x00\x00bad!",
+            ".bmp": b"BM" + b"\x00" * 52,
+        }
+        for extension, payload in malformed.items():
+            with self.subTest(extension=extension):
+                path = os.path.join(d, "asset" + extension)
+                with open(path, "wb") as stream:
+                    stream.write(payload)
+                self.assertIsNotNone(
+                    V._raster_file_validation_error(path, path)
+                )
+        extensionless = os.path.join(d, "typed-asset")
+        with open(extensionless, "wb") as stream:
+            stream.write(b"\xff\xd8\xff\xd9")
+        self.assertIsNotNone(V._raster_file_validation_error(
+            extensionless, "references/assets/typed-asset", "image/jpeg"
+        ))
+
     def test_p0a_explicit_asset_source_overrides_answer_role_fallback(self):
         item = self._asset_item(answer_source_file="official-solutions.pdf")
         asset = {
@@ -812,6 +902,116 @@ class TestValidateWorkspace(unittest.TestCase):
         errors, _, _ = V.validate(self._ws_asset(item))   # file exists, but role is answer-side
         self.assertEqual(V._exit_code(errors), 1)
         self.assertIn("题面侧", err_text(errors))
+
+    def test_student_attempt_role_is_valid_but_never_satisfies_question_gate(self):
+        item = self._asset_item(assets=[{
+            "path": "references/assets/a.png", "role": "student_attempt",
+            "type": "crop_image", "caption": "submitted work",
+        }])
+        errors, _, _ = V.validate(self._ws_asset(item))
+        messages = err_text(errors)
+        self.assertEqual(V._exit_code(errors), 1)
+        self.assertNotIn("role 非法", messages)
+        self.assertIn("student_attempt", messages)
+
+    def _policy_asset_workspace(self, items, teaching=None):
+        ws = self.make_ws(items)
+        os.makedirs(os.path.join(ws, "references", "assets"), exist_ok=True)
+        for name in ("shared.png", "other.png"):
+            with open(os.path.join(ws, "references", "assets", name), "wb") as stream:
+                stream.write(MINIMAL_PNG)
+        if teaching is not None:
+            self.write_teaching_examples(ws, teaching)
+        return ws
+
+    def test_student_attempt_taint_is_order_independent_across_two_quiz_items(self):
+        official = self._ok_item(
+            id="official", assets=[{
+                "path": "references/assets/shared.png", "role": "question_context",
+                "type": "crop_image",
+            }])
+        attempt = self._ok_item(
+            id="attempt", assets=[{
+                "path": "references/assets/shared.png", "role": "student_attempt",
+                "type": "crop_image",
+            }])
+        for rows in ([official, attempt], [attempt, official]):
+            errors, _, _ = V.validate(self._policy_asset_workspace(rows))
+            self.assertIn("student-attempt asset policy conflict", err_text(errors))
+
+    def test_student_attempt_taint_crosses_quiz_and_teaching_layers(self):
+        official = self._ok_item(assets=[{
+            "path": "references/assets/shared.png", "role": "answer_context",
+            "type": "crop_image",
+        }])
+        teaching = self.teaching_example(assets=[{
+            "path": "references/assets/shared.png", "role": "student_attempt",
+            "type": "crop_image",
+        }])
+        errors, _, _ = V.validate(self._policy_asset_workspace([official], [teaching]))
+        self.assertIn("student-attempt asset policy conflict", err_text(errors))
+
+    def test_public_policy_snapshot_cannot_accept_or_reuse_partial_rows(self):
+        official = self._ok_item(id="official", assets=[{
+            "path": "references/assets/shared.png", "role": "question_context",
+            "type": "crop_image",
+        }])
+        attempt = self.teaching_example(id="attempt", assets=[{
+            "path": "references/assets/shared.png", "role": "student_attempt",
+            "type": "crop_image",
+        }])
+        ws = self._policy_asset_workspace([official], [attempt])
+
+        first = V.workspace_asset_policy_snapshot(ws)
+        self.assertTrue(first["tainted_keys"])
+        self.assertTrue(first["conflicts"])
+
+        # The old public kwargs let an arbitrary caller replace every live layer with an empty
+        # hand-built cache.  The safe public API no longer has such an override surface.
+        with self.assertRaises(TypeError):
+            V.workspace_asset_policy_snapshot(
+                ws, quiz_rows=[], teaching_rows=[], content_units=[]
+            )
+
+        # Mutating a returned diagnostic copy also cannot affect the next live snapshot.
+        first["quiz_rows"].clear()
+        first["teaching_rows"].clear()
+        second = V.workspace_asset_policy_snapshot(ws)
+        self.assertTrue(second["tainted_keys"])
+        self.assertTrue(second["conflicts"])
+
+    def test_same_item_slash_alias_cannot_be_prompt_and_answer(self):
+        item = self._ok_item(assets=[
+            {"path": "references/assets/shared.png", "role": "question_context",
+             "type": "crop_image"},
+            {"path": "references\\assets\\shared.png", "role": "worked_solution",
+             "type": "crop_image"},
+        ])
+        errors, _, _ = V.validate(self._policy_asset_workspace([item]))
+        self.assertIn("both prompt and official answer", err_text(errors))
+
+    @unittest.skipUnless(os.name == "nt", "Windows physical identity folds path case")
+    def test_same_item_windows_case_alias_cannot_be_prompt_and_answer(self):
+        item = self._ok_item(assets=[
+            {"path": "references/assets/shared.png", "role": "question_context",
+             "type": "crop_image"},
+            {"path": "references/assets/SHARED.png", "role": "worked_solution",
+             "type": "crop_image"},
+        ])
+        errors, _, _ = V.validate(self._policy_asset_workspace([item]))
+        self.assertIn("both prompt and official answer", err_text(errors))
+
+    def test_different_items_may_reuse_one_official_path_on_opposite_sides(self):
+        prompt = self._ok_item(id="prompt", assets=[{
+            "path": "references/assets/shared.png", "role": "question_context",
+            "type": "crop_image",
+        }])
+        answer = self._ok_item(id="answer", assets=[{
+            "path": "references/assets/shared.png", "role": "worked_solution",
+            "type": "crop_image",
+        }])
+        errors, _, _ = V.validate(self._policy_asset_workspace([prompt, answer]))
+        self.assertEqual([], errors, err_text(errors))
 
     def test_p0a_malformed_role_does_not_crash(self):
         item = self._asset_item(assets=[{"path": "references/assets/a.png", "role": ["x"],

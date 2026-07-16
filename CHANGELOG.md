@@ -4,7 +4,10 @@
 
 ## Unreleased
 
-- 暂无。
+- **完整章节 Study Guide 门禁**：`profile=full` 现在以当前章全部 teaching examples、全部 bank 记录（含 `gradable=false` 教学项）和 typed question units 为去重分母；章节/语言、题面替代、答案 provenance、notebook、逐字段 claim 与 live source revision 均在导入和渲染前失败关闭。
+- **来源与资产完整性**：统一按安全物理身份识别 hardlink/路径别名和全局 `student_attempt` 污染，绑定声明 SHA-256 与 live bytes；PNG/JPEG/WebP/GIF/BMP 使用共享严格解码校验，损坏图片不能进入建库、教学显示、Guide、QA 或小抄。
+- **整批原子发布与代际一致性**：builder、visual index、Study Guide 与 cheatsheet 的多文件/图片发布新增预检、journal、回滚及故障注入覆盖；normal ingestion 将编译输入绑定到 builder 产出的精确 raw-input generation，避免两次锁之间混入另一轮建库结果。
+- **可审计视觉教材**：题面图优先、答案图延后，完整题面图不再重复粘贴原文（双语时仅补目标语言翻译）；HTML/PDF 与逐页视觉 QA receipt 保持同一内容/资产快照，坏图、漂移或残留产物不再被误报为可交付。
 
 ## V4.2 — 2026-07-14
 

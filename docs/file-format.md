@@ -251,9 +251,11 @@ question metadata 中已有的 `keywords` 优先，否则才继承 paired answer
   来自学生提交的作业 PDF，而 `answer_source_file` 指向另一份官方答案册时，必须使用
   这组逐资产来源字段；旧 asset 缺少 `source_file` 时仍按 role 兼容推断。
 
-- **role** ∈ `question_context` / `answer_context` / `figure` / `table` / `diagram` / `worked_solution`
+- **role** ∈ `question_context` / `answer_context` / `figure` / `table` / `diagram` / `worked_solution` / `student_attempt`
   - **题面侧 role**（出题前会展示给学生）= `question_context` / `figure` / `diagram` / `table`。`requires_assets=true` 或 `maybe_requires_assets=true` 的题**至少要有一个题面侧的有效 asset**；只有答案侧 asset（`answer_context` / `worked_solution`）无法在出题前展示题目，会被判 fail-closed。
   - **答案侧 role**（只在解答/复盘阶段展示）= `answer_context` / `worked_solution`。本 schema 不新增 `question` / `prompt` role；外部系统若使用这类名字，导入前应映射到现有题面侧 role。
+  - `student_attempt` 保留学生提交作业中的裁图/原页，并逐资产绑定自身的 `source_file` 与 `source_sha256`。它既不是题面证据，也不是官方/资料答案；不得满足题面可见性、官方答案或 Study Guide 答案覆盖，不得用于 material claim、wiki 或 retrieval。当前 tutor/Guide 不显示它；未来若增加学生作答对照，必须使用独立且显式的策略。
+  - `student_attempt` 按**物理路径全局污染**：在 quiz、teaching examples 或任意 content unit（含其他章节及嵌套 assets）出现一次后，同一物理文件不得再以题面、答案、概念、渲染、检索或 claim 证据使用。比较前先做安全相对路径规范化；安全的 `/` 与 `\` 分隔符别名等价，Windows 上大小写别名也等价。污染是非对称的：没有 `student_attempt` 时，不同 item/unit 可合法复用同一官方 prompt/answer 文件；同一 item 把同一物理文件同时标为题面与答案仍视为直接泄漏并 fail-closed。官方与学生作答位于不同路径时必须保留官方资产，不得因同 item 含独立作答图而误删。
 - **type** ∈ `page_image` / `crop_image` / `diagram` / `table_image` / `other_image`
 - `role` / `type` / `question_text_status` 若写成非字符串（数组/对象等）→ **报错**（校验器不崩溃）；`requires_assets` / `maybe_requires_assets` 必须是真正的布尔 `true`/`false`，字符串 `"false"` 之类 → **报错**。
 
@@ -264,7 +266,7 @@ For any item with `requires_assets=true` or `maybe_requires_assets=true`:
 1. **Before asking, explaining, hinting, or solving**, display every question-side asset first.
 2. Use only question-side assets at first (`question_context` / `figure` / `diagram` / `table`).
 3. Label each displayed prompt image PER THE REPLY-LANGUAGE MODE, and include its role/caption when available: `中文`/`双语` sessions use `题面图` for both the image ALT text and the visible label; `English` sessions use `Question-side asset` for both. Behavior probes accept the zh form as well as the legacy bilingual composite `题面图 / question-side asset` (probes only run on zh-mode transcripts). See docs/language-policy.md.
-4. Do not show answer-side assets (`answer_context` / `worked_solution`) before all question-side assets have already been shown.
+4. Do not show answer-side assets (`answer_context` / `worked_solution`) before all question-side assets have already been shown. Never treat `student_attempt` as either question-side or official answer-side evidence.
 5. If the asset file is missing/unreadable, the UI cannot render it, or the runtime can only print an unrenderable path, **skip the item or stop with a clear explanation**. Do not proceed as if the image was shown.
 6. Show answer-side assets only during solution/review, after the question-side asset display has happened, and label them per the reply-language mode: `中文`/`双语` → `答案图`, `English` → `Answer-side asset` (probes also accept the legacy `答案图 / answer-side asset` composite).
 
@@ -280,7 +282,7 @@ For any item with `requires_assets=true` or `maybe_requires_assets=true`:
 
 ### 路径安全规则（校验器强制）
 
-- asset 必须是工作区内相对路径（推荐 `references/assets/`）；禁止绝对路径、`..`、URL/网络和 symlink escape。
+- asset 必须是工作区内相对路径（推荐 `references/assets/`）；禁止绝对路径、`..`、URL/网络和 symlink escape。所有 host 都执行可移植 Win32 约束：任一路径段不得以 ASCII 空格/点结尾，不得含控制字符或 `< > \" | ? * :`，也不得使用 `CON`/`PRN`/`AUX`/`NUL`/`COM1..9`/`LPT1..9` 等保留设备名（含扩展名及 Win32 认可的上标数字变体）。因此 `a.png.`、`NUL.txt` 等不能在 Windows 上成为另一份安全路径的物理别名。
 - `requires_assets=true` 或 `maybe_requires_assets=true` 要求非空、可读、安全且至少一个题面侧 asset；缺失/只有答案侧均为 error。`stub` 需 source page 或题面 asset；`page_reference` 需安全 `source_file` + 正整数 `source_pages`。
 - bool/string/enum/page 类型不合约均结构化报错；非 required 的缺失 asset 只 warning。旧题库不含这些字段仍有效；任意题型都可要求 asset。
 
@@ -291,7 +293,7 @@ For any item with `requires_assets=true` or `maybe_requires_assets=true`:
 - `image_question_index.json`：逐题 requires/maybe、题面/答案 assets、来源页与答案状态。`prompt_suspects`/`answer_suspects` 分别表示视觉来源页缺题面/答案 asset；legacy `suspects` 仅别名。`prompt_suspects=0` 不证明答案/wiki 完整。
 - `figure_page_index.json`：检测页、视觉类型与 `wiki_visual_coverage` 的 detected/embedded/missing、分章和逐页理由。检测按结构→排版→词面的召回优先启发式；缺结构能力时写 `media_signals=false` 并告警，不宣称人工语义全覆盖。
 
-默认只报告。`--apply` 备份 bank 后分别挂 `question_context` + `maybe_requires_assets=true` 或仅挂 `answer_context`；`--apply-wiki` 按页锚幂等回挂（默认每章 30 页），超限/失败仍列入 missing。回写后重读三侧结果。
+默认只报告。`--apply` 先对 quiz、teaching examples、content units 与本批全部题面/答案修复目标做联合策略预检；同一逻辑 item 把同一物理文件跨题面/答案侧复用、任意 `student_attempt` 物理身份复用、不安全/schema 冲突，或与现有所有权不兼容时，整批在创建备份、写图片、改 bank 或替换索引之前失败，原字节与现有派生文件保持不变。没有 student-attempt 污染时，不同 item 间合法的官方题面/答案复用仍可幂等重建。预检通过后才备份 bank，并分别挂 `question_context` + `maybe_requires_assets=true` 或仅挂 `answer_context`；`--apply-wiki` 按页锚幂等回挂（默认每章 30 页），超限/失败仍列入 missing。回写后重读三侧结果。
 
 全局顺序门禁把 answer-only 页放入 `deferred_answer_pages`，不进 concepts/wiki gallery；无法证明归属的旧/手工嵌图列入 `manual_answer_exposure_pages` 并非零阻断。题答同页进入 `shared_prompt_answer_pages`，无审核裁图还进 `shared_prompt_answer_blocker_pages`。所有 `*_count` 必须等于数组长度；完整 manifest 缺安全数组必须重建，不能默认空值绕过泄题。真正无 manifest trio 的 legacy 才走兼容路径；打印路径或忽略非零退出不是修复。
 

@@ -23,7 +23,7 @@ GROUP_DERIVATIONS = frozenset(("exact_auto", "reviewed_near"))
 KIND_FAMILIES = frozenset(
     ("concept", "formula", "question", "answer", "table", "code", "visual", "heading", "other")
 )
-SOURCE_SIDES = frozenset(("teaching", "prompt", "answer"))
+SOURCE_SIDES = frozenset(("teaching", "prompt", "answer", "attempt"))
 PROVENANCE_CLASSES = frozenset(("source_backed", "ai_supplemented"))
 PRIORITY_TIERS = frozenset(
     ("teacher_official", "course_official", "course_material", "student_notes", "unknown")

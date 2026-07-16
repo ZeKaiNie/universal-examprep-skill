@@ -18,6 +18,10 @@ def _ws_with_sheet():
     d = tempfile.mkdtemp(prefix="r4-")
     with open(os.path.join(d, "cheatsheet.md"), "w", encoding="utf-8") as f:
         f.write("# 小抄\n\n- 要点 x\n")
+    os.makedirs(os.path.join(d, "references"))
+    with open(os.path.join(d, "references", "quiz_bank.json"),
+              "w", encoding="utf-8") as f:
+        json.dump([], f)
     return d
 
 
@@ -38,7 +42,7 @@ class RendererPathSafety(unittest.TestCase):
         open(outside, "w").close()
         self.addCleanup(lambda: os.path.exists(outside) and os.remove(outside))
         try:
-            os.symlink(outside, os.path.join(self.d, "cheatsheet.html.tmp"))
+            os.symlink(outside, os.path.join(self.d, ".cheatsheet.rendering.html"))
         except OSError:
             self.skipTest("symlink privilege unavailable")
         r = _render(self.d, "--html-only")

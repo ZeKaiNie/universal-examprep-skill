@@ -15,9 +15,23 @@ import re
 
 try:  # package import in tests; script-directory import in CLI entrypoints
     from . import study_guide_content, study_guide_qa
+    from .asset_policy import (
+        collect_asset_roles,
+        has_tainted_official_asset,
+        iter_asset_declarations,
+        physical_asset_key,
+        student_attempt_tainted_keys,
+    )
 except ImportError:  # pragma: no cover - exercised by standalone script entrypoints
     import study_guide_content
     import study_guide_qa
+    from asset_policy import (
+        collect_asset_roles,
+        has_tainted_official_asset,
+        iter_asset_declarations,
+        physical_asset_key,
+        student_attempt_tainted_keys,
+    )
 
 
 TERMINAL_REVIEW_STATUSES = frozenset(("applied", "resolved", "unrecoverable", "superseded"))
@@ -29,6 +43,8 @@ HIGH_RISK_ARTIFACT_REASONS = frozenset((
     "homework_roster_visual_mapping_unverified",
 ))
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+PROMPT_ASSET_ROLES = frozenset(("question_context", "figure", "diagram", "table"))
+ANSWER_ASSET_ROLES = frozenset(("answer_context", "worked_solution"))
 
 
 def _load_json(path, default=None):
@@ -546,8 +562,26 @@ def capability_readiness(workspace, errors=(), warnings=(), stats=None, chapter=
     workspace = os.path.abspath(workspace)
     chapter = _current_chapter(workspace, chapter)
     stats = stats or {}
+    try:
+        # Lazy import avoids the module cycle: validate_workspace imports this readiness matrix,
+        # while direct readiness callers still need the exact same three-layer asset snapshot.
+        try:
+            from . import validate_workspace as _workspace_validator
+        except ImportError:  # pragma: no cover - standalone script imports
+            import validate_workspace as _workspace_validator
+        asset_policy = _workspace_validator.workspace_asset_policy_snapshot(workspace)
+        asset_policy_reasons = []
+        if asset_policy["unsafe_paths"]:
+            asset_policy_reasons.append("unsafe_asset_path")
+        if asset_policy["conflicts"]:
+            asset_policy_reasons.append("student_attempt_asset_conflict")
+    except (OSError, UnicodeError, ValueError) as exc:
+        asset_policy = {"tainted_keys": set(), "conflicts": [], "unsafe_paths": []}
+        asset_policy_reasons = ["asset_policy_unreadable_or_incomplete"]
     structural_reasons = ["workspace_validation_error"] if errors else []
-    structural = _result("blocked" if errors else "ready", structural_reasons,
+    structural_reasons.extend(asset_policy_reasons)
+    structural = _result("blocked" if (errors or asset_policy_reasons) else "ready",
+                         structural_reasons,
                          errors=len(errors), warnings=len(warnings))
 
     wiki = _wiki_path(workspace, chapter)
@@ -568,6 +602,7 @@ def capability_readiness(workspace, errors=(), warnings=(), stats=None, chapter=
     teaching_reasons = []
     if errors:
         teaching_reasons.append("workspace_validation_error")
+    teaching_reasons.extend(asset_policy_reasons)
     if wiki is None:
         teaching_reasons.append("chapter_wiki_missing_or_ambiguous")
     if controls:
@@ -602,10 +637,26 @@ def capability_readiness(workspace, errors=(), warnings=(), stats=None, chapter=
                         for value in item.get("keywords"))):
             invalid["subjective_keywords_missing"] += 1
             continue
+        visual_dependent = (
+            item.get("requires_assets") is True
+            or item.get("maybe_requires_assets") is True
+            or item.get("question_text_status") in ("stub", "page_reference")
+        )
+        if visual_dependent:
+            prompt_assets = [
+                asset for asset in (item.get("assets") or [])
+                if (isinstance(asset, dict)
+                    and asset.get("role") in PROMPT_ASSET_ROLES
+                    and physical_asset_key(asset.get("path")) not in asset_policy["tainted_keys"])
+            ]
+            if not prompt_assets:
+                invalid["question_asset_unavailable"] += 1
+                continue
         valid += 1
     quiz_reasons = []
     if errors:
         quiz_reasons.append("workspace_validation_error")
+    quiz_reasons.extend(asset_policy_reasons)
     if not chapter_items:
         quiz_reasons.append("chapter_quiz_pool_empty")
     if not valid and chapter_items:

@@ -19,7 +19,6 @@ import html
 from html.parser import HTMLParser
 import json
 import mimetypes
-import ntpath
 import os
 from pathlib import Path
 import re
@@ -35,7 +34,17 @@ import i18n
 from ingestion import workspace_publication_lock
 from check_deps import (LATEX2MATHML_PIN, LATEX2MATHML_VERSION, build_report,
                         installed_distribution_version)
-from validate_workspace import LATEX_COMMAND_RE
+from validate_workspace import LATEX_COMMAND_RE, workspace_asset_policy_snapshot
+from asset_policy import physical_asset_key, workspace_asset_is_student_attempt
+from ingestion.identifiers import normalize_workspace_path
+try:
+    from .image_validation import (
+        ImageValidationError, validate_image_blob as _shared_validate_image_blob,
+    )
+except ImportError:
+    from image_validation import (
+        ImageValidationError, validate_image_blob as _shared_validate_image_blob,
+    )
 
 
 for _stream in ("stdout", "stderr"):
@@ -47,7 +56,7 @@ for _stream in ("stdout", "stderr"):
 
 QUESTION_ROLES = {"question_context", "figure", "diagram", "table"}
 ANSWER_ROLES = {"answer_context", "worked_solution"}
-ALL_ROLES = QUESTION_ROLES | ANSWER_ROLES
+ALL_ROLES = QUESTION_ROLES | ANSWER_ROLES | {"student_attempt"}
 ARTIFACT_RECEIPT_SCHEMA_VERSION = 2
 SOURCE_LABELS_ZH = {
     "teacher": "🟢 来自资料",
@@ -269,17 +278,19 @@ def _safe_relative_parts(value, label):
     if not isinstance(value, str) or not value.strip():
         raise GuideError("%s 必须是非空的 workspace 相对路径" % label)
     raw = value.strip()
-    norm = raw.replace("\\", "/")
-    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", norm) or norm.startswith("//"):
-        raise GuideError("%s 不得是 URL、data URI 或盘符路径：%s" % (label, raw))
-    if os.path.isabs(raw) or ntpath.isabs(raw) or norm.startswith("/"):
-        raise GuideError("%s 不得是绝对路径：%s" % (label, raw))
-    parts = [p for p in norm.split("/") if p not in ("", ".")]
-    if not parts or ".." in parts:
-        raise GuideError("%s 不得为空或包含 ..：%s" % (label, raw))
-    if any("\x00" in p for p in parts):
-        raise GuideError("%s 含 NUL 字节" % label)
-    return parts
+    # The renderer accepts one spelling for one physical file.  In particular, do not
+    # normalize Markdown backslashes or discard empty/dot components: either operation would
+    # let a tainted asset acquire a second spelling after the policy snapshot was built.
+    if raw != value or "\\" in raw:
+        raise GuideError("%s 必须使用规范的正斜杠相对路径：%s" % (label, raw))
+    try:
+        canonical = normalize_workspace_path(raw)
+    except ValueError as exc:
+        raise GuideError("%s 不是安全、规范的 workspace 相对路径（%s）：%s"
+                         % (label, exc, raw))
+    if canonical != raw:
+        raise GuideError("%s 不是规范的 workspace 相对路径：%s" % (label, raw))
+    return canonical.split("/")
 
 
 def _validate_provenance_path(value, label):
@@ -288,7 +299,73 @@ def _validate_provenance_path(value, label):
     _safe_relative_parts(value, label)
 
 
-def _resolve_asset(ws, rel, label, allow_wiki_parent_asset=False):
+_ASSET_POLICY_UNSET = object()
+
+
+class _VerifiedTaintedKeys(frozenset):
+    """Workspace-bound capability produced only after a complete live policy read."""
+
+    def __new__(cls, values, workspace, policy):
+        value = super(_VerifiedTaintedKeys, cls).__new__(cls, values)
+        value.workspace_real = os.path.normcase(os.path.realpath(os.path.abspath(workspace)))
+        value.policy = policy
+        return value
+
+
+def _workspace_tainted_asset_keys(ws, label):
+    """Load the complete three-layer policy; omission must never mean "no taint"."""
+    try:
+        snapshot = workspace_asset_policy_snapshot(ws)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise GuideError("%s cannot build the complete workspace asset policy: %s" %
+                         (label, exc))
+    if snapshot["unsafe_paths"]:
+        raise GuideError("%s found an unsafe workspace asset declaration: %s" %
+                         (label, snapshot["unsafe_paths"][0]))
+    if snapshot["conflicts"]:
+        raise GuideError("%s found a student-attempt/asset-role conflict: %s" %
+                         (label, snapshot["conflicts"][0]))
+    return _VerifiedTaintedKeys(snapshot["tainted_keys"], ws, snapshot)
+
+
+def _coerce_tainted_asset_keys(ws, supplied, label):
+    """Never let an arbitrary caller-supplied empty set weaken the live policy."""
+
+    workspace_real = os.path.normcase(os.path.realpath(os.path.abspath(ws)))
+    if (isinstance(supplied, _VerifiedTaintedKeys)
+            and supplied.workspace_real == workspace_real
+            and isinstance(getattr(supplied, "policy", None), dict)):
+        return supplied
+    live = _workspace_tainted_asset_keys(ws, label)
+    if supplied is _ASSET_POLICY_UNSET or supplied is None:
+        return live
+    supplied_policy = supplied if isinstance(supplied, dict) else None
+    try:
+        extra = (set(supplied_policy.get("tainted_keys", ()))
+                 if supplied_policy is not None else set(supplied))
+    except TypeError as exc:
+        raise GuideError("%s received an invalid asset-policy key collection: %s" %
+                         (label, exc))
+    if any(not isinstance(key, str) for key in extra):
+        raise GuideError("%s received a non-string asset-policy key" % label)
+    merged_policy = dict(live.policy)
+    merged_policy["tainted_keys"] = frozenset(set(live) | extra)
+    if supplied_policy is not None:
+        try:
+            identities = set(supplied_policy.get("tainted_identity_keys", ()))
+        except TypeError as exc:
+            raise GuideError("%s received invalid asset identity capabilities: %s" %
+                             (label, exc))
+        if any(not isinstance(key, str) for key in identities):
+            raise GuideError("%s received a non-string asset identity capability" % label)
+        merged_policy["tainted_identity_keys"] = frozenset(
+            set(live.policy.get("tainted_identity_keys", ())) | identities
+        )
+    return _VerifiedTaintedKeys(merged_policy["tainted_keys"], ws, merged_policy)
+
+
+def _resolve_asset(ws, rel, label, allow_wiki_parent_asset=False,
+                   student_attempt_tainted_keys=_ASSET_POLICY_UNSET, taint_message=None):
     """Resolve a workspace asset.
 
     Normal sources must use workspace-relative paths and may never contain ``..``.  The only
@@ -296,13 +373,14 @@ def _resolve_asset(ws, rel, label, allow_wiki_parent_asset=False):
     ``references/wiki/*.md`` by build_visual_index.  It is remapped to
     ``<ws>/references/assets/<tail>`` and receives the same component/symlink checks.
     """
+    student_attempt_tainted_keys = _coerce_tainted_asset_keys(
+        ws, student_attempt_tainted_keys, label)
     raw = rel.strip() if isinstance(rel, str) else rel
-    norm = raw.replace("\\", "/") if isinstance(raw, str) else raw
     wiki_compat = bool(
-        allow_wiki_parent_asset and isinstance(norm, str) and norm.startswith("../assets/")
+        allow_wiki_parent_asset and isinstance(raw, str) and raw.startswith("../assets/")
     )
     if wiki_compat:
-        tail = norm[len("../assets/"):]
+        tail = raw[len("../assets/"):]
         tail_parts = _safe_relative_parts(tail, label)
         parts = ["references", "assets"] + tail_parts
     else:
@@ -310,7 +388,11 @@ def _resolve_asset(ws, rel, label, allow_wiki_parent_asset=False):
     cur = ws
     for part in parts:
         cur = os.path.join(cur, part)
-        if os.path.islink(cur):
+        try:
+            reparse = os.path.lexists(cur) and _is_reparse_stat(os.lstat(cur))
+        except OSError:
+            reparse = False
+        if os.path.islink(cur) or reparse:
             raise GuideError("%s 含符号链接路径组件，拒绝读取：%s" % (label, rel))
     if not _contained(ws, cur):
         raise GuideError("%s 逃出 workspace：%s" % (label, rel))
@@ -322,6 +404,31 @@ def _resolve_asset(ws, rel, label, allow_wiki_parent_asset=False):
             raise GuideError("wiki ../assets 兼容路径未落在 references/assets：%s" % rel)
     if not os.path.isfile(cur):
         raise GuideError("%s 图片不存在：%s" % (label, rel))
+    # Compare taint only after resolving the validated path beneath the canonical workspace.
+    # This keeps the wiki ../assets compatibility spelling and the stored workspace spelling on
+    # the same physical identity without trusting either raw Markdown string as the key.
+    ws_real = os.path.realpath(os.path.abspath(ws))
+    cur_real = os.path.realpath(cur)
+    try:
+        resolved_relative = os.path.relpath(cur_real, ws_real).replace("\\", "/")
+        resolved_relative = normalize_workspace_path(resolved_relative)
+    except (OSError, ValueError) as exc:
+        raise GuideError("%s 无法建立规范的 workspace 资产身份（%s）：%s"
+                         % (label, exc, rel))
+    taint_key = physical_asset_key(resolved_relative)
+    if taint_key is None:
+        raise GuideError("%s 无法建立安全的资产策略键：%s" % (label, rel))
+    try:
+        tainted = workspace_asset_is_student_attempt(
+            resolved_relative, ws, student_attempt_tainted_keys.policy
+        )
+    except ValueError as exc:
+        raise GuideError("%s 无法核验实时物理资产身份（%s）：%s" %
+                         (label, exc, rel))
+    if tainted:
+        raise GuideError(
+            (taint_message or "%s 绑定到 student_attempt 污染资产：%%s" % label) % rel
+        )
     mime = mimetypes.guess_type(cur)[0]
     if not mime or not mime.startswith("image/"):
         raise GuideError("%s 不是可识别的图片文件：%s" % (label, rel))
@@ -336,23 +443,22 @@ def _resolve_asset(ws, rel, label, allow_wiki_parent_asset=False):
 
 def _validate_image_blob(mime, blob, label):
     """Use deterministic signatures so a readable-but-corrupt file cannot become a broken figure."""
-    valid = False
-    if mime == "image/png":
-        valid = len(blob) >= 24 and blob.startswith(b"\x89PNG\r\n\x1a\n") and blob[12:16] == b"IHDR"
-    elif mime in {"image/jpeg", "image/jpg"}:
-        valid = len(blob) >= 4 and blob.startswith(b"\xff\xd8") and blob.endswith(b"\xff\xd9")
-    elif mime == "image/gif":
-        valid = len(blob) >= 13 and blob[:6] in {b"GIF87a", b"GIF89a"}
-    elif mime == "image/webp":
-        valid = len(blob) >= 16 and blob.startswith(b"RIFF") and blob[8:12] == b"WEBP"
-    elif mime in {"image/bmp", "image/x-ms-bmp"}:
-        valid = len(blob) >= 14 and blob.startswith(b"BM")
-    elif mime == "image/svg+xml":
-        raise GuideError("%s 是 SVG；自包含教材拒绝潜在可执行图片，请先转为 PNG" % label)
-    else:
+    if mime == "image/svg+xml":
+        raise GuideError(
+            "%s 是 SVG；自包含教材拒绝潜在可执行图片，请先转为 PNG" % label
+        )
+    supported = {
+        "image/png", "image/jpeg", "image/jpg", "image/gif",
+        "image/webp", "image/bmp", "image/x-ms-bmp",
+    }
+    if mime not in supported:
         raise GuideError("%s 使用不受支持的图片 MIME：%s" % (label, mime))
-    if not valid:
-        raise GuideError("%s 图片内容损坏或与扩展名不符" % label)
+    try:
+        _shared_validate_image_blob(mime, blob)
+    except ImageValidationError as exc:
+        raise GuideError(
+            "%s 图片内容损坏或与扩展名不符（%s）" % (label, exc)
+        )
 
 
 def _read_text(ws, path, label):
@@ -433,16 +539,23 @@ def load_chapter_sources(workspace, chapter):
     wiki_path, wiki_rel = _find_wiki(ws, chapter)
     wiki = _read_text(ws, wiki_path, wiki_rel)
 
-    teaching_all, teaching_missing = _read_json_array(
-        ws,
-        os.path.join(ws, "references", "teaching_examples.json"),
-        "references/teaching_examples.json",
-        optional=True,
+    try:
+        asset_policy = workspace_asset_policy_snapshot(ws)
+    except ValueError as exc:
+        raise GuideError("无法建立完整 student-attempt 资产策略快照：%s" % exc)
+    if asset_policy["unsafe_paths"]:
+        raise GuideError("工作区含不安全资产声明：%s" % asset_policy["unsafe_paths"][0])
+    if asset_policy["conflicts"]:
+        raise GuideError(
+            "工作区含 student-attempt/题面/答案资产角色冲突：%s"
+            % asset_policy["conflicts"][0]
+        )
+    teaching_all = asset_policy["teaching_rows"]
+    teaching_missing = not os.path.lexists(
+        os.path.join(ws, "references", "teaching_examples.json")
     )
     teaching = [row for row in teaching_all if _chapter_matches(row, chapter)]
-    quiz_all, _ = _read_json_array(
-        ws, os.path.join(ws, "references", "quiz_bank.json"), "references/quiz_bank.json"
-    )
+    quiz_all = asset_policy["quiz_rows"]
     quizzes = [row for row in quiz_all if _chapter_matches(row, chapter)]
 
     notebook_path = os.path.join(ws, "notebook", "ch%02d.md" % chapter)
@@ -458,6 +571,7 @@ def load_chapter_sources(workspace, chapter):
         "teaching_manifest_missing": teaching_missing,
         "quizzes": quizzes,
         "notebook": notebook,
+        "student_attempt_tainted_keys": asset_policy["tainted_keys"],
     }
 
 
@@ -619,11 +733,13 @@ def _display_value(value, language="中文"):
 
 class MarkdownRenderer:
     def __init__(self, workspace, math_converter=None, allow_wiki_parent_assets=False,
-                 language="中文"):
+                 language="中文", student_attempt_tainted_keys=_ASSET_POLICY_UNSET):
         self.workspace = workspace
         self.math_converter = math_converter
         self.allow_wiki_parent_assets = allow_wiki_parent_assets
         self.language = language
+        self.student_attempt_tainted_keys = _coerce_tainted_asset_keys(
+            workspace, student_attempt_tainted_keys, "Markdown renderer")
 
     def _protect(self, value, protected):
         token = "STUDYGUIDEPROTECTED%06dZZ" % len(protected)
@@ -645,6 +761,10 @@ class MarkdownRenderer:
             src = _resolve_asset(
                 self.workspace, rel, "Markdown 图片",
                 allow_wiki_parent_asset=self.allow_wiki_parent_assets,
+                student_attempt_tainted_keys=self.student_attempt_tainted_keys,
+                taint_message=(
+                    "Markdown 图片绑定到 student_attempt 污染资产，不能作为概念/讲义证据：%s"
+                ),
             )
             tag = '<figure><img src="%s" alt="%s"><figcaption>%s</figcaption></figure>' % (
                 src,
@@ -863,7 +983,7 @@ def _provenance_html(item, language, answer_missing=False):
     )
 
 
-def _asset_groups(workspace, item, language):
+def _asset_groups(workspace, item, language, tainted_keys=None):
     assets = item.get("assets") or []
     if not isinstance(assets, list):
         raise GuideError("item.assets 必须是数组")
@@ -875,7 +995,17 @@ def _asset_groups(workspace, item, language):
         if role not in ALL_ROLES:
             raise GuideError("assets[%d].role 非法或缺失：%r" % (index, role))
         rel = asset.get("path")
-        src = _resolve_asset(workspace, rel, "assets[%d].path" % index)
+        if role == "student_attempt":
+            # Retain in the source JSON for audit, but never print a student's submission as a
+            # prompt, official solution, or concept illustration.
+            continue
+        src = _resolve_asset(
+            workspace, rel, "assets[%d].path" % index,
+            student_attempt_tainted_keys=tainted_keys,
+            taint_message=(
+                "assets[%d] 把 student_attempt 污染资产作为正式渲染证据：%%s" % index
+            ),
+        )
         caption = _display_value(asset.get("caption") or role, language)
         label_key = "prompt_asset" if role in QUESTION_ROLES else "answer_asset"
         label = _ui_fact_html(language, label_key, role, separator=" · ")
@@ -921,7 +1051,8 @@ def _render_teaching(renderer, workspace, items, language):
     for index, item in enumerate(items, 1):
         if not isinstance(item, dict):
             raise GuideError("teaching_examples 当前章第 %d 项必须是对象" % index)
-        prompt_assets, answer_assets = _asset_groups(workspace, item, language)
+        prompt_assets, answer_assets = _asset_groups(
+            workspace, item, language, renderer.student_attempt_tainted_keys)
         _enforce_prompt_assets(item, prompt_assets)
         title = _display_value(item.get("title") or item.get("id") or "example-%d" % index,
                                language)
@@ -994,7 +1125,8 @@ def _render_quizzes(renderer, workspace, items, language):
     for index, item in enumerate(items, 1):
         if not isinstance(item, dict):
             raise GuideError("quiz_bank 当前章第 %d 项必须是对象" % index)
-        prompt_assets, answer_assets = _asset_groups(workspace, item, language)
+        prompt_assets, answer_assets = _asset_groups(
+            workspace, item, language, renderer.student_attempt_tainted_keys)
         _enforce_prompt_assets(item, prompt_assets)
         qid = _display_value(item.get("id") or "quiz-%d" % index, language)
         answer = item.get("answer")
@@ -1046,9 +1178,16 @@ def render_study_guide(sources, math_converter=None):
     language = sources.get("language", "中文")
     if language not in CANON_LANGUAGES:
         raise GuideError("renderer language 必须是 canonical 中文、English 或 双语")
-    renderer = MarkdownRenderer(ws, math_converter, language=language)
+    # Re-read instead of trusting a compatibility caller to provide the policy key.  The public
+    # render API must fail closed even when a new host constructs ``sources`` by hand.
+    tainted_keys = _workspace_tainted_asset_keys(ws, "source-packet renderer")
+    renderer = MarkdownRenderer(
+        ws, math_converter, language=language,
+        student_attempt_tainted_keys=tainted_keys,
+    )
     wiki_renderer = MarkdownRenderer(
-        ws, math_converter, allow_wiki_parent_assets=True, language=language
+        ws, math_converter, allow_wiki_parent_assets=True, language=language,
+        student_attempt_tainted_keys=tainted_keys,
     )
     wiki = wiki_renderer.render(sources["wiki"])
     teaching = _render_teaching(renderer, ws, sources["teaching"], language)
