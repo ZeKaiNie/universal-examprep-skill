@@ -111,5 +111,14 @@ class SharedRasterValidation(unittest.TestCase):
                     validate_image_blob(mime, payload)
 
 
+class CIWorkflowContract(unittest.TestCase):
+    def test_ci_installs_pinned_decoder_for_non_png_integration(self):
+        workflow_path = os.path.join(ROOT, ".github", "workflows", "ci.yml")
+        with open(workflow_path, encoding="utf-8") as handle:
+            workflow = handle.read()
+        self.assertIn("Pillow==10.4.0", workflow)
+        self.assertIn("latex2mathml==3.60.0", workflow)
+
+
 if __name__ == "__main__":
     unittest.main()
