@@ -27,6 +27,11 @@ import i18n as _i18n
 import retrieve as _retrieve
 import strict_json as _strict_json
 import readiness as _readiness_matrix
+from image_validation import (
+    ImageValidationError as _ImageValidationError,
+    validate_image_blob as _validate_image_blob,
+)
+from asset_policy import audit_asset_policy as _audit_asset_policy
 from ingestion.identifiers import is_link_or_reparse
 from host_adapters.command_core import (
     CommandCoreError as _SnapshotError,
@@ -50,12 +55,24 @@ TRUE_FALSE_OK = {"true", "false", "t", "f", "yes", "no", "真", "假", "对", "�
 # that depend on a slide figure (e.g. a Venn diagram). The bank must be able to attach the
 # source page/image, and the validator + quiz must fail-closed: never ask a
 # diagram/figure-dependent item without its question-side context displayed first.
-ASSET_ROLES = {"question_context", "answer_context", "figure", "table", "diagram", "worked_solution"}
+ASSET_ROLES = {
+    "question_context", "answer_context", "figure", "table", "diagram",
+    "worked_solution", "student_attempt",
+}
 # roles whose asset is shown to the student BEFORE asking — a requires_assets item needs one of these
 # (an answer-side-only asset doesn't let the question be asked).
 QUESTION_SIDE_ROLES = {"question_context", "figure", "diagram", "table"}
 ASSET_TYPES = {"page_image", "crop_image", "diagram", "table_image", "other_image"}
 QUESTION_TEXT_STATUS = {"full", "stub", "page_reference"}
+RASTER_MIME_BY_EXTENSION = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+}
+SUPPORTED_RASTER_MIMES = frozenset(RASTER_MIME_BY_EXTENSION.values())
 
 # A lecture prompt produced by the deterministic Example/Quiz parser normally retains its heading.
 # If such a prompt is labelled ``full`` but ends on a syntactic continuation cue, it is unsafe to
@@ -134,6 +151,45 @@ def _sha256_file(path):
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _raster_mime(path, media_type=None):
+    """Return the shared-validator MIME for a declared raster asset.
+
+    The asset filename is authoritative when it has one of the advertised
+    raster extensions.  A typed source/unit may additionally identify an
+    extensionless asset through its media type.  Other formats (including the
+    existing SVG path) retain their pre-existing handling and are not routed
+    through a raster decoder by this helper.
+    """
+
+    if isinstance(path, str):
+        by_extension = RASTER_MIME_BY_EXTENSION.get(
+            os.path.splitext(path)[1].lower()
+        )
+        if by_extension:
+            return by_extension
+    normalized = str(media_type or "").lower().split(";", 1)[0].strip()
+    if normalized == "image/jpg":
+        normalized = "image/jpeg"
+    if normalized == "image/x-ms-bmp":
+        normalized = "image/bmp"
+    return normalized if normalized in SUPPORTED_RASTER_MIMES else None
+
+
+def _raster_file_validation_error(full_path, declared_path, media_type=None):
+    """Return a deterministic corruption reason, or ``None`` when valid/N/A."""
+
+    mime = _raster_mime(declared_path, media_type)
+    if mime is None:
+        return None
+    try:
+        with open(full_path, "rb") as stream:
+            payload = stream.read()
+        _validate_image_blob(mime, payload)
+    except (OSError, _ImageValidationError) as exc:
+        return str(exc)
+    return None
 
 
 def _plan_phase_nums(text):
@@ -300,6 +356,95 @@ def _raw_latex_lines(text):
     return sorted({prose.count("\n", 0, m.start()) + 1 for m in LATEX_COMMAND_RE.finditer(prose)})
 
 
+def _policy_json_array(ws, relative, optional=False):
+    path = os.path.join(ws, *relative.split("/"))
+    if optional and not os.path.lexists(path):
+        return []
+    ws_real = os.path.normcase(os.path.realpath(ws))
+    path_real = os.path.normcase(os.path.realpath(path))
+    if (_is_symlink(path) or not os.path.isfile(path)
+            or (path_real != ws_real and not path_real.startswith(ws_real + os.sep))):
+        raise ValueError("%s is missing, non-regular, or escapes the workspace" % relative)
+    try:
+        value = _strict_json.loads(_read(path))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("%s is not strict UTF-8 JSON: %s" % (relative, exc))
+    if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+        raise ValueError("%s must be an array of objects" % relative)
+    return value
+
+
+def _policy_content_units(ws):
+    ingest = os.path.join(ws, ".ingest")
+    if not os.path.lexists(ingest):
+        return []
+    path = os.path.join(ingest, "content_units.jsonl")
+    ws_real = os.path.normcase(os.path.realpath(ws))
+    path_real = os.path.normcase(os.path.realpath(path))
+    if (_is_symlink(ingest) or not os.path.isdir(ingest) or _is_symlink(path)
+            or not os.path.isfile(path)
+            or (path_real != ws_real and not path_real.startswith(ws_real + os.sep))):
+        raise ValueError(
+            ".ingest exists but content_units.jsonl is missing, non-regular, or unsafe"
+        )
+    rows = []
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                row = _strict_json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError("line %d is not an object" % line_number)
+                rows.append(row)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(".ingest/content_units.jsonl is invalid: %s" % exc)
+    return rows
+
+
+def workspace_asset_policy_snapshot(ws):
+    """Return the shared physical asset policy over every workspace evidence layer.
+
+    This is the safe public workspace entry: every invocation rereads the live quiz bank,
+    teaching-example sidecar, and (when ``.ingest`` exists) the complete content-unit file.
+    Callers cannot substitute cached, chapter-filtered, or hand-built rows.  That invariant is
+    deliberate: an empty/partial cache must never erase a student-attempt declaration from a
+    different layer or chapter.  No chapter filter is applied.
+    """
+
+    quizzes = _policy_json_array(ws, "references/quiz_bank.json")
+    teaching = _policy_json_array(
+        ws, "references/teaching_examples.json", optional=True
+    )
+    units = _policy_content_units(ws)
+    labelled = (
+        ("references/quiz_bank.json", quizzes),
+        ("references/teaching_examples.json", teaching),
+        (".ingest/content_units.jsonl", units),
+    )
+    for label, rows in labelled:
+        if any(not isinstance(row, dict) and not hasattr(row, "metadata") for row in rows):
+            raise ValueError("%s must contain item/content-unit objects" % label)
+
+    audit = _audit_asset_policy(
+        quiz_rows=quizzes,
+        teaching_rows=teaching,
+        content_units=units,
+        workspace=ws,
+    )
+    return {
+        "quiz_rows": quizzes,
+        "teaching_rows": teaching,
+        "content_units": units,
+        "tainted_keys": audit["tainted_keys"],
+        "tainted_identity_keys": audit["tainted_identity_keys"],
+        "conflicts": audit["conflicts"],
+        # Preserve the established consumer key while broadening it from unsafe
+        # paths to every malformed/unknown asset declaration.
+        "unsafe_paths": audit["invalid_declarations"],
+    }
+
+
 def validate(ws):
     """Return (errors, warnings, stats). errors may carry level 'error' or 'fatal'."""
     errors, warnings, stats = [], [], {}
@@ -452,6 +597,9 @@ def validate(ws):
                                     f"{source.path}（{exc}）"
                                 )
 
+                    source_media_types = {
+                        source.source_id: source.media_type for source in sources
+                    }
                     for unit in units.values():
                         if not unit.asset_path:
                             continue
@@ -466,6 +614,17 @@ def validate(ws):
                                 % (unit.asset_path, unit.unit_id)
                             )
                         else:
+                            raster_error = _raster_file_validation_error(
+                                asset_path,
+                                unit.asset_path,
+                                source_media_types.get(unit.source_id),
+                            )
+                            if raster_error:
+                                err(
+                                    "ContentUnit 光栅资产损坏或与扩展名不符: "
+                                    "%s（unit %s；%s）"
+                                    % (unit.asset_path, unit.unit_id, raster_error)
+                                )
                             expected_asset_hash = unit.metadata.get("asset_sha256")
                             if (expected_asset_hash is not None
                                     and _sha256_file(asset_path) != expected_asset_hash):
@@ -1035,16 +1194,16 @@ def validate(ws):
                     else:
                         warn(f"{tag} assets[{ai}] 资源文件不存在或不可读: {apath}（建议补齐 references/assets/ 下的文件）")
                 else:
-                    asset_ok += 1
-                    try:
-                        with open(full, "rb") as stream:
-                            signature = stream.read(8)
-                    except OSError:
-                        signature = b""
-                    if isinstance(apath, str) and apath.lower().endswith(".png") \
-                            and signature != b"\x89PNG\r\n\x1a\n":
-                        err(f"{tag} assets[{ai}] 声明为 PNG 但文件签名无效: {apath}")
+                    raster_error = _raster_file_validation_error(
+                        full, apath, a.get("media_type") or a.get("mime_type")
+                    )
+                    if raster_error:
+                        err(
+                            f"{tag} assets[{ai}] 光栅图像损坏或与扩展名不符: "
+                            f"{apath}（{raster_error}）"
+                        )
                         continue
+                    asset_ok += 1
                     expected_asset_hash = a.get("sha256")
                     if expected_asset_hash is not None:
                         if not (isinstance(expected_asset_hash, str)
@@ -1075,7 +1234,7 @@ def validate(ws):
                 err(f"{tag} {visual_gate_label} 但没有任何有效（安全且存在）的 asset，须 fail-closed")
             elif visual_required and q_side_ok == 0:
                 err(f"{tag} {visual_gate_label} 但没有『题面侧』有效 asset（role 须含 "
-                    f"{sorted(QUESTION_SIDE_ROLES)} 之一）——只有答案侧 asset（answer_context/worked_solution）"
+                    f"{sorted(QUESTION_SIDE_ROLES)} 之一）——只有非题面 asset（answer_context/worked_solution/student_attempt）"
                     "无法在出题前展示题面，测验须 fail-closed")
             # source_file / answer_source_file, when present, must be a non-empty string (not obj/list/blank)
             for sf in ("source_file", "answer_source_file"):
@@ -1254,9 +1413,21 @@ def validate(ws):
                 if unsafe:
                     err(f"{tag} assets[{ai}] 不安全的 path: {unsafe}")
                 elif readable:
-                    valid_assets += 1
-                    if isinstance(role, str) and role in QUESTION_SIDE_ROLES:
-                        valid_prompt_assets += 1
+                    asset_path = asset.get("path")
+                    raster_error = _raster_file_validation_error(
+                        full,
+                        asset_path,
+                        asset.get("media_type") or asset.get("mime_type"),
+                    )
+                    if raster_error:
+                        err(
+                            f"{tag} assets[{ai}] 光栅图像损坏或与扩展名不符: "
+                            f"{asset_path}（{raster_error}）"
+                        )
+                    else:
+                        valid_assets += 1
+                        if isinstance(role, str) and role in QUESTION_SIDE_ROLES:
+                            valid_prompt_assets += 1
                 elif requires:
                     err(f"{tag} 必需教学资源文件不存在或不可读: {asset.get('path')}")
                 else:
@@ -1267,10 +1438,34 @@ def validate(ws):
                 err(f"{tag} requires_assets/maybe_requires_assets=true 但无有效 asset")
             elif requires and valid_prompt_assets == 0:
                 err(f"{tag} requires_assets/maybe_requires_assets=true 但无题面侧有效 asset（role 须含 "
-                    f"{sorted(QUESTION_SIDE_ROLES)} 之一）；只有 answer_context/worked_solution 不能先展示题面")
+                    f"{sorted(QUESTION_SIDE_ROLES)} 之一）；只有 answer_context/worked_solution/student_attempt 不能先展示题面")
         stats["teaching_example_roles"] = role_counts
 
-    quiz_items_for_overlap = data if has_qb and isinstance(data, list) else []
+    # Student submissions are audit evidence, never prompt/answer evidence.  Taint is
+    # workspace-global and physical-path based: a later official-looking declaration must not
+    # launder a path that any quiz, teaching row, or ContentUnit identifies as student work.
+    # Run this after both human-facing arrays have been loaded so file order cannot affect the
+    # verdict, and include every ContentUnit (including foreign chapters).
+    quiz_policy_rows = data if has_qb and isinstance(data, list) else []
+    teaching_policy_rows = teaching_items if isinstance(teaching_items, list) else []
+    try:
+        # Re-read the live files at this security boundary.  The arrays above are useful for
+        # schema diagnostics, but accepting them as a policy cache would let a public caller (or
+        # a stale validator-local slice) omit another layer's student-attempt declaration.
+        asset_policy = workspace_asset_policy_snapshot(ws)
+    except ValueError as exc:
+        # The underlying schema/path checks above already classify malformed JSON and unsafe
+        # entries.  The policy layer must still block, but it should not upgrade an ordinary
+        # missing/symlinked quiz-bank validation error to the CLI's malformed-input exit code.
+        err("student-attempt asset policy 无法建立完整快照: %s" % exc)
+        asset_policy = {"tainted_keys": set(), "conflicts": [], "unsafe_paths": []}
+    stats["student_attempt_tainted_assets"] = len(asset_policy["tainted_keys"])
+    for problem in asset_policy["conflicts"]:
+        err("student-attempt asset policy conflict: %s" % problem)
+    for problem in asset_policy["unsafe_paths"]:
+        err("student-attempt asset policy path error: %s" % problem)
+
+    quiz_items_for_overlap = quiz_policy_rows
     quiz_ids = {q.get("id") for q in quiz_items_for_overlap
                 if isinstance(q, dict)
                 and q.get("gradable") is not False

@@ -15,6 +15,21 @@ sys.path.insert(0, SCRIPTS)
 import cheatsheet_render  # noqa: E402
 import notebook as nb     # noqa: E402
 PY = sys.executable
+PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+    "0000000c49444154789c63f8ffff3f0005fe02fe0def46b80000000049454e44ae426082"
+)
+
+
+def _prepare_image_workspace(ws, image=False):
+    assets = os.path.join(ws, "references", "assets")
+    os.makedirs(assets)
+    with open(os.path.join(ws, "references", "quiz_bank.json"),
+              "w", encoding="utf-8") as stream:
+        json.dump([], stream)
+    if image:
+        with open(os.path.join(assets, "f.png"), "wb") as stream:
+            stream.write(PNG)
 
 
 def run_nb(ws, *args, stdin=None):
@@ -75,24 +90,28 @@ class BodyHeadingsCountForSlugs(unittest.TestCase):
 
 class ImgContainment(unittest.TestCase):
     def test_url_image_rejected(self):
-        with self.assertRaises(SystemExit):
-            cheatsheet_render.md_to_html_body("![x](https://evil.com/a.png)")
+        with tempfile.TemporaryDirectory() as ws:
+            _prepare_image_workspace(ws)
+            with self.assertRaises(SystemExit):
+                cheatsheet_render.md_to_html_body("![x](https://evil.com/a.png)", ws)
 
     def test_traversal_image_rejected(self):
-        with self.assertRaises(SystemExit):
-            cheatsheet_render.md_to_html_body("![x](../outside.png)")
+        with tempfile.TemporaryDirectory() as ws:
+            _prepare_image_workspace(ws)
+            with self.assertRaises(SystemExit):
+                cheatsheet_render.md_to_html_body("![x](../outside.png)", ws)
 
     def test_missing_image_fails_closed_with_ws(self):
         with tempfile.TemporaryDirectory() as ws:
+            _prepare_image_workspace(ws)
             with self.assertRaises(SystemExit):
                 cheatsheet_render.md_to_html_body("![x](references/assets/gone.png)", ws)
 
     def test_contained_existing_image_renders(self):
         with tempfile.TemporaryDirectory() as ws:
-            os.makedirs(os.path.join(ws, "references", "assets"))
-            open(os.path.join(ws, "references", "assets", "f.png"), "wb").write(b"png")
+            _prepare_image_workspace(ws, image=True)
             body = cheatsheet_render.md_to_html_body("![题面图](references/assets/f.png)", ws)
-            self.assertIn('<img src="references/assets/f.png"', body)
+            self.assertIn('<img src="data:image/png;base64,', body)
 
 
 class IngestLanguagePersistence(unittest.TestCase):

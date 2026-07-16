@@ -22,7 +22,7 @@
 
 ## 视觉门禁
 
-题目带 `requires_assets=true`、`maybe_requires_assets=true`、`question_text_status="stub"` 或 `"page_reference"` 时，必须在提问、提示、讲解、解答之前真实显示全部题面图/原页上下文（`question_context|figure|diagram|table`）。路径、文件名、坏链接不算展示。不得先展示答案图（`answer_context|worked_solution`）；它只能在题面图之后的解答/复盘出现。看不到题面时跳过，从挂载题库另选题面自足的 `full` 题；若没有就如实说明本章无法在网页端测验，绝不自编替代题。
+题目带 `requires_assets=true`、`maybe_requires_assets=true`、`question_text_status="stub"` 或 `"page_reference"` 时，必须在提问、提示、讲解、解答之前真实显示全部题面图/原页上下文（`question_context|figure|diagram|table`）。路径、文件名、坏链接不算展示。不得先展示答案图（`answer_context|worked_solution`）；它只能在题面图之后的解答/复盘出现。`student_attempt` 是学生作答审计证据，绝不作为题面、答案、概念图或来源证据展示。网页端至少要先扫描**全部已挂载题库行**：把安全相对路径的 `/` 与 `\` 分隔写法视为同一路径；若任一行把该路径标为 `student_attempt`，同一路径在其他行即使另标为官方角色也一律排除。拒绝空段、`.`、`..`、绝对路径、URL、微软视窗系统的尾点、尾空格与保留设备名；无法完整扫描挂载题库时不得声称做过全局资产审计。网页端看不到未挂载的内容单元，因此这里只能承诺“挂载题库范围内”的局部门禁。看不到安全完整题面时跳过，从挂载题库另选题面自足的 `full` 题；若没有就如实说明本章无法在网页端测验，绝不自编替代题。
 
 ## 知识来源标注
 

@@ -27,7 +27,6 @@ import os
 import re
 import shutil
 import stat
-import struct
 from pathlib import Path
 import sys
 import tempfile
@@ -35,14 +34,21 @@ import tempfile
 try:  # package imports in readiness; script-directory imports in the CLI/tests
     from . import exam_start, i18n, study_guide_content
     from .ingestion import workspace_publication_lock
+    from .image_validation import (
+        ImageValidationError, PNG_SIGNATURE,
+        png_dimensions as _shared_png_dimensions,
+    )
 except ImportError:  # pragma: no cover - standalone entrypoint path
     import exam_start
     import i18n
     import study_guide_content
     from ingestion import workspace_publication_lock
+    from image_validation import (
+        ImageValidationError, PNG_SIGNATURE,
+        png_dimensions as _shared_png_dimensions,
+    )
 
 
-PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 SCHEMA_VERSION = 1
 ARTIFACT_RECEIPT_SCHEMA_VERSION = 2
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -885,13 +891,10 @@ def _page_number_visible(text, page_number, page_count):
 
 
 def _png_dimensions(payload):
-    if (not isinstance(payload, (bytes, bytearray)) or len(payload) < 24
-            or bytes(payload[:8]) != PNG_SIGNATURE or bytes(payload[12:16]) != b"IHDR"):
-        raise QAError("renderer did not produce a PNG with a readable IHDR")
-    width, height = struct.unpack(">II", bytes(payload[16:24]))
-    if width < 1 or height < 1:
-        raise QAError("renderer PNG has invalid IHDR dimensions")
-    return width, height
+    try:
+        return _shared_png_dimensions(payload)
+    except ImageValidationError as exc:
+        raise QAError("renderer did not produce a valid PNG: %s" % exc)
 
 
 def _looks_like_orphan_heading(text):

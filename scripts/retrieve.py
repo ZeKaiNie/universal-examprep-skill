@@ -54,6 +54,7 @@ for _s in ("stdout", "stderr"):
 
 INDEX_NAME = os.path.join("references", "retrieval_index.json")
 TERMS_NAME = os.path.join("references", "terms.json")
+TEACHING_EXAMPLES_NAME = "references/teaching_examples.json"
 INDEX_VERSION = 2
 K1, B = 1.5, 0.75          # standard BM25 constants; persisted in the index for provenance
 DEFAULT_TOP_K = 4          # spike contract default
@@ -276,13 +277,38 @@ def _verify_integrity(ws, integrity):
     wiki = integrity.get("wiki", [])
     if not isinstance(wiki, list):
         _die("retrieval_index.json integrity.wiki 必须是数组——请重跑 ingest 重建")
+    fixed_files = {
+        "source_manifest": ".ingest/source_manifest.json",
+        "content_units": ".ingest/content_units.jsonl",
+        "canonical_groups": ".ingest/canonical_groups.jsonl",
+        "source_conflicts": ".ingest/source_conflicts.jsonl",
+        "quiz_bank": "references/quiz_bank.json",
+        "teaching_examples": TEACHING_EXAMPLES_NAME,
+    }
     rows = list(wiki)
-    for key in (
-        "source_manifest", "content_units", "canonical_groups",
-        "source_conflicts", "quiz_bank",
-    ):
+    for key, fixed_file in fixed_files.items():
         if integrity.get(key) is not None:
-            rows.append(integrity[key])
+            row = integrity[key]
+            if not isinstance(row, dict) or row.get("file") != fixed_file:
+                _die(
+                    "retrieval_index.json integrity.%s must bind fixed file %s"
+                    "——请重跑 ingest 重建" % (key, fixed_file)
+                )
+            rows.append(row)
+
+    # Legacy indexes remain usable only while no teaching layer exists.  Once
+    # that layer is present it participates in retrieval policy, so an index
+    # that does not bind its exact bytes is stale even when every indexed wiki
+    # and quiz-bank byte is unchanged.
+    try:
+        teaching_path = str(safe_workspace_entry(ws, TEACHING_EXAMPLES_NAME))
+    except (TypeError, ValueError) as exc:
+        _die("teaching layer path is unsafe: %s" % exc)
+    if os.path.lexists(teaching_path) and integrity.get("teaching_examples") is None:
+        _die(
+            "stale_index: references/teaching_examples.json exists but the index "
+            "does not bind it——请重跑 ingest 重建"
+        )
     for row in rows:
         if not isinstance(row, dict) or set(row) != {"file", "sha256"}:
             _die("retrieval_index.json integrity 条目损坏——请重跑 ingest 重建")
@@ -340,7 +366,7 @@ def load_index(ws):
         integrity_rows = list(idx["integrity"].get("wiki") or ())
         for key in (
             "source_manifest", "content_units", "canonical_groups",
-            "source_conflicts", "quiz_bank",
+            "source_conflicts", "quiz_bank", "teaching_examples",
         ):
             if idx["integrity"].get(key) is not None:
                 integrity_rows.append(idx["integrity"][key])

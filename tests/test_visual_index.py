@@ -4,14 +4,18 @@
 Recall-first is the whole point: a page with an embedded image but NO caption keywords must still be
 flagged; detector vocabulary must be multi-domain (circuit/flowchart/waveform …), never bound to one
 subject. Pure stdlib; PDF backends are faked — no real pypdf/PyMuPDF needed, no network, no LLM."""
+import base64
 import json
 import hashlib
+import copy
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,7 +26,41 @@ import list_image_questions as LIQ        # noqa: E402
 import list_figure_pages as LFP           # noqa: E402
 import show_question_assets as SQA        # noqa: E402
 
-PNG = (b"\x89PNG\r\n\x1a\n" + b"0" * 60)  # tiny fake png bytes (content irrelevant for these tests)
+PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+    "0000000c49444154789c63f8ffff3f0005fe02fe0def46b80000000049454e44ae426082"
+)  # structurally valid, decodable 1x1 RGB PNG
+
+VALID_JPEG = base64.b64decode(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkS"
+    "Ew8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJ"
+    "CQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIy"
+    "MjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAA"
+    "AAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEG"
+    "E1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RF"
+    "RkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKj"
+    "pKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP0"
+    "9fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgEC"
+    "BAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLR"
+    "ChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0"
+    "dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbH"
+    "yMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD3+iii"
+    "gD//2Q=="
+)
+
+
+def _png_chunk(kind, payload):
+    return (struct.pack(">I", len(payload)) + kind + payload
+            + struct.pack(">I", zlib.crc32(kind + payload) & 0xffffffff))
+
+
+BAD_ZLIB_PNG = (
+    b"\x89PNG\r\n\x1a\n"
+    + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+    + _png_chunk(b"IDAT", b"valid framing, not a zlib stream")
+    + _png_chunk(b"IEND", b"")
+)
+BAD_CRC_PNG = PNG[:-1] + bytes([PNG[-1] ^ 1])
 
 
 class FakeBackend(object):
@@ -154,6 +192,25 @@ class ClassifyPage(unittest.TestCase):
 
 
 class BuildIndices(unittest.TestCase):
+    @staticmethod
+    def _workspace_snapshot(ws):
+        result = {}
+        for directory, _subdirs, names in os.walk(ws):
+            for name in names:
+                path = os.path.join(directory, name)
+                with open(path, "rb") as stream:
+                    result[os.path.relpath(path, ws)] = stream.read()
+        return result
+
+    def _assert_no_transaction_temps(self, ws):
+        leftovers = []
+        for directory, _subdirs, names in os.walk(ws):
+            leftovers.extend(
+                os.path.join(directory, name) for name in names
+                if name.startswith(".") and name.endswith(".tmp")
+            )
+        self.assertEqual([], leftovers)
+
     def test_canonical_markdown_relpath_normalizes_lexical_aliases(self):
         tmp = tempfile.mkdtemp()
         canonical_wiki = os.path.join(tmp, "ws", "references", "wiki")
@@ -308,6 +365,231 @@ class BuildIndices(unittest.TestCase):
                            capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
+    def test_apply_rejects_deterministic_target_ownership_before_any_write(self):
+        cases = (
+            ("answer-overwrites-current-prompt", "ansfig_1", "answer", 3,
+             "answer_context", "ansfig_1", "question_context", b"PROMPT"),
+            ("prompt-overwrites-current-answer", "suspect_1", "prompt", 2,
+             "question_context", "suspect_1", "answer_context", b"ANSWER"),
+            ("answer-overwrites-cross-item-prompt", "ansfig_1", "answer", 3,
+             "answer_context", "plain_1", "question_context", b"SHARED"),
+        )
+        for (label, target_id, side, page, _planned_role, owner_id, owner_role,
+             sentinel) in cases:
+            with self.subTest(label):
+                tmp = tempfile.mkdtemp()
+                ws = _mk_workspace(tmp)
+                mat = os.path.join(tmp, "mat")
+                _mk_materials(mat, ["ch01.pdf", "ch02.pdf"])
+                bank_path = os.path.join(ws, "references", "quiz_bank.json")
+                bank = json.load(open(bank_path, encoding="utf-8"))
+                target = next(item for item in bank if item["id"] == target_id)
+                source_file = (
+                    target.get("answer_source_file") or target.get("source_file")
+                    if side == "answer" else target.get("source_file")
+                )
+                suspect = {
+                    "id": target_id, "source_layer": "quiz_bank",
+                    "source_file": source_file, "visual_pages": [page],
+                }
+                asset_root = os.path.join(ws, "references", "assets")
+                plan = BVI._planned_repair_assets(
+                    ws, asset_root, bank, [suspect], side)[0]
+                owner = next(item for item in bank if item["id"] == owner_id)
+                owner["assets"] = [{
+                    "path": plan["path"], "role": owner_role,
+                    "type": "page_image",
+                }]
+                os.makedirs(os.path.dirname(plan["full_path"]), exist_ok=True)
+                with open(plan["full_path"], "wb") as stream:
+                    stream.write(sentinel)
+                with open(bank_path, "w", encoding="utf-8") as stream:
+                    json.dump(bank, stream, ensure_ascii=False, indent=2)
+
+                # Establish deterministic pre-existing indices, then prove the
+                # unsafe --apply attempt cannot rewrite any authoritative or
+                # derived artifact (nor create the bank backup).
+                self.assertEqual(BVI.run(
+                    ["--workspace", ws, "--materials", mat],
+                    backend=_default_backend()), 0)
+                watched = [
+                    bank_path,
+                    plan["full_path"],
+                    os.path.join(ws, "references", "figure_page_index.json"),
+                    os.path.join(ws, "references", "image_question_index.json"),
+                ]
+                before = {path: open(path, "rb").read() for path in watched}
+                with self.assertRaises(SystemExit) as stopped:
+                    BVI.run(
+                        ["--workspace", ws, "--materials", mat, "--apply"],
+                        backend=_default_backend())
+                self.assertEqual(stopped.exception.code, 2)
+                self.assertEqual(
+                    before, {path: open(path, "rb").read() for path in watched})
+                self.assertFalse(os.path.lexists(bank_path + ".bak"))
+
+    def test_apply_rejects_unowned_existing_target_before_render_or_mutation(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        mat = os.path.join(tmp, "mat")
+        _mk_materials(mat, ["ch01.pdf", "ch02.pdf"])
+        bank_path = os.path.join(ws, "references", "quiz_bank.json")
+        bank = json.load(open(bank_path, encoding="utf-8"))
+        suspect = {
+            "id": "suspect_1", "source_layer": "quiz_bank",
+            "source_file": "lectures/ch01.pdf", "visual_pages": [2],
+        }
+        plan = BVI._planned_repair_assets(
+            ws, os.path.join(ws, "references", "assets"), bank,
+            [suspect], "prompt",
+        )[0]
+        sentinel = PNG + b"UNOWNED"
+        with open(plan["full_path"], "wb") as stream:
+            stream.write(sentinel)
+        self.assertEqual(BVI.run(
+            ["--workspace", ws, "--materials", mat],
+            backend=_default_backend()), 0)
+        wiki_path = os.path.join(ws, "references", "wiki", "ch1.md")
+        watched = [
+            bank_path, wiki_path, plan["full_path"],
+            os.path.join(ws, "references", "figure_page_index.json"),
+            os.path.join(ws, "references", "image_question_index.json"),
+        ]
+        before = {path: open(path, "rb").read() for path in watched}
+
+        class MustNotRender(FakeBackend):
+            def render_page_png(self, pdf_path, page_index):
+                raise AssertionError("ownership preflight must precede rendering")
+
+        base = _default_backend()
+        backend = MustNotRender(base.texts, base.media)
+        with self.assertRaises(SystemExit) as stopped:
+            BVI.run(
+                ["--workspace", ws, "--materials", mat, "--apply"],
+                backend=backend,
+            )
+        self.assertEqual(2, stopped.exception.code)
+        self.assertEqual(
+            before, {path: open(path, "rb").read() for path in watched}
+        )
+        self.assertFalse(os.path.lexists(bank_path + ".bak"))
+
+    def test_direct_apply_allows_proved_same_side_source_refresh(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        mat = os.path.join(tmp, "mat")
+        _mk_materials(mat, ["ch01.pdf", "ch02.pdf"])
+        bank_path = os.path.join(ws, "references", "quiz_bank.json")
+        bank = json.load(open(bank_path, encoding="utf-8"))
+        item = next(row for row in bank if row["id"] == "suspect_1")
+        suspect = {
+            "id": item["id"], "source_layer": "quiz_bank",
+            "source_file": item["source_file"], "visual_pages": [2],
+        }
+        plan = BVI._planned_repair_assets(
+            ws, os.path.join(ws, "references", "assets"), bank,
+            [suspect], "prompt",
+        )[0]
+        old = PNG + b"OLD"
+        with open(plan["full_path"], "wb") as stream:
+            stream.write(old)
+        item["assets"] = [{
+            "path": plan["path"], "role": "question_context",
+            "type": "page_image", "sha256": hashlib.sha256(old).hexdigest(),
+            "generated_by": BVI._REPAIR_WRITER_ID,
+            "source_layer": "quiz_bank", "source_file": item["source_file"],
+            "source_page": 2, "side": "prompt",
+        }]
+        with open(bank_path, "w", encoding="utf-8") as stream:
+            json.dump(bank, stream, ensure_ascii=False, indent=2)
+
+        applied = BVI.apply_suspects(
+            ws, mat, bank, [suspect], _default_backend(),
+            os.path.join(ws, "references", "assets"), [],
+            # A caller-supplied empty policy/taint cannot weaken the live policy.
+            tainted_keys=set(),
+            policy_rows={"quiz_rows": [], "teaching_rows": [], "content_units": []},
+        )
+        self.assertEqual(1, applied)
+        self.assertEqual(PNG, open(plan["full_path"], "rb").read())
+        refreshed = next(
+            asset for asset in item["assets"]
+            if BVI.physical_asset_key(asset.get("path")) == plan["key"]
+        )
+        self.assertEqual(hashlib.sha256(PNG).hexdigest(), refreshed["sha256"])
+        self.assertEqual(BVI._REPAIR_WRITER_ID, refreshed["generated_by"])
+
+    def test_direct_apply_empty_policy_cannot_hide_foreign_attempt_owner(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        mat = os.path.join(tmp, "mat")
+        _mk_materials(mat, ["ch01.pdf", "ch02.pdf"])
+        bank_path = os.path.join(ws, "references", "quiz_bank.json")
+        bank = json.load(open(bank_path, encoding="utf-8"))
+        suspect = {
+            "id": "suspect_1", "source_layer": "quiz_bank",
+            "source_file": "lectures/ch01.pdf", "visual_pages": [2],
+        }
+        plan = BVI._planned_repair_assets(
+            ws, os.path.join(ws, "references", "assets"), bank,
+            [suspect], "prompt",
+        )[0]
+        ingest = os.path.join(ws, ".ingest")
+        os.makedirs(ingest, exist_ok=True)
+        with open(os.path.join(ingest, "content_units.jsonl"),
+                  "w", encoding="utf-8") as stream:
+            stream.write(json.dumps({
+                "unit_id": "foreign-attempt", "chapter_id": "ch02",
+                "kind": "figure", "asset_path": plan["path"],
+                "asset_role": "student_attempt", "metadata": {},
+            }) + "\n")
+        before_bank = json.dumps(bank, ensure_ascii=False, sort_keys=True)
+
+        class MustNotRender(FakeBackend):
+            def render_page_png(self, pdf_path, page_index):
+                raise AssertionError("live foreign-attempt policy must stop rendering")
+
+        base = _default_backend()
+        with self.assertRaises(SystemExit) as stopped:
+            BVI.apply_suspects(
+                ws, mat, bank, [suspect],
+                MustNotRender(base.texts, base.media),
+                os.path.join(ws, "references", "assets"), [],
+                tainted_keys=set(),
+                policy_rows={
+                    "quiz_rows": [], "teaching_rows": [], "content_units": [],
+                },
+            )
+        self.assertEqual(2, stopped.exception.code)
+        self.assertEqual(before_bank,
+                         json.dumps(bank, ensure_ascii=False, sort_keys=True))
+        self.assertFalse(os.path.lexists(plan["full_path"]))
+
+    def test_visual_index_rejects_win32_trailing_dot_alias_before_outputs(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        self.assertEqual(BVI.run(["--workspace", ws], backend=_default_backend()), 0)
+        teaching_path = os.path.join(ws, "references", "teaching_examples.json")
+        with open(teaching_path, "w", encoding="utf-8") as stream:
+            json.dump([{
+                "id": "attempt-alias", "chapter": 1,
+                "assets": [{
+                    "path": "references/assets/shared.png.",
+                    "role": "student_attempt", "type": "crop_image",
+                }],
+            }], stream, ensure_ascii=False, indent=2)
+        watched = [
+            teaching_path,
+            os.path.join(ws, "references", "figure_page_index.json"),
+            os.path.join(ws, "references", "image_question_index.json"),
+        ]
+        before = {path: open(path, "rb").read() for path in watched}
+
+        with self.assertRaises(SystemExit) as stopped:
+            BVI.run(["--workspace", ws], backend=_default_backend())
+        self.assertEqual(stopped.exception.code, 2)
+        self.assertEqual(before, {path: open(path, "rb").read() for path in watched})
+
     def test_apply_repairs_overlapping_and_teaching_only_examples_in_both_layers(self):
         tmp = tempfile.mkdtemp()
         ws = _mk_workspace(tmp)
@@ -407,6 +689,119 @@ class BuildIndices(unittest.TestCase):
         self.assertEqual(BVI.run(argv, backend=be), 0)
         text2 = open(wiki, encoding="utf-8").read()
         self.assertEqual(text2, text1)
+
+    def test_direct_coverage_empty_taint_cannot_count_foreign_attempt_image(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        asset_path = os.path.join(ws, "references", "assets", "attempt-direct.png")
+        with open(asset_path, "wb") as stream:
+            stream.write(PNG)
+        wiki = os.path.join(ws, "references", "wiki", "ch1.md")
+        with open(wiki, "w", encoding="utf-8") as stream:
+            stream.write(
+                "# ch1\n\n<!-- lectures/ch01.pdf p.2 -->\n"
+                "![lectures/ch01.pdf 第 2 页图示](../assets/attempt-direct.png)\n"
+            )
+        ingest = os.path.join(ws, ".ingest")
+        os.makedirs(ingest, exist_ok=True)
+        with open(os.path.join(ingest, "content_units.jsonl"),
+                  "w", encoding="utf-8") as stream:
+            stream.write(json.dumps({
+                "unit_id": "foreign-attempt-direct", "chapter_id": "ch02",
+                "kind": "figure",
+                "asset_path": "references/assets/attempt-direct.png",
+                "asset_role": "student_attempt", "metadata": {},
+            }) + "\n")
+        coverage = BVI.build_wiki_visual_coverage(
+            ws,
+            {"lectures/ch01.pdf": {"visual": {2: {"has_visual": True}}}},
+            tainted_keys=set(),
+        )
+        self.assertEqual((coverage["embedded"], coverage["missing"]), (0, 1))
+        self.assertEqual([], coverage["pages"][0]["asset_paths"])
+        self.assertIn("references/assets/attempt-direct.png",
+                      coverage["pages"][0]["declared_assets"])
+
+    def test_apply_wiki_target_ownership_rejects_whole_batch_before_removal(self):
+        cases = ("unowned", "prompt", "answer", "attempt")
+        for owner_kind in cases:
+            with self.subTest(owner_kind):
+                tmp = tempfile.mkdtemp()
+                ws = _mk_workspace(tmp)
+                mat = os.path.join(tmp, "mat")
+                _mk_materials(mat, ["ch01.pdf", "ch02.pdf"])
+                wiki = os.path.join(ws, "references", "wiki", "ch1.md")
+                old_answer = os.path.join(
+                    ws, "references", "assets", "old-generated-answer.png"
+                )
+                with open(old_answer, "wb") as stream:
+                    stream.write(PNG)
+                with open(wiki, "w", encoding="utf-8") as stream:
+                    stream.write(
+                        "# ch1\n\n<!-- lectures/ch01.pdf p.2 -->\nvisual\n\n"
+                        "<!-- wiki-visual-index: lectures/ch02.pdf p.3 -->\n"
+                        "![原页图示 lectures/ch02.pdf p.3]"
+                        "(../assets/old-generated-answer.png)\n"
+                    )
+                digest = hashlib.sha1(
+                    b"lectures/ch01.pdf"
+                ).hexdigest()[:10]
+                target = os.path.join(
+                    ws, "references", "assets", "wiki_%s_p0002.png" % digest
+                )
+                target_rel = "references/assets/" + os.path.basename(target)
+                sentinel = PNG + owner_kind.encode("ascii")
+                with open(target, "wb") as stream:
+                    stream.write(sentinel)
+                bank_path = os.path.join(ws, "references", "quiz_bank.json")
+                bank = json.load(open(bank_path, encoding="utf-8"))
+                if owner_kind in ("prompt", "answer"):
+                    owner = next(row for row in bank if row["id"] == "plain_1")
+                    owner["assets"] = [{
+                        "path": target_rel,
+                        "role": ("question_context" if owner_kind == "prompt"
+                                 else "answer_context"),
+                        "type": "page_image",
+                    }]
+                    with open(bank_path, "w", encoding="utf-8") as stream:
+                        json.dump(bank, stream, ensure_ascii=False, indent=2)
+                elif owner_kind == "attempt":
+                    ingest = os.path.join(ws, ".ingest")
+                    os.makedirs(ingest, exist_ok=True)
+                    with open(os.path.join(ingest, "content_units.jsonl"),
+                              "w", encoding="utf-8") as stream:
+                        stream.write(json.dumps({
+                            "unit_id": "wiki-target-attempt", "chapter_id": "ch02",
+                            "kind": "figure", "asset_path": target_rel,
+                            "asset_role": "student_attempt", "metadata": {},
+                        }) + "\n")
+
+                self.assertEqual(BVI.run(
+                    ["--workspace", ws, "--materials", mat],
+                    backend=_default_backend()), 0)
+                watched = [
+                    wiki, bank_path, target,
+                    os.path.join(ws, "references", "figure_page_index.json"),
+                    os.path.join(ws, "references", "image_question_index.json"),
+                ]
+                before = {path: open(path, "rb").read() for path in watched}
+
+                class MustNotRender(FakeBackend):
+                    def render_page_png(self, pdf_path, page_index):
+                        raise AssertionError("wiki ownership preflight must run first")
+
+                base = _default_backend()
+                with self.assertRaises(SystemExit) as stopped:
+                    BVI.run(
+                        ["--workspace", ws, "--materials", mat, "--apply-wiki"],
+                        backend=MustNotRender(base.texts, base.media),
+                    )
+                self.assertEqual(2, stopped.exception.code)
+                self.assertEqual(
+                    before, {path: open(path, "rb").read() for path in watched}
+                )
+                self.assertIn("old-generated-answer.png",
+                              open(wiki, encoding="utf-8").read())
 
     def test_solution_page_is_deferred_from_wiki_but_applied_as_answer_context(self):
         tmp = tempfile.mkdtemp()
@@ -746,6 +1141,467 @@ class BuildIndices(unittest.TestCase):
         warnings = _load(ws, "figure_page_index.json")["warnings"]
         self.assertTrue(any(w.startswith("nul_text: lectures/ch01.pdf p.1") for w in warnings))
 
+    def test_prompt_and_answer_batches_reject_later_malformed_png_without_any_mutation(self):
+        for side, bad_name, bad_payload in (
+                ("prompt", "bad_crc", BAD_CRC_PNG),
+                ("prompt", "bad_zlib", BAD_ZLIB_PNG),
+                ("answer", "bad_crc", BAD_CRC_PNG),
+                ("answer", "bad_zlib", BAD_ZLIB_PNG),
+        ):
+            with self.subTest(side=side, malformed=bad_name):
+                tmp = tempfile.mkdtemp()
+                ws = _mk_workspace(tmp)
+                mat = os.path.join(tmp, "mat")
+                _mk_materials(mat, ["ch01.pdf", "ch02.pdf"])
+                bank_path = os.path.join(ws, "references", "quiz_bank.json")
+                bank = json.load(open(bank_path, encoding="utf-8"))
+                template_id = "suspect_1" if side == "prompt" else "ansfig_1"
+                first = next(row for row in bank if row["id"] == template_id)
+                second = copy.deepcopy(first)
+                second["id"] = template_id + "_later"
+                bank.append(second)
+                page = 2 if side == "prompt" else 3
+                source = (
+                    first.get("source_file") if side == "prompt"
+                    else first.get("answer_source_file") or first.get("source_file")
+                )
+                suspects = [{
+                    "id": row["id"], "source_layer": "quiz_bank",
+                    "source_file": source, "visual_pages": [page],
+                } for row in (first, second)]
+                plans = BVI._planned_repair_assets(
+                    ws, os.path.join(ws, "references", "assets"),
+                    bank, suspects, side,
+                )
+                old = PNG + b"PREEXISTING"
+                with open(plans[0]["full_path"], "wb") as stream:
+                    stream.write(old)
+                first["assets"] = [{
+                    "path": plans[0]["path"],
+                    "role": ("question_context" if side == "prompt" else "answer_context"),
+                    "type": "page_image", "sha256": hashlib.sha256(old).hexdigest(),
+                    "generated_by": BVI._REPAIR_WRITER_ID,
+                    "source_layer": "quiz_bank", "source_file": source,
+                    "source_page": page, "side": side,
+                }]
+                with open(bank_path, "w", encoding="utf-8") as stream:
+                    json.dump(bank, stream, ensure_ascii=False, indent=2)
+                before_bank = copy.deepcopy(bank)
+                before_item = copy.deepcopy(first)
+
+                class BadLater(FakeBackend):
+                    calls = 0
+
+                    def render_page_png(self, pdf_path, page_index):
+                        self.calls += 1
+                        return PNG if self.calls == 1 else bad_payload
+
+                base = _default_backend()
+                backend = BadLater(base.texts, base.media)
+                writer = BVI.apply_suspects if side == "prompt" else BVI.apply_answer_suspects
+                with self.assertRaises(SystemExit):
+                    writer(
+                        ws, mat, bank, suspects, backend,
+                        os.path.join(ws, "references", "assets"), [],
+                    )
+                self.assertEqual(before_bank, bank)
+                self.assertEqual(before_item, first)
+                self.assertEqual(old, open(plans[0]["full_path"], "rb").read())
+                self.assertFalse(os.path.lexists(plans[1]["full_path"]))
+                self._assert_no_transaction_temps(ws)
+
+    def test_later_asset_replace_failure_restores_assets_and_in_memory_bank(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        mat = os.path.join(tmp, "mat")
+        _mk_materials(mat, ["ch01.pdf", "ch02.pdf"])
+        bank_path = os.path.join(ws, "references", "quiz_bank.json")
+        bank = json.load(open(bank_path, encoding="utf-8"))
+        first = next(row for row in bank if row["id"] == "suspect_1")
+        second = copy.deepcopy(first)
+        second["id"] = "suspect_replace_later"
+        bank.append(second)
+        suspects = [{
+            "id": row["id"], "source_layer": "quiz_bank",
+            "source_file": row["source_file"], "visual_pages": [2],
+        } for row in (first, second)]
+        plans = BVI._planned_repair_assets(
+            ws, os.path.join(ws, "references", "assets"), bank, suspects, "prompt"
+        )
+        with open(bank_path, "w", encoding="utf-8") as stream:
+            json.dump(bank, stream, ensure_ascii=False, indent=2)
+        before = copy.deepcopy(bank)
+        original_replace = os.replace
+        failed = {"done": False}
+
+        def fail_second(source, destination):
+            if destination == plans[1]["full_path"] and not failed["done"]:
+                failed["done"] = True
+                raise OSError("later asset replacement failed")
+            return original_replace(source, destination)
+
+        with mock.patch.object(BVI.os, "replace", side_effect=fail_second), \
+                self.assertRaises(SystemExit):
+            BVI.apply_suspects(
+                ws, mat, bank, suspects, _default_backend(),
+                os.path.join(ws, "references", "assets"), [],
+            )
+        self.assertEqual(before, bank)
+        self.assertFalse(os.path.lexists(plans[0]["full_path"]))
+        self.assertFalse(os.path.lexists(plans[1]["full_path"]))
+        self._assert_no_transaction_temps(ws)
+
+    def test_bank_save_failure_rolls_back_run_assets_bank_and_backup(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        mat = os.path.join(tmp, "mat")
+        _mk_materials(mat, ["ch01.pdf", "ch02.pdf"])
+        self.assertEqual(BVI.run(
+            ["--workspace", ws, "--materials", mat], backend=_default_backend()), 0)
+        before = self._workspace_snapshot(ws)
+        with mock.patch.object(
+                BVI, "_write_json_with_backup", side_effect=OSError("bank save failed")):
+            with self.assertRaises(OSError):
+                BVI.run(
+                    ["--workspace", ws, "--materials", mat, "--apply"],
+                    backend=_default_backend(),
+                )
+        self.assertEqual(before, self._workspace_snapshot(ws))
+        self._assert_no_transaction_temps(ws)
+
+    def test_apply_wiki_rejects_later_non_png_before_any_publication(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        with open(os.path.join(ws, "references", "quiz_bank.json"),
+                  "w", encoding="utf-8") as stream:
+            json.dump([], stream)
+        wiki = os.path.join(ws, "references", "wiki", "ch1.md")
+        with open(wiki, "w", encoding="utf-8") as stream:
+            stream.write(
+                "# ch1\n\n<!-- lectures/ch01.pdf p.1 -->\none\n\n"
+                "<!-- lectures/ch01.pdf p.2 -->\ntwo\n"
+            )
+        mat = os.path.join(tmp, "mat")
+        _mk_materials(mat, ["ch01.pdf"])
+        base = FakeBackend(
+            texts_by_name={"ch01.pdf": ["one", "two"]},
+            media_by_name={"ch01.pdf": [(1, 0), (1, 0)]},
+        )
+        self.assertEqual(BVI.run(
+            ["--workspace", ws, "--materials", mat], backend=base), 0)
+        before = self._workspace_snapshot(ws)
+
+        class BadLater(FakeBackend):
+            calls = 0
+
+            def render_page_png(self, pdf_path, page_index):
+                self.calls += 1
+                return PNG if self.calls == 1 else b"later-not-png"
+
+        bad = BadLater(base.texts, base.media)
+        with self.assertRaises(SystemExit):
+            BVI.run(
+                ["--workspace", ws, "--materials", mat, "--apply-wiki"],
+                backend=bad,
+            )
+        self.assertEqual(before, self._workspace_snapshot(ws))
+        self._assert_no_transaction_temps(ws)
+
+    def test_apply_wiki_repairs_owned_stale_link_to_canonical_target(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        with open(os.path.join(ws, "references", "quiz_bank.json"),
+                  "w", encoding="utf-8") as stream:
+            json.dump([], stream)
+        source = "lectures/ch01.pdf"
+        digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:10]
+        target = os.path.join(
+            ws, "references", "assets", "wiki_%s_p0001.png" % digest
+        )
+        with open(target, "wb") as stream:
+            stream.write(PNG + b"STALE")
+        wrong = os.path.join(ws, "references", "assets", "wrong-existing.png")
+        with open(wrong, "wb") as stream:
+            stream.write(PNG)
+        wiki = os.path.join(ws, "references", "wiki", "ch1.md")
+        with open(wiki, "w", encoding="utf-8") as stream:
+            stream.write(
+                "# ch1\n\n<!-- lectures/ch01.pdf p.1 -->\nvisual\n\n"
+                "<!-- wiki-visual-index: lectures/ch01.pdf p.1 -->\n"
+                "![old](../assets/wrong-existing.png)\n"
+            )
+        mat = os.path.join(tmp, "mat")
+        _mk_materials(mat, ["ch01.pdf"])
+        backend = FakeBackend(
+            texts_by_name={"ch01.pdf": ["visual"]},
+            media_by_name={"ch01.pdf": [(1, 0)]},
+        )
+        self.assertEqual(BVI.run(
+            ["--workspace", ws, "--materials", mat], backend=backend,
+        ), 0)
+        before = _load(ws, "figure_page_index.json")["wiki_visual_coverage"]
+        record = next(row for row in before["pages"] if row["page"] == 1)
+        self.assertEqual("missing", record["status"])
+        self.assertIn("references/assets/wrong-existing.png", record["declared_assets"])
+        self.assertEqual(BVI.run(
+            ["--workspace", ws, "--materials", mat, "--apply-wiki"],
+            backend=backend,
+        ), 0)
+        text = open(wiki, encoding="utf-8").read()
+        self.assertNotIn("wrong-existing.png", text)
+        self.assertIn("../assets/%s" % os.path.basename(target), text)
+        self.assertEqual(PNG, open(target, "rb").read())
+
+    def test_malformed_canonical_wiki_png_is_missing_then_refreshed(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        with open(os.path.join(ws, "references", "quiz_bank.json"),
+                  "w", encoding="utf-8") as stream:
+            json.dump([], stream)
+        source = "lectures/ch01.pdf"
+        target_rel = BVI._wiki_generated_asset_rel(source, 1)
+        target = os.path.join(ws, *target_rel.split("/"))
+        with open(target, "wb") as stream:
+            stream.write(BAD_ZLIB_PNG)
+        wiki = os.path.join(ws, "references", "wiki", "ch1.md")
+        with open(wiki, "w", encoding="utf-8") as stream:
+            stream.write(
+                "# ch1\n\n<!-- lectures/ch01.pdf p.1 -->\nvisual\n\n"
+                "<!-- wiki-visual-index: lectures/ch01.pdf p.1 -->\n"
+                "![page](../assets/%s)\n" % os.path.basename(target)
+            )
+        mat = os.path.join(tmp, "mat")
+        _mk_materials(mat, ["ch01.pdf"])
+        backend = FakeBackend(
+            texts_by_name={"ch01.pdf": ["visual"]},
+            media_by_name={"ch01.pdf": [(1, 0)]},
+        )
+        self.assertEqual(BVI.run(
+            ["--workspace", ws, "--materials", mat], backend=backend,
+        ), 0)
+        coverage = _load(ws, "figure_page_index.json")["wiki_visual_coverage"]
+        self.assertEqual("missing", coverage["pages"][0]["status"])
+        self.assertEqual(BVI.run(
+            ["--workspace", ws, "--materials", mat, "--apply-wiki"],
+            backend=backend,
+        ), 0)
+        self.assertEqual(PNG, open(target, "rb").read())
+        coverage = _load(ws, "figure_page_index.json")["wiki_visual_coverage"]
+        self.assertEqual("embedded", coverage["pages"][0]["status"])
+
+    def test_apply_wiki_marker_only_fails_before_render_or_publication(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        with open(os.path.join(ws, "references", "quiz_bank.json"),
+                  "w", encoding="utf-8") as stream:
+            json.dump([], stream)
+        wiki = os.path.join(ws, "references", "wiki", "ch1.md")
+        with open(wiki, "w", encoding="utf-8") as stream:
+            stream.write(
+                "# ch1\n\n<!-- lectures/ch01.pdf p.1 -->\nvisual\n\n"
+                "<!-- wiki-visual-index: lectures/ch01.pdf p.1 -->\n"
+            )
+        mat = os.path.join(tmp, "mat")
+        _mk_materials(mat, ["ch01.pdf"])
+        base = FakeBackend(
+            texts_by_name={"ch01.pdf": ["visual"]},
+            media_by_name={"ch01.pdf": [(1, 0)]},
+        )
+        self.assertEqual(BVI.run(
+            ["--workspace", ws, "--materials", mat], backend=base), 0)
+        before = self._workspace_snapshot(ws)
+        base.render_page_png = mock.Mock(
+            side_effect=AssertionError("marker preflight must precede rendering")
+        )
+        with self.assertRaises(SystemExit):
+            BVI.run(
+                ["--workspace", ws, "--materials", mat, "--apply-wiki"],
+                backend=base,
+            )
+        base.render_page_png.assert_not_called()
+        self.assertEqual(before, self._workspace_snapshot(ws))
+        self._assert_no_transaction_temps(ws)
+
+    def test_apply_wiki_rejects_marker_only_even_when_page_is_cap_excluded(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        with open(os.path.join(ws, "references", "quiz_bank.json"),
+                  "w", encoding="utf-8") as stream:
+            json.dump([], stream)
+        wiki = os.path.join(ws, "references", "wiki", "ch1.md")
+        with open(wiki, "w", encoding="utf-8") as stream:
+            stream.write(
+                "# ch1\n\n<!-- lectures/ch01.pdf p.1 -->\none\n\n"
+                "<!-- lectures/ch01.pdf p.2 -->\ntwo\n\n"
+                "<!-- wiki-visual-index: lectures/ch01.pdf p.2 -->\n"
+            )
+        mat = os.path.join(tmp, "mat")
+        _mk_materials(mat, ["ch01.pdf"])
+        backend = FakeBackend(
+            texts_by_name={"ch01.pdf": ["one", "two"]},
+            media_by_name={"ch01.pdf": [(1, 0), (1, 0)]},
+        )
+        self.assertEqual(BVI.run(
+            ["--workspace", ws, "--materials", mat], backend=backend,
+        ), 0)
+        before = self._workspace_snapshot(ws)
+        backend.render_page_png = mock.Mock(
+            side_effect=AssertionError("all marker contracts precede rendering")
+        )
+        with self.assertRaises(SystemExit):
+            BVI.run(
+                ["--workspace", ws, "--materials", mat, "--apply-wiki",
+                 "--wiki-page-cap", "1"],
+                backend=backend,
+            )
+        backend.render_page_png.assert_not_called()
+        self.assertEqual(before, self._workspace_snapshot(ws))
+        self._assert_no_transaction_temps(ws)
+
+    def test_apply_wiki_later_wiki_replace_failure_rolls_back_assets_and_markdown(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        with open(os.path.join(ws, "references", "quiz_bank.json"),
+                  "w", encoding="utf-8") as stream:
+            json.dump([], stream)
+        wiki = os.path.join(ws, "references", "wiki", "ch1.md")
+        with open(wiki, "w", encoding="utf-8") as stream:
+            stream.write(
+                "# ch1\n\n<!-- lectures/ch01.pdf p.1 -->\none\n\n"
+                "<!-- lectures/ch01.pdf p.2 -->\ntwo\n"
+            )
+        mat = os.path.join(tmp, "mat")
+        _mk_materials(mat, ["ch01.pdf"])
+        backend = FakeBackend(
+            texts_by_name={"ch01.pdf": ["one", "two"]},
+            media_by_name={"ch01.pdf": [(1, 0), (1, 0)]},
+        )
+        self.assertEqual(BVI.run(
+            ["--workspace", ws, "--materials", mat], backend=backend), 0)
+        before = self._workspace_snapshot(ws)
+        original_replace = os.replace
+        failed = {"done": False}
+
+        def fail_wiki(source, destination):
+            if destination == wiki and not failed["done"]:
+                failed["done"] = True
+                raise OSError("wiki replacement failed")
+            return original_replace(source, destination)
+
+        with mock.patch.object(BVI.os, "replace", side_effect=fail_wiki), \
+                self.assertRaises(SystemExit):
+            BVI.run(
+                ["--workspace", ws, "--materials", mat, "--apply-wiki"],
+                backend=backend,
+            )
+        self.assertEqual(before, self._workspace_snapshot(ws))
+        self._assert_no_transaction_temps(ws)
+
+    def test_out_dir_cannot_redirect_indices_over_asset_or_control_directories(self):
+        for relative in ("references/assets", "notebook"):
+            with self.subTest(relative=relative):
+                tmp = tempfile.mkdtemp()
+                ws = _mk_workspace(tmp)
+                target_dir = os.path.join(ws, *relative.split("/"))
+                os.makedirs(target_dir, exist_ok=True)
+                sentinel = os.path.join(target_dir, "figure_page_index.json")
+                with open(sentinel, "wb") as stream:
+                    stream.write(b"DO-NOT-OVERWRITE")
+                with self.assertRaises(SystemExit):
+                    BVI.run(
+                        ["--workspace", ws, "--out-dir", target_dir],
+                        backend=_default_backend(),
+                    )
+                self.assertEqual(b"DO-NOT-OVERWRITE", open(sentinel, "rb").read())
+                self._assert_no_transaction_temps(ws)
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction/reparse regression")
+    def test_junction_backed_asset_and_index_parents_are_rejected(self):
+        def junction(link, target):
+            result = subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", link, target],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True,
+            )
+            if result.returncode != 0 or not BVI.is_link_or_reparse(link):
+                self.skipTest("junction creation unavailable: %s" % (
+                    result.stderr.strip() or result.stdout.strip()
+                ))
+
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        mat = os.path.join(tmp, "mat")
+        _mk_materials(mat, ["ch01.pdf", "ch02.pdf"])
+        asset_root = os.path.join(ws, "references", "assets")
+        original_assets = os.path.join(tmp, "original-assets")
+        outside_assets = os.path.join(tmp, "outside-assets")
+        os.replace(asset_root, original_assets)
+        os.makedirs(outside_assets)
+        bank_path = os.path.join(ws, "references", "quiz_bank.json")
+        before_bank = open(bank_path, "rb").read()
+        try:
+            junction(asset_root, outside_assets)
+            with self.assertRaises(SystemExit) as caught:
+                BVI.run(
+                    ["--workspace", ws, "--materials", mat, "--apply"],
+                    backend=_default_backend(),
+                )
+            self.assertEqual(2, caught.exception.code)
+            self.assertEqual([], os.listdir(outside_assets))
+            self.assertEqual(before_bank, open(bank_path, "rb").read())
+        finally:
+            if os.path.lexists(asset_root):
+                os.rmdir(asset_root)
+            os.replace(original_assets, asset_root)
+
+        tmp2 = tempfile.mkdtemp()
+        ws2 = _mk_workspace(tmp2)
+        references = os.path.join(ws2, "references")
+        outside_references = os.path.join(tmp2, "outside-references")
+        os.replace(references, outside_references)
+        outside_bank = os.path.join(outside_references, "quiz_bank.json")
+        before_bank = open(outside_bank, "rb").read()
+        try:
+            junction(references, outside_references)
+            with self.assertRaises(SystemExit) as caught:
+                BVI.run(["--workspace", ws2], backend=_default_backend())
+            self.assertEqual(2, caught.exception.code)
+            self.assertEqual(before_bank, open(outside_bank, "rb").read())
+            self.assertFalse(os.path.lexists(os.path.join(
+                outside_references, "figure_page_index.json"
+            )))
+            self.assertFalse(os.path.lexists(os.path.join(
+                outside_references, "image_question_index.json"
+            )))
+        finally:
+            if os.path.lexists(references):
+                os.rmdir(references)
+            os.replace(outside_references, references)
+
+    def test_second_index_replacement_failure_restores_both_previous_indices(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        self.assertEqual(BVI.run(["--workspace", ws], backend=_default_backend()), 0)
+        figure = os.path.join(ws, "references", "figure_page_index.json")
+        questions = os.path.join(ws, "references", "image_question_index.json")
+        before = {path: open(path, "rb").read() for path in (figure, questions)}
+        original_replace = os.replace
+        failed = {"done": False}
+
+        def fail_second(source, destination):
+            if destination == questions and not failed["done"]:
+                failed["done"] = True
+                raise OSError("second index replacement failed")
+            return original_replace(source, destination)
+
+        with mock.patch.object(BVI.os, "replace", side_effect=fail_second), \
+                self.assertRaises(SystemExit):
+            BVI.run(["--workspace", ws], backend=_default_backend())
+        self.assertEqual(before, {
+            path: open(path, "rb").read() for path in (figure, questions)
+        })
+        self._assert_no_transaction_temps(ws)
+
     def test_missing_workspace_or_bad_bank_exit_2(self):
         with self.assertRaises(SystemExit) as cm:
             BVI.run(["--workspace", os.path.join(tempfile.mkdtemp(), "nope")], backend=_default_backend())
@@ -800,6 +1656,9 @@ class OfficialTools(unittest.TestCase):
         self.assertNotIn("question-side asset", out)             # 默认 zh 模式=纯 题面图，非复合形
         self.assertIn("references/assets/", out)
         self.assertNotIn("\\", out.split("(")[1].split(")")[0])   # renderable POSIX path
+        with self.assertRaises(SystemExit) as cm2:
+            SQA.run(["--workspace", ws, "--id", "no_such_id"])
+        self.assertEqual(cm2.exception.code, 2)
         # a visual item whose asset file is deleted → fail-closed exit 1
         bank = json.load(open(os.path.join(ws, "references", "quiz_bank.json"), encoding="utf-8"))
         q = next(x for x in bank if x["id"] == "suspect_1")
@@ -807,9 +1666,189 @@ class OfficialTools(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             SQA.run(["--workspace", ws, "--id", "suspect_1"])
         self.assertEqual(cm.exception.code, 1)
-        with self.assertRaises(SystemExit) as cm2:
-            SQA.run(["--workspace", ws, "--id", "no_such_id"])
-        self.assertEqual(cm2.exception.code, 2)
+
+    def test_show_question_assets_rejects_signature_prefixed_corrupt_png(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        assets = os.path.join(ws, "references", "assets")
+        os.makedirs(assets, exist_ok=True)
+        relative = "references/assets/corrupt.png"
+        with open(os.path.join(ws, *relative.split("/")), "wb") as stream:
+            stream.write(BAD_ZLIB_PNG)
+        bank_path = os.path.join(ws, "references", "quiz_bank.json")
+        bank = json.load(open(bank_path, encoding="utf-8"))
+        bank.append({
+            "id": "corrupt-visual", "chapter": 1, "type": "diagram",
+            "question": "Use the image.", "answer": "A",
+            "requires_assets": True,
+            "assets": [{
+                "path": relative, "role": "figure", "type": "crop_image",
+            }],
+        })
+        with open(bank_path, "w", encoding="utf-8") as stream:
+            json.dump(bank, stream, ensure_ascii=False, indent=2)
+
+        with self.assertRaises(SystemExit) as caught:
+            SQA.run(["--workspace", ws, "--id", "corrupt-visual"])
+        self.assertEqual(1, caught.exception.code)
+
+    def test_show_question_assets_accepts_valid_jpeg(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        relative = "references/assets/prompt.jpg"
+        full = os.path.join(ws, *relative.split("/"))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as stream:
+            stream.write(VALID_JPEG)
+        bank_path = os.path.join(ws, "references", "quiz_bank.json")
+        bank = json.load(open(bank_path, encoding="utf-8"))
+        bank.append({
+            "id": "valid-jpeg", "chapter": 1, "type": "diagram",
+            "question": "Use the image.", "answer": "A", "requires_assets": True,
+            "assets": [{
+                "path": relative, "role": "figure", "type": "crop_image",
+            }],
+        })
+        with open(bank_path, "w", encoding="utf-8") as stream:
+            json.dump(bank, stream, ensure_ascii=False, indent=2)
+
+        rc, output = self._capture(
+            SQA.run, ["--workspace", ws, "--id", "valid-jpeg"]
+        )
+        self.assertEqual(0, rc)
+        self.assertIn(relative, output)
+
+    def test_show_question_assets_rejects_corrupt_jpeg(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        relative = "references/assets/corrupt.jpg"
+        full = os.path.join(ws, *relative.split("/"))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as stream:
+            stream.write(b"\xff\xd8\xff\xd9")
+        bank_path = os.path.join(ws, "references", "quiz_bank.json")
+        bank = json.load(open(bank_path, encoding="utf-8"))
+        bank.append({
+            "id": "corrupt-jpeg", "chapter": 1, "type": "diagram",
+            "question": "Use the image.", "answer": "A", "requires_assets": True,
+            "assets": [{
+                "path": relative, "role": "figure", "type": "crop_image",
+            }],
+        })
+        with open(bank_path, "w", encoding="utf-8") as stream:
+            json.dump(bank, stream, ensure_ascii=False, indent=2)
+
+        with self.assertRaises(SystemExit) as caught:
+            SQA.run(["--workspace", ws, "--id", "corrupt-jpeg"])
+        self.assertEqual(1, caught.exception.code)
+
+    def test_visual_index_foreign_attempt_conflict_fails_before_any_publish(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        bank_path = os.path.join(ws, "references", "quiz_bank.json")
+        bank = json.load(open(bank_path, encoding="utf-8"))
+        bank[0].setdefault("assets", []).append({
+            "path": "references/assets/a.png", "role": "question_context",
+            "type": "crop_image",
+        })
+        with open(bank_path, "w", encoding="utf-8") as stream:
+            json.dump(bank, stream, ensure_ascii=False, indent=2)
+        ingest = os.path.join(ws, ".ingest")
+        os.makedirs(ingest, exist_ok=True)
+        with open(os.path.join(ingest, "content_units.jsonl"), "w", encoding="utf-8") as stream:
+            stream.write(json.dumps({
+                "unit_id": "foreign-attempt", "chapter_id": "ch02", "kind": "figure",
+                "asset_path": "references\\assets\\a.png",
+                "asset_role": "student_attempt", "metadata": {},
+            }) + "\n")
+        sentinels = {}
+        for name in ("image_question_index.json", "figure_page_index.json"):
+            path = os.path.join(ws, "references", name)
+            with open(path, "wb") as stream:
+                stream.write(("sentinel-" + name).encode("ascii"))
+            sentinels[path] = open(path, "rb").read()
+        sentinels[bank_path] = open(bank_path, "rb").read()
+        wiki_path = os.path.join(ws, "references", "wiki", "ch1.md")
+        sentinels[wiki_path] = open(wiki_path, "rb").read()
+        with self.assertRaises(SystemExit) as caught:
+            BVI.run(["--workspace", ws], backend=_default_backend())
+        self.assertEqual(2, caught.exception.code)
+        for path, before in sentinels.items():
+            self.assertEqual(before, open(path, "rb").read(), path)
+
+    def test_visual_index_does_not_count_attempt_tainted_manual_wiki_image(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        bank_path = os.path.join(ws, "references", "quiz_bank.json")
+        bank = json.load(open(bank_path, encoding="utf-8"))
+        bank.append({
+            "id": "attempt-audit", "chapter": 2, "type": "subjective",
+            "question": "Audit only", "answer": "", "source": "material",
+            "assets": [{"path": "references/assets/a.png", "role": "student_attempt"}],
+        })
+        with open(bank_path, "w", encoding="utf-8") as stream:
+            json.dump(bank, stream, ensure_ascii=False, indent=2)
+        wiki_path = os.path.join(ws, "references", "wiki", "ch1.md")
+        with open(wiki_path, "w", encoding="utf-8") as stream:
+            stream.write(
+                "# Chapter 1\n\n<!-- lectures/ch01.pdf p.2 -->\n"
+                "![lectures/ch01.pdf 第 2 页图示](../assets/a.png)\n"
+            )
+        materials = os.path.join(tmp, "materials")
+        _mk_materials(materials, ["ch01.pdf", "ch02.pdf"])
+        self.assertEqual(
+            0, BVI.run(["--workspace", ws, "--materials", materials],
+                       backend=_default_backend())
+        )
+        coverage = _load(ws, "figure_page_index.json")["wiki_visual_coverage"]
+        page = next(row for row in coverage["pages"]
+                    if row.get("source_file") == "lectures/ch01.pdf" and row.get("page") == 2)
+        self.assertEqual("missing", page["status"])
+        self.assertEqual([], page["asset_paths"])
+        self.assertIn("references/assets/a.png", page["declared_assets"])
+
+    def test_visual_index_does_not_count_undeclared_hardlink_alias_of_attempt(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        assets = os.path.join(ws, "references", "assets")
+        os.makedirs(assets, exist_ok=True)
+        attempt = os.path.join(assets, "attempt.png")
+        alias = os.path.join(assets, "official-alias.png")
+        with open(attempt, "wb") as stream:
+            stream.write(PNG)
+        try:
+            os.link(attempt, alias)
+        except (OSError, NotImplementedError):
+            self.skipTest("hard links unavailable")
+        bank_path = os.path.join(ws, "references", "quiz_bank.json")
+        bank = json.load(open(bank_path, encoding="utf-8"))
+        bank.append({
+            "id": "attempt-audit", "chapter": 2, "type": "subjective",
+            "question": "Audit only", "answer": "", "source": "material",
+            "assets": [{"path": "references/assets/attempt.png",
+                        "role": "student_attempt"}],
+        })
+        with open(bank_path, "w", encoding="utf-8") as stream:
+            json.dump(bank, stream, ensure_ascii=False, indent=2)
+        wiki_path = os.path.join(ws, "references", "wiki", "ch1.md")
+        with open(wiki_path, "w", encoding="utf-8") as stream:
+            stream.write(
+                "# Chapter 1\n\n<!-- lectures/ch01.pdf p.2 -->\n"
+                "![lectures/ch01.pdf 第 2 页图示](../assets/official-alias.png)\n"
+            )
+        materials = os.path.join(tmp, "materials")
+        _mk_materials(materials, ["ch01.pdf", "ch02.pdf"])
+        self.assertEqual(
+            0, BVI.run(["--workspace", ws, "--materials", materials],
+                       backend=_default_backend())
+        )
+        coverage = _load(ws, "figure_page_index.json")["wiki_visual_coverage"]
+        page = next(row for row in coverage["pages"]
+                    if row.get("source_file") == "lectures/ch01.pdf"
+                    and row.get("page") == 2)
+        self.assertEqual("missing", page["status"])
+        self.assertEqual([], page["asset_paths"])
+        self.assertIn("references/assets/official-alias.png", page["declared_assets"])
 
     def test_show_question_assets_answer_side_only_on_demand(self):
         tmp = tempfile.mkdtemp()
@@ -833,6 +1872,113 @@ class OfficialTools(unittest.TestCase):
         rc, out2 = self._capture(SQA.run, ["--workspace", ws, "--id", "both_1", "--with-answer"])
         self.assertIn("s.png", out2)
         self.assertLess(out2.index("p.png"), out2.index("s.png"))  # prompt strictly before answer
+
+    def test_show_question_assets_global_attempt_taint_is_order_independent(self):
+        for reverse in (False, True):
+            tmp = tempfile.mkdtemp()
+            ws = _mk_workspace(tmp)
+            path = os.path.join(ws, "references", "assets", "shared.png")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as stream:
+                stream.write(PNG)
+            bank_path = os.path.join(ws, "references", "quiz_bank.json")
+            bank = json.load(open(bank_path, encoding="utf-8"))
+            rows = [
+                {"id": "official", "chapter": 1, "type": "subjective",
+                 "question": "Use the figure.", "answer": "A", "source": "material",
+                 "requires_assets": True,
+                 "assets": [{"path": "references/assets/shared.png",
+                              "role": "question_context", "type": "crop_image"}]},
+                {"id": "attempt", "chapter": 1, "type": "subjective",
+                 "question": "Audit row", "answer": "", "source": "material",
+                 "assets": [{"path": "references\\assets\\shared.png",
+                              "role": "student_attempt", "type": "crop_image"}]},
+            ]
+            if reverse:
+                rows.reverse()
+            json.dump(bank + rows, open(bank_path, "w", encoding="utf-8"),
+                      ensure_ascii=False, indent=2)
+            with self.assertRaises(SystemExit) as caught:
+                SQA.run(["--workspace", ws, "--id", "official"])
+            self.assertEqual(1, caught.exception.code)
+
+    def test_show_question_assets_never_prints_attempt_only_asset(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        path = os.path.join(ws, "references", "assets", "attempt.png")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as stream:
+            stream.write(PNG)
+        bank_path = os.path.join(ws, "references", "quiz_bank.json")
+        bank = json.load(open(bank_path, encoding="utf-8"))
+        bank.append({
+            "id": "attempt_only", "chapter": 1, "type": "subjective",
+            "question": "Self-contained text prompt.", "answer": "A", "source": "material",
+            "assets": [{"path": "references/assets/attempt.png",
+                        "role": "student_attempt", "type": "crop_image"}],
+        })
+        json.dump(bank, open(bank_path, "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=2)
+        rc, out = self._capture(
+            SQA.run, ["--workspace", ws, "--id", "attempt_only", "--with-answer"])
+        self.assertEqual(0, rc)
+        self.assertNotIn("attempt.png", out)
+
+    def test_show_target_quiz_is_tainted_by_foreign_chapter_content_unit(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        asset_path = os.path.join(ws, "references", "assets", "foreign-shared.png")
+        os.makedirs(os.path.dirname(asset_path), exist_ok=True)
+        with open(asset_path, "wb") as stream:
+            stream.write(PNG)
+        bank_path = os.path.join(ws, "references", "quiz_bank.json")
+        bank = json.load(open(bank_path, encoding="utf-8"))
+        bank.append({
+            "id": "target_q", "chapter": 1, "type": "subjective",
+            "question": "Use the target figure.", "answer": "A", "source": "material",
+            "requires_assets": True,
+            "assets": [{"path": "references/assets/foreign-shared.png",
+                        "role": "question_context", "type": "crop_image"}],
+        })
+        json.dump(bank, open(bank_path, "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=2)
+        ingest = os.path.join(ws, ".ingest")
+        os.makedirs(ingest, exist_ok=True)
+        with open(os.path.join(ingest, "content_units.jsonl"), "w", encoding="utf-8") as stream:
+            stream.write(json.dumps({
+                "unit_id": "unit_foreign_attempt", "chapter_id": "ch02",
+                "kind": "figure", "asset_path": "references\\assets\\foreign-shared.png",
+                "asset_role": "student_attempt", "metadata": {},
+            }) + "\n")
+        with self.assertRaises(SystemExit) as caught:
+            SQA.run(["--workspace", ws, "--id", "target_q"])
+        self.assertEqual(1, caught.exception.code)
+
+    @unittest.skipUnless(os.name == "nt", "Windows physical identity folds path case")
+    def test_show_rejects_same_item_windows_case_alias_across_prompt_answer(self):
+        tmp = tempfile.mkdtemp()
+        ws = _mk_workspace(tmp)
+        path = os.path.join(ws, "references", "assets", "Case.png")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as stream:
+            stream.write(PNG)
+        bank_path = os.path.join(ws, "references", "quiz_bank.json")
+        bank = json.load(open(bank_path, encoding="utf-8"))
+        bank.append({
+            "id": "case_alias", "chapter": 1, "type": "subjective",
+            "question": "Use the figure.", "answer": "A", "source": "material",
+            "assets": [
+                {"path": "references/assets/Case.png", "role": "question_context",
+                 "type": "crop_image"},
+                {"path": "references/assets/case.png", "role": "worked_solution",
+                 "type": "crop_image"},
+            ],
+        })
+        json.dump(bank, open(bank_path, "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=2)
+        with self.assertRaises(SystemExit) as caught:
+            SQA.run(["--workspace", ws, "--id", "case_alias"])
+        self.assertEqual(1, caught.exception.code)
 
     # ---- regression guards for Codex round-1 (6 findings) ----
 
@@ -1035,6 +2181,52 @@ class OfficialTools(unittest.TestCase):
             BVI.run(["--workspace", ws, "--materials", mat, "--apply", "--asset-root", link],
                     backend=_default_backend())
         self.assertEqual(cm.exception.code, 2)                   # realpath containment refuses the escape
+
+    def test_apply_writers_reject_nonstandard_workspace_roots_before_mutation(self):
+        for action, relative_root in (("--apply", "notebook"),
+                                      ("--apply-wiki", ".ingest")):
+            with self.subTest(action=action, relative_root=relative_root):
+                tmp = tempfile.mkdtemp()
+                ws, _bank = self._ws_with(tmp, [
+                    {"id": "root_guard", "chapter": 1, "type": "subjective",
+                     "question": "See the figure.", "source": "material",
+                     "ai_generated": False, "source_file": "lectures/ch01.pdf",
+                     "source_pages": [2]},
+                ])
+                mat = os.path.join(tmp, "mat")
+                _mk_materials(mat, ["ch01.pdf", "ch02.pdf"])
+                self.assertEqual(
+                    0,
+                    BVI.run(["--workspace", ws, "--materials", mat],
+                            backend=_default_backend(), _state_locked=True),
+                )
+                unsafe_root = os.path.join(ws, relative_root)
+                os.makedirs(unsafe_root, exist_ok=True)
+                with open(os.path.join(unsafe_root, "sentinel.bin"), "wb") as stream:
+                    stream.write(b"DO-NOT-TOUCH")
+
+                def snapshot():
+                    result = {}
+                    for parent, _dirs, files in os.walk(ws):
+                        for filename in files:
+                            path = os.path.join(parent, filename)
+                            with open(path, "rb") as stream:
+                                result[os.path.relpath(path, ws)] = stream.read()
+                    return result
+
+                before = snapshot()
+                backend = _default_backend()
+                backend.render_page_png = mock.Mock(
+                    side_effect=AssertionError("render must not run for an unsafe asset root")
+                )
+                with self.assertRaises(SystemExit) as cm:
+                    BVI.run([
+                        "--workspace", ws, "--materials", mat, action,
+                        "--asset-root", unsafe_root,
+                    ], backend=backend, _state_locked=True)
+                self.assertEqual(2, cm.exception.code)
+                backend.render_page_png.assert_not_called()
+                self.assertEqual(before, snapshot())
 
     def test_apply_rejects_unsafe_source_file(self):
         # after round-5, a QUALIFIED escaping path never even becomes a suspect (no basename stand-in) —

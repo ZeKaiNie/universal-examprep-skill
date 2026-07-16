@@ -14,17 +14,37 @@ sys.path.insert(0, SCRIPTS)
 import cheatsheet_render   # noqa: E402
 import validate_workspace as V  # noqa: E402
 PY = sys.executable
+PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+    "0000000c49444154789c63f8ffff3f0005fe02fe0def46b80000000049454e44ae426082"
+)
+
+
+def _safe_image_workspace(testcase):
+    ws = tempfile.mkdtemp(prefix="r3img-")
+    testcase.addCleanup(shutil.rmtree, ws, ignore_errors=True)
+    assets = os.path.join(ws, "references", "assets")
+    os.makedirs(assets)
+    with open(os.path.join(assets, "f.png"), "wb") as stream:
+        stream.write(PNG)
+    with open(os.path.join(ws, "references", "quiz_bank.json"),
+              "w", encoding="utf-8") as stream:
+        json.dump([], stream)
+    return ws
 
 
 class ImgAttributeEscaping(unittest.TestCase):
     def test_quote_in_alt_cannot_escape_attribute(self):
+        ws = _safe_image_workspace(self)
         body = cheatsheet_render.md_to_html_body(
-            '![x" onerror="alert(1)](references/assets/f.png)\n')
+            '![x" onerror="alert(1)](references/assets/f.png)\n', ws)
         self.assertNotIn('onerror="alert', body, "alt 引号必须被转义，不得逃出属性")
         self.assertIn("&quot;", body)
 
     def test_ampersand_not_double_escaped(self):
-        body = cheatsheet_render.md_to_html_body('![A & B](references/assets/f.png)\n')
+        ws = _safe_image_workspace(self)
+        body = cheatsheet_render.md_to_html_body(
+            '![A & B](references/assets/f.png)\n', ws)
         self.assertIn('alt="A &amp; B"', body)
         self.assertNotIn("&amp;amp;", body, "整行已 escape 过一次，属性不得二次转义 &")
 
@@ -35,6 +55,10 @@ class OutputPathSafety(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d, ignore_errors=True)
         with open(os.path.join(d, "cheatsheet.md"), "w", encoding="utf-8") as f:
             f.write("# 小抄\n\n- 要点 x\n")
+        os.makedirs(os.path.join(d, "references"))
+        with open(os.path.join(d, "references", "quiz_bank.json"),
+                  "w", encoding="utf-8") as f:
+            json.dump([], f)
         return d
 
     @unittest.skipUnless(hasattr(os, "symlink"), "no symlink support")
@@ -60,7 +84,7 @@ class OutputPathSafety(unittest.TestCase):
                            capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertTrue(os.path.isfile(os.path.join(d, "cheatsheet.html")))
-        self.assertFalse(os.path.exists(os.path.join(d, "cheatsheet.html.tmp")),
+        self.assertFalse(os.path.exists(os.path.join(d, ".cheatsheet.rendering.html")),
                          "临时文件必须被 os.replace 收走")
 
 

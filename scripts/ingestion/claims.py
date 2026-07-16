@@ -7,15 +7,39 @@ entails, supports, or semantically agrees with the authored claim.
 
 import hashlib
 import json
+import os
 import re
 import unicodedata
+
+try:
+    from asset_policy import (
+        audit_asset_policy,
+        has_tainted_official_asset,
+        iter_asset_declarations,
+    )
+except ImportError:  # imported as ``scripts.ingestion.claims``
+    from scripts.asset_policy import (
+        audit_asset_policy,
+        has_tainted_official_asset,
+        iter_asset_declarations,
+    )
 from dataclasses import dataclass
 from pathlib import Path
 
 from .facts import FactValidationError, UnitRevisionRef, stable_fact_id
-from .identifiers import canonical_json, safe_workspace_entry, validate_sha256
+from .identifiers import (
+    canonical_json,
+    is_link_or_reparse,
+    safe_workspace_entry,
+    validate_sha256,
+)
 from .language import MATERIAL_TEXT_LANGUAGE_CODES
-from .storage import atomic_write_jsonl
+from .models import ContentUnit, SourceRecord
+from .storage import (
+    ConflictError,
+    atomic_write_jsonl,
+    workspace_publication_lock,
+)
 
 
 CLAIM_RECORDS_PATH = ".ingest/claim_records.jsonl"
@@ -110,6 +134,14 @@ _EXPLANATION_PROVENANCE = frozenset(("material", "ai_translation", "ai_supplemen
 
 class ClaimValidationError(FactValidationError):
     """A claim or location receipt violated its exact schema."""
+
+
+@dataclass(frozen=True)
+class _ClaimAssetPolicy:
+    """Internal result distinguishing a live workspace scan from a unit slice."""
+
+    tainted_keys: frozenset
+    workspace_complete: bool
 
 
 def _fail(message):
@@ -454,21 +486,102 @@ def read_claim_jsonl(path, allow_empty=False):
     return _claim_records(rows, allow_empty=allow_empty)
 
 
+def _lexical_workspace_root(workspace):
+    """Validate a workspace without resolving away a symlink/junction identity."""
+    root = Path(os.path.abspath(str(workspace)))
+    if os.path.lexists(str(root)) and is_link_or_reparse(root):
+        _fail("claim workspace must not be a symlink, junction, or reparse point")
+    if not root.is_dir():
+        _fail("workspace must be an existing directory")
+    return root
+
+
 def load_claim_records(workspace, relative_path=CLAIM_RECORDS_PATH, allow_empty=False):
-    path = safe_workspace_entry(Path(workspace).resolve(), relative_path)
+    path = safe_workspace_entry(_lexical_workspace_root(workspace), relative_path)
     return read_claim_jsonl(path, allow_empty=allow_empty)
 
 
-def import_claim_records(workspace, records, relative_path=CLAIM_RECORDS_PATH):
-    """Strictly validate then atomically replace the authoritative claim sidecar."""
+def _read_live_claim_inputs(root):
+    """Load exact live source/unit facts while the caller holds the workspace lock."""
 
-    root = Path(workspace).resolve()
-    if not root.is_dir():
-        _fail("workspace must be an existing directory")
+    source_path = safe_workspace_entry(root, ".ingest/source_manifest.json")
+    unit_path = safe_workspace_entry(root, ".ingest/content_units.jsonl")
+    if (source_path.is_symlink() or not source_path.is_file()
+            or unit_path.is_symlink() or not unit_path.is_file()):
+        _fail("claim import requires regular live source_manifest.json and content_units.jsonl")
+    try:
+        with open(source_path, "r", encoding="utf-8") as stream:
+            source_document = json.load(
+                stream,
+                object_pairs_hook=_object_without_duplicates,
+                parse_constant=_reject_constant,
+            )
+        if (not isinstance(source_document, dict)
+                or set(source_document) != {"schema_version", "sources"}
+                or source_document.get("schema_version") != 1
+                or not isinstance(source_document.get("sources"), list)):
+            _fail("source manifest has an invalid exact schema")
+        sources = tuple(
+            SourceRecord.from_dict(row) for row in source_document["sources"]
+        )
+        unit_rows = []
+        with open(unit_path, "r", encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                try:
+                    value = json.loads(
+                        line,
+                        object_pairs_hook=_object_without_duplicates,
+                        parse_constant=_reject_constant,
+                    )
+                except (json.JSONDecodeError, ClaimValidationError) as exc:
+                    _fail("invalid content unit JSONL line %d: %s" % (line_number, exc))
+                unit_rows.append(ContentUnit.from_dict(value))
+        units = tuple(unit_rows)
+    except ClaimValidationError:
+        raise
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        _fail("cannot load live claim evidence: %s" % exc)
+    if len({row.source_id for row in sources}) != len(sources):
+        _fail("source manifest contains duplicate source IDs")
+    if len({row.unit_id for row in units}) != len(units):
+        _fail("content units contain duplicate unit IDs")
+    return units, sources
+
+
+def _import_claim_records_locked(workspace, records):
+    """Private import body; caller must already hold ``workspace_publication_lock``."""
+
+    root = _lexical_workspace_root(workspace)
     rows = _claim_records(records)
-    destination = safe_workspace_entry(root, relative_path)
+    units, sources = _read_live_claim_inputs(root)
+    verify_claim_batch(rows, units, sources, workspace=root)
+    destination = safe_workspace_entry(root, CLAIM_RECORDS_PATH)
     atomic_write_jsonl(destination, [row.to_dict() for row in rows])
     return rows
+
+
+def import_claim_records(workspace, records, relative_path=CLAIM_RECORDS_PATH):
+    """Verify live evidence, then atomically replace the sole authoritative sidecar.
+
+    This public API owns the workspace publication/mutation lock.  It intentionally
+    rejects alternate destinations: a successfully validated claim collection has
+    exactly one authoritative location and must not be used as an arbitrary JSONL
+    writer.  The CLI, which already holds the same lock across a larger operation,
+    calls the private ``_import_claim_records_locked`` body instead.
+    """
+
+    if relative_path != CLAIM_RECORDS_PATH:
+        _fail("claim import destination is fixed to %s" % CLAIM_RECORDS_PATH)
+    root = _lexical_workspace_root(workspace)
+    try:
+        with workspace_publication_lock(root):
+            return _import_claim_records_locked(root, records)
+    except ClaimValidationError:
+        raise
+    except (ConflictError, OSError, ValueError) as exc:
+        _fail("cannot mutate claim workspace: %s" % exc)
 
 
 def _quote_from_proposal(payload, proposal, label):
@@ -516,13 +629,17 @@ def _quote_from_proposal(payload, proposal, label):
     return QuoteSpan.create(start, start + len(text), text)
 
 
-def compile_claim_proposals(proposals, units, sources=()):
+def compile_claim_proposals(
+        proposals, units, sources=(), tainted_keys=None, *, workspace=None):
     """Compile ergonomic proposals into full revision-bound ClaimRecords."""
 
     if not isinstance(proposals, (list, tuple)) or not proposals:
         _fail("claim proposals must be a non-empty array")
     units_by_id = _unit_index(units)
     sources_by_id = _source_index(sources)
+    tainted_keys = _claim_asset_policy(
+        units_by_id.values(), tainted_keys, workspace=workspace
+    )
     records = []
     expected = {"subject", "source_unit_id", "payload_field", "role", "claim_text", "quote"}
     for index, proposal in enumerate(proposals):
@@ -555,7 +672,7 @@ def compile_claim_proposals(proposals, units, sources=()):
             source,
             _quote_from_proposal(payload, proposal["quote"], label),
         )
-        verify_claim(record, units_by_id, sources_by_id)
+        _verify_claim_checked(record, units_by_id, sources_by_id, tainted_keys)
         records.append(record)
     return _claim_records(records)
 
@@ -584,9 +701,96 @@ def _source_index(sources):
     return result
 
 
-def _verify_role(record, unit):
+def _workspace_claim_asset_policy(workspace, unit_rows):
+    """Read live policy and bind every supplied unit to that workspace revision."""
+
+    try:
+        try:
+            from ..validate_workspace import workspace_asset_policy_snapshot
+        except (ImportError, ValueError):
+            from validate_workspace import workspace_asset_policy_snapshot
+        snapshot = workspace_asset_policy_snapshot(workspace)
+    except (OSError, UnicodeError, TypeError, ValueError) as exc:
+        _fail("workspace asset policy could not be loaded: %s" % exc)
+    problems = list(snapshot.get("unsafe_paths", ())) + list(
+        snapshot.get("conflicts", ())
+    )
+    if problems:
+        _fail("workspace asset policy failed: %s" % "; ".join(problems))
+    keys = snapshot.get("tainted_keys")
+    if not isinstance(keys, (set, frozenset)) or any(
+            not isinstance(key, str) for key in keys):
+        _fail("workspace asset policy returned invalid tainted keys")
+    live_units = snapshot.get("content_units")
+    if not isinstance(live_units, list) or any(
+            not isinstance(row, dict) for row in live_units):
+        _fail("workspace asset policy returned invalid content units")
+    live_by_id = {}
+    for row in live_units:
+        unit_id = row.get("unit_id")
+        if not isinstance(unit_id, str) or unit_id in live_by_id:
+            _fail("workspace asset policy returned missing/duplicate content-unit identity")
+        live_by_id[unit_id] = row
+    for row in unit_rows:
+        unit_id = row.get("unit_id") if isinstance(row, dict) else None
+        live = live_by_id.get(unit_id)
+        if live is None:
+            _fail("claim unit is absent from the bound workspace: %s" % unit_id)
+        if canonical_json(live) != canonical_json(row):
+            _fail("claim unit revision differs from the bound workspace: %s" % unit_id)
+    return set(keys)
+
+
+def _claim_asset_policy(units, tainted_keys=None, *, workspace=None):
+    """Fail closed before any claim can use asset-bearing evidence.
+
+    The complete content-unit slice is always re-audited.  Asset-bearing claims
+    additionally require ``workspace`` so this function can reread the live
+    quiz, teaching, and content-unit layers itself.  A caller-provided
+    ``tainted_keys`` collection is only additive to that live policy; it never
+    substitutes for it and therefore an empty/partial set cannot weaken the
+    result.  Pure text/formula unit tests may keep using the slice-only path.
+    """
+
+    unit_rows = list(units)
+    audit = audit_asset_policy(content_units=unit_rows)
+    problems = audit["invalid_declarations"] + audit["conflicts"]
+    if problems:
+        _fail("content-unit asset policy failed: %s" % "; ".join(problems))
+    checked = set(audit["tainted_keys"])
+    if workspace is not None:
+        checked.update(_workspace_claim_asset_policy(workspace, unit_rows))
+    if tainted_keys is not None:
+        try:
+            extras = set(tainted_keys)
+        except TypeError as exc:
+            _fail("tainted_keys must be a collection of physical-path strings: %s" % exc)
+        if any(not isinstance(key, str) for key in extras):
+            _fail("tainted_keys must contain only physical-path strings")
+        # Additive only.  The live workspace scan above remains authoritative.
+        checked.update(extras)
+    return _ClaimAssetPolicy(frozenset(checked), workspace is not None)
+
+
+def _verify_role(record, unit, asset_policy):
     kind = unit.get("kind")
     role = record.source.role
+    if unit.get("asset_role") == "student_attempt":
+        _fail(
+            "student_attempt evidence cannot support material, prompt, answer, translation, "
+            "or context claims"
+        )
+    if has_tainted_official_asset(unit, asset_policy.tainted_keys):
+        _fail(
+            "globally student-attempt-tainted asset evidence cannot support a claim"
+        )
+    if (tuple(iter_asset_declarations((unit,)))
+            and not asset_policy.workspace_complete):
+        _fail(
+            "asset-bearing claim verification requires workspace=... so the complete live "
+            "quiz, teaching, and content-unit policy can be verified; raw tainted_keys are "
+            "not a policy receipt"
+        )
     if role == "concept_evidence" and kind not in _CONCEPT_KINDS:
         _fail("concept_evidence must reference a teaching-content unit")
     if role == "formula_evidence" and kind != "formula":
@@ -596,23 +800,23 @@ def _verify_role(record, unit):
     if role == "answer_evidence" and kind != "answer":
         _fail("answer_evidence must reference an answer unit")
     field = record.subject.field
-    if field in _PROMPT_FIELDS and (kind == "answer" or unit.get("asset_role") in ("answer_context", "worked_solution")):
+    if field in _PROMPT_FIELDS and (
+            kind == "answer" or unit.get("asset_role") in (
+                "answer_context", "worked_solution", "student_attempt"
+            )):
         _fail("prompt claims cannot cite answer-side content")
     if kind == "answer" and field not in _ANSWER_FIELDS and role != "translation_evidence":
         _fail("answer units may only support explicitly answer-side claim fields")
 
 
-def verify_claim(record, units, sources=()):
-    """Verify one claim's exact revision, payload hash, and code-point slice."""
+def _verify_claim_checked(row, units_by_id, sources_by_id, tainted_keys):
+    """Verify one normalized claim after the complete unit slice was audited."""
 
-    row = record if isinstance(record, ClaimRecord) else ClaimRecord.from_dict(record)
-    units_by_id = units if isinstance(units, dict) else _unit_index(units)
     unit = units_by_id.get(row.source.unit_ref.unit_id)
     if unit is None:
         _fail("claim references missing unit %s" % row.source.unit_ref.unit_id)
     if UnitRevisionRef.from_unit(unit) != row.source.unit_ref:
         _fail("claim unit revision is stale: %s" % row.source.unit_ref.unit_id)
-    sources_by_id = sources if isinstance(sources, dict) else _source_index(sources)
     if sources_by_id:
         source = sources_by_id.get(row.source.unit_ref.source_id)
         if source is None:
@@ -630,8 +834,35 @@ def verify_claim(record, units, sources=()):
         _fail("claim quote span exceeds the Unicode code-point payload length")
     if payload[start:end] != row.quote.text:
         _fail("claim quote is not the exact live Unicode code-point slice")
-    _verify_role(row, unit)
+    _verify_role(row, unit, tainted_keys)
     return row.claim_id
+
+
+def verify_claim_batch(
+        records, units, sources=(), *, tainted_keys=None, workspace=None):
+    """Verify multiple claims with one mandatory complete unit-slice preflight."""
+
+    rows = tuple(
+        value if isinstance(value, ClaimRecord) else ClaimRecord.from_dict(value)
+        for value in records
+    )
+    units_by_id = units if isinstance(units, dict) else _unit_index(units)
+    sources_by_id = sources if isinstance(sources, dict) else _source_index(sources)
+    checked_taint = _claim_asset_policy(
+        units_by_id.values(), tainted_keys, workspace=workspace
+    )
+    return tuple(
+        _verify_claim_checked(row, units_by_id, sources_by_id, checked_taint)
+        for row in rows
+    )
+
+
+def verify_claim(record, units, sources=(), *, tainted_keys=None, workspace=None):
+    """Verify one claim's exact revision, payload hash, and code-point slice."""
+
+    return verify_claim_batch(
+        (record,), units, sources, tainted_keys=tainted_keys, workspace=workspace
+    )[0]
 
 
 def _manifest_array(manifest, field):
@@ -1248,13 +1479,21 @@ def verify_claim_records(
     source_conflicts_sha256,
     claim_records_sha256,
     fact_snapshot_sha256,
+    tainted_keys=None,
+    workspace=None,
 ):
     rows = _claim_records(records)
     _chapter(chapter_id)
     bound_rows = validate_claim_subject_bindings(rows, manifest, chapter_id)
     units_by_id = _unit_index(units)
     sources_by_id = _source_index(sources)
-    verified = [verify_claim(row, units_by_id, sources_by_id) for row in bound_rows]
+    tainted_keys = _claim_asset_policy(
+        units_by_id.values(), tainted_keys, workspace=workspace
+    )
+    verified = [
+        _verify_claim_checked(row, units_by_id, sources_by_id, tainted_keys)
+        for row in bound_rows
+    ]
     return ClaimVerificationReceipt.create(
         chapter_id=chapter_id,
         guide_content_sha256=guide_content_sha256,
@@ -1292,5 +1531,6 @@ __all__ = [
     "validate_guide_claim_coverage",
     "validate_claim_subject_bindings",
     "verify_claim",
+    "verify_claim_batch",
     "verify_claim_records",
 ]

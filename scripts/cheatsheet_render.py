@@ -25,11 +25,18 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 try:
     from .ingestion import workspace_publication_lock
+    from .ingestion.identifiers import is_link_or_reparse
+    from .study_guide_render import GuideError as _GuideAssetError, _resolve_asset
+    from .validate_workspace import workspace_asset_policy_snapshot
 except ImportError:
     from ingestion import workspace_publication_lock
+    from ingestion.identifiers import is_link_or_reparse
+    from study_guide_render import GuideError as _GuideAssetError, _resolve_asset
+    from validate_workspace import workspace_asset_policy_snapshot
 
 for _s in ("stdout", "stderr"):
     try:
@@ -70,42 +77,88 @@ _INLINE = [
 _IMG_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)\)")
 
 
-def _img_tag(m, ws):
-    """图片必须先于普通链接处理（Codex r2），属性引号转义（r3），且 src 必须是工作区内的
-    真实相对文件（r5）——URL/绝对路径/.. 穿越/缺失文件一律 fail-closed：打印版要么真展示图，
-    要么大声失败，绝不静默丢图或让无头浏览器去加载工作区外资源/发网络请求。"""
+def _load_asset_policy(ws):
+    """Load the all-workspace policy; chapter filtering would launder attempts."""
+
+    try:
+        snapshot = workspace_asset_policy_snapshot(ws)
+    except (OSError, UnicodeError, ValueError) as exc:
+        _die("cannot establish the complete workspace asset policy: %s" % exc, 1)
+    if snapshot.get("unsafe_paths"):
+        _die("workspace contains an unsafe asset declaration: %s"
+             % snapshot["unsafe_paths"][0], 1)
+    if snapshot.get("conflicts"):
+        _die("workspace contains an asset-role/identity conflict: %s"
+             % snapshot["conflicts"][0], 1)
+    return snapshot
+
+
+def _asset_policy_token(snapshot):
+    """Return the exact semantic policy inputs used to render this artifact."""
+
+    return (
+        snapshot.get("quiz_rows", []),
+        snapshot.get("teaching_rows", []),
+        snapshot.get("content_units", []),
+        frozenset(snapshot.get("tainted_keys", ())),
+        frozenset(snapshot.get("tainted_identity_keys", ())),
+        tuple(snapshot.get("unsafe_paths", ())),
+        tuple(snapshot.get("conflicts", ())),
+    )
+
+
+def _assert_asset_policy_unchanged(ws, token):
+    current = _load_asset_policy(ws)
+    if _asset_policy_token(current) != token:
+        _die("workspace asset policy changed during rendering; refusing to publish stale output", 1)
+
+
+def _img_tag(m, ws, asset_policy=None):
+    """Resolve one Markdown image through the shared Study Guide security path."""
+
     alt, src = m.group(1), m.group(2)
-    plain = src.replace("&amp;", "&")          # 行先过了 escape(quote=False)，还原后再判语法
-    if "://" in plain:
-        _die("小抄图片不得用 URL（%s）——图片资产必须在工作区内（references/assets/）" % plain[:80], 1)
-    norm = plain.replace("\\", "/")
-    if norm.startswith("/") or (len(norm) >= 2 and norm[1] == ":"):
-        _die("小抄图片不得用绝对路径（%s）" % plain[:80], 1)
-    segs = [x for x in norm.split("/") if x not in ("", ".")]
-    if ".." in segs:
-        _die("小抄图片路径含 .. 穿越（%s）——拒绝渲染" % plain[:80], 1)
-    if ws is not None:
-        full = os.path.join(ws, *segs)
-        ws_real = os.path.normcase(os.path.realpath(ws))
-        real = os.path.normcase(os.path.realpath(full))
-        if real != ws_real and not real.startswith(ws_real + os.sep):
-            _die("小抄图片经符号链接逃出工作区（%s）——拒绝渲染" % plain[:80], 1)
-        if not os.path.isfile(full):
-            _die("小抄图片不存在：%s——fail-closed，请修正 cheatsheet.md 或补资产文件" % plain[:80], 1)
+    plain = src.replace("&amp;", "&")
+    if ws is None:
+        _die("cheatsheet images require a validated workspace", 1)
+    policy = asset_policy if asset_policy is not None else _load_asset_policy(ws)
+    try:
+        # This shared resolver owns canonical spelling, Win32 alias, reparse/containment,
+        # image-signature and physical student-attempt identity checks.  Do not duplicate it.
+        data_uri = _resolve_asset(
+            ws, plain, "cheatsheet Markdown image",
+            # Pass the complete capability: a free-form Markdown path can be an
+            # undeclared hardlink alias of a declared student submission.
+            student_attempt_tainted_keys=policy,
+            taint_message=(
+                "cheatsheet Markdown image is bound to a student_attempt asset: %s"
+            ),
+        )
+    except _GuideAssetError as exc:
+        _die(str(exc), 1)
     q = lambda x: x.replace('"', "&quot;").replace("'", "&#x27;")
-    return '<img src="%s" alt="%s" style="max-width:100%%;max-height:60mm">' % (q(src), q(alt))
+    return '<img src="%s" alt="%s" style="max-width:100%%;max-height:60mm">' % (
+        q(data_uri), q(alt))
 
 
-def _inline(s, ws=None):
+def _inline(s, ws=None, asset_policy=None):
     s = html_mod.escape(s, quote=False)
-    s = _IMG_RE.sub(lambda m: _img_tag(m, ws), s)
+    s = _IMG_RE.sub(lambda m: _img_tag(m, ws, asset_policy), s)
     for pat, rep in _INLINE:
         s = pat.sub(rep, s)
     return s
 
 
-def md_to_html_body(md, ws=None):
+def md_to_html_body(md, ws=None, asset_policy=None):
     """Headings/lists/tables/hr/paragraphs — the documented subset the compiler emits."""
+    if asset_policy is not None:
+        _die("caller-supplied asset policy is not trusted; pass only the workspace", 1)
+    # Public rendering helpers always establish their own complete snapshot.  Accepting a caller
+    # dict here would let `{'tainted_keys': ()}` launder a student submission into a printable
+    # course artifact.  Load only when an image exists so the pure syntax/no-image helper remains
+    # usable without a workspace.
+    asset_policy = (
+        _load_asset_policy(ws) if ws is not None and _IMG_RE.search(md or "") else None
+    )
     out, in_ul, in_ol, in_table = [], False, False, False
 
     def close_lists():
@@ -129,7 +182,7 @@ def md_to_html_body(md, ws=None):
         if m:
             close_lists()
             n = len(m.group(1))
-            out.append("<h%d>%s</h%d>" % (n, _inline(m.group(2), ws), n))
+            out.append("<h%d>%s</h%d>" % (n, _inline(m.group(2), ws, asset_policy), n))
             continue
         if re.match(r"^\s*(?:---+|\*\*\*+)\s*$", s):
             close_lists()
@@ -143,9 +196,11 @@ def md_to_html_body(md, ws=None):
                 close_lists()
                 out.append('<table>')
                 in_table = True
-                out.append("<tr>" + "".join("<th>%s</th>" % _inline(c, ws) for c in cells) + "</tr>")
+                out.append("<tr>" + "".join(
+                    "<th>%s</th>" % _inline(c, ws, asset_policy) for c in cells) + "</tr>")
             else:
-                out.append("<tr>" + "".join("<td>%s</td>" % _inline(c, ws) for c in cells) + "</tr>")
+                out.append("<tr>" + "".join(
+                    "<td>%s</td>" % _inline(c, ws, asset_policy) for c in cells) + "</tr>")
             continue
         m = re.match(r"^\s*[-*]\s+(.*)$", s)
         if m:
@@ -154,7 +209,7 @@ def md_to_html_body(md, ws=None):
             if not in_ul:
                 out.append("<ul>")
                 in_ul = True
-            out.append("<li>%s</li>" % _inline(m.group(1), ws))
+            out.append("<li>%s</li>" % _inline(m.group(1), ws, asset_policy))
             continue
         m = re.match(r"^\s*\d+[.)]\s+(.*)$", s)
         if m:
@@ -163,10 +218,10 @@ def md_to_html_body(md, ws=None):
             if not in_ol:
                 out.append("<ol>")
                 in_ol = True
-            out.append("<li>%s</li>" % _inline(m.group(1), ws))
+            out.append("<li>%s</li>" % _inline(m.group(1), ws, asset_policy))
             continue
         close_lists()
-        out.append("<p>%s</p>" % _inline(s, ws))
+        out.append("<p>%s</p>" % _inline(s, ws, asset_policy))
     close_lists()
     return "\n".join(out)
 
@@ -189,7 +244,10 @@ def pick_font(total_chars, pages):
     return FONT_MIN, 3
 
 
-def render_html(md, font_pt, columns, margin_mm=MIN_MARGIN_MM, title="Cheatsheet", ws=None):
+def render_html(md, font_pt, columns, margin_mm=MIN_MARGIN_MM, title="Cheatsheet", ws=None,
+                asset_policy=None):
+    if asset_policy is not None:
+        _die("caller-supplied asset policy is not trusted; pass only the workspace", 1)
     if margin_mm < MIN_MARGIN_MM:
         margin_mm = MIN_MARGIN_MM                      # hard floor — printers eat edges
     body = md_to_html_body(md, ws)
@@ -256,6 +314,77 @@ def pdf_page_count(pdf_path):
     return len(re.findall(rb"/Type\s*/Page\b(?!s)", data))
 
 
+def _artifact_snapshot(path, label):
+    """Capture one public artifact before a multi-file publication."""
+
+    if not os.path.lexists(path):
+        return None
+    if is_link_or_reparse(path) or not os.path.isfile(path):
+        _die("%s is not a regular non-reparse file; refusing publication" % label, 1)
+    try:
+        with open(path, "rb") as stream:
+            return stream.read()
+    except OSError as exc:
+        _die("cannot snapshot %s before publication: %s" % (label, exc), 1)
+
+
+def _restore_artifact(path, payload):
+    """Restore one snapshot without writing through an existing hardlink."""
+
+    if payload is None:
+        if os.path.lexists(path):
+            os.remove(path)
+        return
+    directory = os.path.dirname(path)
+    fd, temporary = tempfile.mkstemp(
+        prefix=".cheatsheet.rollback-", suffix="-" + os.path.basename(path),
+        dir=directory,
+    )
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.lexists(temporary):
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
+
+
+def _publish_rendered_artifacts(html_stage, html_path, pdf_stage, pdf_path):
+    """Publish HTML/PDF as one rollback-protected logical generation.
+
+    ``pdf_stage is None`` is an explicit HTML-only generation.  Any old PDF is
+    deleted inside the same rollback boundary, because leaving it beside the new
+    HTML would let a stale printable artifact masquerade as current output.
+    """
+
+    html_before = _artifact_snapshot(html_path, "cheatsheet.html")
+    pdf_before = _artifact_snapshot(pdf_path, "cheatsheet.pdf")
+    stale_pdf_existed = pdf_before is not None
+    try:
+        os.replace(html_stage, html_path)
+        if pdf_stage is not None:
+            os.replace(pdf_stage, pdf_path)
+        elif os.path.lexists(pdf_path):
+            os.remove(pdf_path)
+    except BaseException as exc:
+        rollback_errors = []
+        for path, payload in ((pdf_path, pdf_before), (html_path, html_before)):
+            try:
+                _restore_artifact(path, payload)
+            except BaseException as rollback_exc:
+                rollback_errors.append("%s: %s" % (os.path.basename(path), rollback_exc))
+        if rollback_errors:
+            _die("artifact publication failed (%s) and rollback was incomplete: %s" %
+                 (exc, "; ".join(rollback_errors)), 1)
+        _die("artifact publication failed; prior HTML/PDF were restored: %s" % exc, 1)
+    return stale_pdf_existed and pdf_stage is None
+
+
 # ---------------- main ----------------
 
 def main(argv=None, _state_locked=False):
@@ -274,7 +403,7 @@ def main(argv=None, _state_locked=False):
         _die("--font-size 须在 %.1f–%.1f pt 之间" % (FONT_MIN, FONT_MAX))
 
     ws = os.path.abspath(args.workspace)
-    if not os.path.isdir(ws) or os.path.islink(ws):
+    if not os.path.isdir(ws) or is_link_or_reparse(ws):
         _die("--workspace must be an existing non-symlink directory")
     if not _state_locked:
         with workspace_publication_lock(ws):
@@ -282,13 +411,15 @@ def main(argv=None, _state_locked=False):
     md_path = os.path.join(ws, MD_NAME)
     # 输入不得是符号链接（Codex r4）：isfile 会顺着链接把工作区外的文件当小抄渲染出去——
     # 与 retrieve.py / select_hard_questions.py 同口径：islink 先拒 + realpath 归属校验
-    if os.path.islink(md_path):
+    if is_link_or_reparse(md_path):
         _die("%s 是符号链接——可能指向工作区外，拒绝读取（请替换为真实文件）" % MD_NAME)
     if not os.path.isfile(md_path):
         _die("找不到 %s——先让 exam-cheatsheet 编译出小抄，再来渲染" % MD_NAME)
     _assert_contained(ws, md_path, MD_NAME)
     with open(md_path, "r", encoding="utf-8") as f:
         md = f.read()
+    asset_policy = _load_asset_policy(ws)
+    asset_policy_token = _asset_policy_token(asset_policy)
     total = len(re.sub(r"\s+", "", md))
 
     if args.font_size:
@@ -299,62 +430,78 @@ def main(argv=None, _state_locked=False):
     pdf_path = os.path.join(ws, "cheatsheet.pdf")
     # 输出位不得是符号链接（Codex r3）：跟随链接写会覆写工作区外目标——与仓库其它写盘路径同一守卫
     for p, name in ((html_path, "cheatsheet.html"), (pdf_path, "cheatsheet.pdf")):
-        if os.path.islink(p):
+        if os.path.lexists(p) and is_link_or_reparse(p):
             _die("%s 是符号链接（可能指向工作区外）——拒绝写入，请先移除该链接" % name, 1)
 
     browser = None if args.html_only else find_browser()
     font_locked = bool(args.font_size)                  # 显式 --font-size = 手动调字号，拟合环不许再动
-    tmp = html_path + ".tmp"
-    for attempt in range(4):                            # fit loop: nudge font vs actual pages
-        # 可预测的 tmp 路径可能被预植符号链接（Codex r4）：open("w") 会顺链写到工作区外，
-        # os.replace 再把链接顶到 cheatsheet.html 上。先 lexists 清掉（断链也逃不过），
-        # 再以 "x" 独占创建——竞态重植时 FileExistsError 直接 fail-loud，绝不顺链写
-        if os.path.lexists(tmp):
+    html_stage = os.path.join(ws, ".cheatsheet.rendering.html")
+    pdf_stage = os.path.join(ws, ".cheatsheet.rendering.pdf")
+    got = None
+    stale_pdf_removed = False
+    try:
+        for attempt in range(4):                        # fit loop: nudge font vs actual pages
+            # Stage every candidate away from the published names.  A policy failure or drift must
+            # leave both the previous HTML and PDF byte-for-byte intact.
+            for stage in (html_stage, pdf_stage):
+                if os.path.lexists(stage):
+                    try:
+                        os.remove(stage)
+                    except OSError as e:
+                        _die("无法清理残留临时文件 %s（%s）——拒绝写入，请手动清理后重试"
+                             % (stage, e), 1)
             try:
-                os.remove(tmp)
-            except OSError as e:
-                _die("无法清理残留临时文件 %s（%s）——拒绝写入，请手动清理后重试" % (tmp, e), 1)
-        try:
-            with open(tmp, "x", encoding="utf-8") as f:
-                f.write(render_html(md, font, cols, args.margin_mm, ws=ws))
-        except FileExistsError:
-            _die("临时文件 %s 在清理后被重新创建（疑似并发或劫持）——拒绝写入" % tmp, 1)
-        os.replace(tmp, html_path)                      # 原子落盘，与 update_progress 同惯例
-        if args.html_only or not browser:
-            break
-        print_to_pdf(browser, html_path, pdf_path)
-        got = pdf_page_count(pdf_path)
-        if got == args.pages or font_locked:            # 命中目标页数，或字号被显式锁定（Codex r3 P3）
-            break
-        if got > args.pages and font > FONT_MIN:        # overflow → shrink
-            font = max(FONT_MIN, font - 0.5)
-            cols = 3 if font < 7.5 else 2
-        elif got < args.pages and font < FONT_MAX:      # trailing whitespace → grow to refill
-            font = min(FONT_MAX, font + 0.5)
-            cols = 3 if font < 7.5 else 2
-        else:
-            break
+                with open(html_stage, "x", encoding="utf-8") as f:
+                    f.write(render_html(md, font, cols, args.margin_mm, ws=ws))
+            except FileExistsError:
+                _die("临时文件 %s 在清理后被重新创建（疑似并发或劫持）——拒绝写入"
+                     % html_stage, 1)
+            if args.html_only or not browser:
+                break
+            print_to_pdf(browser, html_stage, pdf_stage)
+            got = pdf_page_count(pdf_stage)
+            if got == args.pages or font_locked:        # 命中目标页数，或字号被显式锁定
+                break
+            if got > args.pages and font > FONT_MIN:    # overflow → shrink
+                font = max(FONT_MIN, font - 0.5)
+                cols = 3 if font < 7.5 else 2
+            elif got < args.pages and font < FONT_MAX:  # trailing whitespace → grow to refill
+                font = min(FONT_MAX, font + 0.5)
+                cols = 3 if font < 7.5 else 2
+            else:
+                break
+
+        # Re-read every quiz/teaching/content-unit declaration only after rendering is complete.
+        # Nothing under the public artifact names has been touched yet.
+        _assert_asset_policy_unchanged(ws, asset_policy_token)
+        for p, name in ((html_path, "cheatsheet.html"), (pdf_path, "cheatsheet.pdf")):
+            if os.path.lexists(p) and is_link_or_reparse(p):
+                _die("%s became a symbolic link during rendering; refusing publication" % name, 1)
+        stale_pdf_removed = _publish_rendered_artifacts(
+            html_stage, html_path,
+            pdf_stage if browser and not args.html_only else None,
+            pdf_path,
+        )
+    finally:
+        for stage in (html_stage, pdf_stage):
+            if os.path.lexists(stage):
+                try:
+                    os.remove(stage)
+                except OSError:
+                    pass
 
     print("[+] cheatsheet.html：字号 %.1fpt · %d 栏 · 边距 %dmm（≥%dmm 打印安全）"
           % (font, cols, max(args.margin_mm, MIN_MARGIN_MM), MIN_MARGIN_MM))
     if args.html_only:
         return 0
     if not browser:
-        stale = ""
-        # 降级路径的陈旧 PDF（Codex r4）：上次渲染留下的 cheatsheet.pdf 会挨着新 HTML 冒充
-        # 本次产出被学生拿去打印——lexists 连符号链接一起清掉，并在降级信息里明说
-        if os.path.lexists(pdf_path):
-            try:
-                os.remove(pdf_path)
-            except OSError as e:
-                _die("无法移除过期的 cheatsheet.pdf（%s）——旧产物会冒充本次渲染，"
-                     "请手动清理后重试" % e, 1)
-            stale = "；已移除过期的 cheatsheet.pdf（它不是本次产物）"
+        stale = ("；已移除过期的 cheatsheet.pdf（它不是本次产物）"
+                 if stale_pdf_removed else "")
         sys.stderr.write("cheatsheet_render: no_browser: 本机未找到 Edge/Chrome——已生成 "
                          "cheatsheet.html，请打开后 Ctrl+P 打印为 PDF（边距选默认、勾选背景图形）%s\n"
                          % stale)
         raise SystemExit(3)
-    got = pdf_page_count(pdf_path)
+    got = pdf_page_count(pdf_path) if got is None else got
     print("[+] cheatsheet.pdf：%d 页（目标 %d 页%s）"
           % (got, args.pages, "" if got == args.pages else "——已尽力拟合，可用 --font-size 微调"))
     return 0

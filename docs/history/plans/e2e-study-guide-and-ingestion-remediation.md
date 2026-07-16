@@ -1,14 +1,14 @@
 # E2E Study Guide and Ingestion Remediation Plan
 
-Status: implementation complete through PR 3; final EEC 160 acceptance in progress
+Status: implementation merged through PR #38; source-integrity hardening and final EEC 160 acceptance in progress
 
 Owner: Codex
 
-Baseline: `origin/main` at `0622c8c30c2b63f5df2814890aa5a2ecfbd935b9` after PRs 1–3 and the EEC visual hotfix
+Baseline: `origin/main` at `c5137f2` after PRs #24–#38
 
 Primary audit: `D:\EEC 160\universal-examprep-e2e-audit-2026-07-14.md`
 
-Real-course acceptance workspace: `D:\EEC 160-exam-workspace-vnext` (clean rebuild; the audited workspace remains read-only evidence)
+Real-course acceptance workspace: `D:\EEC 160-exam-workspace-acceptance` (clean rebuild; the audited workspace remains read-only evidence)
 
 Real-course source materials: `D:\EEC 160`
 
@@ -46,7 +46,9 @@ Base: updated `origin/main` after PR 1 merges
 
 Planned merge order: second
 
-No release is part of this request. The maintainer authorized merge without a separate approval round.
+The maintainer authorized merge without a separate approval round and later explicitly authorized
+a new release.  Release metadata/tagging remains last: it may happen only after the merged runtime
+passes the real EEC 160 rebuild and all-page visual acceptance.
 
 ### Post-audit amendment — real EEC acceptance hotfixes
 
@@ -59,6 +61,27 @@ of being hidden inside workspace-local patches:
 - Final acceptance PR (this branch): roster-driven prompt-only homework crops, strict typed-review
   metadata/control-byte repairs, fail-closed supplied/local formula-quality merging, and a compact
   optional LangGraph Study Guide stage guard.
+
+### Source-integrity amendment — chapter scope and student-attempt isolation
+
+The first real Chapter 1 authoring pass exposed a separate evidence-boundary defect: submitted
+homework pages could contain both the original prompt and a student's handwritten/OCR answer, while
+the course also supplied a distinct official solution.  Treating every crop from the submission as
+ordinary prompt/answer evidence could leak student work into the Guide, claims, retrieval, repair
+writers, or Cheatsheet.  The current hardening batch therefore adds and tests all of the following
+before the final rebuild:
+
+- a typed `student_attempt` asset role with workspace-wide physical-path taint across quiz,
+  teaching-example, and content-unit layers;
+- strict chapter-scoped authoring while retaining whole-workspace structural/path/identity checks;
+- canonical portable-path rules, including Win32 aliases, device names, control characters, and
+  reparse-point rejection;
+- live-policy-bound public render/repair/claim helpers so omitted, `None`, empty, or caller-forged
+  policy arguments cannot weaken the workspace policy;
+- preflight-before-write and staged-publication guarantees for visual repair, raw-input assets,
+  Study Guides, and Cheatsheets; and
+- teaching-only handling for non-gradable worked demonstrations, without inventing assessment
+  answers or dropping them from a full Guide.
 
 ## 3. PR 1 work breakdown
 
@@ -214,10 +237,13 @@ This run happens only after both PRs merge, using the merged `origin/main` code 
 | PR 2 merged | complete | upstream PR [#25](https://github.com/ZeKaiNie/universal-examprep-skill/pull/25), merge commit `d5a458626f79afd83b18b9110a0d1f233cb21695` |
 | EEC visual hotfix merged | complete | upstream PR [#26](https://github.com/ZeKaiNie/universal-examprep-skill/pull/26), merge commit `2d75c07d3d05c26e94e26f700e0c8a20e14f7487` |
 | Review batching/A-B pairing merged | complete | upstream PR [#27](https://github.com/ZeKaiNie/universal-examprep-skill/pull/27), merge commit `0622c8c30c2b63f5df2814890aa5a2ecfbd935b9`; Windows/Linux × Python 3.8/3.12 passed |
+| Follow-up ingestion/Guide hardening merged | complete | upstream PRs #28–#38; current `origin/main` is `c5137f2` |
 | Final acceptance hotfix implementation | complete | roster-driven prompt-only crops and visual-review blockers; fail-closed formula/control obligations; typed metadata, chapter inheritance, and cross-source revision replay guards; optional canonical-receipt LangGraph stage guard |
 | Final acceptance hotfix tests | complete | full suite: 1,917 passed, 40 optional-platform skips; focused ingestion/homework/readiness/LangGraph matrix: 617 passed; 11 skill validations, Python compile, `git diff --check`, and runtime package test passed |
-| Runtime package budget | verified | 608,506-byte Windows build; cap adjusted from 595,000 to 610,000 bytes (+2.52%) for the evidence gates and optional adapter while remaining below the 600 KiB hard ceiling |
+| Source-integrity/chapter-scope hardening | complete | frozen adversarial review P0=0/P1=0; final full suite 2,168 passed with 41 optional-platform skips; 11 root/sub-skill validations passed in Python UTF-8 mode; all 50 shipped Python files parse under the Python 3.8 grammar; `git diff --check` and focused transaction/raster/Guide matrices passed |
+| Runtime package budget | verified | final deterministic Windows build: 97 files / 569,659 bytes; enforced cap remains 570,000 bytes, leaving 341 bytes of measured headroom |
 | EEC 160 rebuilt | pending | — |
 | Chapter 1 full visual QA | pending | — |
+| Post-acceptance release | pending | authorized; version/tag/release notes wait for merged-runtime EEC acceptance |
 
 Update this ledger after each completed milestone. Do not mark a milestone complete from a prose claim alone; link it to a commit, test command, receipt, or generated artifact.

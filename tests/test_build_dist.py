@@ -65,6 +65,7 @@ class Manifest(unittest.TestCase):
                   "skills/exam-cram/SKILL.md", "locales/zh/SKILL.md", "locales/en/SKILL.md",
                   "locales/zh/messages.json", "locales/en/messages.json",
                   "scripts/update_progress.py", "scripts/notebook.py", "scripts/retrieve.py",
+                  "scripts/asset_policy.py", "scripts/image_validation.py",
                   "scripts/cheatsheet_render.py", "prompts/web_prompt.md",
                   "docs/language-policy.md", "docs/pdf-capability-adapters.json",
                   "skills/exam-study-guide/SKILL.md", "scripts/exam_start.py",

@@ -17,6 +17,10 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INGEST = os.path.join(ROOT, "scripts", "ingest.py")
 VALIDATE = os.path.join(ROOT, "scripts", "validate_workspace.py")
+PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+    "0000000c49444154789c63f8ffff3f0005fe02fe0def46b80000000049454e44ae426082"
+)
 
 RAW = {
     "course_name": "集成自检课",
@@ -74,7 +78,7 @@ class IngestThenValidateCLI(unittest.TestCase):
         assets = os.path.join(self.tmp, "references", "assets")
         os.makedirs(assets, exist_ok=True)
         with open(os.path.join(assets, "v1_p3.png"), "wb") as f:
-            f.write(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
+            f.write(PNG)
         return self.tmp
 
     def test_real_ingest_product_passes_real_validator_cli(self):

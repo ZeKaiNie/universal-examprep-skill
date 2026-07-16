@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
@@ -18,6 +19,7 @@ SCRIPTS = os.path.join(ROOT, "scripts")
 sys.path.insert(0, SCRIPTS)
 
 import study_guide_content as sgc  # noqa: E402
+from ingestion.pipeline import build_payload  # noqa: E402
 
 
 PY = sys.executable
@@ -29,6 +31,34 @@ def localized(zh, en):
 
 
 class StudyGuideContentTest(unittest.TestCase):
+    def test_global_asset_policy_includes_foreign_units_and_cross_layer_item_identity(self):
+        prompt = "references/assets/shared.png"
+        quiz = [{
+            "id": "same", "chapter": 1,
+            "assets": [{"path": prompt, "role": "question_context"}],
+        }]
+        foreign_attempt = [{
+            "unit_id": "foreign", "external_id": "other", "chapter_id": "ch02",
+            "asset_path": "references\\assets\\shared.png",
+            "asset_role": "student_attempt", "metadata": {},
+        }]
+        with self.assertRaisesRegex(sgc.ContentError, "student_attempt-tainted"):
+            sgc._validate_global_asset_policy([], quiz, foreign_attempt)
+
+        same_item_answer = [{
+            "unit_id": "answer", "external_id": "same", "chapter_id": "ch01",
+            "asset_path": "references\\assets\\shared.png",
+            "asset_role": "worked_solution", "metadata": {},
+        }]
+        with self.assertRaisesRegex(sgc.ContentError, "both prompt and official answer"):
+            sgc._validate_global_asset_policy([], quiz, same_item_answer)
+
+        other_item_answer = copy.deepcopy(same_item_answer)
+        other_item_answer[0]["external_id"] = "different"
+        self.assertEqual(
+            set(), sgc._validate_global_asset_policy([], quiz, other_item_answer)
+        )
+
     def setUp(self):
         self.ws = tempfile.mkdtemp(prefix="study-guide-content-")
         self.addCleanup(shutil.rmtree, self.ws, ignore_errors=True)
@@ -39,6 +69,7 @@ class StudyGuideContentTest(unittest.TestCase):
              "source_type": "lecture", "assets": [{
                  "path": "references/assets/prompt.png", "role": "question_context",
                  "type": "page_image",
+                 "sha256": hashlib.sha256(b"local prompt asset").hexdigest(),
              }]},
             {"id": "teaching-ch2", "chapter": 2},
         ])
@@ -49,6 +80,7 @@ class StudyGuideContentTest(unittest.TestCase):
              "answer": "B", "source_type": "quiz", "assets": [{
                  "path": "references/assets/prompt.png", "role": "figure",
                  "type": "crop_image",
+                 "sha256": hashlib.sha256(b"local prompt asset").hexdigest(),
              }]},
             {"id": "legacy-demo", "chapter": 2, "type": "subjective", "question": "Demo",
              "gradable": False},
@@ -84,10 +116,63 @@ class StudyGuideContentTest(unittest.TestCase):
                 stream.write(json.dumps(row, ensure_ascii=False) + "\n")
         return path
 
+    def _read_json(self, relative):
+        path = os.path.join(self.ws, *relative.split("/"))
+        with open(path, "r", encoding="utf-8") as stream:
+            return json.load(stream)
+
+    def _write_derived_artifacts(self):
+        relatives = (
+            "study_guide/ch01.receipt.json",
+            "study_guide/ch01.pdf",
+            "study_guide/ch01.html",
+            "study_guide/qa/ch01_p001.png",
+            "study_guide/qa/ch01_p017.png",
+        )
+        paths = []
+        for relative in relatives:
+            path = os.path.join(self.ws, *relative.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as stream:
+                stream.write(("old:%s" % relative).encode("utf-8"))
+            paths.append(path)
+        return paths
+
+    @staticmethod
+    def _snapshot_paths(paths):
+        snapshot = {}
+        for path in paths:
+            if os.path.lexists(path):
+                with open(path, "rb") as stream:
+                    snapshot[path] = (True, stream.read())
+            else:
+                snapshot[path] = (False, None)
+        return snapshot
+
+    def _assert_paths_match_snapshot(self, snapshot):
+        for path, (existed, data) in snapshot.items():
+            with self.subTest(path=path):
+                self.assertEqual(existed, os.path.lexists(path))
+                if existed:
+                    with open(path, "rb") as stream:
+                        self.assertEqual(data, stream.read())
+
+    def _assert_no_publication_temps(self):
+        leftovers = []
+        for directory, _subdirs, names in os.walk(self.ws):
+            leftovers.extend(
+                os.path.join(directory, name)
+                for name in names
+                if name.startswith(".") and name.endswith(".tmp")
+            )
+        self.assertEqual([], leftovers)
+
     def _structured_units(self):
+        with open(os.path.join(self.ws, *self.asset.split("/")), "rb") as stream:
+            prompt_sha256 = hashlib.sha256(stream.read()).hexdigest()
         prompt = {
             "path": self.asset, "role": "question_context", "type": "page_image",
-            "contains_full_prompt": True,
+            "contains_full_prompt": True, "sha256": prompt_sha256,
         }
         return [
             {"unit_id": "sem-heading", "source_file": "course/ch01.pdf", "page": 1,
@@ -371,6 +456,401 @@ class StudyGuideContentTest(unittest.TestCase):
         }, sgc.expected_item_source_types(self.ws, 1))
         self.assertTrue(report["structured_workspace"])
 
+    def test_non_target_chapter_body_controls_do_not_block_target_denominator(self):
+        units = self._structured_units()
+        foreign = next(row for row in units if row["unit_id"] == "other-chapter")
+        foreign["text"] += "\x10foreign-body"
+        foreign["metadata"] = {"assets": [{
+            "path": "assets/foreign.png", "source_file": "course/ch02.pdf",
+            "role": "figure", "type": "crop_image", "contains_full_prompt": False,
+            "future_ocr": "foreign\x10authored OCR",
+        }]}
+        self._enable_structured(units)
+
+        self.assertEqual(
+            ["ex1", "q1", "legacy-demo", "unit-only"],
+            sgc.expected_item_ids(self.ws, 1),
+        )
+
+    def test_target_chapter_body_controls_still_block_target_denominator(self):
+        units = self._structured_units()
+        next(row for row in units if row["unit_id"] == "sem-text")[
+            "text"] += "\x10hidden"
+        self._enable_structured(units)
+
+        with self.assertRaisesRegex(sgc.ContentError, "U\\+0010"):
+            sgc.expected_item_ids(self.ws, 1)
+
+    def test_non_target_rows_still_fail_closed_on_json_schema_ids_and_paths(self):
+        path = self._write_jsonl(
+            ".ingest/content_units.jsonl", self._structured_units())
+
+        with self.subTest("malformed JSON"):
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write('{"unit_id":')
+            with self.assertRaisesRegex(sgc.ContentError, "not strict JSON"):
+                sgc.expected_item_ids(self.ws, 1)
+
+        with self.subTest("missing schema field"):
+            units = self._structured_units()
+            del next(row for row in units if row["unit_id"] == "other-chapter")[
+                "provenance"]
+            self._write_jsonl(".ingest/content_units.jsonl", units)
+            with self.assertRaisesRegex(sgc.ContentError, "missing required content-unit keys"):
+                sgc.expected_item_ids(self.ws, 1)
+
+        with self.subTest("duplicate stable ID"):
+            units = self._structured_units()
+            duplicate = copy.deepcopy(
+                next(row for row in units if row["unit_id"] == "other-chapter"))
+            duplicate["page"] = 2
+            units.append(duplicate)
+            self._write_jsonl(".ingest/content_units.jsonl", units)
+            with self.assertRaisesRegex(sgc.ContentError, "repeats unit_id"):
+                sgc.expected_item_ids(self.ws, 1)
+
+        with self.subTest("unsafe source path"):
+            units = self._structured_units()
+            next(row for row in units if row["unit_id"] == "other-chapter")[
+                "source_file"] = "../ch02.pdf"
+            self._write_jsonl(".ingest/content_units.jsonl", units)
+            with self.assertRaisesRegex(sgc.ContentError, "unsafe path component"):
+                sgc.expected_item_ids(self.ws, 1)
+
+        with self.subTest("portable Win32 source alias"):
+            units = self._structured_units()
+            next(row for row in units if row["unit_id"] == "other-chapter")[
+                "source_file"] = "course/ch02.pdf."
+            self._write_jsonl(".ingest/content_units.jsonl", units)
+            with self.assertRaisesRegex(sgc.ContentError, "non-portable"):
+                sgc.expected_item_ids(self.ws, 1)
+
+    def test_non_target_content_unit_asset_controls_still_fail_closed(self):
+        cases = (
+            ("unsafe top-level asset path", {"asset_path": "../attempt.png"},
+             "unsafe path component"),
+            ("invalid top-level asset role", {
+                "asset_path": "assets/attempt.png", "asset_role": "prompt",
+            }, "must be one of"),
+            ("top-level role without path", {"asset_role": "student_attempt"},
+             "requires asset_path"),
+            ("unsafe nested asset path", {"metadata": {"assets": [{
+                "path": "references/assets/../attempt.png", "role": "student_attempt",
+            }]}}, "unsafe path component"),
+            ("unsafe nested source path", {"metadata": {"assets": [{
+                "path": self.asset, "source_file": "../ch02.pdf", "role": "figure",
+            }]}}, "unsafe path component"),
+            ("missing nested role", {"metadata": {"assets": [{
+                "path": self.asset,
+            }]}}, "role is required"),
+            ("invalid nested role", {"metadata": {"assets": [{
+                "path": self.asset, "role": "prompt",
+            }]}}, "must be one of"),
+            ("invalid nested type", {"metadata": {"assets": [{
+                "path": self.asset, "role": "figure", "type": "bitmap",
+            }]}}, "must be one of"),
+            ("invalid nested full-prompt flag", {"metadata": {"assets": [{
+                "path": self.asset, "role": "figure", "contains_full_prompt": "false",
+            }]}}, "must be true or false"),
+            ("unsafe answer-source metadata", {"metadata": {
+                "answer_source_file": "../outside.pdf",
+            }}, "unsafe path component"),
+            ("invalid metadata pages", {"metadata": {
+                "source_pages": [0],
+            }}, "must be a positive integer"),
+            ("invalid metadata boolean", {"metadata": {
+                "requires_assets": "false",
+            }}, "must be true or false"),
+            ("invalid metadata quiz type", {"metadata": {
+                "quiz_type": "choice\x10",
+            }}, "quiz_type must be one of"),
+            ("invalid metadata source type", {"metadata": {
+                "source_type": "quiz\x10",
+            }}, "source_type must be one of"),
+            ("invalid metadata source provenance", {"metadata": {
+                "source": "material\x10",
+            }}, "source must be one of"),
+            ("invalid metadata source language", {"metadata": {
+                "source_language": "en\x10",
+            }}, "source_language must be one of"),
+            ("invalid metadata routing language", {"metadata": {
+                "language": "en\x10",
+            }}, "U\\+0010"),
+            ("invalid nested hash", {"metadata": {"assets": [{
+                "path": self.asset, "role": "figure", "sha256": "bad",
+            }]}}, "lowercase SHA-256"),
+            ("invalid nested page", {"metadata": {"assets": [{
+                "path": self.asset, "role": "figure", "page": -7,
+            }]}}, "must be a positive integer"),
+            ("invalid nested bbox", {"metadata": {"assets": [{
+                "path": self.asset, "role": "figure", "bbox": "bad",
+            }]}}, "four finite numbers"),
+        )
+        for label, mutation, error in cases:
+            with self.subTest(label):
+                units = self._structured_units()
+                next(row for row in units if row["unit_id"] == "other-chapter").update(
+                    copy.deepcopy(mutation)
+                )
+                self._enable_structured(units)
+                with self.assertRaisesRegex(sgc.ContentError, error):
+                    sgc.expected_item_ids(self.ws, 1)
+
+    def test_non_target_content_unit_routing_and_revision_controls_still_fail_closed(self):
+        cases = (
+            ("invalid kind", {"kind": "bogus"}, "kind must be one of"),
+            ("invalid provenance", {"provenance": "bogus"},
+             "provenance must be one of"),
+            ("invalid schema version", {"schema_version": 2},
+             "schema_version must be 1"),
+            ("invalid source id", {"source_id": "src_bad"},
+             "canonical src_ SHA-256"),
+            ("invalid source revision", {"source_sha256": "bad"},
+             "lowercase SHA-256"),
+            ("invalid ordinal", {"ordinal": -7}, "non-negative integer"),
+            ("invalid bbox", {"bbox": [9, 2, 1, 4]}, "must be ordered"),
+            ("unknown parent", {"parent_unit_id": "missing-parent"},
+             "references unknown content unit"),
+            ("unknown pair", {"paired_unit_id": "missing-pair"},
+             "references unknown content unit"),
+            ("invalid section path", {"section_path": "Chapter 2"},
+             "section_path must be an array"),
+            ("invalid phase id", {"phase_id": "../phase"},
+             "safe stable identifier"),
+            ("invalid extraction method", {"method": "magic"},
+             "method must be one of"),
+            ("invalid confidence", {"confidence": 1.1}, "confidence must be at most 1"),
+        )
+        for label, mutation, error in cases:
+            with self.subTest(label):
+                units = self._structured_units()
+                next(row for row in units if row["unit_id"] == "other-chapter").update(
+                    copy.deepcopy(mutation)
+                )
+                self._enable_structured(units)
+                with self.assertRaisesRegex(sgc.ContentError, error):
+                    sgc.expected_item_ids(self.ws, 1)
+
+    def test_pipeline_nullable_asset_fields_remain_valid_content_unit_controls(self):
+        source_path = os.path.join(self.ws, "course", "pipeline.txt")
+        os.makedirs(os.path.dirname(source_path), exist_ok=True)
+        with open(source_path, "w", encoding="utf-8") as stream:
+            stream.write("Chapter 1\nA pipeline semantic unit.")
+        payload = build_payload(
+            self.ws,
+            [source_path],
+            [{
+                "file": "course/pipeline.txt", "page": 1,
+                "text": "Chapter 1\nA pipeline semantic unit.",
+            }],
+            sections=[{"chapter": 1, "page_keys": [("course/pipeline.txt", 1)]}],
+            report={"warnings": [], "skipped": [], "ai_review": []},
+        )
+        units = payload["content_units"]
+        self.assertTrue(any(
+            row.get("kind") in sgc.SEMANTIC_UNIT_KINDS
+            and "asset_path" in row and row["asset_path"] is None
+            and "asset_role" in row and row["asset_role"] is None
+            for row in units
+        ))
+        self._enable_structured(units)
+
+        self.assertEqual(["ex1", "q1"], sgc.expected_item_ids(self.ws, 1))
+
+    def test_non_target_body_controls_cannot_enable_cross_chapter_refs(self):
+        manifest = self._structured_manifest()
+        units = self._structured_units()
+        next(row for row in units if row["unit_id"] == "other-chapter")[
+            "text"] += "\x10foreign-body"
+        self._write_jsonl(".ingest/content_units.jsonl", units)
+        manifest["knowledge_points"][0]["source_refs"][0] = {
+            "source_file": "course/ch02.pdf", "pages": [1],
+            "source_unit_id": "other-chapter", "role": "concept",
+        }
+
+        self.assertInvalid(manifest, "must reference a current-chapter content unit")
+
+    def test_non_target_source_array_body_controls_do_not_block_target_inventory(self):
+        teaching = [
+            {"id": "ex1", "chapter": 1, "source_type": "lecture"},
+            {"id": "teaching-ch2", "chapter": 2,
+             "title": "Foreign\x10teaching body",
+             "future_translation": {"en": "Future\x10translated body"}},
+        ]
+        quizzes = [
+            {"id": "ex1", "chapter": 1, "type": "subjective",
+             "question": "Overlap", "answer": "A", "source_type": "lecture"},
+            {"id": "q1", "phase": 1, "type": "subjective",
+             "question": "Question", "answer": "B", "source_type": "quiz"},
+            {"id": "q-ch2", "chapter": 2, "type": "choice",
+             "question": "Other", "answer": "Foreign\x10answer body",
+             "assets": [{
+                 "path": "references/assets/prompt.png",
+                 "role": "question_context", "type": "page_image",
+                 "future_ocr": "Foreign\x10OCR body",
+             }]},
+        ]
+        self._write_json("references/teaching_examples.json", teaching)
+        self._write_json("references/quiz_bank.json", quizzes)
+
+        self.assertEqual(["ex1", "q1"], sgc.expected_item_ids(self.ws, 1))
+
+    def test_target_source_array_body_controls_still_block_target_inventory(self):
+        teaching = self._read_json("references/teaching_examples.json")
+        teaching[0]["title"] = "Target\x10teaching body"
+        self._write_json("references/teaching_examples.json", teaching)
+        with self.assertRaisesRegex(sgc.ContentError, "U\\+0010"):
+            sgc.expected_item_ids(self.ws, 1)
+
+        self._reset_source_arrays_for_control_test()
+        quizzes = self._read_json("references/quiz_bank.json")
+        quizzes[1]["answer"] = "Target\x10quiz body"
+        self._write_json("references/quiz_bank.json", quizzes)
+        with self.assertRaisesRegex(sgc.ContentError, "U\\+0010"):
+            sgc.expected_item_ids(self.ws, 1)
+
+    def _reset_source_arrays_for_control_test(self):
+        self._write_json("references/teaching_examples.json", [
+            {"id": "ex1", "chapter": 1, "source_type": "lecture"},
+            {"id": "teaching-ch2", "chapter": 2},
+        ])
+        self._write_json("references/quiz_bank.json", [
+            {"id": "ex1", "chapter": 1, "type": "subjective",
+             "question": "Overlap", "answer": "A", "source_type": "lecture"},
+            {"id": "q1", "phase": 1, "type": "subjective",
+             "question": "Question", "answer": "B", "source_type": "quiz"},
+            {"id": "q-ch2", "chapter": 2, "type": "choice",
+             "question": "Other", "answer": "A"},
+        ])
+
+    def test_non_target_source_arrays_keep_structure_fail_closed(self):
+        self._reset_source_arrays_for_control_test()
+        path = os.path.join(self.ws, "references", "quiz_bank.json")
+
+        with self.subTest("malformed JSON"):
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write('[{"id":')
+            with self.assertRaisesRegex(sgc.ContentError, "strict UTF-8 JSON"):
+                sgc.expected_item_ids(self.ws, 1)
+
+        with self.subTest("row shape"):
+            self._reset_source_arrays_for_control_test()
+            quizzes = self._read_json("references/quiz_bank.json")
+            quizzes.append("not-an-object")
+            self._write_json("references/quiz_bank.json", quizzes)
+            with self.assertRaisesRegex(sgc.ContentError, "must be an object"):
+                sgc.expected_item_ids(self.ws, 1)
+
+        with self.subTest("unsafe ID"):
+            self._reset_source_arrays_for_control_test()
+            quizzes = self._read_json("references/quiz_bank.json")
+            quizzes[-1]["id"] = "../foreign"
+            self._write_json("references/quiz_bank.json", quizzes)
+            with self.assertRaisesRegex(sgc.ContentError, "safe stable identifier"):
+                sgc.expected_item_ids(self.ws, 1)
+
+        with self.subTest("unsafe chapter locator"):
+            self._reset_source_arrays_for_control_test()
+            quizzes = self._read_json("references/quiz_bank.json")
+            quizzes[-1]["chapter"] = "2\x10"
+            self._write_json("references/quiz_bank.json", quizzes)
+            with self.assertRaisesRegex(sgc.ContentError, "chapter"):
+                sgc.expected_item_ids(self.ws, 1)
+
+        with self.subTest("unsafe source path"):
+            self._reset_source_arrays_for_control_test()
+            quizzes = self._read_json("references/quiz_bank.json")
+            quizzes[-1]["source_file"] = "../foreign.pdf"
+            quizzes[-1]["source_pages"] = [1]
+            self._write_json("references/quiz_bank.json", quizzes)
+            with self.assertRaisesRegex(sgc.ContentError, "unsafe path component"):
+                sgc.expected_item_ids(self.ws, 1)
+
+        with self.subTest("portable Win32 source alias"):
+            self._reset_source_arrays_for_control_test()
+            quizzes = self._read_json("references/quiz_bank.json")
+            quizzes[-1]["source_file"] = "course/ch02.pdf."
+            quizzes[-1]["source_pages"] = [1]
+            self._write_json("references/quiz_bank.json", quizzes)
+            with self.assertRaisesRegex(sgc.ContentError, "non-portable"):
+                sgc.expected_item_ids(self.ws, 1)
+
+        with self.subTest("foreign answer language remains control-plane"):
+            self._reset_source_arrays_for_control_test()
+            quizzes = self._read_json("references/quiz_bank.json")
+            quizzes[-1]["answer_source_language"] = "en\x10"
+            self._write_json("references/quiz_bank.json", quizzes)
+            with self.assertRaisesRegex(sgc.ContentError, "U\\+0010"):
+                sgc.expected_item_ids(self.ws, 1)
+
+        with self.subTest("duplicate foreign ID"):
+            self._reset_source_arrays_for_control_test()
+            quizzes = self._read_json("references/quiz_bank.json")
+            duplicate = copy.deepcopy(quizzes[-1])
+            duplicate["chapter"] = 3
+            quizzes.append(duplicate)
+            self._write_json("references/quiz_bank.json", quizzes)
+            with self.assertRaisesRegex(sgc.ContentError, "duplicate id"):
+                sgc.expected_item_ids(self.ws, 1)
+
+    def test_non_target_source_array_semantic_controls_still_fail_closed(self):
+        cases = (
+            ("invalid question type", "type", "bogus", "type must be one of"),
+            ("invalid source type", "source_type", "bogus", "source_type must be one of"),
+            ("invalid provenance", "source", "bogus", "source must be one of"),
+            ("invalid prompt language", "source_language", "xx",
+             "source_language must be one of"),
+            ("invalid answer language", "answer_source_language", "xx",
+             "answer_source_language must be one of"),
+            ("invalid prompt status", "question_text_status", "bogus",
+             "question_text_status must be one of"),
+            ("invalid answer status", "answer_status", "bogus",
+             "answer_status must be one of"),
+            ("invalid teaching role", "teaching_role", "bogus",
+             "teaching_role must be one of"),
+            ("invalid difficulty", "difficulty", 0, "integer from 1 to 5"),
+            ("invalid generated flag", "ai_generated", "false", "must be true or false"),
+            ("invalid routing status shape", "status", {}, "non-empty trimmed string"),
+        )
+        for label, field, replacement, error in cases:
+            with self.subTest(label):
+                self._reset_source_arrays_for_control_test()
+                quizzes = self._read_json("references/quiz_bank.json")
+                quizzes[-1][field] = replacement
+                self._write_json("references/quiz_bank.json", quizzes)
+                with self.assertRaisesRegex(sgc.ContentError, error):
+                    sgc.expected_item_ids(self.ws, 1)
+
+    def test_non_target_source_array_asset_controls_still_fail_closed(self):
+        cases = (
+            ("unsafe asset path", {"path": "references/assets/../foreign.png",
+                                   "role": "question_context"}, "unsafe path component"),
+            ("unsafe asset source", {"path": self.asset, "role": "question_context",
+                                     "source_file": "../foreign.pdf"},
+             "unsafe path component"),
+            ("invalid asset role", {"path": self.asset, "role": "prompt"},
+             "must be one of"),
+            ("invalid asset type", {"path": self.asset, "role": "question_context",
+                                    "type": "bitmap"}, "must be one of"),
+            ("invalid full-prompt flag", {"path": self.asset, "role": "question_context",
+                                          "contains_full_prompt": "true"},
+             "must be true or false"),
+            ("invalid asset hash", {"path": self.asset, "role": "question_context",
+                                    "sha256": "bad"}, "lowercase SHA-256"),
+            ("invalid asset page", {"path": self.asset, "role": "question_context",
+                                    "page": -7}, "must be a positive integer"),
+            ("invalid asset bbox", {"path": self.asset, "role": "question_context",
+                                    "bbox": "bad"}, "four finite numbers"),
+        )
+        for label, asset, error in cases:
+            with self.subTest(label):
+                self._reset_source_arrays_for_control_test()
+                quizzes = self._read_json("references/quiz_bank.json")
+                quizzes[-1]["assets"] = [asset]
+                self._write_json("references/quiz_bank.json", quizzes)
+                with self.assertRaisesRegex(sgc.ContentError, error):
+                    sgc.expected_item_ids(self.ws, 1)
+
     def test_ingestion_v2_fails_closed_without_claim_sidecar_and_receipt(self):
         manifest = self._structured_manifest()
         self._write_json(
@@ -513,6 +993,293 @@ class StudyGuideContentTest(unittest.TestCase):
         self._write_jsonl(".ingest/content_units.jsonl", units)
         self.assertInvalid(manifest, "must exactly cover every known answer-side asset")
 
+    def test_student_attempt_is_preserved_but_excluded_from_full_guide_answer_inventory(self):
+        manifest = self._structured_manifest()
+        answer_asset = "references/assets/answer.png"
+        attempt_asset = "references/assets/student-attempt.png"
+        for relative, payload in (
+                (answer_asset, b"official answer"), (attempt_asset, b"student attempt")):
+            with open(os.path.join(self.ws, *relative.split("/")), "wb") as stream:
+                stream.write(payload)
+        units = self._structured_units()
+        next(row for row in units if row["unit_id"] == "a-q1")["metadata"]["assets"] = [
+            {"path": answer_asset, "role": "answer_context", "type": "page_image"},
+            {"path": attempt_asset, "role": "student_attempt", "type": "crop_image"},
+        ]
+        self._write_jsonl(".ingest/content_units.jsonl", units)
+        q1 = next(row for row in manifest["walkthroughs"] if row["item_id"] == "q1")
+        q1["answer_asset_paths"] = [answer_asset]
+
+        self.assertTrue(sgc.validate_manifest(self.ws, 1, manifest)["ok"])
+
+        leaked = copy.deepcopy(manifest)
+        next(row for row in leaked["walkthroughs"] if row["item_id"] == "q1")[
+            "answer_asset_paths"].append(attempt_asset)
+        self.assertInvalid(leaked, "is not bound to an answer-side source asset")
+
+    def test_explicit_source_assets_reject_nested_student_attempt_conflicts(self):
+        for ref_role, unit_id, asset_key in (
+                ("question", "q-ex1", "prompt_asset_paths"),
+                ("answer", "a-ex1", "answer_asset_paths")):
+            with self.subTest(ref_role=ref_role):
+                manifest = self._structured_manifest()
+                attempt_asset = "references/assets/%s-attempt.png" % ref_role
+                with open(os.path.join(self.ws, *attempt_asset.split("/")), "wb") as stream:
+                    stream.write(b"student attempt")
+                units = self._structured_units()
+                unit = next(row for row in units if row["unit_id"] == unit_id)
+                official_role = (
+                    "question_context" if ref_role == "question" else "answer_context"
+                )
+                unit["metadata"]["assets"] = [
+                    {"path": attempt_asset, "role": official_role, "type": "crop_image"},
+                    {"path": attempt_asset, "role": "student_attempt", "type": "crop_image"},
+                ]
+                self._write_jsonl(".ingest/content_units.jsonl", units)
+                walk = next(row for row in manifest["walkthroughs"]
+                            if row["item_id"] == "ex1")
+                ref = next(row for row in walk["source_trace"]
+                           if row["role"] == ref_role)
+                ref["asset_path"] = attempt_asset
+                walk[asset_key] = [attempt_asset]
+
+                traced = sgc._trace_asset_records([ref], {unit_id: unit})
+                self.assertEqual(
+                    {official_role, "student_attempt"},
+                    {record.get("role") for record in traced[attempt_asset]},
+                )
+                self.assertInvalid(manifest, "student_attempt")
+
+    def test_direct_student_attempt_units_cannot_match_question_or_answer_refs(self):
+        for ref_role, unit_id in (("question", "q-q1"), ("answer", "a-q1")):
+            with self.subTest(ref_role=ref_role):
+                manifest = self._structured_manifest()
+                units = self._structured_units()
+                unit = next(row for row in units if row["unit_id"] == unit_id)
+                attempt_asset = "references/assets/direct-%s-attempt.png" % ref_role
+                with open(os.path.join(self.ws, *attempt_asset.split("/")), "wb") as stream:
+                    stream.write(b"direct student attempt")
+                unit["asset_path"] = attempt_asset
+                unit["asset_role"] = "student_attempt"
+                self._write_jsonl(".ingest/content_units.jsonl", units)
+                self.assertInvalid(manifest, "incompatible with content unit")
+
+    def test_top_level_student_attempt_is_excluded_from_all_guide_roles_and_semantics(self):
+        attempt_asset = "references/assets/concept-attempt.png"
+        with open(os.path.join(self.ws, *attempt_asset.split("/")), "wb") as stream:
+            stream.write(b"student concept attempt")
+        attempt = {
+            "unit_id": "attempt-figure", "source_file": "course/ch01.pdf", "page": 13,
+            "kind": "figure", "chapter_id": "ch01", "provenance": "material",
+            "asset_path": attempt_asset, "asset_role": "student_attempt",
+        }
+        for role in sgc.SOURCE_ROLES:
+            with self.subTest(role=role):
+                self.assertFalse(sgc._source_role_matches_unit(attempt, role))
+
+        manifest = self._structured_manifest()
+        units = self._structured_units() + [attempt]
+        self._write_jsonl(".ingest/content_units.jsonl", units)
+        semantic_ids, by_kind = sgc._semantic_unit_ids(units, 1)
+        self.assertNotIn("attempt-figure", semantic_ids)
+        self.assertEqual(1, by_kind["figure"] if "figure" in by_kind else 1)
+        self.assertTrue(sgc.validate_manifest(self.ws, 1, manifest)["ok"])
+
+        laundered = copy.deepcopy(manifest)
+        kp = laundered["knowledge_points"][0]
+        kp["source_unit_ids"].append("attempt-figure")
+        kp["source_refs"].append({
+            "source_file": "course/ch01.pdf", "pages": [13],
+            "source_unit_id": "attempt-figure", "role": "concept",
+        })
+        self.assertInvalid(laundered, "incompatible with content unit")
+
+    def test_top_level_attempt_question_and_answer_units_do_not_create_guide_evidence(self):
+        units = self._structured_units()
+        units.extend([
+            {
+                "unit_id": "attempt-question", "source_file": "course/ch01.pdf", "page": 13,
+                "kind": "question", "chapter_id": "ch01", "provenance": "material",
+                "external_id": "attempt-only", "text": "Student-written prompt",
+                "asset_path": "references/assets/attempt-question.png",
+                "asset_role": "student_attempt",
+                "metadata": {"source_language": "en"},
+            },
+            {
+                "unit_id": "attempt-answer", "source_file": "course/ch01.pdf", "page": 14,
+                "kind": "answer", "chapter_id": "ch01", "provenance": "material",
+                "external_id": "q1", "text": "Student-written answer",
+                "asset_path": "references/assets/attempt-answer.png",
+                "asset_role": "student_attempt",
+                "metadata": {"source_language": "en"},
+            },
+        ])
+        self._enable_structured(units)
+
+        inventory = sgc._source_inventory(self.ws, 1)
+
+        self.assertNotIn("attempt-only", inventory["item_ids"])
+        self.assertNotIn(
+            "attempt-question",
+            inventory["item_evidence"].get("attempt-only", {}).get("question_unit_ids", set()),
+        )
+        self.assertNotIn(
+            "attempt-answer", inventory["item_evidence"]["q1"]["answer_unit_ids"]
+        )
+        self.assertEqual(
+            "student_attempt",
+            inventory["item_assets"]["q1"]["references/assets/attempt-answer.png"][0][
+                "role"
+            ],
+        )
+
+    def test_student_attempt_cannot_be_laundered_by_duplicate_official_asset_role(self):
+        teaching = self._read_json("references/teaching_examples.json")
+        teaching[0]["assets"] = [
+            {"path": self.asset, "role": "question_context", "type": "page_image"},
+            {"path": self.asset, "role": "student_attempt", "type": "crop_image"},
+        ]
+        self._write_json("references/teaching_examples.json", teaching)
+        self.assertInvalid(self._manifest(), "student_attempt-tainted")
+
+    def test_student_attempt_hardlink_alias_taints_official_guide_asset(self):
+        attempt_asset = "references/assets/student-hardlink.png"
+        try:
+            os.link(
+                os.path.join(self.ws, *self.asset.split("/")),
+                os.path.join(self.ws, *attempt_asset.split("/")),
+            )
+        except (OSError, NotImplementedError):
+            self.skipTest("hard links are unavailable")
+        quizzes = self._read_json("references/quiz_bank.json")
+        quizzes.append({
+            "id": "foreign-student-hardlink", "chapter": 2,
+            "assets": [{
+                "path": attempt_asset,
+                "role": "student_attempt",
+                "type": "crop_image",
+            }],
+        })
+        self._write_json("references/quiz_bank.json", quizzes)
+
+        self.assertInvalid(self._manifest(), "student_attempt-tainted")
+
+    def test_ingestion_v2_full_prompt_requires_asset_revision_digest(self):
+        manifest = self._structured_manifest()
+        units = self._structured_units()
+        del next(row for row in units if row["unit_id"] == "q-ex1")[
+            "metadata"]["assets"][0]["sha256"]
+        self._write_jsonl(".ingest/content_units.jsonl", units)
+        self._write_json(
+            ".ingest/build_manifest.json",
+            {"schema_version": 1, "pipeline_version": "ingestion-v2"},
+        )
+
+        self.assertInvalid(manifest, "exact sha256 revision")
+
+    def test_independent_nested_concept_asset_revision_drift_blocks_inventory(self):
+        relative = "references/assets/concept-source.png"
+        absolute = os.path.join(self.ws, *relative.split("/"))
+        payload = b"source-backed concept image"
+        with open(absolute, "wb") as stream:
+            stream.write(payload)
+        units = self._structured_units()
+        concept = next(row for row in units if row["unit_id"] == "sem-text")
+        concept["metadata"] = {"assets": [{
+            "path": relative,
+            "role": "figure",
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }]}
+        self._enable_structured(units)
+        self.assertTrue(sgc._source_inventory(self.ws, 1)["structured"])
+
+        with open(absolute, "wb") as stream:
+            stream.write(b"silently replaced concept image")
+        with self.assertRaisesRegex(sgc.ContentError, "asset revision drift"):
+            sgc._source_inventory(self.ws, 1)
+
+    def test_non_string_source_and_nested_asset_roles_fail_as_content_errors(self):
+        manifest = self._structured_manifest()
+        walk = next(row for row in manifest["walkthroughs"] if row["item_id"] == "ex1")
+        walk["source_trace"][0]["role"] = ["question"]
+        self.assertInvalid(manifest, ".role must be one of")
+
+        manifest = self._structured_manifest()
+        units = self._structured_units()
+        next(row for row in units if row["unit_id"] == "q-ex1")["metadata"][
+            "assets"][0]["role"] = {"side": "question_context"}
+        self._write_jsonl(".ingest/content_units.jsonl", units)
+        self.assertInvalid(manifest, "role must be one of")
+
+    def test_pipeline_mixed_item_assets_bind_refs_by_exact_real_path(self):
+        answer_asset = "references/assets/official-answer.png"
+        with open(os.path.join(self.ws, *answer_asset.split("/")), "wb") as stream:
+            stream.write(b"official answer")
+        source_path = os.path.join(self.ws, "course", "ch01.pdf")
+        os.makedirs(os.path.dirname(source_path), exist_ok=True)
+        with open(source_path, "wb") as stream:
+            stream.write(b"pipeline-shaped mixed visual source")
+        item = {
+            "id": "ex1", "chapter": 1, "type": "subjective",
+            "question": "Given P(A+B)=0.2 and P(B)=0.5, find P(A|B).",
+            "answer": "The answer is 0.4.", "source": "material",
+            "source_type": "example", "source_file": "course/ch01.pdf",
+            "source_pages": [5], "answer_source_pages": [6],
+            "source_language": "en", "answer_source_language": "en",
+            "assets": [
+                {"path": self.asset, "role": "question_context", "type": "page_image"},
+                {"path": answer_asset, "role": "answer_context", "type": "page_image"},
+            ],
+        }
+        payload = build_payload(
+            self.ws,
+            [source_path],
+            [
+                {"file": "course/ch01.pdf", "page": 5, "text": item["question"]},
+                {"file": "course/ch01.pdf", "page": 6, "text": item["answer"]},
+            ],
+            sections=[{
+                "chapter": 1,
+                "page_keys": [("course/ch01.pdf", 5), ("course/ch01.pdf", 6)],
+            }],
+            quiz_items=[item],
+            report={"warnings": [], "skipped": [], "ai_review": []},
+        )
+        generated = [
+            row for row in payload["content_units"]
+            if row.get("external_id") == "ex1" and row.get("kind") in ("question", "answer")
+        ]
+        self.assertEqual({"question", "answer"}, {row["kind"] for row in generated})
+        for row in generated:
+            self.assertEqual(
+                {"question_context", "answer_context"},
+                {asset["role"] for asset in row["metadata"]["assets"]},
+            )
+
+        manifest = self._structured_manifest()
+        units = [row for row in self._structured_units()
+                 if row["unit_id"] not in ("q-ex1", "a-ex1")]
+        units.extend(generated)
+        self._write_jsonl(".ingest/content_units.jsonl", units)
+        question = next(row for row in generated if row["kind"] == "question")
+        answer = next(row for row in generated if row["kind"] == "answer")
+        walk = next(row for row in manifest["walkthroughs"] if row["item_id"] == "ex1")
+        walk["source_trace"] = [
+            {
+                "source_file": question["source_file"], "pages": [question["page"]],
+                "source_unit_id": question["unit_id"], "role": "question",
+                "asset_path": self.asset, "contains_full_prompt": True,
+            },
+            {
+                "source_file": answer["source_file"], "pages": [answer["page"]],
+                "source_unit_id": answer["unit_id"], "role": "answer",
+                "asset_path": answer_asset,
+            },
+        ]
+        walk["answer_asset_paths"] = [answer_asset]
+
+        self.assertTrue(sgc.validate_manifest(self.ws, 1, manifest)["ok"])
+
     def test_full_legacy_visual_dependency_flag_without_asset_blocks_for_ingest_review(self):
         for flag in ("requires_assets", "maybe_requires_assets"):
             with self.subTest(flag=flag):
@@ -613,6 +1380,78 @@ class StudyGuideContentTest(unittest.TestCase):
         wrong_page["knowledge_points"][0]["source_refs"][0]["pages"] = [99]
         self.assertInvalid(wrong_page, "must exactly equal")
 
+    def test_structured_concept_asset_binds_exact_figure_path_not_answer_context(self):
+        concept_asset = "references/assets/concept-figure.png"
+        answer_asset = "references/assets/unrelated-answer.png"
+        for relative, payload in (
+                (concept_asset, b"concept figure"),
+                (answer_asset, b"unrelated official answer")):
+            with open(os.path.join(self.ws, *relative.split("/")), "wb") as stream:
+                stream.write(payload)
+
+        manifest = self._structured_manifest()
+        units = self._structured_units()
+        concept_unit = next(row for row in units if row["unit_id"] == "sem-table")
+        concept_unit["metadata"] = {"assets": [
+            {"path": concept_asset, "role": "figure", "type": "crop_image"},
+            {"path": answer_asset, "role": "answer_context", "type": "page_image"},
+        ]}
+        self._write_jsonl(".ingest/content_units.jsonl", units)
+        concept_ref = next(
+            row for row in manifest["knowledge_points"][0]["source_refs"]
+            if row["source_unit_id"] == "sem-table"
+        )
+        concept_ref["asset_path"] = concept_asset
+
+        self.assertTrue(sgc.validate_manifest(self.ws, 1, manifest)["ok"])
+
+        laundered = copy.deepcopy(manifest)
+        next(
+            row for row in laundered["knowledge_points"][0]["source_refs"]
+            if row["source_unit_id"] == "sem-table"
+        )["asset_path"] = answer_asset
+        self.assertInvalid(laundered, "no real concept-side asset role")
+
+    def test_structured_formula_asset_rejects_worked_solution_role(self):
+        solution_asset = "references/assets/formula-worked-solution.png"
+        with open(os.path.join(self.ws, *solution_asset.split("/")), "wb") as stream:
+            stream.write(b"official worked solution")
+
+        manifest = self._structured_manifest()
+        units = self._structured_units()
+        formula_unit = next(row for row in units if row["unit_id"] == "sem-formula")
+        formula_unit["metadata"] = {"assets": [{
+            "path": solution_asset, "role": "worked_solution", "type": "page_image",
+        }]}
+        self._write_jsonl(".ingest/content_units.jsonl", units)
+        manifest["knowledge_points"][0]["formulas"][0]["source_refs"][0][
+            "asset_path"] = solution_asset
+
+        self.assertInvalid(manifest, "no real formula-side asset role")
+
+    def test_semantic_refs_without_exact_asset_reject_assessment_side_assets(self):
+        cases = (
+            ("concept", "sem-table", "question_context"),
+            ("concept", "sem-table", "answer_context"),
+            ("formula", "sem-formula", "worked_solution"),
+            ("formula", "sem-formula", "student_attempt"),
+        )
+        for ref_role, unit_id, asset_role in cases:
+            with self.subTest(ref_role=ref_role, asset_role=asset_role):
+                relative = "references/assets/no-exact-%s-%s.png" % (
+                    ref_role, asset_role)
+                with open(os.path.join(self.ws, *relative.split("/")), "wb") as stream:
+                    stream.write(b"wrong semantic evidence side")
+                manifest = self._structured_manifest()
+                units = self._structured_units()
+                unit = next(row for row in units if row["unit_id"] == unit_id)
+                unit["metadata"] = {"assets": [{
+                    "path": relative, "role": asset_role, "type": "page_image",
+                }]}
+                self._write_jsonl(".ingest/content_units.jsonl", units)
+
+                self.assertInvalid(manifest, "incompatible with content unit")
+
     def test_structured_kp_source_unit_ids_are_derived_from_typed_refs(self):
         manifest = self._structured_manifest()
 
@@ -689,6 +1528,28 @@ class StudyGuideContentTest(unittest.TestCase):
         missing_role = copy.deepcopy(manifest)
         del missing_role["walkthroughs"][0]["source_trace"][0]["role"]
         self.assertInvalid(missing_role, "role is required")
+
+        foreign_extra = copy.deepcopy(manifest)
+        foreign_extra["walkthroughs"][0]["source_trace"].append({
+            "source_file": "course/ch02.pdf", "pages": [1],
+            "source_unit_id": "other-chapter", "role": "concept",
+        })
+        self.assertInvalid(
+            foreign_extra, "must reference a current-chapter content unit")
+
+        supplemented_extra = copy.deepcopy(manifest)
+        units = self._structured_units()
+        next(row for row in units if row["unit_id"] == "other-chapter").update({
+            "chapter_id": "ch01", "provenance": "ai_supplemented",
+            "source_file": "course/ch01.pdf",
+        })
+        self._write_jsonl(".ingest/content_units.jsonl", units)
+        supplemented_extra["walkthroughs"][0]["source_trace"].append({
+            "source_file": "course/ch01.pdf", "pages": [1],
+            "source_unit_id": "other-chapter", "role": "concept",
+        })
+        self.assertInvalid(
+            supplemented_extra, "must reference material or ai_recovered evidence")
 
     def test_structured_assets_must_bind_to_item_or_source_trace_side(self):
         manifest = self._structured_manifest()
@@ -836,7 +1697,7 @@ class StudyGuideContentTest(unittest.TestCase):
         next(row for row in units if row["unit_id"] == "a-ex1")["metadata"][
             "source_language"] = "mixed"
         self._write_jsonl(".ingest/content_units.jsonl", units)
-        self.assertInvalid(invalid, "metadata.source_language must be zh or en")
+        self.assertInvalid(invalid, "metadata.source_language must be one of")
 
     def test_import_requires_preexisting_official_walkthrough_evidence(self):
         draft = self._draft()
@@ -964,6 +1825,34 @@ class StudyGuideContentTest(unittest.TestCase):
         unaccounted = copy.deepcopy(manifest)
         unaccounted["omissions"][0]["item_id"] = "ex1"
         self.assertInvalid(unaccounted)
+
+    def test_structured_abridged_optional_refs_must_stay_in_requested_chapter(self):
+        foreign_ref = {
+            "source_file": "course/ch02.pdf", "pages": [1],
+            "source_unit_id": "other-chapter", "role": "concept",
+        }
+
+        omission = self._structured_manifest()
+        omission["profile"] = "abridged"
+        omission["walkthroughs"] = [
+            row for row in omission["walkthroughs"] if row["item_id"] != "q1"
+        ]
+        omission["omissions"] = [{
+            "item_id": "q1", "knowledge_point_ids": ["kp1"],
+            "reason": localized("省略。", "Omitted."),
+            "source_refs": [foreign_ref],
+        }]
+        self.assertInvalid(omission, "must reference a current-chapter content unit")
+
+        exclusion = self._structured_manifest()
+        exclusion["profile"] = "abridged"
+        exclusion["semantic_exclusions"] = [{
+            "source_unit_id": "sem-code",
+            "reason_code": "outside_assessed_scope",
+            "reason": localized("不在考试范围。", "Outside the assessed scope."),
+            "source_refs": [foreign_ref],
+        }]
+        self.assertInvalid(exclusion, "must reference a current-chapter content unit")
 
     def test_knowledge_point_links_and_formula_uses_are_bidirectional(self):
         bad_link = self._manifest()
@@ -1243,13 +2132,13 @@ class StudyGuideContentTest(unittest.TestCase):
         }
         draft = self._draft(manifest)
         calls = []
-        original = sgc._atomic_write_text
+        original = os.replace
 
-        def recording_write(path, text, before_publish=None):
-            calls.append(path)
-            return original(path, text, before_publish=before_publish)
+        def recording_replace(source, destination):
+            calls.append(destination)
+            return original(source, destination)
 
-        with mock.patch.object(sgc, "_atomic_write_text", side_effect=recording_write):
+        with mock.patch.object(sgc.os, "replace", side_effect=recording_replace):
             report = sgc.import_manifest(self.ws, 1, draft)
         self.assertTrue(report["imported"])
         self.assertTrue(calls[0].endswith("ch01.md"), calls)
@@ -1302,15 +2191,198 @@ class StudyGuideContentTest(unittest.TestCase):
         self.assertEqual(1, after_notebook_write.count(begin))
         self.assertEqual(1, after_notebook_write.count(end))
 
-    def test_failed_notebook_write_never_attempts_json_publication(self):
+    def test_failed_notebook_stage_never_attempts_public_replacement(self):
         draft = self._draft()
-        with mock.patch.object(sgc, "_atomic_write_text", side_effect=OSError("disk full")) as writer:
-            with self.assertRaisesRegex(sgc.ContentError, "cannot atomically publish"):
+        with mock.patch.object(sgc, "_stage_text", side_effect=OSError("disk full")) as writer, \
+                mock.patch.object(sgc.os, "replace") as replacer:
+            with self.assertRaisesRegex(sgc.ContentError, "cannot stage"):
                 sgc.import_manifest(self.ws, 1, draft)
         self.assertEqual(1, writer.call_count)
+        replacer.assert_not_called()
         self.assertFalse(os.path.exists(os.path.join(self.ws, "notebook", "ch01.guide.json")))
+        self._assert_no_publication_temps()
 
     def test_v2_fact_snapshot_is_rechecked_at_manifest_publication(self):
+        sgc.import_manifest(self.ws, 1, self._draft())
+        manifest = self._manifest()
+        manifest["knowledge_points"][0]["explanation"]["en"] = "Updated only after recheck."
+        expected = {"schema_version": 1, "token": "bound"}
+        report = sgc.validate_manifest(self.ws, 1, manifest)
+        report["claim_verification"] = {
+            "fact_integrity": expected,
+        }
+        derived = self._write_derived_artifacts()
+        md_path = os.path.join(self.ws, "notebook", "ch01.md")
+        json_path = os.path.join(self.ws, "notebook", "ch01.guide.json")
+        before = self._snapshot_paths([md_path, json_path] + derived)
+        with mock.patch.object(
+                sgc,
+                "validate_workspace_fact_integrity",
+                return_value={
+                    "snapshot": {"schema_version": 1, "token": "drifted"},
+                },
+        ), self.assertRaisesRegex(sgc.ContentError, "fact inputs changed"):
+            sgc._publish_manifest(self.ws, 1, manifest, report)
+        self._assert_paths_match_snapshot(before)
+        self._assert_no_publication_temps()
+
+    def test_second_authoritative_replacement_failure_rolls_back_every_public_file(self):
+        sgc.import_manifest(self.ws, 1, self._draft())
+        derived = self._write_derived_artifacts()
+        md_path = os.path.join(self.ws, "notebook", "ch01.md")
+        json_path = os.path.join(self.ws, "notebook", "ch01.guide.json")
+        before = self._snapshot_paths([md_path, json_path] + derived)
+        updated = self._manifest()
+        updated["knowledge_points"][0]["explanation"]["en"] = "Never partially publish me."
+        original = os.replace
+        public_replacements = {md_path: 0, json_path: 0}
+
+        def fail_second(source, destination):
+            if destination in public_replacements:
+                public_replacements[destination] += 1
+                if destination == json_path and public_replacements[destination] == 1:
+                    raise OSError("second public replacement failed")
+            return original(source, destination)
+
+        with mock.patch.object(sgc.os, "replace", side_effect=fail_second), \
+                self.assertRaisesRegex(sgc.ContentError, "cannot atomically publish"):
+            sgc.import_manifest(self.ws, 1, self._draft(updated, "updated.json"))
+        self._assert_paths_match_snapshot(before)
+        self._assert_no_publication_temps()
+
+    def test_post_replace_base_exception_rolls_back_and_is_preserved_as_cause(self):
+        class InjectedPublicationAbort(BaseException):
+            pass
+
+        sgc.import_manifest(self.ws, 1, self._draft())
+        derived = self._write_derived_artifacts()
+        md_path = os.path.join(self.ws, "notebook", "ch01.md")
+        json_path = os.path.join(self.ws, "notebook", "ch01.guide.json")
+        before = self._snapshot_paths([md_path, json_path] + derived)
+        updated = self._manifest()
+        updated["knowledge_points"][0]["explanation"]["en"] = "Abort after mutation."
+        original = os.replace
+        injected = {"done": False}
+
+        def replace_then_abort(source, destination):
+            result = original(source, destination)
+            if destination == json_path and not injected["done"]:
+                injected["done"] = True
+                raise InjectedPublicationAbort("post-replace abort")
+            return result
+
+        with mock.patch.object(sgc.os, "replace", side_effect=replace_then_abort):
+            with self.assertRaisesRegex(
+                    sgc.ContentError, "cannot atomically publish") as caught:
+                sgc.import_manifest(self.ws, 1, self._draft(updated, "updated.json"))
+        self.assertIsInstance(caught.exception.__cause__, InjectedPublicationAbort)
+        self._assert_paths_match_snapshot(before)
+        self._assert_no_publication_temps()
+
+    def test_invalidation_failure_rolls_back_authoritative_pair_and_all_derived_files(self):
+        sgc.import_manifest(self.ws, 1, self._draft())
+        derived = self._write_derived_artifacts()
+        md_path = os.path.join(self.ws, "notebook", "ch01.md")
+        json_path = os.path.join(self.ws, "notebook", "ch01.guide.json")
+        before = self._snapshot_paths([md_path, json_path] + derived)
+        updated = self._manifest()
+        updated["knowledge_points"][0]["explanation"]["en"] = "Rollback after cleanup failure."
+        fail_path = os.path.join(self.ws, "study_guide", "ch01.html")
+        original_remove = os.remove
+        failed = {"done": False}
+
+        def fail_one_invalidation(path):
+            if path == fail_path and not failed["done"]:
+                failed["done"] = True
+                raise OSError("cannot remove derived HTML")
+            return original_remove(path)
+
+        with mock.patch.object(sgc.os, "remove", side_effect=fail_one_invalidation), \
+                self.assertRaisesRegex(sgc.ContentError, "cannot invalidate"):
+            sgc.import_manifest(self.ws, 1, self._draft(updated, "updated.json"))
+        self._assert_paths_match_snapshot(before)
+        self._assert_no_publication_temps()
+
+    def test_post_remove_memory_error_rolls_back_every_public_file(self):
+        sgc.import_manifest(self.ws, 1, self._draft())
+        derived = self._write_derived_artifacts()
+        md_path = os.path.join(self.ws, "notebook", "ch01.md")
+        json_path = os.path.join(self.ws, "notebook", "ch01.guide.json")
+        before = self._snapshot_paths([md_path, json_path] + derived)
+        updated = self._manifest()
+        updated["knowledge_points"][0]["explanation"]["en"] = "Rollback memory abort."
+        fail_path = os.path.join(self.ws, "study_guide", "ch01.html")
+        original_remove = os.remove
+        injected = {"done": False}
+
+        def remove_then_abort(path):
+            result = original_remove(path)
+            if path == fail_path and not injected["done"]:
+                injected["done"] = True
+                raise MemoryError("post-remove abort")
+            return result
+
+        with mock.patch.object(sgc.os, "remove", side_effect=remove_then_abort):
+            with self.assertRaisesRegex(
+                    sgc.ContentError, "cannot invalidate") as caught:
+                sgc.import_manifest(self.ws, 1, self._draft(updated, "updated.json"))
+        self.assertIsInstance(caught.exception.__cause__, MemoryError)
+        self._assert_paths_match_snapshot(before)
+        self._assert_no_publication_temps()
+
+    def test_v1_relocalize_uses_same_rollback_order_when_invalidation_fails(self):
+        sgc.import_manifest(self.ws, 1, self._draft())
+        derived = self._write_derived_artifacts()
+        md_path = os.path.join(self.ws, "notebook", "ch01.md")
+        json_path = os.path.join(self.ws, "notebook", "ch01.guide.json")
+        before = self._snapshot_paths([md_path, json_path] + derived)
+        self._write_json("study_state.json", {"language": "en"})
+        fail_path = os.path.join(self.ws, "study_guide", "ch01.pdf")
+        original_remove = os.remove
+        failed = {"done": False}
+
+        def fail_one_invalidation(path):
+            if path == fail_path and not failed["done"]:
+                failed["done"] = True
+                raise OSError("cannot remove derived PDF")
+            return original_remove(path)
+
+        with mock.patch.object(sgc.os, "remove", side_effect=fail_one_invalidation), \
+                self.assertRaisesRegex(sgc.ContentError, "cannot invalidate"):
+            sgc.relocalize_manifest(self.ws, 1, "en")
+        self._assert_paths_match_snapshot(before)
+        self._assert_no_publication_temps()
+
+    def test_asset_policy_recheck_failure_precedes_every_public_replacement(self):
+        sgc.import_manifest(self.ws, 1, self._draft())
+        derived = self._write_derived_artifacts()
+        md_path = os.path.join(self.ws, "notebook", "ch01.md")
+        json_path = os.path.join(self.ws, "notebook", "ch01.guide.json")
+        before = self._snapshot_paths([md_path, json_path] + derived)
+        updated = self._manifest()
+        updated["knowledge_points"][0]["explanation"]["en"] = "Blocked by policy drift."
+        report = sgc.validate_manifest(self.ws, 1, updated)
+        with mock.patch.object(sgc, "_live_asset_policy_sha256", return_value="drifted"), \
+                self.assertRaisesRegex(sgc.ContentError, "asset policy inputs changed"):
+            sgc._publish_manifest(self.ws, 1, updated, report)
+        self._assert_paths_match_snapshot(before)
+        self._assert_no_publication_temps()
+
+    def test_malformed_marker_blocks_import_without_mutating_any_public_file(self):
+        sgc.import_manifest(self.ws, 1, self._draft())
+        derived = self._write_derived_artifacts()
+        begin, _end, header = sgc._markers(1)
+        notebook_path = os.path.join(self.ws, "notebook", "ch01.md")
+        with open(notebook_path, "a", encoding="utf-8") as stream:
+            stream.write("\n%s\n\n%s\nbroken\n" % (header, begin))
+        json_path = os.path.join(self.ws, "notebook", "ch01.guide.json")
+        before = self._snapshot_paths([notebook_path, json_path] + derived)
+        with self.assertRaisesRegex(sgc.ContentError, "unbalanced"):
+            sgc.import_manifest(self.ws, 1, self._draft())
+        self._assert_paths_match_snapshot(before)
+        self._assert_no_publication_temps()
+
+    def test_legacy_direct_fact_recheck_still_fails_closed_without_manifest(self):
         manifest = self._manifest()
         expected = {"schema_version": 1, "token": "bound"}
         report = {
@@ -1327,14 +2399,6 @@ class StudyGuideContentTest(unittest.TestCase):
         self.assertFalse(os.path.exists(
             os.path.join(self.ws, "notebook", "ch01.guide.json")
         ))
-
-    def test_malformed_marker_blocks_import_without_publishing_json(self):
-        begin, _end, header = sgc._markers(1)
-        with open(os.path.join(self.ws, "notebook", "ch01.md"), "a", encoding="utf-8") as stream:
-            stream.write("\n%s\n\n%s\nbroken\n" % (header, begin))
-        with self.assertRaisesRegex(sgc.ContentError, "unbalanced"):
-            sgc.import_manifest(self.ws, 1, self._draft())
-        self.assertFalse(os.path.exists(os.path.join(self.ws, "notebook", "ch01.guide.json")))
 
     def test_validate_and_import_cli_return_machine_receipts(self):
         draft = self._draft()

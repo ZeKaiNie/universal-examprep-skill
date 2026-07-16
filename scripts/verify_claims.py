@@ -17,11 +17,11 @@ try:
         canonical_fact_snapshot_sha256,
         canonical_manifest_sha256,
         compile_claim_proposals,
-        import_claim_records,
+        _import_claim_records_locked,
         load_claim_records,
         read_claim_jsonl,
         validate_guide_claim_coverage,
-        verify_claim,
+        verify_claim_batch,
         verify_claim_records,
     )
     from .ingestion.dedup import (
@@ -43,11 +43,11 @@ except ImportError:
         canonical_fact_snapshot_sha256,
         canonical_manifest_sha256,
         compile_claim_proposals,
-        import_claim_records,
+        _import_claim_records_locked,
         load_claim_records,
         read_claim_jsonl,
         validate_guide_claim_coverage,
-        verify_claim,
+        verify_claim_batch,
         verify_claim_records,
     )
     from ingestion.dedup import (
@@ -205,9 +205,8 @@ def _run_import(args):
     rows = read_claim_jsonl(source)
     units = _load_units(root)
     sources = _load_sources(root)
-    for row in rows:
-        verify_claim(row, units, sources)
-    imported = import_claim_records(root, rows, claims_relative)
+    verify_claim_batch(rows, units, sources, workspace=root)
+    imported = _import_claim_records_locked(root, rows)
     destination = _entry(root, claims_relative, "claim sidecar")
     return {
         "ok": True,
@@ -232,7 +231,9 @@ def _run_create(args):
         raise ClaimValidationError("proposal document schema_version must be 1")
     units = _load_units(root)
     sources = _load_sources(root)
-    rows = compile_claim_proposals(document["proposals"], units, sources)
+    rows = compile_claim_proposals(
+        document["proposals"], units, sources, workspace=root
+    )
     destination = _entry(root, claims_relative, "claim sidecar", must_exist=False)
     retained = ()
     if not args.replace_all and destination.is_file() and not destination.is_symlink():
@@ -261,9 +262,8 @@ def _run_create(args):
         )
         # A merge must not preserve stale source revisions invisibly.  Update or
         # deliberately replace the full sidecar when a retained record drifts.
-        for row in retained:
-            verify_claim(row, units, sources)
-    imported = import_claim_records(root, retained + tuple(rows), claims_relative)
+        verify_claim_batch(retained, units, sources, workspace=root)
+    imported = _import_claim_records_locked(root, retained + tuple(rows))
     return {
         "ok": True,
         "operation": "create",
@@ -344,6 +344,7 @@ def _run_verify(args):
         manifest=manifest,
         guide_content_sha256=canonical_manifest_sha256(manifest),
         fact_snapshot_sha256=canonical_fact_snapshot_sha256(fact_snapshot),
+        workspace=root,
         **bound_hashes,
     )
     receipt_path = _entry(root, receipt_relative, "receipt destination", must_exist=False)

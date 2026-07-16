@@ -60,6 +60,13 @@ class WorkspaceMixin:
 
 
 class HumanReadableGuide(WorkspaceMixin, unittest.TestCase):
+    def _write_content_units(self, ws, rows):
+        ingest = os.path.join(ws, ".ingest")
+        os.makedirs(ingest, exist_ok=True)
+        with open(os.path.join(ingest, "content_units.jsonl"), "w", encoding="utf-8") as stream:
+            for row in rows:
+                stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+
     def _language_fixture(self, language):
         teaching = [{
             "id": "ex1", "chapter": 1, "title": "Union example", "question": "Find $A \\cup B$.",
@@ -143,6 +150,135 @@ class HumanReadableGuide(WorkspaceMixin, unittest.TestCase):
             # Persisted course facts render once; only fixed UI is mirrored.  No machine translation
             # pass duplicates or rewrites the source material.
             self.assertEqual(doc.count("A union is"), 1)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_source_packet_excludes_attempt_only_asset(self):
+        teaching = [{
+            "id": "attempt-audit", "chapter": 1, "title": "Audit row",
+            "question": "A self-contained official prompt.", "answer": "Official text answer.",
+            "source": "material", "source_file": "ch01.pdf", "source_pages": [1],
+            "assets": [{"path": "references/assets/prompt.png", "role": "student_attempt",
+                        "caption": "STUDENT-SUBMISSION-SECRET"}],
+        }]
+        ws = self.make_ws(teaching=teaching, language="en")
+        try:
+            document = sgr.render_source_packet(sgr.load_chapter_sources(ws, 1), fake_math)
+            self.assertIn("A self-contained official prompt.", document)
+            self.assertNotIn("STUDENT-SUBMISSION-SECRET", document)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_public_markdown_renderer_loads_policy_when_caller_omits_taint_keys(self):
+        quizzes = [{
+            "id": "foreign-attempt", "chapter": 2, "type": "subjective",
+            "question": "Student work", "answer": "Not official", "source": "material",
+            "assets": [{
+                "path": "references/assets/prompt.png", "role": "student_attempt",
+                "type": "page_image",
+            }],
+        }]
+        ws = self.make_ws(quizzes=quizzes, language="en")
+        try:
+            for omitted_value in (sgr._ASSET_POLICY_UNSET, None, set()):
+                with self.subTest(omitted_value=repr(omitted_value)):
+                    kwargs = {} if omitted_value is sgr._ASSET_POLICY_UNSET else {
+                        "student_attempt_tainted_keys": omitted_value,
+                    }
+                    renderer = sgr.MarkdownRenderer(
+                        ws, fake_math, language="English", **kwargs)
+                    with self.assertRaisesRegex(sgr.GuideError, "student_attempt"):
+                        renderer.render(
+                            "![student submission](references/assets/prompt.png)")
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_source_packet_attempt_only_cannot_satisfy_visual_prompt(self):
+        teaching = [{
+            "id": "attempt-visual", "chapter": 1, "title": "Visual row",
+            "question": "See the submitted crop.", "answer": "A",
+            "source": "material", "source_file": "ch01.pdf", "source_pages": [1],
+            "requires_assets": True,
+            "assets": [{"path": "references/assets/prompt.png", "role": "student_attempt"}],
+        }]
+        ws = self.make_ws(teaching=teaching, language="en")
+        try:
+            with self.assertRaisesRegex(sgr.GuideError, "缺少可展示题面图"):
+                sgr.render_source_packet(sgr.load_chapter_sources(ws, 1), fake_math)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_source_packet_target_asset_is_tainted_by_foreign_content_unit(self):
+        quizzes = [{
+            "id": "target", "chapter": 1, "question": "Use the figure", "answer": "A",
+            "source": "material", "requires_assets": True,
+            "assets": [{"path": "references/assets/prompt.png",
+                        "role": "question_context"}],
+        }]
+        ws = self.make_ws(quizzes=quizzes, language="en")
+        self._write_content_units(ws, [{
+            "unit_id": "foreign-attempt", "chapter_id": "ch02", "kind": "figure",
+            "asset_path": "references\\assets\\prompt.png",
+            "asset_role": "student_attempt", "metadata": {},
+        }])
+        try:
+            with self.assertRaisesRegex(sgr.GuideError, "student-attempt"):
+                sgr.load_chapter_sources(ws, 1)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_source_packet_same_item_cross_layer_prompt_answer_alias_is_rejected(self):
+        quizzes = [{
+            "id": "same", "chapter": 1, "question": "Use the figure", "answer": "A",
+            "source": "material",
+            "assets": [{"path": "references/assets/prompt.png",
+                        "role": "question_context"}],
+        }]
+        ws = self.make_ws(quizzes=quizzes, language="en")
+        self._write_content_units(ws, [{
+            "unit_id": "answer-unit", "external_id": "same", "chapter_id": "ch01",
+            "kind": "answer", "asset_path": "references\\assets\\prompt.png",
+            "asset_role": "worked_solution", "metadata": {},
+        }])
+        try:
+            with self.assertRaisesRegex(sgr.GuideError, "both prompt and official answer"):
+                sgr.load_chapter_sources(ws, 1)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_source_packet_cross_item_official_reuse_is_allowed(self):
+        quizzes = [{
+            "id": "prompt-item", "chapter": 1, "question": "Use the figure", "answer": "A",
+            "source": "material",
+            "assets": [{"path": "references/assets/prompt.png",
+                        "role": "question_context"}],
+        }]
+        ws = self.make_ws(quizzes=quizzes, language="en")
+        self._write_content_units(ws, [{
+            "unit_id": "other-answer", "external_id": "other-item", "chapter_id": "ch01",
+            "kind": "answer", "asset_path": "references\\assets\\prompt.png",
+            "asset_role": "worked_solution", "metadata": {},
+        }])
+        try:
+            document = sgr.render_source_packet(sgr.load_chapter_sources(ws, 1), fake_math)
+            self.assertIn("Use the figure", document)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_source_packet_wiki_cannot_render_attempt_tainted_image(self):
+        ws = self.make_ws(
+            wiki="# Concept\n\n![submission](../assets/prompt.png)\n",
+            quizzes=[], language="en",
+        )
+        self._write_content_units(ws, [{
+            "unit_id": "attempt-image", "chapter_id": "ch02", "kind": "figure",
+            "asset_path": "references/assets/prompt.png", "asset_role": "student_attempt",
+            "metadata": {},
+        }])
+        try:
+            sources = sgr.load_chapter_sources(ws, 1)
+            with self.assertRaisesRegex(sgr.GuideError, "student_attempt"):
+                sgr.render_source_packet(sources, fake_math)
         finally:
             shutil.rmtree(ws, ignore_errors=True)
 
@@ -440,16 +576,81 @@ class MathContract(WorkspaceMixin, unittest.TestCase):
 
 
 class PathSafety(WorkspaceMixin, unittest.TestCase):
+    def test_markdown_image_rejects_dot_component_alias(self):
+        ws = self.make_ws(wiki="# X\n\n![bad](references/assets/./prompt.png)\n")
+        try:
+            with self.assertRaisesRegex(sgr.GuideError, "规范"):
+                sgr.render_study_guide(sgr.load_chapter_sources(ws, 1), fake_math)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_markdown_image_rejects_empty_component_alias(self):
+        ws = self.make_ws(wiki="# X\n\n![bad](references/assets//prompt.png)\n")
+        try:
+            with self.assertRaisesRegex(sgr.GuideError, "规范"):
+                sgr.render_study_guide(sgr.load_chapter_sources(ws, 1), fake_math)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_markdown_image_rejects_backslash_alias(self):
+        ws = self.make_ws(wiki="# X\n\n![bad](references\\assets\\prompt.png)\n")
+        try:
+            with self.assertRaises(sgr.GuideError):
+                sgr.render_study_guide(sgr.load_chapter_sources(ws, 1), fake_math)
+            with self.assertRaisesRegex(sgr.GuideError, "正斜杠"):
+                sgr._safe_relative_parts("references\\assets\\prompt.png", "Markdown 图片")
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_wiki_parent_compat_rejects_dot_tail_attempt_laundering(self):
+        quizzes = [{
+            "id": "foreign-attempt", "chapter": 2,
+            "assets": [{
+                "path": "references/assets/prompt.png", "role": "student_attempt",
+            }],
+        }]
+        ws = self.make_ws(
+            wiki="# X\n\n![submission](../assets/./prompt.png)\n", quizzes=quizzes,
+        )
+        try:
+            with self.assertRaisesRegex(sgr.GuideError, "规范"):
+                sgr.render_study_guide(sgr.load_chapter_sources(ws, 1), fake_math)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
     def test_corrupt_image_fails_instead_of_rendering_a_broken_figure(self):
         ws = self.make_ws(quizzes=[{"id": "q", "chapter": 1, "question": "x", "answer": "y",
                                     "assets": [{"path": "references/assets/prompt.png",
                                                 "role": "question_context"}]}])
         with open(os.path.join(ws, "references", "assets", "prompt.png"), "wb") as f:
-            f.write(b"not really a png")
+            # This passed the former signature/IHDR-only check but has no valid
+            # chunk CRCs, zlib stream, scanlines, or terminal IEND.
+            f.write(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"0" * 40)
         try:
             with self.assertRaises(sgr.GuideError) as ctx:
                 sgr.render_study_guide(sgr.load_chapter_sources(ws, 1), fake_math)
             self.assertIn("图片内容损坏", str(ctx.exception))
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_wiki_hardlink_alias_of_student_attempt_is_rejected(self):
+        quizzes = [{
+            "id": "foreign-attempt", "chapter": 2,
+            "assets": [{
+                "path": "references/assets/prompt.png", "role": "student_attempt",
+            }],
+        }]
+        ws = self.make_ws(
+            wiki="# X\n\n![alias](../assets/official-alias.png)\n", quizzes=quizzes,
+        )
+        alias = os.path.join(ws, "references", "assets", "official-alias.png")
+        try:
+            try:
+                os.link(os.path.join(ws, "references", "assets", "prompt.png"), alias)
+            except (OSError, NotImplementedError):
+                self.skipTest("hard links unavailable")
+            with self.assertRaisesRegex(sgr.GuideError, "student_attempt"):
+                sgr.render_study_guide(sgr.load_chapter_sources(ws, 1), fake_math)
         finally:
             shutil.rmtree(ws, ignore_errors=True)
 

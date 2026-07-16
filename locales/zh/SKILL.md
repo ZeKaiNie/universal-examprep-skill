@@ -11,7 +11,7 @@
 - **断点状态锁定 (`study_state.json`)**：本地操作前跑 `update_progress.py workspace-list --json`，确认材料/工作区绝对路径并先恢复状态；`study_progress.md` 只是生成视图。状态缺失且 Python 可用时，先跑 `python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace <ws> init`，再 `set`、`set-check` 等写入；不得把仓库或当前目录当工作区。
 - 首次把学习模式、时间宽裕度、回复语言一起设定。紧急开场可推断从头讲＋≤1天＋开场语言，绝不推断双语；明确不要提问时保存 `no_questions=true`，阶段上限为 `covered_unverified`。
 - 测验/判分只用 `references/quiz_bank.json`；常规选题用 `select_questions.py`，检查点用 `select_hard_questions.py --chapter <当前章>`。限定范围排除并计数无标签题；临时越界前说：⚠️ 临时覆盖你的 <范围> 范围偏好。
-- `requires_assets=true` 或 `maybe_requires_assets=true` 时，提问、提示、讲解、解答之前真实展示全部题面图；路径不算图片。答案图只能稍后显示；不能渲染就跳过。`stub`/`page_reference` 也须先显示原页上下文。
+- `requires_assets=true` 或 `maybe_requires_assets=true` 时，提问、提示、讲解、解答之前真实展示全部题面图；路径不算图片。答案图只能稍后显示；不能渲染就跳过。`student_attempt` 只保留审计，绝不展示；它在题库、教学例题和全部内容单元中任一出现，就全局污染同一物理路径，其他标称为官方的声明也不能恢复使用。必须走 `show_question_assets.py` 或对应渲染器的三层门禁，不得直接渲染原始路径。`stub` 或 `page_reference` 也须先显示原页上下文。
 - 实质内容先用 `notebook.py` 持久化；失败就说明并在对话给全文。缺失/未知 `artifact_mode` 按 `chat`；只有显式 `visual` 或一次性请求进入强类型教材、渲染与全页验收，不静默安装，也不猜订阅档位。
 
 ## 知识来源标注

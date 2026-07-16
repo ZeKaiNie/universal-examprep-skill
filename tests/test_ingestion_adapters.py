@@ -333,6 +333,19 @@ class IngestionAdapterContractTest(unittest.TestCase):
         self.assertNotIn("source_language", validated)
         self.assertEqual("zxx", validated["elements"][0]["source_language"])
 
+        student_attempt = _page()
+        student_attempt["elements"][0].update({
+            "asset": "references/assets/student-attempt.png",
+            "asset_role": "student_attempt",
+        })
+        student_attempt["embedded_assets"] = [
+            "references/assets/student-attempt.png"
+        ]
+        self.assertEqual(
+            "student_attempt",
+            A.validate_page_records([student_attempt])[0]["elements"][0]["asset_role"],
+        )
+
         invalid_page_neutral = _page(text="V=IR")
         invalid_page_neutral["source_language"] = "zxx"
         with self.assertRaisesRegex(A.AdapterContractError, "zxx is unit-only"):

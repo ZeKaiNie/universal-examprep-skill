@@ -1,6 +1,8 @@
 import contextlib
 import copy
 import io
+import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +10,7 @@ from unittest import mock
 
 from scripts import study_guide_content as study_guide_content
 from scripts import verify_claims
+from scripts.ingestion import claims as claims_module
 from scripts.ingestion import dedup as ingestion_dedup
 from scripts.ingestion import IngestionStore, ReviewPatch
 from scripts.ingestion.claims import (
@@ -43,6 +46,9 @@ class ClaimVerificationTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.workspace = Path(self.temp.name)
+        references = self.workspace / "references"
+        references.mkdir()
+        atomic_write_json(references / "quiz_bank.json", [])
         source_path = self.workspace / "materials" / "a.txt"
         source_path.parent.mkdir(parents=True)
         source_path.write_text("authoritative source", encoding="utf-8")
@@ -86,6 +92,22 @@ class ClaimVerificationTest(unittest.TestCase):
             ),
             QuoteSpan.create(start, start + len(quote_text), quote_text),
         )
+
+    def write_live_claim_inputs(self, units=None, sources=None):
+        ingest = self.workspace / ".ingest"
+        ingest.mkdir(exist_ok=True)
+        atomic_write_json(
+            ingest / "source_manifest.json",
+            {
+                "schema_version": 1,
+                "sources": [row.to_dict() for row in (sources or (self.source,))],
+            },
+        )
+        atomic_write_jsonl(
+            ingest / "content_units.jsonl",
+            [row.to_dict() for row in (units or (self.unit,))],
+        )
+        return ingest
 
     def manifest(self, record, reference=True, extra_knowledge_points=()):
         refs = [{"claim_id": record.claim_id}] if reference else []
@@ -160,6 +182,159 @@ class ClaimVerificationTest(unittest.TestCase):
         )
         with self.assertRaises(ClaimValidationError):
             verify_claim(record, (answer,), (self.source,))
+
+    def test_student_attempt_cannot_support_any_existing_guide_claim_role(self):
+        attempt = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "text",
+            self.unit.text,
+            2,
+            ordinal=3,
+            chapter_id="ch01",
+            asset_path="references/assets/student-attempt.png",
+            asset_role="student_attempt",
+        )
+        for role in (
+                "concept_evidence", "formula_evidence", "question_evidence",
+                "answer_evidence", "translation_evidence", "context_evidence"):
+            with self.subTest(role=role):
+                record = ClaimRecord.create(
+                    ClaimSubject("ch01", "knowledge_point", "kp1", "explanation", "zh", 0),
+                    "Student work must not become material evidence.",
+                    ClaimSource(
+                        UnitRevisionRef.from_unit(attempt), "text",
+                        payload_sha256(attempt.text), role,
+                    ),
+                    QuoteSpan.create(0, len(attempt.text), attempt.text),
+                )
+                with self.assertRaisesRegex(ClaimValidationError, "student_attempt"):
+                    verify_claim(record, (attempt,), (self.source,))
+
+    def test_nested_attempt_path_globally_taints_official_claim_unit(self):
+        shared = "references/assets/shared.png"
+        official = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "text",
+            self.unit.text,
+            1,
+            ordinal=10,
+            chapter_id="ch01",
+            asset_path=shared,
+            asset_role="figure",
+        )
+        foreign_attempt = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "question",
+            "Student submission",
+            2,
+            ordinal=11,
+            chapter_id="ch02",
+            metadata={"assets": [{"path": shared, "role": "student_attempt"}]},
+        )
+        record = self.claim(unit=official)
+        with self.assertRaisesRegex(ClaimValidationError, "student_attempt-tainted"):
+            verify_claim(record, (official, foreign_attempt), (self.source,))
+
+    def test_public_claim_api_reloads_outer_layers_and_rejects_empty_fake_policy(self):
+        shared = "references/assets/shared.png"
+        official = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "text",
+            self.unit.text,
+            1,
+            ordinal=12,
+            chapter_id="ch01",
+            asset_path=shared,
+            asset_role="figure",
+        )
+        record = self.claim(unit=official)
+        self.write_live_claim_inputs(units=(official,))
+        bank = self.workspace / "references" / "quiz_bank.json"
+        attempt_row = {
+            "id": "student-upload", "chapter": 2, "assets": [{
+                "path": shared, "role": "student_attempt",
+            }],
+        }
+        atomic_write_json(bank, [attempt_row])
+
+        # The safe workspace entry observes the foreign-chapter quiz layer even though the
+        # caller supplies only the official content-unit slice.
+        with self.assertRaisesRegex(
+                ClaimValidationError, r"student[_-]attempt-tainted"):
+            verify_claim(
+                record, (official,), (self.source,), workspace=self.workspace
+            )
+
+        # A hand-built empty collection is not a verified global policy and cannot recover the
+        # old false-success behavior.
+        with self.assertRaisesRegex(
+                ClaimValidationError, "requires workspace=.*raw tainted_keys"):
+            verify_claim(
+                record, (official,), (self.source,), tainted_keys=set()
+            )
+
+        # The same protection applies when the declaration exists only in teaching examples.
+        atomic_write_json(bank, [])
+        atomic_write_json(
+            self.workspace / "references" / "teaching_examples.json",
+            [attempt_row],
+        )
+        with self.assertRaisesRegex(
+                ClaimValidationError, r"student[_-]attempt-tainted"):
+            verify_claim(
+                record, (official,), (self.source,), workspace=self.workspace
+            )
+
+    def test_claim_create_and_verify_reject_paired_prompt_answer_asset_alias(self):
+        shared = "references/assets/shared.png"
+        question = ContentUnit.create(
+            self.source.source_id, self.source.sha256, self.source.path,
+            "question", self.unit.text, 1, ordinal=30,
+            external_id="q1", chapter_id="ch01", phase_id="phase01",
+            asset_path=shared, asset_role="figure",
+        )
+        answer = ContentUnit.create(
+            self.source.source_id, self.source.sha256, self.source.path,
+            "answer", "Official answer", 1, ordinal=31,
+            external_id=None, chapter_id="ch01", phase_id="phase01",
+            asset_path=shared, asset_role="worked_solution",
+        )
+        question = question.with_pair(answer.unit_id)
+        answer = answer.with_pair(question.unit_id)
+        subject = ClaimSubject(
+            "ch01", "quiz_item", "q1", "prompt_text", "zh", 0
+        )
+        record = ClaimRecord.create(
+            subject,
+            question.text,
+            ClaimSource(
+                UnitRevisionRef.from_unit(question), "text",
+                payload_sha256(question.text), "question_evidence",
+            ),
+            QuoteSpan.create(0, len(question.text), question.text),
+        )
+        units = (question, answer)
+        with self.assertRaisesRegex(ClaimValidationError, "both prompt and official answer"):
+            verify_claim(record, units, (self.source,))
+
+        proposal = {
+            "subject": subject.to_dict(),
+            "source_unit_id": question.unit_id,
+            "payload_field": "text",
+            "role": "question_evidence",
+            "claim_text": question.text,
+            "quote": {"text": question.text, "start": 0},
+        }
+        with self.assertRaisesRegex(ClaimValidationError, "both prompt and official answer"):
+            compile_claim_proposals((proposal,), units, (self.source,))
 
     def test_receipt_is_deterministic_and_binds_every_artifact_hash(self):
         record = self.claim()
@@ -236,31 +411,196 @@ class ClaimVerificationTest(unittest.TestCase):
                 },
             ),
         )
-        receipt = verify_claim_records(
-            (bound, unreferenced),
-            (self.unit,),
-            (self.source,),
-            "ch01",
-            manifest=manifest,
-            guide_content_sha256="1" * 64,
-            source_manifest_sha256="2" * 64,
-            content_units_sha256="3" * 64,
-            canonical_groups_sha256="4" * 64,
-            source_conflicts_sha256="5" * 64,
-            claim_records_sha256="6" * 64,
-            fact_snapshot_sha256="7" * 64,
-        )
+        with mock.patch.object(
+                claims_module,
+                "audit_asset_policy",
+                wraps=claims_module.audit_asset_policy,
+        ) as policy_scan:
+            receipt = verify_claim_records(
+                (bound, unreferenced),
+                (self.unit,),
+                (self.source,),
+                "ch01",
+                manifest=manifest,
+                guide_content_sha256="1" * 64,
+                source_manifest_sha256="2" * 64,
+                content_units_sha256="3" * 64,
+                canonical_groups_sha256="4" * 64,
+                source_conflicts_sha256="5" * 64,
+                claim_records_sha256="6" * 64,
+                fact_snapshot_sha256="7" * 64,
+            )
+        self.assertEqual(1, policy_scan.call_count)
         self.assertEqual((bound.claim_id,), receipt.location_verified_claim_ids)
 
     def test_claim_sidecar_import_is_strict_and_atomic(self):
         record = self.claim()
-        import_claim_records(self.workspace, (record,))
+        self.write_live_claim_inputs()
+        with mock.patch.object(
+                claims_module,
+                "workspace_publication_lock",
+                wraps=claims_module.workspace_publication_lock,
+        ) as lock_call:
+            import_claim_records(self.workspace, (record,))
+        self.assertEqual(1, lock_call.call_count)
         self.assertEqual((record,), load_claim_records(self.workspace))
         malformed = self.workspace / "malformed.jsonl"
         malformed.write_text('{"schema_version":1,"schema_version":1}\n', encoding="utf-8")
         with self.assertRaises(ClaimValidationError):
             read_claim_jsonl(malformed)
         self.assertEqual((record,), load_claim_records(self.workspace))
+
+    def test_claim_sidecar_rejects_workspace_directory_alias_without_mutation(self):
+        record = self.claim()
+        ingest = self.write_live_claim_inputs()
+        import_claim_records(self.workspace, (record,))
+        canonical = ingest / "claim_records.jsonl"
+        before = canonical.read_bytes()
+
+        alias_parent = Path(tempfile.mkdtemp(prefix="claim-workspace-alias-"))
+        self.addCleanup(shutil.rmtree, alias_parent, ignore_errors=True)
+        alias = alias_parent / "workspace-link"
+        try:
+            os.symlink(self.workspace, alias, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("directory symlink/junction creation is unavailable")
+
+        for operation in (
+                lambda: import_claim_records(alias, (record,)),
+                lambda: load_claim_records(alias)):
+            with self.subTest(operation=operation):
+                with self.assertRaisesRegex(
+                        ClaimValidationError, "symlink, junction, or reparse"):
+                    operation()
+                self.assertEqual(before, canonical.read_bytes())
+
+    def test_public_claim_import_rejects_alternate_target_without_mutation(self):
+        record = self.claim()
+        ingest = self.write_live_claim_inputs()
+        import_claim_records(self.workspace, (record,))
+        canonical = ingest / "claim_records.jsonl"
+        before = canonical.read_bytes()
+        alternate = ingest / "alternate.jsonl"
+        alternate.write_bytes(b'{"sentinel":true}\n')
+
+        with self.assertRaisesRegex(ClaimValidationError, "destination is fixed"):
+            import_claim_records(
+                self.workspace, (record,), relative_path=".ingest/alternate.jsonl"
+            )
+        self.assertEqual(before, canonical.read_bytes())
+        self.assertEqual(b'{"sentinel":true}\n', alternate.read_bytes())
+
+    def test_public_claim_import_rejects_missing_live_unit_without_mutation(self):
+        record = self.claim()
+        ingest = self.write_live_claim_inputs()
+        import_claim_records(self.workspace, (record,))
+        canonical = ingest / "claim_records.jsonl"
+        before = canonical.read_bytes()
+        missing = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "text",
+            self.unit.text,
+            9,
+            ordinal=99,
+            chapter_id="ch01",
+        )
+
+        with self.assertRaisesRegex(ClaimValidationError, "missing unit|absent"):
+            import_claim_records(self.workspace, (self.claim(unit=missing),))
+        self.assertEqual(before, canonical.read_bytes())
+
+        stale = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "text",
+            self.unit.text + " changed revision",
+            1,
+            ordinal=1,
+            chapter_id="ch01",
+        )
+        self.assertEqual(self.unit.unit_id, stale.unit_id)
+        with self.assertRaisesRegex(ClaimValidationError, "revision differs|stale"):
+            import_claim_records(self.workspace, (self.claim(unit=stale),))
+        self.assertEqual(before, canonical.read_bytes())
+
+    def test_public_claim_import_rejects_new_cross_layer_taint_without_mutation(self):
+        shared = "references/assets/shared.png"
+        official = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "text",
+            self.unit.text,
+            1,
+            ordinal=44,
+            chapter_id="ch01",
+            asset_path=shared,
+            asset_role="figure",
+        )
+        record = self.claim(unit=official)
+        ingest = self.write_live_claim_inputs(units=(official,))
+        import_claim_records(self.workspace, (record,))
+        canonical = ingest / "claim_records.jsonl"
+        before = canonical.read_bytes()
+        atomic_write_json(
+            self.workspace / "references" / "quiz_bank.json",
+            [{
+                "id": "late-student-upload", "chapter": 2, "assets": [{
+                    "path": shared, "role": "student_attempt",
+                }],
+            }],
+        )
+
+        with self.assertRaisesRegex(ClaimValidationError, "student_attempt-tainted"):
+            import_claim_records(self.workspace, (record,))
+        self.assertEqual(before, canonical.read_bytes())
+
+    def test_claim_import_rejects_hardlink_alias_of_student_attempt(self):
+        ingest = self.write_live_claim_inputs()
+        import_claim_records(self.workspace, (self.claim(),))
+        canonical = ingest / "claim_records.jsonl"
+        before = canonical.read_bytes()
+
+        asset_dir = self.workspace / "references" / "assets"
+        asset_dir.mkdir()
+        official_file = asset_dir / "official.png"
+        attempt_file = asset_dir / "attempt.png"
+        official_file.write_bytes(b"same physical image evidence")
+        try:
+            os.link(official_file, attempt_file)
+        except (OSError, NotImplementedError):
+            self.skipTest("hard links are unavailable")
+
+        official = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "text",
+            self.unit.text,
+            1,
+            ordinal=45,
+            chapter_id="ch01",
+            asset_path="references/assets/official.png",
+            asset_role="figure",
+        )
+        self.write_live_claim_inputs(units=(official,))
+        atomic_write_json(
+            self.workspace / "references" / "quiz_bank.json",
+            [{
+                "id": "student-hardlink", "chapter": 2, "assets": [{
+                    "path": "references/assets/attempt.png",
+                    "role": "student_attempt",
+                }],
+            }],
+        )
+
+        with self.assertRaisesRegex(
+                ClaimValidationError, r"student[_-]attempt-tainted"):
+            import_claim_records(self.workspace, (self.claim(unit=official),))
+        self.assertEqual(before, canonical.read_bytes())
 
     def test_create_proposal_requires_offset_for_repeated_quote(self):
         repeated = ContentUnit.create(
@@ -370,6 +710,48 @@ class ClaimVerificationTest(unittest.TestCase):
             receipt["guide_content_sha256"],
         )
 
+    def test_cli_import_honors_quiz_attempt_taint_and_allows_distinct_path(self):
+        ingest = self.workspace / ".ingest"
+        ingest.mkdir()
+        shared = "references/assets/shared.png"
+        official = ContentUnit.create(
+            self.source.source_id, self.source.sha256, self.source.path,
+            "text", self.unit.text, 1, ordinal=20, chapter_id="ch01",
+            asset_path=shared, asset_role="figure",
+        )
+        atomic_write_json(
+            ingest / "source_manifest.json",
+            {"schema_version": 1, "sources": [self.source.to_dict()]},
+        )
+        atomic_write_jsonl(ingest / "content_units.jsonl", [official.to_dict()])
+        incoming = self.workspace / "incoming_claims.jsonl"
+        atomic_write_jsonl(incoming, [self.claim(unit=official).to_dict()])
+        references = self.workspace / "references"
+        references.mkdir(exist_ok=True)
+        bank = references / "quiz_bank.json"
+        argv = [
+            "import", "--workspace", str(self.workspace),
+            "--input-claims", str(incoming), "--json",
+        ]
+
+        atomic_write_json(bank, [{
+            "id": "attempt", "chapter": 1, "assets": [{
+                "path": shared, "role": "student_attempt",
+            }],
+        }])
+        with self.assertRaisesRegex(
+                ClaimValidationError, "student_attempt-tainted"):
+            verify_claims.run(argv)
+
+        atomic_write_json(bank, [{
+            "id": "attempt", "chapter": 1, "assets": [{
+                "path": "references/assets/distinct.png",
+                "role": "student_attempt",
+            }],
+        }])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, verify_claims.run(argv))
+
     def test_cli_claim_and_receipt_paths_cannot_target_control_files(self):
         (self.workspace / ".ingest").mkdir()
         control = self.workspace / "study_state.json"
@@ -409,6 +791,8 @@ class ClaimVerificationTest(unittest.TestCase):
             ordinal=7,
             chapter_id="ch01",
             metadata={"source_language": "en"},
+            asset_path="references/assets/claim-evidence.png",
+            asset_role="figure",
         )
         claim_text = "Restrict the sample space to the known event."
         quote = "Conditional probability restricts the sample space."
@@ -531,6 +915,26 @@ class ClaimVerificationTest(unittest.TestCase):
             )
         self.assertEqual("location_only", report["verification_scope"])
         self.assertEqual(1, report["required_material_assertion_count"])
+
+        # The on-disk receipt was signed before another workspace layer identified this physical
+        # path as student work.  The Guide consumer must pass its global snapshot into claim
+        # verification instead of accepting that now-stale receipt.
+        bank = self.workspace / "references" / "quiz_bank.json"
+        atomic_write_json(bank, [{
+            "id": "late-student-upload", "chapter": 2, "assets": [{
+                "path": unit.asset_path, "role": "student_attempt",
+            }],
+        }])
+        with mock.patch.object(
+                study_guide_content,
+                "validate_workspace_fact_integrity",
+                return_value=empty_fact_snapshot,
+        ), self.assertRaisesRegex(
+                study_guide_content.ContentError, "student_attempt-tainted"):
+            study_guide_content._validate_v2_claim_gate(
+                str(self.workspace), 1, manifest, inventory
+            )
+        atomic_write_json(bank, [])
 
         with mock.patch.object(
                 study_guide_content,

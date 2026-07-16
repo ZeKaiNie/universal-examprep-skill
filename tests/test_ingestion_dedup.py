@@ -17,6 +17,7 @@ from scripts.ingestion.dedup import (
     load_source_priorities,
     replay_conflict_review_ledger,
     similarity_ppm,
+    compatibility_key,
     validate_persisted_fact_derivation,
 )
 from scripts.ingestion.identifiers import make_source_id
@@ -116,6 +117,27 @@ class IngestionDedupTest(unittest.TestCase):
         conflict = facts["conflicts"][0]
         self.assertEqual("unresolved", conflict.status)
         self.assertIsNone(conflict.resolution)
+
+    def test_student_attempt_has_an_isolated_dedup_source_side(self):
+        text = "The same pixels must not collapse student work into an official solution."
+        attempt = unit(
+            text, 20, kind="figure", asset_path="assets/attempt.png",
+            asset_role="student_attempt",
+        )
+        official = unit(
+            text, 21, kind="figure", asset_path="assets/official.png",
+            asset_role="answer_context",
+        )
+        prompt = unit(
+            text, 22, kind="figure", asset_path="assets/prompt.png",
+            asset_role="question_context",
+        )
+        self.assertEqual("attempt", compatibility_key(attempt).source_side)
+        self.assertEqual("answer", compatibility_key(official).source_side)
+        self.assertEqual("prompt", compatibility_key(prompt).source_side)
+        facts = build_dedup_facts((attempt, official, prompt), (SOURCE_A,))
+        self.assertEqual((), facts["candidates"])
+        self.assertEqual((), facts["canonical_groups"])
 
     def test_numeric_conflict_is_not_decided_by_source_order(self):
         left = unit("The final value is 10 after applying the recurrence relation.", 1)

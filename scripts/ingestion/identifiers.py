@@ -14,6 +14,15 @@ class UnsafePathError(ValueError):
 
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _ID_RE = re.compile(r"^(src|unit|issue|patch)_[0-9a-f]{64}$")
+_WINDOWS_FORBIDDEN_COMPONENT_CHARS = frozenset('<>"|?*')
+_WINDOWS_RESERVED_DEVICE_STEMS = frozenset(
+    ("CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$")
+    + tuple("COM%d" % number for number in range(1, 10))
+    + tuple("LPT%d" % number for number in range(1, 10))
+    # Win32 also recognizes the superscript forms as DOS device names.
+    + tuple("COM%s" % number for number in ("\u00b9", "\u00b2", "\u00b3"))
+    + tuple("LPT%s" % number for number in ("\u00b9", "\u00b2", "\u00b3"))
+)
 
 
 def canonical_json(value):
@@ -26,9 +35,12 @@ def normalize_workspace_path(value):
     """Validate and return a portable workspace-relative POSIX path.
 
     Drive-relative paths (``C:notes.pdf``) are rejected as well as ordinary
-    absolute paths, UNC paths, empty/dot segments, traversal, and non-canonical
-    separators.  Backslashes in otherwise safe relative paths are normalized so
-    that IDs are stable across Windows and POSIX agents.
+    absolute paths, UNC paths, empty/dot segments, traversal, Win32 aliases, and
+    non-canonical separators.  Backslashes in otherwise safe relative paths are
+    normalized so that IDs are stable across Windows and POSIX agents.  The
+    Win32 restrictions are enforced on every host: a persisted path must never
+    acquire a second physical identity merely because another agent runs it on
+    Windows.
     """
 
     if not isinstance(value, str) or not value or value != value.strip():
@@ -47,6 +59,22 @@ def normalize_workspace_path(value):
     # A colon is not portable and can reintroduce Windows drive/stream semantics.
     if any(":" in part for part in parts):
         raise UnsafePathError("path contains a non-portable colon: %r" % value)
+    # Win32 strips trailing ASCII spaces/dots from path components.  Rejecting
+    # them portably prevents aliases such as ``a.png.`` -> ``a.png`` and
+    # ``folder./x`` -> ``folder/x`` from bypassing evidence/taint policy.
+    if any(part.endswith((" ", ".")) for part in parts):
+        raise UnsafePathError("path contains a Win32 trailing-space/dot alias: %r" % value)
+    if any(any(ord(char) < 32 for char in part) for part in parts):
+        raise UnsafePathError("path contains a non-portable control character: %r" % value)
+    if any(any(char in _WINDOWS_FORBIDDEN_COMPONENT_CHARS for char in part)
+           for part in parts):
+        raise UnsafePathError("path contains a Win32-forbidden character: %r" % value)
+    # DOS device names remain reserved even with an extension (``NUL.txt``).
+    # The trailing-dot/space rule above runs first so the stem comparison is
+    # exact rather than relying on host-specific trimming behavior.
+    if any(part.split(".", 1)[0].upper() in _WINDOWS_RESERVED_DEVICE_STEMS
+           for part in parts):
+        raise UnsafePathError("path contains a reserved Win32 device name: %r" % value)
     return "/".join(parts)
 
 

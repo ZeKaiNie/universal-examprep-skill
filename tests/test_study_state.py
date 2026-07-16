@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(ROOT, "scripts")
@@ -17,6 +18,20 @@ import i18n
 import notebook as notebook_engine
 import study_guide_qa as artifact_qa
 from ingestion import workspace_publication_lock
+
+
+def _valid_png(width, height):
+    def chunk(kind, payload):
+        return (struct.pack(">I", len(payload)) + kind + payload
+                + struct.pack(">I", zlib.crc32(kind + payload) & 0xffffffff))
+
+    row = b"\x00" + (b"\x00" * ((width + 7) // 8))
+    return (
+        artifact_qa.PNG_SIGNATURE
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 1, 0, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(row * height))
+        + chunk(b"IEND", b"")
+    )
 
 LEGACY_MD = ("# 🎯 复习进度\n\n## ⏱️ 当前复习断点\n* **当前进行阶段**：阶段 3：树\n\n"
              "## ❌ 错题档案记录\n| 错题ID | 关联章节 | 题目内容简述 | 错误原因分析 | 状态 |\n"
@@ -52,6 +67,8 @@ def _state(ws):
 
 def _refresh_visual_integrity(ws):
     rels = ["references/quiz_bank.json", "references/teaching_examples.json"]
+    if os.path.lexists(os.path.join(ws, ".ingest")):
+        rels.append(".ingest/content_units.jsonl")
     for optional in ("references/teaching_baseline.json", "ingest_report.json"):
         if os.path.isfile(os.path.join(ws, *optional.split("/"))):
             rels.append(optional)
@@ -209,6 +226,9 @@ def _enable_phase_structured(ws):
     with open(os.path.join(ws, "notebook", "ch01.md"), "w",
               encoding="utf-8", newline="\n") as stream:
         stream.write("\n".join(lines).rstrip() + "\n")
+    # Structured completion now requires the visual receipt to bind the exact
+    # content-unit generation used by the asset-policy snapshot.
+    _refresh_visual_integrity(ws)
     return {
         item_id: notebook_engine.entry_anchor(item_id, titles[item_id])
         for item_id in titles
@@ -360,8 +380,7 @@ def _write_visual_receipt(ws):
             name = "phase-fixture-renderer"
 
             def render_pages(self, unused_path):
-                png = (artifact_qa.PNG_SIGNATURE + b"\x00\x00\x00\x0dIHDR"
-                       + struct.pack(">II", 1200, 1800) + b"phase-page-one")
+                png = _valid_png(1200, 1800)
                 return [{
                     "png": png,
                     "text": "Readable chapter study guide content for phase evidence.\nPage 1 of 1",
@@ -645,6 +664,111 @@ class PhaseEvidence(unittest.TestCase):
         self.assertIn("phase_evidence", r.stderr)
         self.assertEqual(open(os.path.join(ws, "study_state.json"), "rb").read(), before)
         self.assertFalse(_state(ws)["phase_checklist"][0]["done"])
+
+    def test_student_attempt_visual_asset_cannot_be_recorded_as_completion_evidence(self):
+        ws = _phase_evidence_ws()
+        asset_rel = "references/assets/attempt.png"
+        asset_path = os.path.join(ws, *asset_rel.split("/"))
+        os.makedirs(os.path.dirname(asset_path), exist_ok=True)
+        with open(asset_path, "wb") as stream:
+            stream.write(b"attempt-audit")
+        teaching_path = os.path.join(ws, "references", "teaching_examples.json")
+        teaching = json.load(open(teaching_path, encoding="utf-8"))
+        teaching[0]["assets"] = [{"path": asset_rel, "role": "student_attempt"}]
+        with open(teaching_path, "w", encoding="utf-8") as stream:
+            json.dump(teaching, stream)
+        _refresh_visual_integrity(ws)
+        before = open(os.path.join(ws, "study_state.json"), "rb").read()
+        result = _up(ws, [
+            "record-phase-evidence", "--phase", "1", "--kind", "visual",
+            "--ref", asset_rel,
+        ])
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("student_attempt", result.stderr)
+        self.assertEqual(before, open(os.path.join(ws, "study_state.json"), "rb").read())
+
+    def test_visual_checkpoint_with_attempt_only_prompt_cannot_count(self):
+        ws = _phase_evidence_ws()
+        asset_rel = "references/assets/attempt.png"
+        asset_path = os.path.join(ws, *asset_rel.split("/"))
+        os.makedirs(os.path.dirname(asset_path), exist_ok=True)
+        with open(asset_path, "wb") as stream:
+            stream.write(b"attempt-audit")
+        bank_path = os.path.join(ws, "references", "quiz_bank.json")
+        bank = json.load(open(bank_path, encoding="utf-8"))
+        bank[0]["requires_assets"] = True
+        bank[0]["assets"] = [{"path": asset_rel, "role": "student_attempt"}]
+        with open(bank_path, "w", encoding="utf-8") as stream:
+            json.dump(bank, stream)
+        _refresh_visual_integrity(ws)
+        result = _up(ws, [
+            "record-phase-evidence", "--phase", "1", "--kind", "checkpoint",
+            "--ref", "q1", "--outcome", "passed",
+        ])
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("student_attempt", result.stderr)
+
+    def test_new_global_attempt_conflict_invalidates_existing_completion_evidence(self):
+        ws = _phase_evidence_ws()
+        self._record_core(ws)
+        asset_rel = "references/assets/shared.png"
+        asset_path = os.path.join(ws, *asset_rel.split("/"))
+        os.makedirs(os.path.dirname(asset_path), exist_ok=True)
+        with open(asset_path, "wb") as stream:
+            stream.write(b"shared-audit")
+        bank_path = os.path.join(ws, "references", "quiz_bank.json")
+        bank = json.load(open(bank_path, encoding="utf-8"))
+        bank[0]["assets"] = [{"path": asset_rel, "role": "question_context"}]
+        with open(bank_path, "w", encoding="utf-8") as stream:
+            json.dump(bank, stream)
+        teaching_path = os.path.join(ws, "references", "teaching_examples.json")
+        teaching = json.load(open(teaching_path, encoding="utf-8"))
+        teaching[0]["assets"] = [{"path": "references\\assets\\shared.png",
+                                  "role": "student_attempt"}]
+        with open(teaching_path, "w", encoding="utf-8") as stream:
+            json.dump(teaching, stream)
+        _refresh_visual_integrity(ws)
+        before = open(os.path.join(ws, "study_state.json"), "rb").read()
+        result = _up(ws, [
+            "complete-phase", "--phase", "1", "--status", "covered_unverified",
+        ])
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("student-attempt", result.stderr)
+        self.assertEqual(before, open(os.path.join(ws, "study_state.json"), "rb").read())
+
+    def test_new_content_unit_attempt_stales_visual_completion_evidence(self):
+        ws = _phase_evidence_ws()
+        _write_phase_guide(ws)
+        asset_rel = "references/assets/wiki-counted.png"
+        asset_path = os.path.join(ws, *asset_rel.split("/"))
+        os.makedirs(os.path.dirname(asset_path), exist_ok=True)
+        with open(asset_path, "wb") as stream:
+            stream.write(b"wiki-counted-before-attempt-classification")
+        wiki_path = os.path.join(ws, "references", "wiki", "ch1.md")
+        with open(wiki_path, "a", encoding="utf-8", newline="\n") as stream:
+            stream.write("\n![counted visual](../assets/wiki-counted.png)\n")
+        # This represents the last trusted visual build.  Its integrity block
+        # binds the benign structured IR as well as the wiki and source layers.
+        _refresh_visual_integrity(ws)
+        self._record_core(ws)
+
+        units_path = os.path.join(ws, ".ingest", "content_units.jsonl")
+        with open(units_path, "a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps({
+                "unit_id": "foreign-attempt-visual", "source_file": "course.pdf",
+                "page": 99, "kind": "figure", "chapter_id": "ch02",
+                "provenance": "material", "text": "",
+                "asset_path": asset_rel, "asset_role": "student_attempt",
+                "metadata": {},
+            }, ensure_ascii=False) + "\n")
+
+        before = open(os.path.join(ws, "study_state.json"), "rb").read()
+        result = _up(ws, [
+            "complete-phase", "--phase", "1", "--status", "covered_unverified",
+        ])
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("content_units.jsonl", result.stderr)
+        self.assertEqual(before, open(os.path.join(ws, "study_state.json"), "rb").read())
 
     def test_le1d_can_complete_covered_unverified_with_core_evidence(self):
         ws = _phase_evidence_ws()

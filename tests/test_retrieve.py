@@ -271,6 +271,61 @@ class CliContract(unittest.TestCase):
         finally:
             shutil.rmtree(ws, ignore_errors=True)
 
+    def test_present_teaching_layer_requires_exact_integrity_binding(self):
+        ws = make_ws(CORPUS)
+        try:
+            teaching_relative = "references/teaching_examples.json"
+            teaching_path = os.path.join(ws, *teaching_relative.split("/"))
+            with open(teaching_path, "w", encoding="utf-8") as stream:
+                json.dump([], stream)
+
+            with self.assertRaises(SystemExit):
+                retrieve.load_index(ws)
+
+            index_path = os.path.join(ws, "references", "retrieval_index.json")
+            with open(index_path, "r", encoding="utf-8") as stream:
+                index = json.load(stream)
+            with open(teaching_path, "rb") as stream:
+                teaching_sha = hashlib.sha256(stream.read()).hexdigest()
+            index["integrity"]["teaching_examples"] = {
+                "file": teaching_relative, "sha256": teaching_sha,
+            }
+            with open(index_path, "w", encoding="utf-8") as stream:
+                json.dump(index, stream)
+            self.assertIsNotNone(retrieve.load_index(ws))
+
+            # Mutating only the teaching layer must stale the otherwise intact
+            # wiki/quiz/content index.
+            with open(teaching_path, "w", encoding="utf-8") as stream:
+                json.dump([{"id": "new-example"}], stream)
+            with self.assertRaises(SystemExit):
+                retrieve.load_index(ws)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_teaching_integrity_key_cannot_bind_an_arbitrary_file(self):
+        ws = make_ws(CORPUS)
+        try:
+            teaching_path = os.path.join(ws, "references", "teaching_examples.json")
+            with open(teaching_path, "w", encoding="utf-8") as stream:
+                json.dump([], stream)
+            arbitrary = CORPUS[0]["file"]
+            arbitrary_path = os.path.join(ws, *arbitrary.split("/"))
+            with open(arbitrary_path, "rb") as stream:
+                digest = hashlib.sha256(stream.read()).hexdigest()
+            index_path = os.path.join(ws, "references", "retrieval_index.json")
+            with open(index_path, "r", encoding="utf-8") as stream:
+                index = json.load(stream)
+            index["integrity"]["teaching_examples"] = {
+                "file": arbitrary, "sha256": digest,
+            }
+            with open(index_path, "w", encoding="utf-8") as stream:
+                json.dump(index, stream)
+            with self.assertRaises(SystemExit):
+                retrieve.load_index(ws)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
     def test_bad_usage(self):
         ws = make_ws(CORPUS)
         try:

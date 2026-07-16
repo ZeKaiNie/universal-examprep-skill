@@ -8,6 +8,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import zlib
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
@@ -18,8 +19,18 @@ import study_guide_qa as qa  # noqa: E402
 
 
 def png_payload(width, height, marker=b""):
-    return (qa.PNG_SIGNATURE + b"\x00\x00\x00\x0dIHDR"
-            + struct.pack(">II", width, height) + marker)
+    def chunk(kind, payload):
+        return (struct.pack(">I", len(payload)) + kind + payload
+                + struct.pack(">I", zlib.crc32(kind + payload) & 0xffffffff))
+
+    row = b"\x00" + (b"\x00" * ((width + 7) // 8))
+    return (
+        qa.PNG_SIGNATURE
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 1, 0, 0, 0, 0))
+        + (chunk(b"tEXt", marker) if marker else b"")
+        + chunk(b"IDAT", zlib.compress(row * height))
+        + chunk(b"IEND", b"")
+    )
 
 
 class FakeBackend(object):
@@ -254,6 +265,35 @@ class StudyGuideQATest(unittest.TestCase):
         code, unused_out, error = self.accept_clean(verdicts=["1=pass"])
         self.assertEqual(1, code)
         self.assertNotEqual("ready", self.read_receipt()["status"])
+
+    def test_malformed_renderer_png_rejects_batch_without_replacing_qa_pages(self):
+        qa_dir = os.path.join(self.guide, "qa")
+        os.makedirs(qa_dir, exist_ok=True)
+        sentinels = {}
+        for number in (1, 2):
+            path = os.path.join(qa_dir, "ch01_p%03d.png" % number)
+            payload = b"OLD-QA-PAGE-%d" % number
+            with open(path, "wb") as stream:
+                stream.write(payload)
+            sentinels[path] = payload
+        malformed = (
+            qa.PNG_SIGNATURE + b"\x00\x00\x00\x0dIHDR"
+            + struct.pack(">II", 1200, 1800) + b"signature-only-garbage"
+        )
+        backend = FakeBackend([
+            clean_page(1),
+            {"png": malformed, "text": "Page 2 of 2", "width": 1200,
+             "height": 1800, "white_ratio": 0.93},
+        ])
+        code, unused_out, error = self.invoke("render", backend=backend)
+        self.assertEqual(1, code, error)
+        self.assertIn("valid PNG", error)
+        for path, payload in sentinels.items():
+            self.assertEqual(payload, open(path, "rb").read())
+        self.assertFalse(any(name.startswith(".ch01-") for name in os.listdir(qa_dir)))
+        visual = self.read_receipt()["visual_qa"]
+        self.assertEqual("blocked", visual["status"])
+        self.assertEqual("render_failed", visual["unresolved_defects"][0]["code"])
 
     def test_accept_requires_and_records_explicit_all_page_inspection(self):
         self.render_clean()

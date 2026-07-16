@@ -25,6 +25,12 @@ sys.path.insert(0, SCRIPTS)
 import build_raw_input_from_workspace as B  # noqa: E402
 
 
+PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+    "0000000c49444154789c63f8ffff3f0005fe02fe0def46b80000000049454e44ae426082"
+)
+
+
 # --------------------------------------------------------------------------- helpers
 
 class FakeBackend(object):
@@ -48,7 +54,7 @@ class FakeBackend(object):
     def render_page_png(self, pdf_path, page_index):
         if not self._can_render:
             return None
-        return b"\x89PNG\r\n\x1a\n" + bytes([page_index & 0xFF])  # tiny non-empty fake PNG
+        return PNG
 
 
 def _pages(file, *texts):
@@ -65,9 +71,18 @@ def _materials_with_pdf(basename="ch01.pdf"):
 
 
 def _args(materials, **over):
+    out_supplied = "out" in over
+    report_supplied = "report" in over
     out = over.pop("out", os.path.join(materials, "raw_input.json"))
     rep = over.pop("report", os.path.join(materials, "parse_report.json"))
     aroot = over.pop("asset_root", os.path.join(materials, "ws", "references", "assets"))
+    if aroot is not None:
+        workspace = os.path.dirname(os.path.dirname(os.path.abspath(aroot)))
+        ingest = os.path.join(workspace, ".ingest")
+        if not out_supplied:
+            out = os.path.join(ingest, "source_raw_input.json")
+        if not report_supplied:
+            rep = os.path.join(ingest, "parse_report.json")
     argv = ["--materials", materials, "--out", out, "--report", rep]
     if aroot is not None:                       # pass asset_root=None to OMIT --asset-root
         argv += ["--asset-root", aroot]
@@ -170,6 +185,25 @@ class CoreExtraction(unittest.TestCase):
         self.assertTrue(B.requires_assets_heuristic("Shade the Venn diagram at right."))
         self.assertTrue(B.requires_assets_heuristic("see the figure / table below"))
         self.assertFalse(B.requires_assets_heuristic("Compute 2 + 2 and simplify."))
+
+    def test_page_reference_language_uses_original_prompt_not_generated_instruction(self):
+        item = B.extract_lecture_items(_pages(
+            "ch01.pdf",
+            "Example 1.6 Determine the probability shown in the figure below.",
+            "Example 1.6 Solution  The probability is one half.",
+        ))[0]
+        self.assertEqual("page_reference", item["question_text_status"])
+        self.assertEqual("en", B._classify_source_language(
+            item["_prompt_text"], kind="question"
+        ))
+        self.assertEqual("zh", B._classify_source_language(
+            item["question"], kind="question"
+        ))
+        chinese = {"question": "计算该事件的概率。", "answer": "答案为二分之一。"}
+        report = {"warnings": []}
+        B._annotate_source_languages([item, chinese], report)
+        self.assertEqual("en", item["source_language"])
+        self.assertEqual("zh", chinese["source_language"])
 
     def test_detect_example_problem_and_solution(self):
         pages = _pages("ch01.pdf",
@@ -1397,7 +1431,7 @@ class CliAndRun(unittest.TestCase):
         be = FakeBackend({"ch01.pdf": [
             "Example 1.1 Problem  Shade the Venn diagram at right.",
             "Example 1.1 Solution  Shade region A.",
-            "Example 1.2  This table demonstrates the completed calculation.",
+            "Example 1.2  This worked demonstration completes the calculation.",
         ]})
         args = _args(d)
         code, raw, report = B.run(args, backend=be)
@@ -1412,6 +1446,41 @@ class CliAndRun(unittest.TestCase):
         self.assertEqual(report["teaching_examples_detected"], 2)
         self.assertEqual(report["teaching_example_roles"],
                          {"paired_problem": 1, "worked_example": 1})
+
+        question_units = [
+            row for row in raw["ingestion"]["content_units"]
+            if row["kind"] == "question"
+        ]
+        by_external_id = {}
+        for row in question_units:
+            by_external_id.setdefault(row.get("external_id"), []).append(row)
+        self.assertEqual(1, len(by_external_id["lecture_example_1_1"]))
+        self.assertEqual(1, len(by_external_id["lecture_example_1_2"]))
+        teaching_only_unit = by_external_id["lecture_example_1_2"][0]
+        self.assertEqual("ch01", teaching_only_unit["chapter_id"])
+        self.assertIs(teaching_only_unit["metadata"]["gradable"], False)
+        self.assertEqual("example", teaching_only_unit["metadata"]["source_type"])
+        self.assertEqual(
+            teaching["lecture_example_1_2"]["source_language"],
+            teaching_only_unit["metadata"]["source_language"],
+        )
+        self.assertFalse(any(
+            row["kind"] == "answer"
+            and row.get("external_id") == "lecture_example_1_2"
+            for row in raw["ingestion"]["content_units"]
+        ))
+        self.assertFalse(any(
+            row["reason_codes"] == ["missing_answer"]
+            and teaching_only_unit["unit_id"] in row.get("target_unit_ids", [])
+            for row in raw["ingestion"]["review_candidates"]
+        ))
+        type_reviews = [
+            row for row in raw["ingestion"]["review_candidates"]
+            if row["reason_codes"] == ["type_defaulted"]
+            and teaching_only_unit["unit_id"] in row.get("target_unit_ids", [])
+        ]
+        # Non-gradable worked examples still need a type for visual teaching and Guide authoring.
+        self.assertEqual(1, len(type_reviews))
 
     def test_warns_when_asset_required_but_no_render(self):
         d = _materials_with_pdf()
@@ -1501,6 +1570,29 @@ class CliAndRun(unittest.TestCase):
         self.assertEqual(code, 0)                                 # did not crash
         self.assertTrue(any("渲染失败" in s.get("why", "") for s in report["skipped"]))
 
+    def test_signature_prefixed_garbage_png_is_never_published(self):
+        materials = _materials_with_pdf()
+
+        class CorruptPng(FakeBackend):
+            def render_page_png(self, pdf_path, page_index):
+                return b"\x89PNG\r\n\x1a\nnot-a-real-png"
+
+        backend = CorruptPng({
+            "ch01.pdf": [
+                "Quiz 1.1  Shade the diagram at right.",
+                "Quiz 1.1 Solution  region A.",
+            ],
+        })
+        args = _args(materials, render_pages="required")
+        code, _payload, report = B.run(args, backend=backend)
+
+        self.assertEqual(3, code)
+        self.assertTrue(any(
+            "invalid or undecodable PNG" in row.get("why", "")
+            for row in report["skipped"]
+        ))
+        self.assertFalse(os.path.exists(args.asset_root))
+
     def test_marker_only_renders_page_when_backend_available(self):
         # round-4 P2: a marker-only item (prompt in image) should still get its page rendered so it's
         # displayable — even though requires_assets stays false
@@ -1543,6 +1635,732 @@ class CliAndRun(unittest.TestCase):
 # --------------------------------------------------------------------------- ingest integration
 
 class PublicationLocking(unittest.TestCase):
+    def _visual_publication_fixture(self):
+        materials = _materials_with_pdf()
+        workspace = os.path.join(os.path.dirname(materials), "workspace")
+        assets = os.path.join(workspace, "references", "assets")
+        os.makedirs(assets, exist_ok=True)
+        ingest = os.path.join(workspace, ".ingest")
+        os.makedirs(ingest, exist_ok=True)
+        out = os.path.join(ingest, "source_raw_input.json")
+        report = os.path.join(ingest, "parse_report.json")
+        backend = FakeBackend({
+            "ch01.pdf": [
+                "Quiz 1.1  Shade the Venn diagram at right.",
+                "Quiz 1.1 Solution  region A.",
+            ],
+        })
+        with open(os.path.join(materials, "ch01.pdf"), "rb") as stream:
+            source_sha256 = hashlib.sha256(stream.read()).hexdigest()
+        name = B._safe_asset_name(
+            "ch01.pdf", 1, "lecture_quiz_1_1", "",
+            source_sha256=source_sha256,
+        )
+        return materials, workspace, assets, out, report, backend, name
+
+    def test_staged_builder_never_overwrites_unowned_target_or_json(self):
+        (materials, unused_workspace, assets, out, report,
+         backend, name) = self._visual_publication_fixture()
+        target = os.path.join(assets, name)
+        sentinel_asset = b"UNOWNED-ASSET"
+        sentinel_out = b"OLD-RAW-INPUT"
+        sentinel_report = b"OLD-REPORT"
+        with open(target, "wb") as stream:
+            stream.write(sentinel_asset)
+        with open(out, "wb") as stream:
+            stream.write(sentinel_out)
+        with open(report, "wb") as stream:
+            stream.write(sentinel_report)
+
+        code = B.main([
+            "--materials", materials, "--out", out, "--report", report,
+            "--asset-root", assets,
+        ], backend=backend)
+
+        self.assertEqual(5, code)
+        self.assertEqual(sentinel_asset, open(target, "rb").read())
+        self.assertEqual(sentinel_out, open(out, "rb").read())
+        self.assertEqual(sentinel_report, open(report, "rb").read())
+
+    def test_staged_builder_live_attempt_policy_rejects_even_identical_bytes(self):
+        (materials, workspace, assets, out, report,
+         backend, name) = self._visual_publication_fixture()
+        target = os.path.join(assets, name)
+        candidate_bytes = backend.render_page_png(
+            os.path.join(materials, "ch01.pdf"), 0
+        )
+        with open(target, "wb") as stream:
+            stream.write(candidate_bytes)
+        references = os.path.join(workspace, "references")
+        os.makedirs(references, exist_ok=True)
+        bank_path = os.path.join(references, "quiz_bank.json")
+        target_rel = "references/assets/" + name
+        with open(bank_path, "w", encoding="utf-8") as stream:
+            json.dump([{
+                "id": "legacy-attempt", "chapter": 9,
+                "assets": [{"path": target_rel, "role": "student_attempt"}],
+            }], stream, ensure_ascii=False, indent=2)
+        with open(os.path.join(workspace, ".ingest", "content_units.jsonl"),
+                  "w", encoding="utf-8"):
+            pass
+        sentinel_out = b"OLD-RAW-INPUT"
+        sentinel_report = b"OLD-REPORT"
+        with open(out, "wb") as stream:
+            stream.write(sentinel_out)
+        with open(report, "wb") as stream:
+            stream.write(sentinel_report)
+
+        code = B.main([
+            "--materials", materials, "--out", out, "--report", report,
+            "--asset-root", assets,
+        ], backend=backend)
+
+        self.assertEqual(5, code)
+        self.assertEqual(candidate_bytes, open(target, "rb").read())
+        self.assertEqual(sentinel_out, open(out, "rb").read())
+        self.assertEqual(sentinel_report, open(report, "rb").read())
+        self.assertIn("student_attempt",
+                      open(bank_path, encoding="utf-8").read())
+
+    def test_staged_candidate_batch_rejects_attempt_laundering_before_publication(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = os.path.join(temp, "workspace")
+            stage = os.path.join(temp, "stage")
+            destination = os.path.join(workspace, "references", "assets")
+            os.makedirs(stage)
+            with open(os.path.join(stage, "shared.png"), "wb") as stream:
+                stream.write(b"candidate")
+            relative = "references/assets/shared.png"
+            candidate = {
+                "quiz_bank": [{
+                    "id": "official-q", "chapter": 1,
+                    "assets": [{"path": relative, "role": "question_context"}],
+                }],
+                "teaching_examples": [{
+                    "id": "foreign-attempt", "chapter": 2,
+                    "assets": [{"path": relative, "role": "student_attempt"}],
+                }],
+                "ingestion": {"content_units": []},
+            }
+
+            with self.assertRaisesRegex(ValueError, "student_attempt"):
+                B._publish_staged_assets(stage, destination, candidate, workspace)
+
+            self.assertFalse(os.path.lexists(destination))
+            self.assertEqual(b"candidate", open(
+                os.path.join(stage, "shared.png"), "rb").read())
+
+    def test_staged_candidate_rejects_hardlink_alias_of_existing_attempt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = os.path.join(temp, "workspace")
+            destination = os.path.join(workspace, "references", "assets")
+            stage = os.path.join(temp, "stage")
+            ingest = os.path.join(workspace, ".ingest")
+            os.makedirs(destination)
+            os.makedirs(stage)
+            os.makedirs(ingest)
+            attempt = os.path.join(destination, "attempt.png")
+            official = os.path.join(destination, "official.png")
+            with open(attempt, "wb") as stream:
+                stream.write(PNG)
+            try:
+                os.link(attempt, official)
+            except (OSError, NotImplementedError):
+                self.skipTest("hard links are unavailable")
+            with open(os.path.join(stage, "official.png"), "wb") as stream:
+                stream.write(PNG)
+            references = os.path.dirname(destination)
+            with open(os.path.join(references, "quiz_bank.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump([{
+                    "id": "old-student-attempt", "chapter": 2,
+                    "assets": [{
+                        "path": "references/assets/attempt.png",
+                        "role": "student_attempt",
+                    }],
+                }], stream)
+            with open(os.path.join(references, "teaching_examples.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump([], stream)
+            with open(os.path.join(ingest, "content_units.jsonl"), "w",
+                      encoding="utf-8"):
+                pass
+            candidate = {
+                "quiz_bank": [{
+                    "id": "new-official", "chapter": 1,
+                    "assets": [{
+                        "path": "references/assets/official.png",
+                        "role": "question_context",
+                    }],
+                }],
+                "teaching_examples": [],
+                "ingestion": {"content_units": []},
+            }
+
+            with self.assertRaisesRegex(ValueError, "hardlink alias.*student_attempt"):
+                B._plan_staged_assets(
+                    stage, destination, candidate, workspace
+                )
+            self.assertTrue(os.path.samefile(attempt, official))
+            self.assertEqual(PNG, open(official, "rb").read())
+
+    def test_staged_candidate_rejects_prompt_alias_of_existing_answer_hardlink(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = os.path.join(temp, "workspace")
+            destination = os.path.join(workspace, "references", "assets")
+            stage = os.path.join(temp, "stage")
+            ingest = os.path.join(workspace, ".ingest")
+            os.makedirs(destination)
+            os.makedirs(stage)
+            os.makedirs(ingest)
+            answer = os.path.join(destination, "answer.png")
+            prompt = os.path.join(destination, "prompt.png")
+            with open(answer, "wb") as stream:
+                stream.write(PNG)
+            try:
+                os.link(answer, prompt)
+            except (OSError, NotImplementedError):
+                self.skipTest("hard links are unavailable")
+            with open(os.path.join(stage, "prompt.png"), "wb") as stream:
+                stream.write(PNG)
+            references = os.path.dirname(destination)
+            with open(os.path.join(references, "quiz_bank.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump([{
+                    "id": "q1", "chapter": 1,
+                    "assets": [{
+                        "path": "references/assets/answer.png",
+                        "role": "answer_context",
+                    }],
+                }], stream)
+            with open(os.path.join(references, "teaching_examples.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump([], stream)
+            with open(os.path.join(ingest, "content_units.jsonl"), "w",
+                      encoding="utf-8"):
+                pass
+            candidate = {
+                "quiz_bank": [{
+                    "id": "q1", "chapter": 1,
+                    "assets": [{
+                        "path": "references/assets/prompt.png",
+                        "role": "question_context",
+                    }],
+                }],
+                "teaching_examples": [],
+                "ingestion": {"content_units": []},
+            }
+
+            with self.assertRaisesRegex(
+                    ValueError, "conflicts with existing workspace ownership"):
+                B._plan_staged_assets(
+                    stage, destination, candidate, workspace
+                )
+
+    def test_staged_candidate_allows_idempotent_cross_item_prompt_answer_reuse(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = os.path.join(temp, "workspace")
+            destination = os.path.join(workspace, "references", "assets")
+            stage = os.path.join(temp, "stage")
+            ingest = os.path.join(workspace, ".ingest")
+            os.makedirs(destination)
+            os.makedirs(stage)
+            os.makedirs(ingest)
+            shared = os.path.join(destination, "shared.png")
+            with open(shared, "wb") as stream:
+                stream.write(PNG)
+            with open(os.path.join(stage, "shared.png"), "wb") as stream:
+                stream.write(PNG)
+            records = [{
+                "id": "prompt-item", "chapter": 1,
+                "assets": [{
+                    "path": "references/assets/shared.png",
+                    "role": "question_context",
+                }],
+            }, {
+                "id": "answer-item", "chapter": 1,
+                "assets": [{
+                    "path": "references/assets/shared.png",
+                    "role": "answer_context",
+                }],
+            }]
+            references = os.path.dirname(destination)
+            with open(os.path.join(references, "quiz_bank.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump(records, stream)
+            with open(os.path.join(references, "teaching_examples.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump([], stream)
+            with open(os.path.join(ingest, "content_units.jsonl"), "w",
+                      encoding="utf-8"):
+                pass
+            candidate = {
+                "quiz_bank": records,
+                "teaching_examples": [],
+                "ingestion": {"content_units": []},
+            }
+
+            plan = B._plan_staged_assets(
+                stage, destination, candidate, workspace
+            )
+
+            self.assertEqual(1, len(plan["publication"]))
+            self.assertFalse(plan["publication"][0][2])
+
+    def test_staged_candidate_rejects_invalid_compatibility_asset_declaration(self):
+        cases = (
+            {"path": "references/assets/NUL.png", "role": "question_context"},
+            {"path": "references/assets/prompt.png", "role": {"side": "prompt"}},
+        )
+        for asset in cases:
+            with self.subTest(asset=asset), tempfile.TemporaryDirectory() as temp:
+                workspace = os.path.join(temp, "workspace")
+                stage = os.path.join(temp, "stage")
+                destination = os.path.join(workspace, "references", "assets")
+                os.makedirs(stage)
+                candidate = {
+                    "quiz_bank": [{
+                        "id": "bad-q", "chapter": 1, "assets": [asset],
+                    }],
+                    "teaching_examples": [],
+                    "ingestion": {"content_units": []},
+                }
+
+                with self.assertRaisesRegex(ValueError, "invalid"):
+                    B._publish_staged_assets(stage, destination, candidate, workspace)
+
+                self.assertFalse(os.path.lexists(destination))
+
+    def test_workspace_inference_rejects_outside_asset_root_before_mutation(self):
+        materials = _materials_with_pdf()
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = os.path.join(temp, "workspace")
+            ingest = os.path.join(workspace, ".ingest")
+            outside_assets = os.path.join(temp, "other", "references", "assets")
+            os.makedirs(ingest)
+            os.makedirs(outside_assets)
+            out = os.path.join(ingest, "source_raw_input.json")
+            report = os.path.join(ingest, "parse_report.json")
+            sentinel_out = b"OLD-RAW-INPUT"
+            sentinel_report = b"OLD-REPORT"
+            sentinel_asset = b"OUTSIDE-ASSET"
+            with open(out, "wb") as stream:
+                stream.write(sentinel_out)
+            with open(report, "wb") as stream:
+                stream.write(sentinel_report)
+            outside_sentinel = os.path.join(outside_assets, "sentinel.bin")
+            with open(outside_sentinel, "wb") as stream:
+                stream.write(sentinel_asset)
+
+            backend = FakeBackend({
+                "ch01.pdf": ["Quiz 1.1  Shade the diagram at right."],
+            })
+            backend.render_page_png = mock.Mock(
+                side_effect=AssertionError("render must not run across workspace roots")
+            )
+            code = B.main([
+                "--materials", materials,
+                "--out", out,
+                "--report", report,
+                "--asset-root", outside_assets,
+            ], backend=backend)
+
+            self.assertEqual(2, code)
+            backend.render_page_png.assert_not_called()
+            self.assertEqual(sentinel_out, open(out, "rb").read())
+            self.assertEqual(sentinel_report, open(report, "rb").read())
+            self.assertEqual(sentinel_asset, open(outside_sentinel, "rb").read())
+            self.assertFalse(os.path.lexists(
+                os.path.join(workspace, "references", "assets")
+            ))
+
+    def test_workspace_publication_paths_require_canonical_component_spelling(self):
+        materials = _materials_with_pdf()
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = os.path.join(temp, "workspace")
+            cases = (
+                (
+                    os.path.join(workspace, ".INGEST", "source_raw_input.json"),
+                    os.path.join(workspace, ".INGEST", "parse_report.json"),
+                    None,
+                    "canonical .ingest",
+                ),
+                (
+                    os.path.join(temp, "raw_input.json"),
+                    os.path.join(temp, "parse_report.json"),
+                    os.path.join(workspace, "References", "Assets"),
+                    "references/assets",
+                ),
+            )
+            for out, report, asset_root, error in cases:
+                with self.subTest(out=out, asset_root=asset_root):
+                    argv = [
+                        "--materials", materials,
+                        "--out", out,
+                        "--report", report,
+                    ]
+                    if asset_root is not None:
+                        argv.extend(["--asset-root", asset_root])
+                    args = B.build_arg_parser().parse_args(argv)
+                    with self.assertRaisesRegex(ValueError, error):
+                        B._publication_workspace(args)
+                    self.assertFalse(os.path.lexists(out))
+                    self.assertFalse(os.path.lexists(report))
+                    if asset_root is not None:
+                        self.assertFalse(os.path.lexists(asset_root))
+
+    def test_workspace_mode_rejects_every_noncanonical_builder_json_target(self):
+        target_relatives = (
+            ".ingest/content_units.jsonl",
+            ".ingest/build_manifest.json",
+            ".ingest/review_queue.jsonl",
+            "references/quiz_bank.json",
+            "study_state.json",
+            "references/assets/candidate.png",
+        )
+        for relative in target_relatives:
+            with self.subTest(relative), tempfile.TemporaryDirectory() as temp:
+                materials = _materials_with_pdf()
+                workspace = os.path.join(temp, "workspace")
+                assets = os.path.join(workspace, "references", "assets")
+                ingest = os.path.join(workspace, ".ingest")
+                os.makedirs(assets)
+                os.makedirs(ingest)
+                target = os.path.join(workspace, *relative.split("/"))
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                sentinel = ("OLD:" + relative).encode("utf-8")
+                with open(target, "wb") as stream:
+                    stream.write(sentinel)
+                report = os.path.join(ingest, "parse_report.json")
+                backend = FakeBackend({"ch01.pdf": ["Quiz 1.1 plain prompt"]})
+                backend.page_texts = mock.Mock(
+                    side_effect=AssertionError("validation must precede parsing")
+                )
+
+                code = B.main([
+                    "--materials", materials,
+                    "--out", target,
+                    "--report", report,
+                    "--asset-root", assets,
+                ], backend=backend)
+
+                self.assertEqual(2, code)
+                backend.page_texts.assert_not_called()
+                self.assertEqual(sentinel, open(target, "rb").read())
+                self.assertFalse(os.path.lexists(report))
+
+    def test_publication_outputs_and_review_manifest_must_be_physically_distinct(self):
+        cases = ("same-out-report", "out-is-review-manifest")
+        for case in cases:
+            with self.subTest(case), tempfile.TemporaryDirectory() as temp:
+                materials = _materials_with_pdf()
+                report = os.path.join(temp, "parse_report.json")
+                out = report if case == "same-out-report" else os.path.join(
+                    temp, "ai_review_manifest.json"
+                )
+                sentinel = b"DO-NOT-REPLACE"
+                with open(out, "wb") as stream:
+                    stream.write(sentinel)
+                backend = FakeBackend({"ch01.pdf": ["Quiz 1.1 plain prompt"]})
+                backend.page_texts = mock.Mock(
+                    side_effect=AssertionError("validation must precede parsing")
+                )
+
+                code = B.main([
+                    "--materials", materials, "--out", out, "--report", report,
+                ], backend=backend)
+
+                self.assertEqual(2, code)
+                backend.page_texts.assert_not_called()
+                self.assertEqual(sentinel, open(out, "rb").read())
+
+    def test_official_visual_publication_commits_deferred_assets_with_all_json(self):
+        (materials, workspace, assets, out, report,
+         backend, name) = self._visual_publication_fixture()
+        self.addCleanup(
+            shutil.rmtree, os.path.dirname(materials), ignore_errors=True
+        )
+
+        code = B.main([
+            "--materials", materials,
+            "--out", out,
+            "--report", report,
+            "--asset-root", assets,
+        ], backend=backend)
+
+        self.assertEqual(0, code)
+        self.assertTrue(os.path.isfile(os.path.join(assets, name)))
+        with open(out, encoding="utf-8") as stream:
+            self.assertIsInstance(json.load(stream), dict)
+        with open(report, encoding="utf-8") as stream:
+            self.assertIsInstance(json.load(stream), dict)
+        manifest = os.path.join(
+            workspace, ".ingest", "ai_review_manifest.json"
+        )
+        with open(manifest, encoding="utf-8") as stream:
+            self.assertIsInstance(json.load(stream), dict)
+
+    def test_official_visual_publication_rolls_back_every_late_json_failure(self):
+        for fail_at in (1, 2, 3):
+            with self.subTest(fail_at=fail_at):
+                (materials, workspace, assets, out, report,
+                 backend, name) = self._visual_publication_fixture()
+                root = os.path.dirname(materials)
+                try:
+                    manifest = os.path.join(
+                        workspace, ".ingest", "ai_review_manifest.json"
+                    )
+                    sentinels = {
+                        out: b"OLD-RAW-INPUT",
+                        report: b"OLD-PARSE-REPORT",
+                        manifest: b"OLD-AI-REVIEW-MANIFEST",
+                    }
+                    for path, payload in sentinels.items():
+                        with open(path, "wb") as stream:
+                            stream.write(payload)
+                    target = os.path.join(assets, name)
+                    self.assertFalse(os.path.lexists(target))
+
+                    real_replace = B._replace_publication_stage
+                    call_count = [0]
+
+                    def fail_selected(temporary, destination):
+                        call_count[0] += 1
+                        if call_count[0] == fail_at:
+                            raise OSError(
+                                "injected JSON replace failure %d" % fail_at
+                            )
+                        return real_replace(temporary, destination)
+
+                    with mock.patch.object(
+                            B, "_replace_publication_stage",
+                            side_effect=fail_selected):
+                        code = B.main([
+                            "--materials", materials,
+                            "--out", out,
+                            "--report", report,
+                            "--asset-root", assets,
+                        ], backend=backend)
+
+                    self.assertEqual(2, code)
+                    self.assertEqual(fail_at, call_count[0])
+                    for path, payload in sentinels.items():
+                        with open(path, "rb") as stream:
+                            self.assertEqual(payload, stream.read())
+                    self.assertFalse(os.path.lexists(target))
+                    leftovers = []
+                    for base, _dirs, files in os.walk(workspace):
+                        leftovers.extend(
+                            os.path.join(base, filename)
+                            for filename in files
+                            if (".builder-publication." in filename
+                                or ".builder-rollback." in filename
+                                or filename.endswith(".tmp"))
+                        )
+                    self.assertEqual([], leftovers)
+                finally:
+                    shutil.rmtree(root, ignore_errors=True)
+
+    def test_asset_publish_raise_after_replace_still_rolls_back_everything(self):
+        (materials, workspace, assets, out, report,
+         backend, name) = self._visual_publication_fixture()
+        self.addCleanup(
+            shutil.rmtree, os.path.dirname(materials), ignore_errors=True
+        )
+        manifest = os.path.join(
+            workspace, ".ingest", "ai_review_manifest.json"
+        )
+        sentinels = {
+            out: b"OLD-RAW-INPUT",
+            report: b"OLD-PARSE-REPORT",
+            manifest: b"OLD-AI-REVIEW-MANIFEST",
+        }
+        for path, payload in sentinels.items():
+            with open(path, "wb") as stream:
+                stream.write(payload)
+        target = os.path.join(assets, name)
+        real_publish = B._write_new_asset_atomic
+
+        def publish_then_raise(asset_root, asset_name, payload):
+            real_publish(asset_root, asset_name, payload)
+            raise OSError("injected failure after asset replace")
+
+        with mock.patch.object(
+                B, "_write_new_asset_atomic", side_effect=publish_then_raise):
+            code = B.main([
+                "--materials", materials,
+                "--out", out,
+                "--report", report,
+                "--asset-root", assets,
+            ], backend=backend)
+
+        self.assertEqual(2, code)
+        self.assertFalse(os.path.lexists(target))
+        for path, payload in sentinels.items():
+            with open(path, "rb") as stream:
+                self.assertEqual(payload, stream.read())
+
+    def test_asset_publisher_raise_after_return_uses_outer_registered_journal(self):
+        (materials, workspace, assets, out, report,
+         backend, name) = self._visual_publication_fixture()
+        self.addCleanup(
+            shutil.rmtree, os.path.dirname(materials), ignore_errors=True
+        )
+        manifest = os.path.join(
+            workspace, ".ingest", "ai_review_manifest.json"
+        )
+        sentinels = {
+            out: b"OLD-RAW-INPUT",
+            report: b"OLD-PARSE-REPORT",
+            manifest: b"OLD-AI-REVIEW-MANIFEST",
+        }
+        for path, payload in sentinels.items():
+            with open(path, "wb") as stream:
+                stream.write(payload)
+        real_publish = B._publish_asset_plan
+
+        def publish_then_raise(plan, journal=None):
+            real_publish(plan, journal=journal)
+            raise OSError("injected failure after asset publisher return")
+
+        with mock.patch.object(
+                B, "_publish_asset_plan", side_effect=publish_then_raise):
+            code = B.main([
+                "--materials", materials,
+                "--out", out,
+                "--report", report,
+                "--asset-root", assets,
+            ], backend=backend)
+
+        self.assertEqual(2, code)
+        self.assertFalse(os.path.lexists(os.path.join(assets, name)))
+        for path, payload in sentinels.items():
+            with open(path, "rb") as stream:
+                self.assertEqual(payload, stream.read())
+
+    def test_json_stager_raise_after_return_cleans_registered_stages(self):
+        (materials, workspace, assets, out, report,
+         backend, name) = self._visual_publication_fixture()
+        self.addCleanup(
+            shutil.rmtree, os.path.dirname(materials), ignore_errors=True
+        )
+        real_stage = B._stage_json_publications
+
+        def stage_then_raise(publications, journal=None):
+            real_stage(publications, journal=journal)
+            raise OSError("injected failure after JSON stager return")
+
+        with mock.patch.object(
+                B, "_stage_json_publications", side_effect=stage_then_raise):
+            code = B.main([
+                "--materials", materials,
+                "--out", out,
+                "--report", report,
+                "--asset-root", assets,
+            ], backend=backend)
+
+        self.assertEqual(2, code)
+        self.assertFalse(os.path.lexists(os.path.join(assets, name)))
+
+    def test_json_stager_append_failure_cleans_unregistered_temp(self):
+        class BoomList(list):
+            def append(self, value):
+                raise MemoryError("injected journal append failure")
+
+        with tempfile.TemporaryDirectory() as temp:
+            target = os.path.join(temp, "out.json")
+            journal = {
+                "entries": BoomList(),
+                "states": {},
+                "created_dirs": [],
+            }
+
+            with self.assertRaisesRegex(MemoryError, "journal append"):
+                B._stage_json_publications(
+                    [(target, {"ok": True})], journal=journal
+                )
+
+            self.assertEqual([], [
+                name for name in os.listdir(temp)
+                if ".builder-publication." in name
+            ])
+
+    def test_partial_json_parent_creation_is_rollback_visible(self):
+        with tempfile.TemporaryDirectory() as temp:
+            ancestor = os.path.join(temp, "new-parent")
+            target = os.path.join(ancestor, "nested", "out.json")
+
+            def partial_makedirs(_path, exist_ok=False):
+                os.mkdir(ancestor)
+                raise OSError("injected partial recursive mkdir")
+
+            with mock.patch.object(B.os, "makedirs", side_effect=partial_makedirs):
+                with self.assertRaisesRegex(OSError, "partial recursive mkdir"):
+                    B._stage_json_publications([(target, {"ok": True})])
+            self.assertFalse(os.path.lexists(ancestor))
+
+    def test_stage_cleanup_failure_is_an_explicit_operation_failure(self):
+        (materials, _workspace, assets, out, report,
+         backend, _name) = self._visual_publication_fixture()
+        self.addCleanup(
+            shutil.rmtree, os.path.dirname(materials), ignore_errors=True
+        )
+        staged_paths = []
+
+        def fail_cleanup(path, *args, **kwargs):
+            staged_paths.append(path)
+            raise OSError("injected secure cleanup failure")
+
+        try:
+            with mock.patch.object(B.shutil, "rmtree", side_effect=fail_cleanup):
+                code = B.main([
+                    "--materials", materials,
+                    "--out", out,
+                    "--report", report,
+                    "--asset-root", assets,
+                ], backend=backend)
+        finally:
+            for path in staged_paths:
+                shutil.rmtree(path, ignore_errors=True)
+
+        self.assertEqual(2, code)
+        self.assertTrue(staged_paths)
+        self.assertTrue(any(
+            os.path.basename(path).startswith("exam-cram-asset-stage-")
+            for path in staged_paths
+        ))
+
+    def test_partial_asset_stage_mkdir_failure_cleans_stage_root(self):
+        (materials, _workspace, assets, out, report,
+         backend, _name) = self._visual_publication_fixture()
+        self.addCleanup(
+            shutil.rmtree, os.path.dirname(materials), ignore_errors=True
+        )
+        controlled_parent = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, controlled_parent, ignore_errors=True)
+        stage_base = os.path.join(controlled_parent, "controlled-stage")
+        os.mkdir(stage_base)
+        stage_root = os.path.join(stage_base, "references", "assets")
+        real_makedirs = os.makedirs
+
+        def partial_makedirs(path, exist_ok=False):
+            if os.path.abspath(path) == os.path.abspath(stage_root):
+                real_makedirs(os.path.dirname(path), exist_ok=True)
+                raise OSError("injected partial asset-stage mkdir")
+            return real_makedirs(path, exist_ok=exist_ok)
+
+        with mock.patch.object(B.tempfile, "mkdtemp", return_value=stage_base), \
+                mock.patch.object(B.os, "makedirs", side_effect=partial_makedirs):
+            code = B.main([
+                "--materials", materials,
+                "--out", out,
+                "--report", report,
+                "--asset-root", assets,
+            ], backend=backend)
+
+        self.assertEqual(2, code)
+        self.assertFalse(os.path.lexists(stage_base))
+
     def test_official_workspace_main_publishes_under_new_ingestion_lock(self):
         with tempfile.TemporaryDirectory() as temp:
             root = os.path.abspath(temp)
@@ -1624,6 +2442,7 @@ class IngestIntegration(unittest.TestCase):
         args = _args(d)
         code, ri, _ = B.run(args, backend=be)
         self.assertEqual(code, 0)
+        os.makedirs(os.path.dirname(args.out), exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(ri, f, ensure_ascii=False)
         ws = os.path.join(d, "ws")
@@ -1637,6 +2456,7 @@ class IngestIntegration(unittest.TestCase):
         args = _args(d)  # asset-root points into ws/references/assets so renders land in the workspace
         args.asset_root = os.path.join(d, "ws", "references", "assets")
         code, ri, _ = B.run(args, backend=be)
+        os.makedirs(os.path.dirname(args.out), exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(ri, f, ensure_ascii=False)
         ws = os.path.join(d, "ws")
@@ -1658,6 +2478,7 @@ class IngestIntegration(unittest.TestCase):
         args = _args(d, render_pages="auto")
         args.asset_root = os.path.join(d, "ws", "references", "assets")
         code, ri, _ = B.run(args, backend=be)
+        os.makedirs(os.path.dirname(args.out), exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(ri, f, ensure_ascii=False)
         ws = os.path.join(d, "ws")

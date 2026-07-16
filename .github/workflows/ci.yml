@@ -47,7 +47,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install audited optional MathML converter for real integration coverage
-        run: python -m pip install latex2mathml==3.60.0
+      - name: Install audited optional render dependencies for real integration coverage
+        run: python -m pip install latex2mathml==3.60.0 Pillow==10.4.0
       - name: Run unittest (core is stdlib; renderer also exercises the pinned optional converter)
         run: python -m unittest discover -s tests -v

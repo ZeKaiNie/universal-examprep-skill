@@ -48,6 +48,7 @@ ASSET_ROLES = frozenset(
         "question_context",
         "answer_context",
         "worked_solution",
+        "student_attempt",
         "figure",
         "diagram",
         "table",
@@ -55,7 +56,7 @@ ASSET_ROLES = frozenset(
         "other",
     )
 )
-ANSWER_SIDE_ROLES = frozenset(("answer_context", "worked_solution"))
+LEAKAGE_SIDE_ROLES = frozenset(("answer_context", "worked_solution", "student_attempt"))
 
 GOLD_FIELDS = ("schema_version", "sources", "units", "qa_pairs", "retrieval_queries")
 PREDICTION_FIELDS = (
@@ -473,6 +474,7 @@ def _visual_metrics(gold, prediction):
         if unit_id in prediction["units"]
         and prediction["units"][unit_id]["requires_visual"]
         and prediction["units"][unit_id]["asset_role"] is not None
+        and prediction["units"][unit_id]["asset_role"] != "student_attempt"
         and prediction["units"][unit_id]["asset_path"] is not None
         and prediction["units"][unit_id]["asset_sha256"] is not None
     }
@@ -488,7 +490,7 @@ def _leakage_metrics(prediction):
         unit_id
         for unit_id, unit in prediction["units"].items()
         if unit["exposed_in_question"] and (
-            unit["asset_role"] in ANSWER_SIDE_ROLES
+            unit["asset_role"] in LEAKAGE_SIDE_ROLES
             or unit["kind"] in ("answer", "speaker_notes")
         )
     )

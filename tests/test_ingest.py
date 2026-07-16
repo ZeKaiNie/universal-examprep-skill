@@ -9,6 +9,7 @@
     python tests/test_ingest.py
 """
 
+import hashlib
 import os
 import sys
 import io
@@ -25,6 +26,7 @@ SCRIPTS = os.path.join(REPO_ROOT, "scripts")
 sys.path.insert(0, SCRIPTS)
 
 from scripts import ingest as ingest_module
+from scripts.ingestion import ContentUnit
 from scripts.ingestion.pipeline import build_payload
 from scripts.ingestion.storage import workspace_publication_lock
 UnsafePathError = ingest_module.UnsafePathError
@@ -133,6 +135,113 @@ class IngestEndToEndTest(unittest.TestCase):
         bank = json.loads(read(self.tmp, "references", "quiz_bank.json"))
         self.assertEqual(len(bank), 2)  # 题库是合法 JSON 数组
 
+    def test_legacy_ingest_blocks_attempt_tainted_knowledge_point_concept_in_both_orders(self):
+        shared = "references/assets/shared.png"
+        official = {
+            "id": "official", "chapter": 1, "type": "subjective",
+            "question": "Official prompt", "answer": "Official answer",
+            "knowledge_points": ["Sensitive concept"],
+            "assets": [{"path": shared, "role": "question_context"}],
+        }
+        attempt = {
+            "id": "attempt", "chapter": 1, "type": "subjective",
+            "question": "Student submission", "answer": "",
+            "assets": [{"path": shared, "role": "student_attempt"}],
+        }
+        for index, bank in enumerate(([attempt, official], [official, attempt])):
+            with self.subTest(order=index):
+                workspace = os.path.join(self.tmp, "legacy-taint-%d" % index)
+                payload = {
+                    "course_name": "Asset policy",
+                    "phases": [{
+                        "phase_num": 1, "phase_name": "Core",
+                        "wiki_filename": "ch1.md", "wiki_content": "# Core",
+                    }],
+                    "quiz_bank": bank,
+                }
+                result = run_ingest(payload, workspace)
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("student_attempt", result.stdout + result.stderr)
+                self.assertFalse(os.path.exists(os.path.join(
+                    workspace, "references", "retrieval_index.json"
+                )))
+
+    def test_structured_initial_ingest_blocks_foreign_attempt_tainted_concept(self):
+        workspace, input_obj = self.structured_input()
+        shared = "references/assets/shared.png"
+        input_obj["quiz_bank"][0]["knowledge_points"] = ["Sensitive concept"]
+        input_obj["quiz_bank"][0]["assets"] = [{
+            "path": shared, "role": "question_context",
+        }]
+        rows = input_obj["ingestion"]["content_units"]
+        q_index = next(i for i, row in enumerate(rows) if row["kind"] == "question")
+        question = dict(rows[q_index])
+        question["metadata"] = dict(question["metadata"])
+        question["metadata"]["assets"] = [{
+            "path": shared, "role": "question_context",
+        }]
+        official = ContentUnit.from_dict(question)
+        rows[q_index] = official.to_dict()
+        rows.append(ContentUnit.create(
+            official.source_id, official.source_sha256, official.source_file,
+            "figure", "Foreign student work", 1, ordinal=990,
+            chapter_id="ch02", phase_id="phase02",
+            asset_path=shared, asset_role="student_attempt",
+        ).to_dict())
+        asset = os.path.join(workspace, "references", "assets", "shared.png")
+        os.makedirs(os.path.dirname(asset), exist_ok=True)
+        with open(asset, "wb") as stream:
+            stream.write(b"\x89PNG\r\n\x1a\n")
+
+        result = run_ingest(input_obj, workspace, "--force")
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("student_attempt", result.stdout + result.stderr)
+        self.assertFalse(os.path.exists(os.path.join(
+            workspace, "references", "retrieval_index.json"
+        )))
+
+    def test_structured_initial_pair_alias_fails_before_any_derivative_write(self):
+        workspace, input_obj = self.structured_input()
+        shared = "references/assets/shared.png"
+        rows = input_obj["ingestion"]["content_units"]
+        question_index = next(i for i, row in enumerate(rows) if row["kind"] == "question")
+        answer_index = next(i for i, row in enumerate(rows) if row["kind"] == "answer")
+        question = dict(rows[question_index])
+        answer = dict(rows[answer_index])
+        self.assertEqual(answer["unit_id"], question["paired_unit_id"])
+        self.assertEqual(question["unit_id"], answer["paired_unit_id"])
+        question.update(asset_path=shared, asset_role="figure")
+        answer.update(
+            external_id=None,
+            asset_path=shared,
+            asset_role="worked_solution",
+        )
+        rows[question_index] = ContentUnit.from_dict(question).to_dict()
+        rows[answer_index] = ContentUnit.from_dict(answer).to_dict()
+        # Hostile legacy spelling is injected only after typed model creation;
+        # the shared preflight must still compare it as the same physical file.
+        rows[answer_index]["asset_path"] = "references\\assets\\shared.png"
+
+        sentinels = {
+            "references/wiki/ch1.md": b"OLD WIKI",
+            "references/quiz_bank.json": b"OLD BANK",
+            "references/retrieval_index.json": b"OLD INDEX",
+            ".ingest/content_units.jsonl": b"OLD UNITS",
+            ".ingest/canonical_groups.jsonl": b"OLD FACTS",
+        }
+        for relative, payload in sentinels.items():
+            path = os.path.join(workspace, *relative.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as stream:
+                stream.write(payload)
+        before = self.workspace_snapshot(workspace)
+
+        result = run_ingest(input_obj, workspace, "--force")
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("both prompt and official answer", result.stdout + result.stderr)
+        self.assertEqual(before, self.workspace_snapshot(workspace))
+
     def test_structured_cli_reingest_does_not_reenter_mutation_lock(self):
         workspace, input_obj = self.structured_input()
         first = run_ingest(input_obj, workspace)
@@ -192,6 +301,42 @@ class IngestEndToEndTest(unittest.TestCase):
         self.assertNotIn("Core concept", wiki)
         persisted_input = json.loads(read(input_path))
         self.assertEqual("Replacement generation", persisted_input["course_name"])
+
+    def test_expected_input_sha_rejects_replaced_generation_inside_lock(self):
+        workspace, input_a = self.structured_input()
+        ingest_dir = os.path.join(workspace, ".ingest")
+        os.makedirs(ingest_dir, exist_ok=True)
+        input_path = os.path.join(ingest_dir, "source_raw_input.json")
+        with open(input_path, "w", encoding="utf-8") as stream:
+            json.dump(input_a, stream, ensure_ascii=False)
+        with open(input_path, "rb") as stream:
+            expected_sha256 = hashlib.sha256(stream.read()).hexdigest()
+
+        input_b = json.loads(json.dumps(input_a, ensure_ascii=False))
+        input_b["course_name"] = "Replacement generation"
+        input_b["phases"][0]["wiki_content"] = "# Chapter 1\nGENERATION B"
+
+        def replace_before_lock(_args, _output_dir):
+            replacement = input_path + ".next"
+            with open(replacement, "w", encoding="utf-8") as stream:
+                json.dump(input_b, stream, ensure_ascii=False)
+            os.replace(replacement, input_path)
+
+        argv = [
+            INGEST, "-i", input_path, "-o", workspace,
+            "--expected-input-sha256", expected_sha256,
+        ]
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            ingest_module, "_before_publication_lock", replace_before_lock
+        ), redirect_stdout(output), self.assertRaises(SystemExit) as stopped:
+            ingest_module.main()
+
+        self.assertEqual(1, stopped.exception.code)
+        self.assertIn("input generation drifted before compilation", output.getvalue())
+        self.assertFalse(os.path.exists(
+            os.path.join(workspace, "references", "wiki", "ch1.md")
+        ))
 
     def test_path_guard_error_is_reported_without_traceback(self):
         output = io.StringIO()
@@ -354,8 +499,27 @@ class IngestEndToEndTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(path))
         saved = json.loads(read(path))
         self.assertEqual(saved, [example])
+        index = json.loads(read(
+            self.tmp, "references", "retrieval_index.json"))
+        teaching_integrity = index["integrity"]["teaching_examples"]
+        self.assertEqual(
+            "references/teaching_examples.json", teaching_integrity["file"]
+        )
+        with open(path, "rb") as stream:
+            self.assertEqual(
+                hashlib.sha256(stream.read()).hexdigest(),
+                teaching_integrity["sha256"],
+            )
         report = json.loads(read(self.tmp, "ingest_report.json"))
         self.assertEqual(report["teaching_examples"], 1)
+        index = json.loads(read(
+            self.tmp, "references", "retrieval_index.json"))
+        with open(os.path.join(
+                self.tmp, "references", "teaching_examples.json"), "rb") as stream:
+            self.assertEqual(
+                hashlib.sha256(stream.read()).hexdigest(),
+                index["integrity"]["teaching_examples"]["sha256"],
+            )
         self.assertEqual(report["teaching_example_ids"], ["lecture_example_1_2"])
         self.assertEqual(report["teaching_examples_by_chapter"], {"1": 1})
         self.assertEqual(report["teaching_example_ids_by_chapter"],

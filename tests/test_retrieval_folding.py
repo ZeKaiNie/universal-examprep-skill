@@ -49,7 +49,10 @@ class RetrievalFoldingTest(unittest.TestCase):
         )
         folded = fold_units_for_retrieval([left, right], [group])
         self.assertEqual(1, len(folded))
-        chunks = chunk.chunk_units(folded)
+        policy = chunk._verified_asset_policy_from_layers(
+            content_units=[left, right], canonical_groups=[group]
+        )
+        chunks = chunk.chunk_units(folded, tainted_keys=policy)
         self.assertEqual(1, len(chunks))
         self.assertEqual(
             sorted((left["unit_id"], right["unit_id"])),

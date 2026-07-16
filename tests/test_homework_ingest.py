@@ -3,6 +3,7 @@
 inline solutions, provenance, source_type tagging, visual dependence, fail-loud orphans."""
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -11,7 +12,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import build_raw_input_from_workspace as B   # noqa: E402
 
-PNG = b"\x89PNG\r\n\x1a\nfakepng"
+PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+    "0000000c49444154789c63f8ffff3f0005fe02fe0def46b80000000049454e44ae426082"
+)
 
 
 class FakeBackend(object):
@@ -67,15 +71,25 @@ def _mk(tmp, names_texts):
     fake = {}
     for name, pages in names_texts.items():
         path = os.path.join(mat, "homework", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as f:
             f.write(b"%PDF-fake")
-        fake[name] = pages
+        fake[os.path.basename(name)] = pages
     return mat, FakeBackend(fake)
 
 
 def _run(mat, backend, extra=None):
-    argv = ["--materials", mat, "--out", os.path.join(mat, "..", "raw.json"),
-            "--report", os.path.join(mat, "..", "rep.json")] + (extra or [])
+    extra = list(extra or [])
+    if "--asset-root" in extra:
+        asset_root = extra[extra.index("--asset-root") + 1]
+        workspace = os.path.dirname(os.path.dirname(os.path.abspath(asset_root)))
+        out = os.path.join(workspace, ".ingest", "source_raw_input.json")
+        report_path = os.path.join(workspace, ".ingest", "parse_report.json")
+    else:
+        out = os.path.join(mat, "..", "raw.json")
+        report_path = os.path.join(mat, "..", "rep.json")
+    argv = ["--materials", mat, "--out", out,
+            "--report", report_path] + extra
     args = B.build_arg_parser().parse_args(argv)
     code, payload, report = B.run(args, backend=backend)
     return code, payload, report
@@ -194,7 +208,7 @@ class HomeworkIngest(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         mat, be = _mk(tmp, {"hw1.pdf": HW1, "hw1_sol.pdf": HW1_SOL})
         code, payload, report = _run(mat, be)
-        q3 = next(q for q in payload["quiz_bank"] if q["id"] == "hw_homework_hw1_3")
+        q3 = next(q for q in payload["quiz_bank"] if q["id"].endswith("_hw1_3"))
         self.assertNotIn("answer", q3)
         self.assertEqual(q3["answer_status"], "unknown")
         self.assertTrue(any(w.startswith("hw_unanswered: hw_homework_hw1_3") for w in report["warnings"]))
@@ -221,10 +235,10 @@ class HomeworkIngest(unittest.TestCase):
 
     def test_visual_dependent_homework_renders_assets(self):
         tmp = tempfile.mkdtemp()
-        mat, be = _mk(tmp, {"hw1.pdf": HW1, "hw1_sol.pdf": HW1_SOL})
+        mat, be = _mk(tmp, {"ch01/hw1.pdf": HW1, "ch01/hw1_sol.pdf": HW1_SOL})
         asset_root = os.path.join(tmp, "ws", "references", "assets")
         code, payload, report = _run(mat, be, ["--asset-root", asset_root])
-        q3 = next(q for q in payload["quiz_bank"] if q["id"] == "hw_homework_hw1_3")
+        q3 = next(q for q in payload["quiz_bank"] if q["id"].endswith("_hw1_3"))
         self.assertIs(q3["requires_assets"], True)                # Venn/shown at right → 图依赖
         self.assertTrue(q3["assets"])
         self.assertEqual(q3["assets"][0]["role"], "question_context")
@@ -260,13 +274,18 @@ class HomeworkIngest(unittest.TestCase):
         # e2e: builder → ingest.py → validate_workspace.py（真 CLI），homework 项带标签通过校验
         import subprocess
         tmp = tempfile.mkdtemp()
-        mat, be = _mk(tmp, {"hw1.pdf": HW1, "hw1_sol.pdf": HW1_SOL})
-        raw = os.path.join(tmp, "raw.json")
+        mat, be = _mk(tmp, {
+            "hw1_ch01.pdf": HW1,
+            "hw1_ch01_sol.pdf": HW1_SOL,
+        })
         ws = os.path.join(tmp, "ws")
+        raw = os.path.join(ws, ".ingest", "source_raw_input.json")
+        report_path = os.path.join(ws, ".ingest", "parse_report.json")
         args = B.build_arg_parser().parse_args(["--materials", mat, "--out", raw,
-                                                "--report", os.path.join(tmp, "rep.json"),
+                                                "--report", report_path,
                                                 "--asset-root", os.path.join(ws, "references", "assets")])
         code, payload, report = B.run(args, backend=be)
+        os.makedirs(os.path.dirname(raw), exist_ok=True)
         json.dump(payload, open(raw, "w", encoding="utf-8"), ensure_ascii=False)
         r1 = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "ingest.py"),
                              "-i", raw, "-o", ws], capture_output=True, text=True, encoding="utf-8")
@@ -336,7 +355,7 @@ class HomeworkIngest(unittest.TestCase):
 
     def test_marker_only_prompt_becomes_page_reference(self):
         tmp = tempfile.mkdtemp()
-        mat, be = _mk(tmp, {"hw7.pdf": ["Problem 1\n"]})          # 只有标题，真题面是页上的图
+        mat, be = _mk(tmp, {"ch01/hw7.pdf": ["Problem 1\n"]})  # 只有标题，真题面是页上的图
         asset_root = os.path.join(tmp, "ws", "references", "assets")
         code, payload, report = _run(mat, be, ["--asset-root", asset_root])
         q = next(x for x in payload["quiz_bank"] if x.get("source_type") == "homework")
@@ -817,7 +836,7 @@ class HomeworkIngest(unittest.TestCase):
 
     def test_numeric_only_body_is_page_reference(self):
         tmp = tempfile.mkdtemp()
-        mat, be = _mk(tmp, {"hw30.pdf": ["Problem 1\n12\n\nProblem 2\n2+2=?"]})
+        mat, be = _mk(tmp, {"ch01/hw30.pdf": ["Problem 1\n12\n\nProblem 2\n2+2=?"]})
         asset_root = os.path.join(tmp, "ws", "references", "assets")
         code, payload, report = _run(mat, be, ["--asset-root", asset_root])
         hw = {q["homework_number"]: q for q in payload["quiz_bank"] if q.get("source_type") == "homework"}
@@ -1037,8 +1056,8 @@ class HomeworkIngest(unittest.TestCase):
 
     def test_visual_answer_for_text_question_rendered(self):
         tmp = tempfile.mkdtemp()
-        mat, be = _mk(tmp, {"hw17.pdf": ["Problem 1\n纯文本题面，直接作答。"],
-                            "hw17_sol.pdf": ["Problem 1\nAnswer 1: see the graph below for the shape."]})
+        mat, be = _mk(tmp, {"ch01/hw17.pdf": ["Problem 1\n纯文本题面，直接作答。"],
+                            "ch01/hw17_sol.pdf": ["Problem 1\nAnswer 1: see the graph below for the shape."]})
         asset_root = os.path.join(tmp, "ws", "references", "assets")
         code, payload, report = _run(mat, be, ["--asset-root", asset_root])
         q = next(x for x in payload["quiz_bank"] if x.get("source_type") == "homework")
@@ -2986,7 +3005,7 @@ class HomeworkIngest(unittest.TestCase):
 
     def test_adjacent_page_rendered_for_next_page_figure(self):
         tmp = tempfile.mkdtemp()
-        mat, be = _mk(tmp, {"hw127.pdf": ["Problem 1\n见下页图，求最短路径。", "图在此页。"]})
+        mat, be = _mk(tmp, {"ch01/hw127.pdf": ["Problem 1\n见下页图，求最短路径。", "图在此页。"]})
         asset_root = os.path.join(tmp, "ws", "references", "assets")
         code, payload, report = _run(mat, be, ["--asset-root", asset_root])
         hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
@@ -3021,7 +3040,7 @@ class HomeworkIngest(unittest.TestCase):
 
     def test_adjacent_answer_page_never_becomes_prompt_asset(self):
         tmp = tempfile.mkdtemp()
-        mat, be = _mk(tmp, {"hw128.pdf": ["Problem 1\n见下页图，求最短路径。",
+        mat, be = _mk(tmp, {"ch01/hw128.pdf": ["Problem 1\n见下页图，求最短路径。",
                                           "Answer 1: 官方答案在此页。"]})
         asset_root = os.path.join(tmp, "ws", "references", "assets")
         code, payload, report = _run(mat, be, ["--asset-root", asset_root])
@@ -3031,7 +3050,7 @@ class HomeworkIngest(unittest.TestCase):
 
     def test_residue_figure_page_still_renderable_as_adjacent(self):
         tmp = tempfile.mkdtemp()
-        mat, be = _mk(tmp, {"hw129.pdf": ["Problem 1\n见下页图，求电路电流。", "37"]})
+        mat, be = _mk(tmp, {"ch01/hw129.pdf": ["Problem 1\n见下页图，求电路电流。", "37"]})
         asset_root = os.path.join(tmp, "ws", "references", "assets")
         code, payload, report = _run(mat, be, ["--asset-root", asset_root])
         hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
@@ -3093,7 +3112,7 @@ class HomeworkIngest(unittest.TestCase):
 
     def test_cn_adjacent_answer_page_never_prompt_asset(self):
         tmp = tempfile.mkdtemp()
-        mat, be = _mk(tmp, {"hw130.pdf": ["Problem 1\n见下页图，求值。", "答案：42。"]})
+        mat, be = _mk(tmp, {"ch01/hw130.pdf": ["Problem 1\n见下页图，求值。", "答案：42。"]})
         asset_root = os.path.join(tmp, "ws", "references", "assets")
         code, payload, report = _run(mat, be, ["--asset-root", asset_root])
         hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
@@ -3145,7 +3164,7 @@ class HomeworkIngest(unittest.TestCase):
 
     def test_adjacent_render_anchored_to_cue_page(self):
         tmp = tempfile.mkdtemp()
-        mat, be = _mk(tmp, {"hw131.pdf": ["Problem 1\n见下页图，求值。", "题面续页，无线索。",
+        mat, be = _mk(tmp, {"ch01/hw131.pdf": ["Problem 1\n见下页图，求值。", "题面续页，无线索。",
                                           "Problem 2\n下一题的题面。"]})
         asset_root = os.path.join(tmp, "ws", "references", "assets")
         code, payload, report = _run(mat, be, ["--asset-root", asset_root])
@@ -3173,6 +3192,19 @@ class HomeworkIngest(unittest.TestCase):
         )
         with open(fixture_path, encoding="utf-8") as stream:
             fixture = json.load(stream)
+        # Exercise the real mixed case: the submitted PDF contributes prompt + student-work
+        # crops and misleading OCR answer text, while a separate official solution page
+        # contributes the only material answer/context.
+        fixture["texts"]["hw_scan.pdf"][1] = (
+            "Answer 1.1.2: SUBMISSION OCR says the wrong value"
+        )
+        fixture["texts"]["hw_scan.pdf"][3] = (
+            "Answer 1.2.1: SUBMISSION OCR also disagrees"
+        )
+        fixture["texts"]["hw_scan_sol.pdf"] = [
+            "Problem 1.1.2\nAnswer 1.1.2: official one; see the graph below\n\n"
+            "Problem 1.2.1\nAnswer 1.2.1: official two; see the graph below"
+        ]
         tmp = tempfile.mkdtemp()
         mat, _unused = _mk(tmp, fixture["texts"])
         backend = LayoutBackend(fixture)
@@ -3190,6 +3222,9 @@ class HomeworkIngest(unittest.TestCase):
             item = homework[number]
             self.assertEqual(item["chapter"], expected["chapter"])
             self.assertEqual(item["source_pages"], expected["source_pages"])
+            self.assertIn("official", item["answer"].lower())
+            self.assertNotIn("submission ocr", item["answer"].lower())
+            self.assertTrue(item["answer_source_file"].endswith("hw_scan_sol.pdf"))
             self.assertNotIn(1, item["source_pages"])  # roster is not a prompt page
             self.assertNotIn("student answer", item["question"])
             question_assets = [
@@ -3200,35 +3235,83 @@ class HomeworkIngest(unittest.TestCase):
                 asset for asset in item["assets"]
                 if asset["role"] == "answer_context"
             ]
+            attempt_assets = [
+                asset for asset in item["assets"]
+                if asset["role"] == "student_attempt"
+            ]
             self.assertEqual(len(question_assets), 1)
             self.assertTrue(answer_assets)
+            self.assertTrue(attempt_assets)
             self.assertEqual(question_assets[0]["type"], "crop_image")
-            self.assertTrue(all(asset["type"] == "crop_image" for asset in answer_assets))
+            self.assertTrue(all(asset["type"] == "crop_image" for asset in attempt_assets))
+            self.assertTrue(all(asset["type"] == "page_image" for asset in answer_assets))
             self.assertTrue(all(
                 asset["source_file"] == item["source_file"]
                 for asset in question_assets
             ))
             self.assertTrue(all(
-                asset["source_file"] in {
-                    item["source_file"], item.get("answer_source_file")
-                }
+                asset["source_file"] == item["source_file"]
+                and re.fullmatch(r"[0-9a-f]{64}", asset["source_sha256"])
+                for asset in attempt_assets
+            ))
+            self.assertTrue(all(
+                asset["source_file"] == item["answer_source_file"]
+                and re.fullmatch(r"[0-9a-f]{64}", asset["source_sha256"])
                 for asset in answer_assets
             ))
             self.assertIn("source_bbox_pdf_points", question_assets[0])
             self.assertFalse(
                 set(asset["path"] for asset in question_assets)
-                & set(asset["path"] for asset in answer_assets)
+                & set(asset["path"] for asset in attempt_assets)
             )
             if number == "1.1.2":
                 # The continuation page is useful answer evidence, but it must
                 # never expand the question provenance beyond the prompt crop.
-                self.assertTrue(any("p.3" in asset["caption"] for asset in answer_assets))
+                self.assertTrue(any("p.3" in asset["caption"] for asset in attempt_assets))
                 self.assertNotIn(3, item["source_pages"])
+            question_unit = next(
+                row for row in payload["ingestion"]["content_units"]
+                if row["kind"] == "question" and row.get("external_id") == item["id"]
+            )
+            persisted_attempts = [
+                asset for asset in question_unit["metadata"].get("assets", [])
+                if asset["role"] == "student_attempt"
+            ]
+            persisted_official = [
+                asset for asset in question_unit["metadata"].get("assets", [])
+                if asset["role"] == "answer_context"
+            ]
+            self.assertEqual(len(attempt_assets), len(persisted_attempts))
+            self.assertEqual(len(answer_assets), len(persisted_official))
+            self.assertTrue(all(
+                asset["source_file"] == item["source_file"]
+                and re.fullmatch(r"[0-9a-f]{64}", asset["source_sha256"])
+                for asset in persisted_attempts
+            ))
+            answer_unit = next(
+                row for row in payload["ingestion"]["content_units"]
+                if row["kind"] == "answer" and row.get("external_id") == item["id"]
+            )
+            self.assertEqual("answer_context", answer_unit.get("asset_role"))
+            self.assertIn(answer_unit.get("asset_path"), {
+                asset["path"] for asset in answer_assets
+            })
+            self.assertEqual(len(attempt_assets), len([
+                asset for asset in answer_unit["metadata"].get("assets", [])
+                if asset["role"] == "student_attempt"
+            ]))
+            self.assertEqual(len(answer_assets), len([
+                asset for asset in answer_unit["metadata"].get("assets", [])
+                if asset["role"] == "answer_context"
+            ]))
         self.assertEqual(report["homework_roster_files"], 1)
         self.assertEqual(report["homework_prompt_crops"], 2)
         self.assertEqual(report["homework_answer_crops"], 4)
         self.assertEqual(len(backend.clip_calls), 6)
-        self.assertEqual(backend.page_calls, [])  # never fall back to an answer-bearing page
+        self.assertEqual(
+            [("hw_scan_sol.pdf", 1), ("hw_scan_sol.pdf", 1)],
+            backend.page_calls,
+        )
         mapping_reviews = [
             entry for entry in report["ai_review"]
             if entry.get("kind") == "homework_roster_visual_mapping_unverified"
@@ -3240,6 +3323,54 @@ class HomeworkIngest(unittest.TestCase):
             {"hw_homework_hw_scan_1_1_2", "hw_homework_hw_scan_1_2_1"},
         )
         self.assertIn("Visually compare every printed prompt crop", mapping_reviews[0]["action"])
+
+    def test_roster_submission_ocr_answer_is_not_material_without_paired_solution(self):
+        fixture_path = os.path.join(
+            ROOT, "tests", "fixtures", "homework_roster_layout_gold.json"
+        )
+        with open(fixture_path, encoding="utf-8") as stream:
+            fixture = json.load(stream)
+        fixture["texts"].pop("hw_scan_sol.pdf")
+        fixture["texts"]["hw_scan.pdf"][1] = (
+            "Answer 1.1.2: SUBMISSION OCR must not become official"
+        )
+        fixture["texts"]["hw_scan.pdf"][3] = (
+            "Answer 1.2.1: SUBMISSION OCR must remain student work"
+        )
+        tmp = tempfile.mkdtemp()
+        mat, _unused = _mk(tmp, fixture["texts"])
+        backend = LayoutBackend(fixture)
+        asset_root = os.path.join(tmp, "ws", "references", "assets")
+
+        code, payload, report = _run(mat, backend, ["--asset-root", asset_root])
+
+        self.assertEqual(0, code, report)
+        homework = [
+            item for item in payload["quiz_bank"]
+            if item.get("source_type") == "homework"
+        ]
+        self.assertEqual(2, len(homework))
+        units = payload["ingestion"]["content_units"]
+        reviews = payload["ingestion"]["review_candidates"]
+        for item in homework:
+            self.assertNotIn("answer", item)
+            self.assertEqual("unknown", item["answer_status"])
+            self.assertTrue(any(
+                asset["role"] == "student_attempt" for asset in item.get("assets", [])
+            ))
+            question = next(
+                row for row in units
+                if row["kind"] == "question" and row.get("external_id") == item["id"]
+            )
+            self.assertFalse(any(
+                row["kind"] == "answer" and row.get("external_id") == item["id"]
+                for row in units
+            ))
+            self.assertTrue(any(
+                "missing_answer" in (review.get("reason_codes") or [])
+                and question["unit_id"] in (review.get("target_unit_ids") or [])
+                for review in reviews
+            ))
 
     def test_hw7_roster_expanded_fallback_recovers_all_12_prompt_crops(self):
         fixture = _hw7_roster_fixture()

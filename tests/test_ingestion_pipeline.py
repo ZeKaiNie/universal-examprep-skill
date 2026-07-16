@@ -3,8 +3,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
-from scripts import validate_workspace
+from scripts.asset_policy import physical_asset_key
+from scripts import retrieve, validate_workspace
 from scripts.ingestion import (
     ContentUnit,
     IngestionStore,
@@ -21,11 +23,14 @@ from scripts.ingestion.dedup import (
 )
 from scripts.ingestion.identifiers import file_sha256
 from scripts.ingestion.pipeline import (
+    _assert_publishable_qa,
     _deduplicate_bound_candidates,
+    _metadata_assets,
     _new_quiz_item,
     _update_quiz_item_from_units,
     build_payload,
     compile_review_outputs,
+    compile_structured_visuals,
     persist_payload,
 )
 from scripts.ingestion.storage import atomic_write_json, atomic_write_jsonl
@@ -80,6 +85,78 @@ class IngestionPipelineTest(unittest.TestCase):
                 }],
             },
         )
+
+    @staticmethod
+    def asset_unit(unit_id, assets=(), asset_path=None, asset_role=None):
+        return SimpleNamespace(
+            unit_id=unit_id,
+            metadata={"assets": list(assets)},
+            asset_path=asset_path,
+            asset_role=asset_role,
+        )
+
+    def test_metadata_assets_is_attempt_dominant_order_invariant_and_canonical(self):
+        official = self.asset_unit("official", assets=({
+            "path": "references/assets/X.png",
+            "role": "question_context",
+            "type": "crop_image",
+        },))
+        attempt = self.asset_unit(
+            "attempt",
+            asset_path="references\\assets\\X.png",
+            asset_role="student_attempt",
+        )
+        first = _metadata_assets(official, attempt)
+        second = _metadata_assets(attempt, official)
+        self.assertEqual(first, second)
+        self.assertEqual("references/assets/X.png", first[0]["path"])
+        self.assertEqual("student_attempt", first[0]["role"])
+
+    def test_metadata_assets_rejects_missing_role_and_conflicting_metadata(self):
+        missing = self.asset_unit("missing", assets=({
+            "path": "references/assets/x.png",
+            "type": "crop_image",
+        },))
+        with self.assertRaisesRegex(ValueError, "role"):
+            _metadata_assets(missing)
+
+        first = self.asset_unit("first", assets=({
+            "path": "references/assets/x.png",
+            "role": "question_context",
+            "caption": "first",
+        },))
+        second = self.asset_unit("second", assets=({
+            "path": "references/assets/x.png",
+            "role": "figure",
+            "caption": "second",
+        },))
+        with self.assertRaisesRegex(ValueError, "conflicting caption"):
+            _metadata_assets(first, second)
+
+    def test_publishable_qa_rejects_direct_leak_but_allows_distinct_attempt_path(self):
+        question = self.asset_unit("question", assets=({
+            "path": "references/assets/prompt.png", "role": "question_context",
+        }, {
+            "path": "references/assets/attempt.png", "role": "student_attempt",
+        }))
+        answer = self.asset_unit("answer", assets=({
+            "path": "references/assets/answer.png", "role": "worked_solution",
+        },))
+        tainted = {
+            physical_asset_key("references/assets/attempt.png")
+        }
+        _assert_publishable_qa(question, answer, tainted)
+        assets = _metadata_assets(question, answer, tainted_keys=tainted)
+        self.assertEqual(
+            {"question_context", "worked_solution", "student_attempt"},
+            {asset["role"] for asset in assets},
+        )
+
+        leaking_answer = self.asset_unit("leak", assets=({
+            "path": "references/assets/prompt.png", "role": "worked_solution",
+        },))
+        with self.assertRaisesRegex(ValueError, "both prompt and answer"):
+            _assert_publishable_qa(question, leaking_answer, tainted)
 
     def near_answer_conflict_payload(self):
         alternate = self.materials / "alternate.txt"
@@ -398,6 +475,42 @@ class IngestionPipelineTest(unittest.TestCase):
             ),
             errors,
         )
+
+    def test_validator_rejects_corrupt_content_unit_jpeg_with_matching_hash(self):
+        payload = self.payload(missing_answer=False)
+        seed = ContentUnit.from_dict(next(
+            row for row in payload["content_units"] if row["kind"] == "text"
+        ))
+        relative = "references/assets/corrupt-source.jpg"
+        corrupt = b"\xff\xd8\xff\xd9"
+        asset = self.workspace.joinpath(*relative.split("/"))
+        asset.parent.mkdir(parents=True)
+        asset.write_bytes(corrupt)
+        figure = ContentUnit.create(
+            seed.source_id,
+            seed.source_sha256,
+            seed.source_file,
+            "figure",
+            "Official source figure",
+            1,
+            ordinal=901,
+            chapter_id="ch01",
+            phase_id="phase01",
+            asset_path=relative,
+            asset_role="figure",
+            metadata={"asset_sha256": hashlib.sha256(corrupt).hexdigest()},
+        )
+        payload["content_units"].append(figure.to_dict())
+        persist_payload(self.workspace, payload)
+
+        errors, _warnings, _stats = validate_workspace.validate(
+            str(self.workspace)
+        )
+        self.assertTrue(any(
+            "ContentUnit 光栅资产损坏" in entry["msg"]
+            and figure.unit_id in entry["msg"]
+            for entry in errors
+        ), errors)
 
     def test_review_route_requires_exact_active_source_location_and_reason_issue(self):
         payload = self.payload()
@@ -1975,6 +2088,221 @@ class IngestionPipelineTest(unittest.TestCase):
             "ch01.txt", question["metadata"]["assets"][0]["source_file"]
         )
 
+    def test_persist_payload_rejects_globally_tainted_official_unit_before_write(self):
+        payload = self.payload(missing_answer=False)
+        seed = ContentUnit.from_dict(next(
+            row for row in payload["content_units"] if row["kind"] == "text"
+        ))
+        shared = "references/assets/shared.png"
+        attempt = ContentUnit.create(
+            seed.source_id, seed.source_sha256, seed.source_file,
+            "figure", "Student work", 1, ordinal=900,
+            chapter_id="ch02", phase_id="phase02",
+            asset_path=shared, asset_role="student_attempt",
+        )
+        official_visual = ContentUnit.create(
+            seed.source_id, seed.source_sha256, seed.source_file,
+            "figure", "Official visual", 1, ordinal=901,
+            chapter_id="ch01", phase_id="phase01",
+            asset_path=shared, asset_role="figure",
+        )
+        payload["content_units"].extend([
+            attempt.to_dict(), official_visual.to_dict(),
+        ])
+        with self.assertRaisesRegex(ValueError, "student_attempt-tainted"):
+            persist_payload(self.workspace, payload)
+        self.assertFalse((self.workspace / ".ingest").exists())
+
+    def test_persist_payload_audits_seeded_bank_with_payload_before_any_write(self):
+        payload = self.payload(missing_answer=False)
+        seed = ContentUnit.from_dict(next(
+            row for row in payload["content_units"] if row["kind"] == "text"
+        ))
+        shared = "references/assets/shared.png"
+        attempt = ContentUnit.create(
+            seed.source_id, seed.source_sha256, seed.source_file,
+            "figure", "Student work", 1, ordinal=920,
+            chapter_id="ch01", phase_id="phase01",
+            asset_path=shared, asset_role="student_attempt",
+        )
+        payload["content_units"].append(attempt.to_dict())
+
+        references = self.workspace / "references"
+        references.mkdir()
+        (references / "quiz_bank.json").write_text(json.dumps([{
+            "id": "seeded-q", "chapter": 1, "type": "subjective",
+            "question": "Explain the official prompt.", "answer": "Answer",
+            "source": "material", "source_file": "ch01.txt",
+            "source_pages": [1],
+            "assets": [{"path": shared, "role": "question_context"}],
+        }]), encoding="utf-8")
+        sentinel = self.workspace / "must-not-change.txt"
+        sentinel.write_bytes(b"NO WRITE")
+        before = {
+            path.relative_to(self.workspace).as_posix(): path.read_bytes()
+            for path in self.workspace.rglob("*") if path.is_file()
+        }
+
+        with self.assertRaisesRegex(ValueError, "student_attempt-tainted"):
+            persist_payload(self.workspace, payload)
+
+        after = {
+            path.relative_to(self.workspace).as_posix(): path.read_bytes()
+            for path in self.workspace.rglob("*") if path.is_file()
+        }
+        self.assertEqual(before, after)
+        self.assertFalse((self.workspace / ".ingest").exists())
+
+    def test_review_compile_rejects_cross_unit_attempt_laundering_without_bank_overwrite(self):
+        payload = self.payload(missing_answer=False)
+        shared = "references/assets/shared.png"
+        seed = ContentUnit.from_dict(next(
+            row for row in payload["content_units"] if row["kind"] == "text"
+        ))
+        attempt = ContentUnit.create(
+            seed.source_id, seed.source_sha256, seed.source_file,
+            "figure", "Foreign student work", 1, ordinal=990,
+            chapter_id="ch02", phase_id="phase02",
+            asset_path=shared, asset_role="student_attempt",
+        )
+        payload["content_units"].append(attempt.to_dict())
+        asset_dir = self.workspace / "references" / "assets"
+        asset_dir.mkdir(parents=True)
+        (asset_dir / "shared.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        persist_payload(self.workspace, payload)
+
+        # Introduce the laundering only through a real validated review patch,
+        # after the benign base generation has already been persisted.
+        store = IngestionStore(self.workspace, source_root=self.materials)
+        issue = next(
+            row for row in store.review_queue.issues()
+            if "pages_no_text" in row.reason_codes
+        )
+        recovered = ContentUnit.create(
+            seed.source_id, seed.source_sha256, seed.source_file,
+            "text", "Recovered text must stay hidden", 2, ordinal=991,
+            chapter_id="ch01", phase_id="phase01",
+            asset_path=shared, asset_role="figure",
+            method="ai_recovered", provenance="ai_recovered",
+        )
+        patch = ReviewPatch.create(
+            issue.issue_id, issue.source_id, issue.source_sha256,
+            [{"op": "add_unit", "unit": recovered.to_dict()}],
+            list(issue.evidence), reviewer="test",
+            created_at="2026-07-16T10:00:00Z", status="validated",
+        )
+        store.apply_patch(patch)
+
+        wiki = self.workspace / "references" / "wiki"
+        wiki.mkdir(parents=True)
+        (wiki / "ch01.md").write_text("# Chapter 1\n", encoding="utf-8")
+        quiz_path = self.workspace / "references" / "quiz_bank.json"
+        bank = [{
+            "id": "q1", "chapter": 1, "type": "subjective",
+            "question": "Explain the core concept.", "answer": "Official answer",
+            "source": "material", "source_file": "ch01.txt", "source_pages": [1],
+        }]
+        quiz_path.write_text(json.dumps(bank), encoding="utf-8")
+        retrieval_path = self.workspace / "references" / "retrieval_index.json"
+        retrieval_path.write_bytes(b"OLD INDEX")
+        watched = [
+            self.workspace / ".ingest" / "content_units.jsonl",
+            self.workspace / ".ingest" / "chapter_phase_mappings.jsonl",
+            self.workspace / ".ingest" / "canonical_groups.jsonl",
+            self.workspace / ".ingest" / "source_conflicts.jsonl",
+            self.workspace / "references" / "wiki" / "ch01.md",
+            quiz_path,
+            retrieval_path,
+        ]
+        before = {path: path.read_bytes() for path in watched}
+
+        with self.assertRaisesRegex(ValueError, "student_attempt-tainted"):
+            compile_structured_visuals(self.workspace)
+        self.assertEqual(before, {path: path.read_bytes() for path in watched})
+
+        with self.assertRaisesRegex(ValueError, "student_attempt-tainted"):
+            compile_review_outputs(self.workspace)
+        self.assertEqual(before, {path: path.read_bytes() for path in watched})
+
+    def test_review_compile_preflights_direct_attempt_question_before_all_writes(self):
+        payload = self.payload(missing_answer=True)
+        persist_payload(self.workspace, payload)
+        store = IngestionStore(self.workspace, source_root=self.materials)
+        issue = next(
+            row for row in store.review_queue.issues()
+            if "missing_answer" in row.reason_codes
+        )
+        attempt_path = "references/assets/student-attempt.png"
+        asset = self.workspace / "references" / "assets" / "student-attempt.png"
+        asset.parent.mkdir(parents=True)
+        asset.write_bytes(b"\x89PNG\r\n\x1a\n")
+        existing_question = next(
+            unit for unit in store.units().values()
+            if unit.kind == "question" and unit.external_id == "q1"
+        )
+        question_payload = existing_question.to_dict()
+        question_payload["asset_path"] = attempt_path
+        question_payload["asset_role"] = "student_attempt"
+        question = ContentUnit.from_dict(question_payload)
+        answer = ContentUnit.create(
+            question.source_id, question.source_sha256, question.source_file,
+            "answer", "Official answer", question.page,
+            ordinal=question.ordinal + 100, external_id="q1",
+            chapter_id=question.chapter_id, phase_id=question.phase_id,
+            metadata={"answer_source_pages": [question.page]},
+            method="ai_recovered", provenance="ai_recovered",
+        )
+        patch = ReviewPatch.create(
+            issue.issue_id, issue.source_id, issue.source_sha256,
+            [
+                {
+                    "op": "replace_unit",
+                    "unit_id": existing_question.unit_id,
+                    "unit": question.to_dict(),
+                },
+                {"op": "add_unit", "unit": answer.to_dict()},
+                {
+                    "op": "pair_qa",
+                    "question_unit_id": question.unit_id,
+                    "answer_unit_id": answer.unit_id,
+                },
+            ],
+            list(issue.evidence), reviewer="test",
+            created_at="2026-07-16T10:05:00Z", status="validated",
+        )
+        store.apply_patch(patch)
+
+        wiki = self.workspace / "references" / "wiki"
+        wiki.mkdir(parents=True)
+        wiki_path = wiki / "ch01.md"
+        wiki_path.write_bytes(b"# Chapter 1\n\nUNCHANGED WIKI\n")
+        quiz_path = self.workspace / "references" / "quiz_bank.json"
+        quiz_path.write_text(json.dumps([{
+            "id": "q1", "chapter": 1, "type": "subjective",
+            "question": "Explain the core concept.", "answer": "Official answer",
+            "source": "material", "source_file": "ch01.txt", "source_pages": [1],
+        }]), encoding="utf-8")
+        retrieval_path = self.workspace / "references" / "retrieval_index.json"
+        retrieval_path.write_bytes(b"UNCHANGED INDEX")
+        watched = [
+            self.workspace / ".ingest" / "content_units.jsonl",
+            self.workspace / ".ingest" / "chapter_phase_mappings.jsonl",
+            self.workspace / ".ingest" / "duplicate_candidates.jsonl",
+            self.workspace / ".ingest" / "canonical_groups.jsonl",
+            self.workspace / ".ingest" / "source_conflicts.jsonl",
+            self.workspace / ".ingest" / "source_priorities.jsonl",
+            wiki_path,
+            quiz_path,
+            retrieval_path,
+        ]
+        self.assertTrue(all(path.is_file() for path in watched))
+        before = {path: path.read_bytes() for path in watched}
+
+        with self.assertRaisesRegex(ValueError, "is student_attempt evidence"):
+            compile_review_outputs(self.workspace)
+
+        self.assertEqual(before, {path: path.read_bytes() for path in watched})
+
     def test_validated_answer_patch_compiles_and_survives_base_resync(self):
         payload = self.payload()
         persist_payload(self.workspace, payload)
@@ -2080,6 +2408,81 @@ class IngestionPipelineTest(unittest.TestCase):
         )
         self.assertEqual(2, index["version"])
         self.assertIn("content_units", index["integrity"])
+
+    def test_teaching_attempt_mutation_stales_and_blocks_asset_index_rebuild(self):
+        payload = self.payload(missing_answer=False)
+        shared = "references/assets/official-prompt.png"
+        rows = payload["content_units"]
+        question_index = next(
+            index for index, row in enumerate(rows) if row["kind"] == "question"
+        )
+        question = dict(rows[question_index])
+        question["metadata"] = dict(question.get("metadata") or {})
+        question["metadata"]["assets"] = [{
+            "path": shared, "role": "question_context",
+        }]
+        rows[question_index] = ContentUnit.from_dict(question).to_dict()
+
+        references = self.workspace / "references"
+        references.mkdir()
+        teaching_path = references / "teaching_examples.json"
+        teaching_path.write_text("[]\n", encoding="utf-8")
+        asset = references / "assets" / "official-prompt.png"
+        asset.parent.mkdir()
+        asset.write_bytes(b"\x89PNG\r\n\x1a\n")
+        persist_payload(self.workspace, payload)
+
+        wiki = references / "wiki"
+        wiki.mkdir()
+        (wiki / "ch01.md").write_text("# Chapter 1\n\nCore concept\n", encoding="utf-8")
+        quiz_path = references / "quiz_bank.json"
+        quiz_path.write_text(json.dumps([{
+            "id": "q1", "chapter": 1, "type": "subjective",
+            "question": "Explain the core concept.", "answer": "Official answer",
+            "source": "material", "source_file": "ch01.txt", "source_pages": [1],
+            "assets": [{"path": shared, "role": "question_context"}],
+        }]), encoding="utf-8")
+
+        compile_review_outputs(self.workspace)
+        retrieval_path = references / "retrieval_index.json"
+        clean_index = retrieve.load_index(str(self.workspace))
+        self.assertEqual(
+            "references/teaching_examples.json",
+            clean_index["integrity"]["teaching_examples"]["file"],
+        )
+        self.assertEqual(
+            file_sha256(teaching_path),
+            clean_index["integrity"]["teaching_examples"]["sha256"],
+        )
+
+        hostile = [{
+            "id": "foreign-student-attempt", "chapter": 2,
+            "type": "subjective", "question": "Student work",
+            "source_file": "foreign.pdf", "source_pages": [1],
+            "teaching_role": "worked_example",
+            "assets": [{"path": shared, "role": "student_attempt"}],
+        }]
+        teaching_path.write_text(json.dumps(hostile), encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            retrieve.load_index(str(self.workspace))
+        errors, _warnings, _stats = validate_workspace.validate(str(self.workspace))
+        self.assertTrue(any(
+            "retrieval_index.json" in entry["msg"] for entry in errors
+        ), errors)
+
+        stale_bytes = retrieval_path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "student_attempt-tainted"):
+            compile_review_outputs(self.workspace)
+        self.assertEqual(stale_bytes, retrieval_path.read_bytes())
+
+        # Removing the hostile declaration permits a fresh exact binding; no
+        # attempt role survives in the rebuilt retrieval corpus.
+        teaching_path.write_text("[]\n", encoding="utf-8")
+        compile_review_outputs(self.workspace)
+        rebuilt = retrieve.load_index(str(self.workspace))
+        self.assertFalse(any(
+            "student_attempt" in doc["asset_roles"] for doc in rebuilt["docs"]
+        ))
 
 
 if __name__ == "__main__":
