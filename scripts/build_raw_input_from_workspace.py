@@ -925,14 +925,8 @@ def _boxes_connected(left, right, gap):
             or (vertical_gap <= gap and horizontal_overlap))
 
 
-def _prompt_image_cluster(layout):
-    """Find a separable upper-page prompt image cluster from PDF layout facts.
-
-    Repeated image motifs (tiled paper backgrounds and repeated answer-table
-    templates) are excluded.  The accepted cluster must be wide, start near
-    the top, and leave enough page area that it cannot be a whole-page scan
-    containing both prompt and handwritten answer.
-    """
+def _prompt_image_components(layout):
+    """Return wide-image components after excluding repeated page motifs."""
     if not isinstance(layout, dict):
         return None
     page_bbox = layout.get("page_bbox")
@@ -976,6 +970,21 @@ def _prompt_image_cluster(layout):
         components[base] = _bbox_union((components[base], box))
         for index in reversed(touching[1:]):
             components[base] = _bbox_union((components[base], components.pop(index)))
+    return list(page_bbox), width, height, components
+
+
+def _prompt_image_cluster(layout):
+    """Find one conservative upper-page prompt image cluster.
+
+    Repeated image motifs (tiled paper backgrounds and repeated answer-table
+    templates) are excluded.  The accepted cluster must be wide, start near
+    the top, and leave enough page area that it cannot be a whole-page scan
+    containing both prompt and handwritten answer.
+    """
+    facts = _prompt_image_components(layout)
+    if facts is None:
+        return None
+    page_bbox, width, height, components = facts
     candidates = []
     for component in components:
         component_width = component[2] - component[0]
@@ -989,6 +998,43 @@ def _prompt_image_cluster(layout):
     if not candidates:
         return None
     return min(candidates, key=lambda box: (box[1], -(box[2] - box[0])))
+
+
+def _inset_bbox(bbox, inset):
+    """Inset all sides of a PDF-point rectangle, or return no usable interior."""
+    inner = [
+        float(bbox[0]) + float(inset), float(bbox[1]) + float(inset),
+        float(bbox[2]) - float(inset), float(bbox[3]) - float(inset),
+    ]
+    return inner if inner[2] > inner[0] and inner[3] > inner[1] else None
+
+
+def _expanded_prompt_image_clusters(layout, text_inset=8.0):
+    """Find roster-only prompt candidates at any vertical page position.
+
+    This deliberately returns *all* candidates so the caller can require both
+    exact roster cardinality and at most one candidate on each page.  A native
+    text box intersecting the candidate's 8-point inset interior rejects it;
+    the inset tolerates harmless PDF extraction noise that only touches a crop
+    boundary while still failing closed on text/handwriting inside the raster.
+    """
+    facts = _prompt_image_components(layout)
+    if facts is None:
+        return []
+    unused_page_bbox, width, height, components = facts
+    page_area = width * height
+    candidates = []
+    for component in components:
+        component_width = component[2] - component[0]
+        component_height = component[3] - component[1]
+        area_ratio = component_width * component_height / page_area
+        if component_width < 0.55 * width or area_ratio > 0.80:
+            continue
+        interior = _inset_bbox(component, text_inset)
+        if interior is None or _bbox_has_text(layout, interior):
+            continue
+        candidates.append(component)
+    return sorted(candidates, key=lambda box: (box[1], box[0], box[3], box[2]))
 
 
 def _bbox_has_text(layout, bbox):
@@ -1077,7 +1123,8 @@ def _homework_roster_route(pages, source_file, backend):
             ),
         }
     layouts = {}
-    anchors = []
+    conservative_anchors = []
+    expanded_by_page = {}
     scan_evidence = False
     scan_pages = []
     try:
@@ -1098,10 +1145,11 @@ def _homework_roster_route(pages, source_file, backend):
             if crop is not None:
                 scan_evidence = True
                 scan_pages.append(page["page"])
-                anchors.append({
+                conservative_anchors.append({
                     "page": page["page"], "crop": crop,
                     "page_bbox": list(layout["page_bbox"]),
                 })
+            expanded_by_page[page["page"]] = _expanded_prompt_image_clusters(layout)
     except Exception as exc:
         return {
             "status": "review",
@@ -1109,6 +1157,47 @@ def _homework_roster_route(pages, source_file, backend):
             "entries": roster["entries"],
             "reason": "layout inspection failed: %s" % exc,
         }
+    geometry_route = "conservative_upper_page"
+    anchors = conservative_anchors
+    if len(conservative_anchors) != len(roster["entries"]):
+        expanded_anchors = []
+        ambiguous_pages = []
+        for page in source_pages:
+            if page.get("page") in roster_pages:
+                continue
+            candidates = expanded_by_page.get(page["page"]) or []
+            if len(candidates) > 1:
+                ambiguous_pages.append((page["page"], len(candidates)))
+                continue
+            if len(candidates) == 1:
+                expanded_anchors.append({
+                    "page": page["page"], "crop": candidates[0],
+                    "page_bbox": list(layouts[page["page"]]["page_bbox"]),
+                })
+        expanded_pages = [anchor["page"] for anchor in expanded_anchors]
+        if expanded_pages or ambiguous_pages:
+            scan_evidence = True
+            scan_pages.extend(expanded_pages)
+            scan_pages.extend(page for page, unused_count in ambiguous_pages)
+        if ambiguous_pages:
+            return {
+                "status": "review",
+                "pages": sorted(set(
+                    roster["pages"] + scan_pages
+                    + [page for page, unused_count in ambiguous_pages]
+                )),
+                "entries": roster["entries"],
+                "reason": (
+                    "expanded roster fallback requires at most one prompt image "
+                    "candidate per page after the 8-point inset native-text gate; "
+                    "found %s"
+                ) % ", ".join(
+                    "page %d=%d" % pair for pair in ambiguous_pages
+                ),
+            }
+        if len(expanded_anchors) == len(roster["entries"]):
+            anchors = expanded_anchors
+            geometry_route = "expanded_roster_fallback"
     # Native text pages may use the ordinary slicer.  OCR text over a scan is
     # categorically different: it can contain an unlabeled handwritten answer,
     # so its matching problem-number set is only a routing hint, never proof.
@@ -1135,9 +1224,14 @@ def _homework_roster_route(pages, source_file, backend):
             )),
             "entries": roster["entries"],
             "reason": (
-                "roster has %d problems but scan/layout evidence proves %d "
-                "prompt-only image anchors"
-            ) % (len(roster["entries"]), len(anchors)),
+                "roster has %d problems but prompt-only image anchors do not "
+                "match: the conservative upper-page rule proves %d anchors and "
+                "the expanded roster fallback proves %d single-candidate anchors "
+                "after the 8-point inset native-text gate"
+            ) % (
+                len(roster["entries"]), len(conservative_anchors),
+                len(expanded_anchors),
+            ),
         }
     page_positions = {page["page"]: index for index, page in enumerate(source_pages)}
     plans = {}
@@ -1183,6 +1277,7 @@ def _homework_roster_route(pages, source_file, backend):
     return {
         "status": "visual", "pages": roster["pages"],
         "entries": roster["entries"], "plans": plans,
+        "geometry_route": geometry_route,
     }
 
 
@@ -1610,6 +1705,7 @@ def extract_homework_items(pages, root_name="", exclude=frozenset(), backend=Non
                 "kind": "homework_roster_visual_mapping_unverified",
                 "file": hf,
                 "pages": review_pages,
+                "geometry_route": roster_route.get("geometry_route"),
                 "external_ids": [
                     "%s_%s_%s" % (
                         "exam" if hf in exam_files else "hw", stem,
@@ -1620,8 +1716,11 @@ def extract_homework_items(pages, root_name="", exclude=frozenset(), backend=Non
                 "action": (
                     "The parser proved prompt-only geometry but not the semantic roster-to-crop "
                     "labels. Visually compare every printed prompt crop with the roster in order; "
-                    "confirm each problem number and that no handwriting is question-side before "
-                    "resolving this artifact-critical review."
+                    "confirm each problem number, that no handwriting is question-side, and that "
+                    "the prompt is self-contained. A referenced prerequisite, missing table, or "
+                    "missing subquestion must be attached as additional prompt-only evidence; a "
+                    "crop is never made complete merely by passing geometry. Resolve this "
+                    "artifact-critical review only after those checks."
                 ),
             })
         prob_nums = {m["num"] for m in probs if m["num"] is not None}

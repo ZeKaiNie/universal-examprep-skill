@@ -81,6 +81,97 @@ def _run(mat, backend, extra=None):
     return code, payload, report
 
 
+HW7_ROSTER_LAYOUT = [
+    ("5.3.1", 2, [124.63200378417969, 0.0, 486.44677734375, 501.4912109375]),
+    ("5.3.3", 4, [55.180328369140625, 144.0, 560.6307373046875, 402.9419860839844]),
+    ("5.4.2", 5, [54.0, 108.00003051757812, 558.3735961914062, 527.638916015625]),
+    ("5.5.2", 7, [89.71269989013672, 144.0, 524.2877807617188, 417.6986999511719]),
+    ("5.5.5", 8, [90.0, 360.0, 522.57421875, 570.2319946289062]),
+    ("5.6.2", 9, [54.0, 468.0000305175781, 553.2578125, 782.1644287109375]),
+    ("5.6.6", 10, [54.0, 576.0000610351562, 557.4240112304688, 784.1573486328125]),
+    ("5.7.4", 11, [55.180328369140625, 287.9999694824219, 557.0831298828125, 569.8170776367188]),
+    ("5.7.12", 12, [90.0, 251.99996948242188, 520.472412109375, 645.0399780273438]),
+    ("5.8.2", 14, [91.18032836914062, 10.02691650390625, 524.0361328125, 388.71630859375]),
+    ("5.8.6", 16, [124.9573974609375, 10.986480712890625, 486.0, 485.6005859375]),
+    ("5.8.8", 18, [55.180328369140625, 325.03778076171875, 557.951904296875, 539.445068359375]),
+]
+
+
+def _hw7_roster_fixture():
+    """Synthetic layout facts modeled on the 12-problem HW7 regression."""
+    roster = "Homework 7\n" + "\n".join(
+        "%d. Problem %s" % (index, number)
+        for index, (number, unused_page, unused_bbox) in enumerate(
+            HW7_ROSTER_LAYOUT, 1
+        )
+    )
+    texts = [roster] + ["student work page %d" % page for page in range(2, 20)]
+    solution = "\n\n".join(
+        "Problem %s\nAnswer: official solution %s" % (number, number)
+        for number, unused_page, unused_bbox in HW7_ROSTER_LAYOUT
+    )
+    page_bbox = [0.0, 0.0, 612.0, 792.0]
+    by_page = {page: (number, bbox) for number, page, bbox in HW7_ROSTER_LAYOUT}
+    answer_text = {
+        2: [[55.0, 510.0, 545.0, 780.0]],
+        4: [[55.0, 410.0, 545.0, 780.0]],
+        5: [[55.0, 535.0, 545.0, 780.0]],
+        7: [[55.0, 425.0, 545.0, 780.0]],
+        # These next three boxes cross the raw crop boundary by less than 8pt.
+        # The inset gate admits the prompt raster without admitting handwriting.
+        8: [[55.0, 567.54, 545.0, 780.0]],
+        9: [[55.0, 450.0, 545.0, 474.42]],
+        10: [[55.0, 550.0, 545.0, 581.0]],
+        11: [[55.0, 575.0, 545.0, 780.0]],
+        12: [[55.0, 650.0, 545.0, 780.0]],
+        14: [[55.0, 395.0, 545.0, 780.0]],
+        16: [[55.0, 492.0, 545.0, 780.0]],
+        18: [[55.0, 545.0, 545.0, 780.0]],
+    }
+    layouts = []
+    for page in range(1, 20):
+        if page == 1:
+            layouts.append({
+                "page_bbox": list(page_bbox), "images": [],
+                "text_boxes": [[40.0, 40.0, 560.0, 300.0]],
+            })
+            continue
+        images = []
+        for row in range(3):
+            for column in range(3):
+                images.append({
+                    "image_id": "repeated-graph-paper",
+                    "bbox": [
+                        204.0 * column, 264.0 * row,
+                        204.0 * (column + 1), 264.0 * (row + 1),
+                    ],
+                })
+        if page in by_page:
+            number, bbox = by_page[page]
+            if number == "5.3.1":
+                split = 320.2018127441406
+                images.extend([
+                    {"image_id": "prompt-%s-a" % number,
+                     "bbox": [bbox[0], bbox[1], bbox[2], split]},
+                    {"image_id": "prompt-%s-b" % number,
+                     "bbox": [bbox[0], split, bbox[2], bbox[3]]},
+                ])
+            else:
+                images.append({"image_id": "prompt-%s" % number, "bbox": list(bbox)})
+        layouts.append({
+            "page_bbox": list(page_bbox), "images": images,
+            "text_boxes": list(answer_text.get(page, [[55.0, 20.0, 545.0, 780.0]])),
+        })
+    return {
+        "texts": {"hw7.pdf": texts, "hw7_sol.pdf": [solution]},
+        "layouts": {"hw7.pdf": layouts},
+        "expected": {
+            number: {"page": page, "bbox": list(bbox)}
+            for number, page, bbox in HW7_ROSTER_LAYOUT
+        },
+    }
+
+
 class HomeworkIngest(unittest.TestCase):
     def test_separate_solution_pdf_paired(self):
         tmp = tempfile.mkdtemp()
@@ -3142,6 +3233,145 @@ class HomeworkIngest(unittest.TestCase):
             {"hw_homework_hw_scan_1_1_2", "hw_homework_hw_scan_1_2_1"},
         )
         self.assertIn("Visually compare every printed prompt crop", mapping_reviews[0]["action"])
+
+    def test_hw7_roster_expanded_fallback_recovers_all_12_prompt_crops(self):
+        fixture = _hw7_roster_fixture()
+        tmp = tempfile.mkdtemp()
+        mat, _unused = _mk(tmp, fixture["texts"])
+        backend = LayoutBackend(fixture)
+        asset_root = os.path.join(tmp, "ws", "references", "assets")
+
+        code, payload, report = _run(mat, backend, ["--asset-root", asset_root])
+
+        self.assertEqual(0, code, report)
+        homework = {
+            str(item["homework_number"]): item for item in payload["quiz_bank"]
+            if item.get("source_type") == "homework"
+        }
+        self.assertEqual(set(fixture["expected"]), set(homework))
+        self.assertEqual(12, report["homework_prompt_crops"])
+        self.assertEqual(6, sum(
+            B._prompt_image_cluster(layout) is not None
+            for layout in fixture["layouts"]["hw7.pdf"][1:]
+        ))
+        for number, expected in fixture["expected"].items():
+            item = homework[number]
+            self.assertEqual([expected["page"]], item["source_pages"])
+            # Geometry recovery never upgrades a roster-only label to full text.
+            self.assertEqual("page_reference", item["question_text_status"])
+            question_assets = [
+                asset for asset in item["assets"]
+                if asset.get("role") == "question_context"
+            ]
+            self.assertEqual(1, len(question_assets))
+            self.assertEqual(
+                expected["bbox"], question_assets[0]["source_bbox_pdf_points"]
+            )
+        lower_prompt_pages = {8, 9, 10, 11, 12, 18}
+        self.assertTrue(lower_prompt_pages <= {
+            item["source_pages"][0] for item in homework.values()
+        })
+        self.assertEqual([], backend.page_calls)
+
+        mapping = [
+            row for row in report["ai_review"]
+            if row.get("kind") == "homework_roster_visual_mapping_unverified"
+        ]
+        self.assertEqual(1, len(mapping))
+        self.assertEqual("expanded_roster_fallback", mapping[0]["geometry_route"])
+        self.assertEqual(
+            set(item["id"] for item in homework.values()),
+            set(mapping[0]["external_ids"]),
+        )
+        self.assertIn("referenced prerequisite", mapping[0]["action"])
+        self.assertIn("missing table", mapping[0]["action"])
+        self.assertIn("missing subquestion", mapping[0]["action"])
+        self.assertIn("never made complete merely by passing geometry", mapping[0]["action"])
+        # The known p9/p14 semantic boundaries stay unresolved and page-referenced.
+        for number in ("5.6.2", "5.8.2"):
+            self.assertEqual("page_reference", homework[number]["question_text_status"])
+            self.assertIn(homework[number]["id"], mapping[0]["external_ids"])
+
+    def test_hw7_roster_extra_answer_raster_breaks_exact_cardinality(self):
+        fixture = _hw7_roster_fixture()
+        page_13 = fixture["layouts"]["hw7.pdf"][12]
+        page_13["text_boxes"] = []
+        page_13["images"].append({
+            "image_id": "unique-answer-raster",
+            "bbox": [80.0, 300.0, 532.0, 650.0],
+        })
+        tmp = tempfile.mkdtemp()
+        mat, _unused = _mk(tmp, fixture["texts"])
+        backend = LayoutBackend(fixture)
+
+        code, payload, report = _run(mat, backend)
+
+        self.assertEqual(0, code, report)
+        self.assertFalse([
+            item for item in payload["quiz_bank"]
+            if item.get("source_type") == "homework"
+        ])
+        review = next(
+            row for row in report["ai_review"]
+            if row.get("kind") == "homework_prompt_crop_unsafe_leakage"
+        )
+        self.assertIn("roster has 12 problems", review["action"])
+        self.assertIn("expanded roster fallback proves 13", review["action"])
+        self.assertEqual([], backend.clip_calls)
+        self.assertEqual([], backend.page_calls)
+
+    def test_hw7_roster_expanded_fallback_allows_only_one_candidate_per_page(self):
+        fixture = _hw7_roster_fixture()
+        page_13 = fixture["layouts"]["hw7.pdf"][12]
+        page_13["text_boxes"] = []
+        page_13["images"].extend([
+            {"image_id": "ambiguous-a", "bbox": [60.0, 40.0, 550.0, 250.0]},
+            {"image_id": "ambiguous-b", "bbox": [60.0, 400.0, 550.0, 610.0]},
+        ])
+        tmp = tempfile.mkdtemp()
+        mat, _unused = _mk(tmp, fixture["texts"])
+        backend = LayoutBackend(fixture)
+
+        code, payload, report = _run(mat, backend)
+
+        self.assertEqual(0, code, report)
+        self.assertFalse([
+            item for item in payload["quiz_bank"]
+            if item.get("source_type") == "homework"
+        ])
+        review = next(
+            row for row in report["ai_review"]
+            if row.get("kind") == "homework_prompt_crop_unsafe_leakage"
+        )
+        self.assertIn("at most one prompt image candidate per page", review["action"])
+        self.assertIn("page 13=2", review["action"])
+        self.assertEqual([], backend.clip_calls)
+        self.assertEqual([], backend.page_calls)
+
+    def test_hw7_roster_expanded_fallback_rejects_interior_native_text(self):
+        fixture = _hw7_roster_fixture()
+        fixture["layouts"]["hw7.pdf"][17]["text_boxes"].append(
+            [100.0, 350.0, 500.0, 500.0]
+        )
+        tmp = tempfile.mkdtemp()
+        mat, _unused = _mk(tmp, fixture["texts"])
+        backend = LayoutBackend(fixture)
+
+        code, payload, report = _run(mat, backend)
+
+        self.assertEqual(0, code, report)
+        self.assertFalse([
+            item for item in payload["quiz_bank"]
+            if item.get("source_type") == "homework"
+        ])
+        review = next(
+            row for row in report["ai_review"]
+            if row.get("kind") == "homework_prompt_crop_unsafe_leakage"
+        )
+        self.assertIn("expanded roster fallback proves 11", review["action"])
+        self.assertIn("8-point inset native-text gate", review["action"])
+        self.assertEqual([], backend.clip_calls)
+        self.assertEqual([], backend.page_calls)
 
     def test_roster_ocr_problem_markers_do_not_leak_unlabelled_handwriting(self):
         fixture_path = os.path.join(
