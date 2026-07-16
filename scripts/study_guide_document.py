@@ -28,6 +28,10 @@ SOURCE_TYPE_LABELS = {
     "textbook": ("教材", "Textbook"),
     "other": ("其他资料", "Other material"),
 }
+SOURCE_INVENTORY_ABSENCE = (
+    "当前工作区/资料集中未提供。",
+    "Not provided in the current workspace/material set.",
+)
 
 PROVENANCE_LABELS = {
     "material": ("🟢 来自资料", "🟢 From your materials"),
@@ -47,6 +51,7 @@ LABELS = {
     "coverage": ("覆盖证明", "Coverage proof"),
     "coverage_line": ("{kp} 个知识点；{done}/{expected} 道例题；模式：{profile}",
                       "{kp} knowledge points; {done}/{expected} examples; profile: {profile}"),
+    "source_inventory": ("例题来源清单", "Example source inventory"),
     "contents": ("本章路线", "Chapter route"),
     "knowledge_point": ("知识点 {index}", "Knowledge point {index}"),
     "plain_explanation": ("先用白话讲懂", "Start with the plain-language idea"),
@@ -100,6 +105,49 @@ def _label(language, key, **values):
     if language == "en":
         return en.format(**values)
     return "%s / %s" % (zh.format(**values), en.format(**values))
+
+
+def _source_inventory_language(counts, code, bilingual=False):
+    label_index = 0 if code == "zh" else 1
+    separator = "：" if code == "zh" else ": "
+    rows = []
+    for source_type, labels in SOURCE_TYPE_LABELS.items():
+        count = counts.get(source_type, 0)
+        label = labels[label_index]
+        if count:
+            text = "%s%s%d" % (label, separator, count)
+        elif source_type in ("mock_exam", "past_exam"):
+            absence = SOURCE_INVENTORY_ABSENCE[label_index]
+            text = "%s%s0 — %s" % (label, separator, absence)
+        else:
+            continue
+        rows.append("<li>%s</li>" % html.escape(text))
+    prefix = (
+        '<span class="en-prefix">EN · </span>'
+        if bilingual and code == "en" else ""
+    )
+    return (
+        '<div lang="%s">%s<ul>%s</ul></div>' % (
+            "zh-CN" if code == "zh" else "en",
+            prefix,
+            "".join(rows),
+        )
+    )
+
+
+def _source_inventory(walkthroughs, language):
+    counts = Counter(row["source_type"] for row in walkthroughs)
+    codes = ("zh", "en") if language == "bilingual" else (language,)
+    blocks = "".join(
+        _source_inventory_language(counts, code, language == "bilingual")
+        for code in codes
+    )
+    return (
+        '<section class="source-inventory"><p>'
+        '<strong>%s</strong></p>%s</section>' % (
+            html.escape(_label(language, "source_inventory")), blocks,
+        )
+    )
 
 
 def _localized_text(renderer, value, language, css="localized"):
@@ -512,8 +560,7 @@ def render_manifest(workspace, manifest, math_converter=None, materials_root=Non
                 _source_trace(omission["source_refs"], materials_root)))
         omissions = '<section class="omissions"><h2>%s</h2><ul>%s</ul></section>' % (
             html.escape(_label(language, "omissions")), "".join(rows))
-    counts = Counter(row["source_type"] for row in manifest["walkthroughs"])
-    buckets = " · ".join("%s: %d" % (key, counts[key]) for key in sorted(counts))
+    source_inventory = _source_inventory(manifest["walkthroughs"], language)
     route = "".join('<li><code>%s</code> · %s</li>' %
                     (html.escape(kp["id"]), _localized_heading(kp["title"], language))
                     for kp in manifest["knowledge_points"])
@@ -526,18 +573,18 @@ def render_manifest(workspace, manifest, math_converter=None, materials_root=Non
 :root{--ink:#172033;--muted:#59677f;--line:#d9e2ef;--accent:#2457c5;--blue:#eef6ff;--violet:#f6f2ff;--green:#eaf8ef;}
 *{box-sizing:border-box}html{background:#edf1f7}body{max-width:1040px;margin:0 auto;padding:36px 46px 90px;background:#fff;color:var(--ink);font:17px/1.7 "Segoe UI","Microsoft YaHei","Noto Sans CJK SC",sans-serif}
 h1{font-size:2.2rem;line-height:1.18;margin:.2em 0}h2{font-size:1.65rem;line-height:1.3;border-bottom:3px solid var(--accent);padding-bottom:.25em;margin:2em 0 .8em}h3{font-size:1.25rem;margin:1.45em 0 .55em}h4{margin:1.1em 0 .4em}h5{margin:.75em 0 .3em}p{margin:.5em 0}ul,ol{padding-left:1.6em}li{margin:.28em 0}
-.hero{border-bottom:1px solid var(--line);padding-bottom:1.1em}.subtitle,.eyebrow,.chapter-marker,.source-box,.coverage-detail{color:var(--muted)}.coverage{background:#f4f7fb;border-left:5px solid var(--accent);padding:.8em 1em;margin:1.2em 0}.route{columns:2}.heading-en,.lang-en{display:block;margin-top:.2em}.heading-en,.en-prefix{color:#315689;font-size:.92em}.localized>p:first-child{margin-top:.2em}.compact p{display:inline}.formula-card{border:1px solid var(--line);border-radius:12px;padding:1em 1.15em;margin:.8em 0}.formula-display{text-align:center;overflow-x:auto;background:#f8fafc;border-radius:8px;padding:.55em;margin:.6em 0}.formula-display p{margin:0}.variables,table{width:100%%;border-collapse:collapse;margin:.7em 0}th,td{border:1px solid #bdc9d9;padding:.5em .65em;vertical-align:top}th{background:#edf3fb}.source-box{border-left:3px solid #a9bad2;padding:.25em .7em;margin:.8em 0;font-size:.88rem}.source-list{margin:.2em 0}
+.hero{border-bottom:1px solid var(--line);padding-bottom:1.1em}.subtitle,.eyebrow,.chapter-marker,.source-box{color:var(--muted)}.coverage{background:#f4f7fb;border-left:5px solid var(--accent);padding:.8em 1em;margin:1.2em 0}.route{columns:2}.heading-en,.lang-en{display:block;margin-top:.2em}.heading-en,.en-prefix{color:#315689;font-size:.92em}.localized>p:first-child{margin-top:.2em}.compact p{display:inline}.formula-card{border:1px solid var(--line);border-radius:12px;padding:1em 1.15em;margin:.8em 0}.formula-display{text-align:center;overflow-x:auto;background:#f8fafc;border-radius:8px;padding:.55em;margin:.6em 0}.formula-display p{margin:0}.variables,table{width:100%%;border-collapse:collapse;margin:.7em 0}th,td{border:1px solid #bdc9d9;padding:.5em .65em;vertical-align:top}th{background:#edf3fb}.source-box{border-left:3px solid #a9bad2;padding:.25em .7em;margin:.8em 0;font-size:.88rem}.source-list{margin:.2em 0}
  .example-card{border:1px solid var(--line);border-radius:16px;margin:1.3em 0;overflow:hidden;box-shadow:0 3px 14px rgba(30,55,90,.07)}.example-card:target{outline:4px solid #dcae29}.example-header{padding:1em 1.2em}.example-header h3{margin:.2em 0}.kp-uses{padding:.2em 1.2em .9em;background:#f8fafc}.cross-reference a,.source-list a{color:var(--accent);text-decoration:underline}.prompt-zone{background:var(--blue);padding:1em 1.2em}.walkthrough-zone{background:var(--violet);padding:1em 1.2em}.formula-use{background:#fff;border:1px solid #dcd7eb;border-radius:10px;padding:.8em 1em;margin:.9em 0}.notice{background:#fff8df;border-left:4px solid #dcae29;padding:.55em .8em}.quantity-grid{display:grid;grid-template-columns:1fr 1fr;gap:1em}.quantity-grid>div{background:#fff8;padding:.4em .8em;border-radius:8px}.quantity-value{margin:.15em 0 .4em}.substitution{font-size:1.05em}.final-answer{background:var(--green);border-left:5px solid #3f9b60;padding:.65em .9em;margin:1em 0}.answer-language+.answer-language{border-top:1px solid #b9d8c3;margin-top:.7em;padding-top:.6em}.self-check{background:#fff;border:1px dashed #9aacbf;padding:.65em .9em}.translation{background:#fff9dd;border-left:4px solid #dcae29;padding:.5em .8em;margin:.7em 0}.source-asset{text-align:center;margin:1em auto}.source-asset img{display:block;max-width:100%%;max-height:76vh;margin:auto;border:1px solid var(--line);border-radius:8px}.source-asset figcaption{font-size:.82rem;color:var(--muted);margin-top:.3em}code{font-family:Consolas,monospace;background:#edf1f5;padding:.08em .25em;border-radius:4px}.omissions,.semantic-exclusions{background:#fff8df;padding:1em}
 @page{size:A4;margin:16mm 14mm 18mm;@bottom-center{content:"%s " counter(page) " / " counter(pages);font-size:9pt;color:#667085}}
 @media print{html,body{background:#fff}body{max-width:none;padding:0;font-size:10.5pt}.hero{break-after:page}.knowledge-section{break-before:page}.knowledge-section:first-of-type{break-before:auto}h2,h3,h4,h5{break-after:avoid}.mapped-examples-heading{break-before:page}.formula-card,.formula-use,.final-answer,.self-check,table,figure,.example-header,.kp-uses{break-inside:avoid}.example-header,.kp-uses{break-after:avoid}.example-card{box-shadow:none;overflow:visible}.prompt-zone,.walkthrough-zone{break-inside:auto}.source-asset img{max-height:95mm}.route{columns:2}}
 </style></head><body><header class="hero"><p class="subtitle">%s</p><h1>%s</h1>
-<div class="coverage"><strong>%s</strong><p>%s</p><p class="coverage-detail">%s</p></div>
+<div class="coverage"><strong>%s</strong><p>%s</p>%s</div>
   <h2>%s</h2><ol class="route">%s</ol></header><main>%s%s%s</main></body></html>""" % (
         html.escape(lang_attr, quote=True), html.escape(title), html.escape(_label(language, "page")),
         html.escape(_label(language, "subtitle")), html.escape(title), html.escape(_label(language, "coverage")),
         html.escape(_label(language, "coverage_line", kp=len(manifest["knowledge_points"]),
                            done=len(manifest["walkthroughs"]), expected=len(report["expected_item_ids"]),
-                           profile=manifest["profile"])), html.escape(buckets),
+                           profile=manifest["profile"])), source_inventory,
         html.escape(_label(language, "contents")), route, "".join(sections),
         semantic_exclusions, omissions)
     validate_guide_document(

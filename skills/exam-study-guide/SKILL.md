@@ -100,6 +100,7 @@ Use only `$...$` and `$$...$$` as formula delimiters in source Markdown. Forms s
 
 - Produce `study_guide/chNN.html` as an offline document with inline CSS, native MathML, and data-URI images. It must require no network, CDN, script, or browser extension.
 - Dispatch every agent-authored heading, explanation, step, answer, and receipt from canonical `zh|en|bilingual`. Bilingual content is complete blockwise zh+en—not merely bilingual UI chrome. Source quotations/images stay original-language evidence and use the translation rule above.
+- In the hero, inventory typed-walkthrough `source_type`s in the active language(s). Missing `mock_exam`/`past_exam`: “not provided in the current workspace/material set”; scoped zeroes neither alter the denominator nor imply global absence.
 - Place prompt-side assets first and answer-side assets later. The printable Study Guide contains no hidden `details`, answer toggle, form control, or screen-only answer.
 - Retain `source_file`, the adapter's honest location anchors (for example PDF page, PPTX slide, XLSX worksheet, or DOCX logical segment), and the canonical provenance labels from the workspace.
 - Produce `study_guide/chNN.receipt.json` with manifest/HTML/PDF hashes, exact coverage of the current chapter's de-duplicated teaching-example + all-bank-item + typed-question-unit ID denominator, selected backend/converter, and QA state. This does not prove semantic recall of every source claim. Never claim completion from file existence alone.

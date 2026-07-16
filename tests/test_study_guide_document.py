@@ -192,6 +192,94 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
             self.materials, "lecture", "ch01.pdf")).resolve().as_uri() + "#page=4"
         self.assertIn('href="%s"' % expected_uri, document)
 
+    def test_source_inventory_is_localized_in_hero_for_every_language(self):
+        cases = {
+            "zh": (
+                ("课件 / 讲义：1", "模拟考试：0 — 当前工作区/资料集中未提供。",
+                 "往年考试：0 — 当前工作区/资料集中未提供。"),
+                ("Lecture / handout: 1", "Not provided in the current workspace/material set."),
+            ),
+            "en": (
+                ("Lecture / handout: 1",
+                 "Mock exam: 0 — Not provided in the current workspace/material set.",
+                 "Past exam: 0 — Not provided in the current workspace/material set."),
+                ("课件 / 讲义：1", "当前工作区/资料集中未提供。"),
+            ),
+            "bilingual": (
+                ("课件 / 讲义：1", "Lecture / handout: 1",
+                 "模拟考试：0 — 当前工作区/资料集中未提供。",
+                 "Mock exam: 0 — Not provided in the current workspace/material set.",
+                 "往年考试：0 — 当前工作区/资料集中未提供。",
+                 "Past exam: 0 — Not provided in the current workspace/material set."),
+                (),
+            ),
+        }
+        for language, (expected, excluded) in cases.items():
+            with self.subTest(language=language):
+                self._json("study_state.json", {"language": language})
+                manifest = self.manifest()
+                manifest["language"] = language
+                document, report = self._render(manifest)
+                match = re.search(
+                    r'<section class="source-inventory">.*?</section>', document, re.S)
+                self.assertIsNotNone(match)
+                inventory = match.group(0)
+                for text in expected:
+                    self.assertIn(text, inventory)
+                for text in excluded:
+                    self.assertNotIn(text, inventory)
+                self.assertLess(document.index(inventory), document.index('<ol class="route">'))
+                self.assertEqual(["ex-lecture-1"], report["expected_item_ids"])
+                self.assertEqual(["ex-lecture-1"], report["walkthrough_item_ids"])
+
+    def test_source_inventory_counts_mock_and_past_without_zero_claims(self):
+        walks = [
+            {"source_type": "other"},
+            {"source_type": "mock_exam"},
+            {"source_type": "lecture"},
+            {"source_type": "past_exam"},
+            {"source_type": "mock_exam"},
+            {"source_type": "quiz"},
+        ]
+        inventory = sgd._source_inventory(walks, "en")
+        expected_order = (
+            "Lecture / handout: 1", "Quiz: 1", "Mock exam: 2",
+            "Past exam: 1", "Other material: 1",
+        )
+        positions = [inventory.index(text) for text in expected_order]
+        self.assertEqual(sorted(positions), positions)
+        self.assertNotIn("Mock exam: 0", inventory)
+        self.assertNotIn("Past exam: 0", inventory)
+        self.assertNotIn("Homework", inventory)
+        self.assertNotIn("Textbook", inventory)
+
+    def test_source_inventory_escapes_labels_and_scoped_absence_text(self):
+        with mock.patch.dict(
+                sgd.SOURCE_TYPE_LABELS,
+                {"lecture": ("讲义<测试>&", 'Lecture <script>&"')}
+        ), mock.patch.object(
+                sgd, "SOURCE_INVENTORY_ABSENCE",
+                ("当前<范围>&", 'Not <provided> & "scoped".')
+        ):
+            inventory = sgd._source_inventory([{"source_type": "lecture"}], "bilingual")
+        self.assertIn("讲义&lt;测试&gt;&amp;：1", inventory)
+        self.assertIn("Lecture &lt;script&gt;&amp;&quot;: 1", inventory)
+        self.assertIn("当前&lt;范围&gt;&amp;", inventory)
+        self.assertIn("Not &lt;provided&gt; &amp; &quot;scoped&quot;.", inventory)
+        self.assertNotIn("<script>", inventory)
+        self.assertNotIn("<provided>", inventory)
+
+    def test_source_inventory_uses_only_source_type_not_course_specific_fields(self):
+        inventory = sgd._source_inventory([{
+            "source_type": "quiz",
+            "item_id": "EEC-160-course-specific-marker",
+            "title": both("不应进入来源清单", "Must not enter the source inventory"),
+        }], "en")
+        self.assertIn("Quiz: 1", inventory)
+        self.assertNotIn("EEC", inventory)
+        self.assertNotIn("160", inventory)
+        self.assertNotIn("course-specific-marker", inventory)
+
     def test_figure_only_keeps_original_prompt_and_image(self):
         manifest = self.manifest()
         walk = manifest["walkthroughs"][0]
