@@ -1,12 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Render a validated typed chapter manifest as a real study guide.
-
-The legacy renderer can still build a source packet.  This module owns the stricter teaching
-document: knowledge points are followed by every mapped example exactly once, formulas are
-rendered as MathML, full-prompt images are not followed by duplicated OCR, and every example
-contains the complete worked-solution contract.
-"""
+# Render a validated typed chapter manifest as a real study guide. The stricter teaching
+# document maps every example once, renders formulas as MathML, avoids duplicated full-prompt
+# OCR, and keeps the complete worked-solution contract. The legacy source packet remains.
 
 from collections import Counter
 import html
@@ -28,7 +24,7 @@ SOURCE_TYPE_LABELS = {
     "textbook": ("教材", "Textbook"),
     "other": ("其他资料", "Other material"),
 }
-SOURCE_INVENTORY_ABSENCE = (
+SOURCE_ABSENCE = (
     "当前工作区/资料集中未提供。",
     "Not provided in the current workspace/material set.",
 )
@@ -107,47 +103,25 @@ def _label(language, key, **values):
     return "%s / %s" % (zh.format(**values), en.format(**values))
 
 
-def _source_inventory_language(counts, code, bilingual=False):
-    label_index = 0 if code == "zh" else 1
-    separator = "：" if code == "zh" else ": "
-    rows = []
-    for source_type, labels in SOURCE_TYPE_LABELS.items():
-        count = counts.get(source_type, 0)
-        label = labels[label_index]
-        if count:
-            text = "%s%s%d" % (label, separator, count)
-        elif source_type in ("mock_exam", "past_exam"):
-            absence = SOURCE_INVENTORY_ABSENCE[label_index]
-            text = "%s%s0 — %s" % (label, separator, absence)
-        else:
-            continue
-        rows.append("<li>%s</li>" % html.escape(text))
-    prefix = (
-        '<span class="en-prefix">EN · </span>'
-        if bilingual and code == "en" else ""
-    )
-    return (
-        '<div lang="%s">%s<ul>%s</ul></div>' % (
-            "zh-CN" if code == "zh" else "en",
-            prefix,
-            "".join(rows),
-        )
-    )
-
-
 def _source_inventory(walkthroughs, language):
     counts = Counter(row["source_type"] for row in walkthroughs)
-    codes = ("zh", "en") if language == "bilingual" else (language,)
-    blocks = "".join(
-        _source_inventory_language(counts, code, language == "bilingual")
-        for code in codes
-    )
-    return (
-        '<section class="source-inventory"><p>'
-        '<strong>%s</strong></p>%s</section>' % (
-            html.escape(_label(language, "source_inventory")), blocks,
-        )
-    )
+    lines = []
+    for code in (("zh", "en") if language == "bilingual" else (language,)):
+        en = code == "en"
+        items = []
+        for source_type, labels in SOURCE_TYPE_LABELS.items():
+            count = counts.get(source_type, 0)
+            if not count and source_type not in ("mock_exam", "past_exam"):
+                continue
+            value = count or "0 — %s" % SOURCE_ABSENCE[en]
+            items.append(html.escape("%s%s%s" % (
+                labels[en], ": " if en else "：", value)))
+        lines.append('<span lang="%s">%s<strong>%s</strong> %s</span>' % (
+            code,
+            '<span class="en-prefix">EN · </span>' if en and language == "bilingual" else "",
+            html.escape(LABELS["source_inventory"][en]), " · ".join(items),
+        ))
+    return '<p class="source-inventory">%s</p>' % "<br>".join(lines)
 
 
 def _localized_text(renderer, value, language, css="localized"):

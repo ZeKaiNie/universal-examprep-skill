@@ -221,7 +221,7 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
                 manifest["language"] = language
                 document, report = self._render(manifest)
                 match = re.search(
-                    r'<section class="source-inventory">.*?</section>', document, re.S)
+                    r'<p class="source-inventory">.*?</p>', document, re.S)
                 self.assertIsNotNone(match)
                 inventory = match.group(0)
                 for text in expected:
@@ -258,7 +258,7 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
                 sgd.SOURCE_TYPE_LABELS,
                 {"lecture": ("讲义<测试>&", 'Lecture <script>&"')}
         ), mock.patch.object(
-                sgd, "SOURCE_INVENTORY_ABSENCE",
+                sgd, "SOURCE_ABSENCE",
                 ("当前<范围>&", 'Not <provided> & "scoped".')
         ):
             inventory = sgd._source_inventory([{"source_type": "lecture"}], "bilingual")
