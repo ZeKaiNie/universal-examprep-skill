@@ -662,6 +662,8 @@ def _conflict_member(unit, fingerprint, unit_index, priorities):
 
 
 def build_source_conflicts(candidates, units, priorities=()):
+    """Promote divergent near matches to conflicts only across sources."""
+
     index = _unit_index(units)
     priority_by_revision = _priority_index(priorities)
     rows = [
@@ -679,6 +681,8 @@ def build_source_conflicts(candidates, units, priorities=()):
         conflict_kind = next(kind for kind in kind_order if kind in candidate.conflict_signals)
         left = index[candidate.left.unit_id]
         right = index[candidate.right.unit_id]
+        if left["source_id"] == right["source_id"]:
+            continue
         conflicts.append(
             SourceConflict.create(
                 candidate_id=candidate.candidate_id,
