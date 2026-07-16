@@ -134,6 +134,62 @@ class IngestionDedupTest(unittest.TestCase):
         self.assertIn("numeric_mismatch", facts["conflicts"][0].reason_codes)
         self.assertTrue(all(member.priority_rank == 0 for member in facts["conflicts"][0].members))
 
+    def test_same_source_formula_variants_remain_candidates_not_conflicts(self):
+        left = unit(
+            r"P(G_2\mid G_1)=P(B_2\mid B_1)=\frac{3}{4}",
+            1,
+            kind="formula",
+        )
+        right = unit(
+            r"P(B_2\mid G_1)=P(G_2\mid B_1)=\frac{1}{4}",
+            2,
+            kind="formula",
+        )
+        facts = build_dedup_facts((left, right), (SOURCE_A,))
+        near = [row for row in facts["candidates"] if row.match_kind == "near"]
+        self.assertEqual(1, len(near))
+        self.assertIn("formula_mismatch", near[0].conflict_signals)
+        self.assertIn("numeric_mismatch", near[0].conflict_signals)
+        self.assertEqual(0, len(facts["conflicts"]))
+
+    def test_cross_source_formula_variants_still_fail_closed(self):
+        left = unit(
+            r"P(G_2\mid G_1)=P(B_2\mid B_1)=\frac{3}{4}",
+            1,
+            kind="formula",
+        )
+        right = unit(
+            r"P(B_2\mid G_1)=P(G_2\mid B_1)=\frac{1}{4}",
+            2,
+            SOURCE_B,
+            "materials/b.txt",
+            kind="formula",
+        )
+        facts = build_dedup_facts((left, right), (SOURCE_A, SOURCE_B))
+        self.assertEqual(1, len(facts["conflicts"]))
+        self.assertEqual("numeric_mismatch", facts["conflicts"][0].conflict_kind)
+
+    def test_same_source_visual_variants_do_not_become_source_conflicts(self):
+        left = unit(
+            "Use the diagram to identify the traversal shown in this question.",
+            1,
+            kind="question",
+            asset_path="assets/a.png",
+            asset_role="question_context",
+        )
+        right = unit(
+            "Use the diagram to identify the traversal shown in this question.",
+            2,
+            kind="question",
+            asset_path="assets/b.png",
+            asset_role="question_context",
+        )
+        facts = build_dedup_facts((left, right), (SOURCE_A,))
+        near = [row for row in facts["candidates"] if row.match_kind == "near"]
+        self.assertEqual(1, len(near))
+        self.assertIn("visual_context_mismatch", near[0].conflict_signals)
+        self.assertEqual(0, len(facts["conflicts"]))
+
     def test_structural_theorem_numbers_do_not_create_false_numeric_conflict(self):
         left = unit(
             "Theorem 7.8\n"
