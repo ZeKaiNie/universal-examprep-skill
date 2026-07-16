@@ -94,6 +94,7 @@ QUIZ_SOURCES = frozenset(("teacher", "material", "ai_generated", "mixed", "unkno
 QUIZ_SOURCE_TYPES = frozenset(
     ("homework", "lecture_quiz", "example", "practice_exam", "exam", "other")
 )
+QUESTION_TEXT_STATUSES = frozenset(("full", "stub", "page_reference"))
 CONTENT_METADATA_FIELDS = frozenset(
     (
         "quiz_type",
@@ -109,6 +110,12 @@ CONTENT_METADATA_FIELDS = frozenset(
         "assets",
         "requires_assets",
         "maybe_requires_assets",
+        "gradable",
+        "question_text_status",
+        "diagram_type",
+        "language",
+        "expected_behavior",
+        "tests",
         "answer_value",
         "asset_sha256",
         "source_language",
@@ -578,6 +585,28 @@ class ContentUnit:
                 value = metadata.get(field)
                 if value is not None and type(value) is not bool:
                     _fail("ContentUnit.metadata.%s must be a boolean" % field)
+            gradable = metadata.get("gradable")
+            if gradable is not None and type(gradable) is not bool:
+                _fail("ContentUnit.metadata.gradable must be a boolean")
+            question_text_status = metadata.get("question_text_status")
+            if question_text_status is not None:
+                _enum(
+                    question_text_status,
+                    QUESTION_TEXT_STATUSES,
+                    "ContentUnit.metadata.question_text_status",
+                )
+            for field in ("diagram_type", "language", "expected_behavior"):
+                value = metadata.get(field)
+                if value is not None:
+                    _nonempty(value, "ContentUnit.metadata.%s" % field)
+            tests = metadata.get("tests")
+            if tests is not None and (
+                    not isinstance(tests, list) or not tests
+                    or not all(
+                        isinstance(value, str) and value and value == value.strip()
+                        for value in tests
+                    )):
+                _fail("ContentUnit.metadata.tests must be non-empty, trimmed strings")
             assets = metadata.get("assets")
             if assets is not None:
                 if not isinstance(assets, list):
@@ -843,12 +872,42 @@ def _operation_fields(name):
     }[name]
 
 
+def canonicalize_source_revisions(value, label="source_revisions"):
+    """Return a sorted, unique list of exact source revision bindings."""
+
+    if not isinstance(value, (list, tuple)) or not value:
+        _fail("%s must be a non-empty list" % label)
+    revisions = []
+    seen = set()
+    for index, raw in enumerate(value):
+        if not isinstance(raw, dict) or set(raw) != {"source_id", "source_sha256"}:
+            _fail("%s[%d] must contain source_id/source_sha256" % (label, index))
+        source_id = _stable_id(
+            raw["source_id"], "src", "%s[%d].source_id" % (label, index)
+        )
+        source_sha256 = _sha(
+            raw["source_sha256"], "%s[%d].source_sha256" % (label, index)
+        )
+        if source_id in seen:
+            _fail("%s contains duplicate source_id %s" % (label, source_id))
+        seen.add(source_id)
+        revisions.append({"source_id": source_id, "source_sha256": source_sha256})
+    ordered = sorted(revisions, key=lambda row: row["source_id"])
+    if revisions != ordered:
+        _fail("%s must be sorted by source_id" % label)
+    return ordered
+
+
 def canonicalize_operation(operation):
     if not isinstance(operation, dict):
         _fail("ReviewPatch operations must be objects")
     name = operation.get("op")
     _enum(name, PATCH_OPERATIONS, "ReviewPatch.operations[].op")
-    _strict_mapping(operation, _operation_fields(name), "ReviewPatch operation %s" % name)
+    fields = _operation_fields(name)
+    if name == "pair_qa" and set(operation) == set(fields).union({"source_revisions"}):
+        pass
+    else:
+        _strict_mapping(operation, fields, "ReviewPatch operation %s" % name)
 
     result = copy.deepcopy(operation)
     if name in ("add_unit", "replace_unit"):
@@ -871,6 +930,10 @@ def canonicalize_operation(operation):
         _stable_id(operation["answer_unit_id"], "unit", "pair_qa.answer_unit_id")
         if operation["question_unit_id"] == operation["answer_unit_id"]:
             _fail("pair_qa requires two different units")
+        if "source_revisions" in operation:
+            result["source_revisions"] = canonicalize_source_revisions(
+                operation["source_revisions"], "pair_qa.source_revisions"
+            )
     elif name == "classify_asset":
         _stable_id(operation["unit_id"], "unit", "classify_asset.unit_id")
         _enum(operation["asset_role"], ASSET_ROLES, "classify_asset.asset_role")

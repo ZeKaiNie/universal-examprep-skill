@@ -105,6 +105,8 @@ attestation；host 负责约束 runner 内部行为。
 
 `ingest_review.py --workspace <ws> --json <command>` 提供 `list/show/claim/validate-patch/apply/apply-batch/mark-unrecoverable/rebuild`；patch 必须证据绑定且每个 issue 独立，ledger append-only。`apply-batch` 只把派生编译合并到批次末尾。`ai_review_manifest.json` 仅为 legacy view。
 
+跨来源 `pair_qa` 操作必须在 `source_revisions` 中按 `source_id` 排序并完整绑定题面与答案的当前 `source_id/source_sha256`；任一来源漂移都会停止旧补丁回放、重新打开对应 review issue，并要求基于新 revision 复核。旧 ledger 仅在当前 compiled pair 的两侧 revision 与互相配对关系都能被精确证明未变时兼容回放。
+
 ### canonical groups 与 source conflicts（派生事实）
 
 ingestion-v2 会从当前 `content_units.jsonl` + `source_manifest.json` 确定性重建四个 sidecar：

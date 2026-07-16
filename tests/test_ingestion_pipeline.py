@@ -5,7 +5,13 @@ import unittest
 from pathlib import Path
 
 from scripts import validate_workspace
-from scripts.ingestion import ContentUnit, IngestionStore, ReviewPatch, render_answer_value
+from scripts.ingestion import (
+    ContentUnit,
+    IngestionStore,
+    PatchApplicationError,
+    ReviewPatch,
+    render_answer_value,
+)
 from scripts.ingestion.dedup import (
     DedupConfig,
     build_dedup_facts,
@@ -16,6 +22,8 @@ from scripts.ingestion.dedup import (
 from scripts.ingestion.identifiers import file_sha256
 from scripts.ingestion.pipeline import (
     _deduplicate_bound_candidates,
+    _new_quiz_item,
+    _update_quiz_item_from_units,
     build_payload,
     compile_review_outputs,
     persist_payload,
@@ -815,6 +823,187 @@ class IngestionPipelineTest(unittest.TestCase):
         self.assertEqual("B2", formula["metadata"]["parser_metadata"]["cell"])
         persist_payload(self.workspace, payload)
 
+    def test_supplied_fast_quality_cannot_hide_local_formula_evidence(self):
+        samples = [
+            "This page introduces the next lecture topic in ordinary English prose.",
+            "Use the probability notation P(A) for event A.",
+            "Set identities include A ∪ B, A ∩ B, and x ∈ A.",
+            "Conditional probability is P(A|B) = P(A ∩ B)/P(B).",
+            "The measured probability is 3/4.",
+            "P(A)=12/16=3/4; P(B)=6/16; P(A∩B)=3/16.",
+        ]
+        pages = [{
+            "file": "ch01.txt",
+            "page": index,
+            "text": sample,
+            "source_language": "en",
+            "quality_signals": {
+                "score": 1.0,
+                "route": "fast",
+                "reason_codes": [],
+            },
+        } for index, sample in enumerate(samples, 1)]
+        payload = build_payload(
+            str(self.materials), [str(self.source)], pages,
+            sections=[{
+                "chapter": 1,
+                "page_keys": [("ch01.txt", page) for page in range(1, len(pages) + 1)],
+            }],
+            report={"warnings": [], "skipped": [], "ai_review": []},
+        )
+
+        quality_by_page = {row["page"]: row for row in payload["page_quality"]}
+        self.assertEqual("fast", quality_by_page[1]["route"])
+        self.assertNotIn("formula_hint", quality_by_page[1]["reason_codes"])
+        unit_index = {row["unit_id"]: row for row in payload["content_units"]}
+        for page in range(2, len(pages) + 1):
+            self.assertEqual("recover", quality_by_page[page]["route"])
+            self.assertIn("formula_hint", quality_by_page[page]["reason_codes"])
+            candidate = next(
+                row for row in payload["review_candidates"]
+                if row["pages"] == [page] and "formula_hint" in row["reason_codes"]
+            )
+            self.assertEqual([], candidate["target_unit_ids"])
+            self.assertFalse(any(
+                row["kind"] == "formula" and row["page"] == page
+                for row in payload["content_units"]
+            ), "formula hints must request source-backed review, not invent formula units")
+
+        persist_payload(self.workspace, payload)
+        store = IngestionStore(self.workspace, source_root=self.materials)
+        issue = next(
+            issue for issue in store.review_queue.issues()
+            if issue.pages == (2,) and "formula_hint" in issue.reason_codes
+        )
+        generic_resolution = ReviewPatch.create(
+            issue.issue_id,
+            issue.source_id,
+            issue.source_sha256,
+            [{"op": "mark_resolved", "reason": "generic acknowledgement"}],
+            list(issue.evidence),
+            reviewer="test-vision-reviewer",
+            created_at="2026-07-15T11:59:59Z",
+            status="validated",
+        )
+        with self.assertRaisesRegex(
+                PatchApplicationError, "evidence-backed formula unit"):
+            store.apply_patch(generic_resolution)
+        recovered = ContentUnit.create(
+            issue.source_id, issue.source_sha256, "ch01.txt", "formula",
+            "P(A)", 2, ordinal=50, latex=r"P(A)", chapter_id="ch01",
+            phase_id="phase01", metadata={"source_language": "en"},
+            method="ai_recovered", confidence=1.0, provenance="ai_recovered",
+        )
+        patch = ReviewPatch.create(
+            issue.issue_id,
+            issue.source_id,
+            issue.source_sha256,
+            [
+                {"op": "add_unit", "unit": recovered.to_dict()},
+            ],
+            list(issue.evidence),
+            reviewer="test-vision-reviewer",
+            created_at="2026-07-15T12:00:00Z",
+            status="validated",
+        )
+        store.apply_patch(patch)
+        self.assertEqual("formula", store.units()[recovered.unit_id].kind)
+        self.assertEqual("ch01", store.units()[recovered.unit_id].chapter_id)
+        self.assertEqual("applied", store.review_queue.get(issue.issue_id).status)
+
+    def test_supplied_review_route_and_adapter_reason_survive_local_merge(self):
+        payload = build_payload(
+            str(self.materials), [str(self.source)], [{
+                "file": "ch01.txt", "page": 1,
+                "text": "Ordinary source prose still requires adapter-declared review.",
+                "source_language": "en",
+                "quality_signals": {
+                    "score": 0.2,
+                    "route": "review",
+                    "reason_codes": ["adapter_ocr_failed"],
+                },
+            }],
+            sections=[{"chapter": 1, "page_keys": [("ch01.txt", 1)]}],
+            report={"warnings": [], "skipped": [], "ai_review": []},
+        )
+        quality = payload["page_quality"][0]
+        self.assertEqual("review", quality["route"])
+        self.assertEqual(0.2, quality["score"])
+        self.assertIn("adapter_ocr_failed", quality["reason_codes"])
+        candidate = next(
+            row for row in payload["review_candidates"]
+            if "adapter_ocr_failed" in row["reason_codes"]
+        )
+        self.assertTrue(candidate["target_unit_ids"])
+
+    def test_local_table_layout_and_corruption_upgrade_supplied_fast_quality(self):
+        supplied_fast = {"score": 0.99, "route": "fast", "reason_codes": []}
+        pages = [
+            {
+                "file": "ch01.txt", "page": 1, "text": "Name\tValue",
+                "source_language": "en", "quality_signals": supplied_fast,
+                "elements": [{
+                    "kind": "table", "text": "Name\tValue", "ordinal": 0,
+                    "source_language": "en",
+                }],
+            },
+            {
+                "file": "ch01.txt", "page": 2, "text": "Left and right columns",
+                "source_language": "en", "quality_signals": supplied_fast,
+                "elements": [
+                    {"kind": "text", "text": "L1", "bbox": [0, 0, 40, 20],
+                     "source_language": "en"},
+                    {"kind": "text", "text": "L2", "bbox": [0, 25, 40, 45],
+                     "source_language": "en"},
+                    {"kind": "text", "text": "R1", "bbox": [60, 0, 100, 20],
+                     "source_language": "en"},
+                    {"kind": "text", "text": "R2", "bbox": [60, 25, 100, 45],
+                     "source_language": "en"},
+                ],
+            },
+            {
+                "file": "ch01.txt", "page": 3, "text": "damaged\x00extraction",
+                "source_language": "en", "quality_signals": supplied_fast,
+            },
+        ]
+        payload = build_payload(
+            str(self.materials), [str(self.source)], pages,
+            sections=[{
+                "chapter": 1,
+                "page_keys": [("ch01.txt", page) for page in (1, 2, 3)],
+            }],
+            report={"warnings": [], "skipped": [], "ai_review": []},
+        )
+        quality = {row["page"]: row for row in payload["page_quality"]}
+        self.assertEqual("recover", quality[1]["route"])
+        self.assertIn("table_hint", quality[1]["reason_codes"])
+        self.assertEqual("recover", quality[2]["route"])
+        self.assertIn("multi_column_hint", quality[2]["reason_codes"])
+        self.assertEqual("recover", quality[3]["route"])
+        self.assertIn("nul_or_replacement_char", quality[3]["reason_codes"])
+
+        units = {row["unit_id"]: row for row in payload["content_units"]}
+        for page, reason in ((1, "table_hint"), (2, "multi_column_hint")):
+            candidate = next(
+                row for row in payload["review_candidates"]
+                if row["pages"] == [page] and reason in row["reason_codes"]
+            )
+            self.assertTrue(candidate["target_unit_ids"])
+            self.assertTrue(all(
+                unit_id in units and units[unit_id]["page"] == page
+                for unit_id in candidate["target_unit_ids"]
+            ))
+        damaged = next(
+            row for row in payload["content_units"]
+            if row["kind"] == "text" and "\x00" in row["text"]
+        )
+        candidate = next(
+            row for row in payload["review_candidates"]
+            if row["pages"] == [3]
+            and "nul_or_replacement_char" in row["reason_codes"]
+        )
+        self.assertEqual([damaged["unit_id"]], candidate["target_unit_ids"])
+
     def test_legacy_v1_payload_remains_readable_without_claiming_v2_receipts(self):
         payload = self.payload()
         payload["schema_version"] = 1
@@ -902,6 +1091,42 @@ class IngestionPipelineTest(unittest.TestCase):
             ]),
         )
 
+    def test_ai_review_external_ids_bind_the_exact_question_units(self):
+        payload = build_payload(
+            str(self.materials),
+            [str(self.source)],
+            [{"file": "ch01.txt", "page": 1,
+              "text": "Chapter 1\nPrinted prompt above a handwritten answer."}],
+            sections=[{"chapter": 1, "page_keys": [("ch01.txt", 1)]}],
+            quiz_items=[{
+                "id": "hw_ch01_1_1", "chapter": 1, "type": "subjective",
+                "question": "Printed prompt crop", "answer": "Handwritten response",
+                "source": "material", "source_type": "homework",
+                "source_file": "ch01.txt", "source_pages": [1],
+                "answer_source_pages": [1],
+            }],
+            report={
+                "warnings": [], "skipped": [],
+                "ai_review": [{
+                    "kind": "homework_roster_visual_mapping_unverified",
+                    "file": "ch01.txt", "pages": [1],
+                    "external_ids": ["hw_ch01_1_1"],
+                    "action": "Visually verify the roster-to-prompt crop mapping.",
+                }],
+            },
+        )
+        question = next(
+            unit for unit in payload["content_units"]
+            if unit["kind"] == "question" and unit["external_id"] == "hw_ch01_1_1"
+        )
+        review = next(
+            row for row in payload["review_candidates"]
+            if row["reason_codes"] == ["homework_roster_visual_mapping_unverified"]
+        )
+        self.assertEqual(review["target_unit_ids"], [question["unit_id"]])
+        self.assertEqual(review["source_file"], "ch01.txt")
+        self.assertEqual(review["pages"], [1])
+
     def test_non_gradable_legacy_item_creates_no_missing_answer_review(self):
         payload = build_payload(
             str(self.materials),
@@ -949,6 +1174,404 @@ class IngestionPipelineTest(unittest.TestCase):
                 target = self.root / ("typed-workspace-%d" % index)
                 target.mkdir()
                 persist_payload(target, payload)
+
+    def test_extended_quiz_metadata_survives_ir_and_compile_mappings(self):
+        source_item = {
+            "id": "code-contract-q1",
+            "chapter": 1,
+            "type": "code",
+            "question": "Implement solve(values).",
+            "answer": "def solve(values): return sorted(values)",
+            "source": "material",
+            "source_file": "ch01.txt",
+            "source_pages": [1],
+            "answer_source_pages": [1],
+            "source_language": "en",
+            "answer_source_language": "en",
+            "gradable": True,
+            "question_text_status": "full",
+            "diagram_type": "control_flow",
+            "language": "python",
+            "expected_behavior": "Return values in ascending order.",
+            "tests": ["assert solve([2, 1]) == [1, 2]"],
+        }
+        payload = build_payload(
+            str(self.materials),
+            [str(self.source)],
+            [{
+                "file": "ch01.txt", "page": 1,
+                "text": "Chapter 1\nImplement solve(values).",
+                "source_language": "en",
+            }],
+            sections=[{"chapter": 1, "page_keys": [("ch01.txt", 1)]}],
+            quiz_items=[source_item],
+            report={"warnings": [], "skipped": [], "ai_review": []},
+        )
+        question = ContentUnit.from_dict(next(
+            row for row in payload["content_units"] if row["kind"] == "question"
+        ))
+        answer = ContentUnit.from_dict(next(
+            row for row in payload["content_units"] if row["kind"] == "answer"
+        ))
+        question_fields = (
+            "gradable", "question_text_status", "diagram_type", "language",
+            "expected_behavior", "tests",
+        )
+        for field in question_fields:
+            self.assertEqual(source_item[field], question.metadata[field])
+
+        new_item = _new_quiz_item(question, answer)
+        for field in question_fields + ("source_language",):
+            self.assertEqual(source_item[field], new_item[field])
+        self.assertEqual("en", new_item["answer_source_language"])
+
+        existing = {
+            "id": source_item["id"],
+            "chapter": 99,
+            "type": "subjective",
+            "question": "stale",
+            "answer": "stale",
+            "source": "material",
+        }
+        updates = _update_quiz_item_from_units(
+            existing, question, answer, {question.unit_id, answer.unit_id}
+        )
+        self.assertGreater(updates, 0)
+        for field in question_fields + ("source_language",):
+            self.assertEqual(source_item[field], existing[field])
+        self.assertEqual("en", existing["answer_source_language"])
+
+    def test_touched_units_remove_stale_optional_quiz_fields(self):
+        source_item = {
+            "id": "metadata-delete-q1",
+            "chapter": 1,
+            "type": "code",
+            "question": "Implement solve(values).",
+            "answer": "return sorted(values)",
+            "source": "material",
+            "source_file": "ch01.txt",
+            "source_pages": [1],
+            "answer_source_pages": [1],
+            "source_language": "en",
+            "answer_source_language": "en",
+            "gradable": True,
+            "question_text_status": "full",
+            "language": "python",
+            "tests": ["assert solve([2, 1]) == [1, 2]"],
+        }
+        payload = build_payload(
+            str(self.materials),
+            [str(self.source)],
+            [{
+                "file": "ch01.txt", "page": 1,
+                "text": "Chapter 1\nImplement solve(values).",
+                "source_language": "en",
+            }],
+            sections=[{"chapter": 1, "page_keys": [("ch01.txt", 1)]}],
+            quiz_items=[source_item],
+            report={"warnings": [], "skipped": [], "ai_review": []},
+        )
+        question = ContentUnit.from_dict(next(
+            row for row in payload["content_units"] if row["kind"] == "question"
+        ))
+        answer = ContentUnit.from_dict(next(
+            row for row in payload["content_units"] if row["kind"] == "answer"
+        ))
+        question_dict = question.to_dict()
+        question_dict["metadata"] = {"quiz_type": "code"}
+        clean_question = ContentUnit.from_dict(question_dict)
+        answer_dict = answer.to_dict()
+        answer_dict["metadata"] = {
+            "answer_value": answer.metadata["answer_value"],
+        }
+        clean_answer = ContentUnit.from_dict(answer_dict)
+
+        existing = _new_quiz_item(question, answer)
+        existing.update({
+            "source_file": "stale.pdf",
+            "source_pages": [99],
+            "answer_source_file": "stale-solutions.pdf",
+            "answer_source_pages": [98],
+            "options": ["stale"],
+            "keywords": ["stale"],
+            "knowledge_point": "stale",
+            "knowledge_points": ["stale"],
+            "source_type": "stale",
+            "requires_assets": True,
+            "maybe_requires_assets": True,
+            "diagram_type": "stale",
+            "expected_behavior": "stale",
+            "assets": [{"path": "stale.png", "role": "question_context"}],
+        })
+        updates = _update_quiz_item_from_units(
+            existing,
+            clean_question,
+            clean_answer,
+            {clean_question.unit_id, clean_answer.unit_id},
+        )
+
+        self.assertGreater(updates, 0)
+        self.assertEqual("metadata-delete-q1", existing["id"])
+        self.assertEqual("code", existing["type"])
+        self.assertEqual(clean_question.source_file, existing["source_file"])
+        self.assertEqual([clean_question.page], existing["source_pages"])
+        self.assertEqual(clean_answer.source_file, existing["answer_source_file"])
+        self.assertEqual([clean_answer.page], existing["answer_source_pages"])
+        self.assertIn("question_provenance", existing)
+        self.assertIn("answer_provenance", existing)
+        for field in (
+                "options", "keywords", "knowledge_point", "knowledge_points",
+                "source_type", "requires_assets", "maybe_requires_assets",
+                "gradable", "question_text_status", "diagram_type", "language",
+                "expected_behavior", "tests", "source_language",
+                "answer_source_language", "assets"):
+            self.assertNotIn(field, existing)
+
+    def test_control_character_review_binds_replaceable_bad_unit(self):
+        payload = build_payload(
+            str(self.materials),
+            [str(self.source)],
+            [{
+                "file": "ch01.txt", "page": 1,
+                "text": "Chapter 1\x00damaged extraction",
+                "source_language": "en",
+            }],
+            sections=[{"chapter": 1, "page_keys": [("ch01.txt", 1)]}],
+            report={"warnings": [], "skipped": [], "ai_review": []},
+        )
+        damaged = next(
+            row for row in payload["content_units"]
+            if row["kind"] == "text" and "\x00" in row["text"]
+        )
+        candidate = next(
+            row for row in payload["review_candidates"]
+            if "nul_or_replacement_char" in row["reason_codes"]
+        )
+        self.assertEqual([damaged["unit_id"]], candidate["target_unit_ids"])
+
+        persist_payload(self.workspace, payload)
+        store = IngestionStore(self.workspace, source_root=self.materials)
+        issue = next(
+            issue for issue in store.review_queue.issues()
+            if "nul_or_replacement_char" in issue.reason_codes
+        )
+        self.assertEqual((damaged["unit_id"],), issue.target_unit_ids)
+        still_damaged = dict(damaged)
+        still_damaged["method"] = "manual"
+        ineffective = ReviewPatch.create(
+            issue.issue_id,
+            issue.source_id,
+            issue.source_sha256,
+            [{
+                "op": "replace_unit",
+                "unit_id": damaged["unit_id"],
+                "unit": still_damaged,
+            }],
+            list(issue.evidence),
+            reviewer="test",
+            created_at="2026-07-14T12:00:00Z",
+            status="validated",
+        )
+        with self.assertRaises(PatchApplicationError):
+            store.apply_patch(ineffective)
+
+        replacement = dict(damaged)
+        replacement["text"] = "Chapter 1 recovered extraction"
+        patch = ReviewPatch.create(
+            issue.issue_id,
+            issue.source_id,
+            issue.source_sha256,
+            [{
+                "op": "replace_unit",
+                "unit_id": damaged["unit_id"],
+                "unit": replacement,
+            }],
+            list(issue.evidence),
+            reviewer="test",
+            created_at="2026-07-14T12:00:00Z",
+            status="validated",
+        )
+        store.apply_patch(patch)
+        self.assertNotIn("\x00", store.units()[damaged["unit_id"]].text)
+
+    def test_mixed_formula_and_control_page_keeps_two_obligations(self):
+        payload = build_payload(
+            str(self.materials),
+            [str(self.source)],
+            [{
+                "file": "ch01.txt", "page": 1,
+                "text": "P(A)=12/16=3/4\x00damaged extraction",
+                "source_language": "en",
+            }],
+            sections=[{"chapter": 1, "page_keys": [("ch01.txt", 1)]}],
+            report={"warnings": [], "skipped": [], "ai_review": []},
+        )
+        formula_candidate = next(
+            row for row in payload["review_candidates"]
+            if row["reason_codes"] == ["formula_hint"]
+        )
+        control_candidate = next(
+            row for row in payload["review_candidates"]
+            if "nul_or_replacement_char" in row["reason_codes"]
+        )
+        self.assertEqual([], formula_candidate["target_unit_ids"])
+        self.assertTrue(control_candidate["target_unit_ids"])
+        self.assertNotIn("formula_hint", control_candidate["reason_codes"])
+
+        persist_payload(self.workspace, payload)
+        store = IngestionStore(self.workspace, source_root=self.materials)
+        formula_issue = next(
+            issue for issue in store.review_queue.issues()
+            if issue.reason_codes == ("formula_hint",)
+        )
+        control_issue = next(
+            issue for issue in store.review_queue.issues()
+            if "nul_or_replacement_char" in issue.reason_codes
+        )
+        repair_operations = []
+        for unit_id in control_issue.target_unit_ids:
+            unit = store.units()[unit_id]
+            repaired = unit.to_dict()
+            repaired["text"] = repaired["text"].replace("\x00", " ")
+            repair_operations.append({
+                "op": "replace_unit", "unit_id": unit_id, "unit": repaired,
+            })
+        store.apply_patch(ReviewPatch.create(
+            control_issue.issue_id,
+            control_issue.source_id,
+            control_issue.source_sha256,
+            repair_operations,
+            list(control_issue.evidence),
+            reviewer="test",
+            created_at="2026-07-15T12:00:00Z",
+            status="validated",
+        ))
+        self.assertEqual(
+            "pending", store.review_queue.get(formula_issue.issue_id).status
+        )
+        with self.assertRaisesRegex(
+                PatchApplicationError, "evidence-backed formula unit"):
+            store.apply_patch(ReviewPatch.create(
+                formula_issue.issue_id,
+                formula_issue.source_id,
+                formula_issue.source_sha256,
+                [{"op": "mark_resolved", "reason": "control bytes are fixed"}],
+                list(formula_issue.evidence),
+                reviewer="test",
+                created_at="2026-07-15T12:00:01Z",
+                status="validated",
+            ))
+
+        formula = ContentUnit.create(
+            formula_issue.source_id,
+            formula_issue.source_sha256,
+            "ch01.txt",
+            "formula",
+            "P(A)=12/16=3/4",
+            1,
+            ordinal=99,
+            latex=r"P(A)=\frac{12}{16}=\frac{3}{4}",
+            chapter_id="ch01",
+            phase_id="phase01",
+            metadata={"source_language": "en"},
+            method="ai_recovered",
+            confidence=1.0,
+            provenance="ai_recovered",
+        )
+        store.apply_patch(ReviewPatch.create(
+            formula_issue.issue_id,
+            formula_issue.source_id,
+            formula_issue.source_sha256,
+            [{"op": "add_unit", "unit": formula.to_dict()}],
+            list(formula_issue.evidence),
+            reviewer="test-vision-reviewer",
+            created_at="2026-07-15T12:00:02Z",
+            status="validated",
+        ))
+        self.assertEqual(
+            "applied", store.review_queue.get(formula_issue.issue_id).status
+        )
+
+    def test_control_postcondition_covers_inherited_section_path(self):
+        bad_heading = "Chapter 1\x00Damaged"
+        payload = build_payload(
+            str(self.materials),
+            [str(self.source)],
+            [{
+                "file": "ch01.txt", "page": 1,
+                "text": bad_heading + "\nBody",
+                "source_language": "en",
+                "elements": [
+                    {"kind": "heading", "text": bad_heading, "ordinal": 0,
+                     "level": 1, "source_language": "en"},
+                    {"kind": "text", "text": "Body", "ordinal": 1,
+                     "source_language": "en"},
+                ],
+            }],
+            sections=[{"chapter": 1, "page_keys": [("ch01.txt", 1)]}],
+            report={"warnings": [], "skipped": [], "ai_review": []},
+        )
+        units = {row["unit_id"]: row for row in payload["content_units"]}
+        candidate = next(
+            row for row in payload["review_candidates"]
+            if "nul_or_replacement_char" in row["reason_codes"]
+        )
+        self.assertEqual(
+            {"heading", "text"},
+            {units[unit_id]["kind"] for unit_id in candidate["target_unit_ids"]},
+        )
+        body_id = next(
+            unit_id for unit_id in candidate["target_unit_ids"]
+            if units[unit_id]["kind"] == "text"
+        )
+        self.assertIn("\x00", units[body_id]["section_path"][0])
+
+        persist_payload(self.workspace, payload)
+        store = IngestionStore(self.workspace, source_root=self.materials)
+        issue = next(
+            issue for issue in store.review_queue.issues()
+            if "nul_or_replacement_char" in issue.reason_codes
+        )
+        current = store.units()
+        heading_id = next(
+            unit_id for unit_id in issue.target_unit_ids
+            if current[unit_id].kind == "heading"
+        )
+        repaired_heading = current[heading_id].to_dict()
+        repaired_heading["text"] = "Chapter 1 Recovered"
+        with self.assertRaisesRegex(
+                PatchApplicationError, "unsafe control-text postcondition"):
+            store.apply_patch(ReviewPatch.create(
+                issue.issue_id,
+                issue.source_id,
+                issue.source_sha256,
+                [{"op": "replace_unit", "unit_id": heading_id,
+                  "unit": repaired_heading}],
+                list(issue.evidence),
+                reviewer="test",
+                created_at="2026-07-15T12:01:00Z",
+                status="validated",
+            ))
+        self.assertIn("\x00", store.units()[heading_id].text)
+
+        repaired_body = current[body_id].to_dict()
+        repaired_body["section_path"] = ["Chapter 1 Recovered"]
+        store.apply_patch(ReviewPatch.create(
+            issue.issue_id,
+            issue.source_id,
+            issue.source_sha256,
+            [
+                {"op": "replace_unit", "unit_id": heading_id,
+                 "unit": repaired_heading},
+                {"op": "replace_unit", "unit_id": body_id,
+                 "unit": repaired_body},
+            ],
+            list(issue.evidence),
+            reviewer="test",
+            created_at="2026-07-15T12:01:01Z",
+            status="validated",
+        ))
+        self.assertNotIn("\x00", store.units()[body_id].section_path[0])
 
     def test_source_language_is_persisted_or_routed_to_typed_review(self):
         explicit = build_payload(

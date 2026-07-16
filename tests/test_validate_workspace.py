@@ -85,6 +85,39 @@ class TestValidateWorkspace(unittest.TestCase):
         _, warnings, _, _ = run("warnings_workspace")
         self.assertIn("diagram_type", warn_text(warnings))
 
+    def test_extended_compiled_quiz_fields_satisfy_type_validators(self):
+        items = [{
+            "id": "code-contract",
+            "chapter": 1,
+            "type": "code",
+            "question": "Implement solve(values).",
+            "answer": "return sorted(values)",
+            "source": "material",
+            "gradable": True,
+            "question_text_status": "full",
+            "language": "python",
+            "expected_behavior": "Return ascending values.",
+            "tests": ["assert solve([2, 1]) == [1, 2]"],
+            "source_language": "en",
+            "answer_source_language": "en",
+        }, {
+            "id": "diagram-contract",
+            "chapter": 1,
+            "type": "diagram",
+            "question": "Draw the final tree.",
+            "answer": "A balanced tree.",
+            "source": "material",
+            "gradable": True,
+            "question_text_status": "full",
+            "diagram_type": "avl_tree",
+        }]
+        d = self.make_ws(items)
+        errors, warnings, _stats = V.validate(d)
+        self.assertEqual([], errors, err_text(errors))
+        warning_messages = warn_text(warnings)
+        self.assertNotIn("diagram_type", warning_messages)
+        self.assertNotIn("expected_behavior/tests", warning_messages)
+
     def make_ws(self, quiz, prog=None, plan=None):
         """Build a minimal workspace in a tmpdir with a custom quiz_bank (for the regression cases)."""
         d = tempfile.mkdtemp(prefix="vws-")

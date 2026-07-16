@@ -22,9 +22,11 @@ except ImportError:  # pragma: no cover - exercised by standalone script entrypo
 
 TERMINAL_REVIEW_STATUSES = frozenset(("applied", "resolved", "unrecoverable", "superseded"))
 HIGH_RISK_ARTIFACT_REASONS = frozenset((
-    "formula_hint", "garbled_text", "nul_byte", "control_character", "no_text",
+    "formula_hint", "garbled_text", "nul_or_replacement_char", "nul_byte",
+    "control_character", "replacement_character", "no_text",
     "page_no_text", "unsupported_formula", "review_queue_unreadable_or_invalid",
-    "content_units_unreadable_or_invalid",
+    "content_units_unreadable_or_invalid", "homework_prompt_crop_unsafe_leakage",
+    "homework_roster_visual_mapping_unverified",
 ))
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 

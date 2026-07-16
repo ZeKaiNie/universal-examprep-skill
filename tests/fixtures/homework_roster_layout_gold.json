@@ -1,0 +1,59 @@
+{
+  "description": "Gold regression for a roster PDF whose printed prompts are embedded above handwritten answers. Question provenance contains only the prompt anchor page; answer continuations stay answer-side.",
+  "texts": {
+    "hw_scan.pdf": [
+      "Homework 1\n1. Problem 1.1.2\n2. Problem 1.2.1\n",
+      "student answer one begins here",
+      "student answer one continues here",
+      "tail of student answer one\nstudent answer two"
+    ],
+    "hw_scan_sol.pdf": [
+      "Problem 1.1.2\nAnswer 1.1.2: official one\n\nProblem 1.2.1\nAnswer 1.2.1: official two"
+    ]
+  },
+  "layouts": {
+    "hw_scan.pdf": [
+      {
+        "page_bbox": [0, 0, 600, 800],
+        "images": [],
+        "text_boxes": [[40, 40, 560, 150]]
+      },
+      {
+        "page_bbox": [0, 0, 600, 800],
+        "images": [
+          {"image_id": "bg", "bbox": [0, 0, 300, 400]},
+          {"image_id": "bg", "bbox": [300, 0, 600, 400]},
+          {"image_id": "bg", "bbox": [0, 400, 300, 800]},
+          {"image_id": "bg", "bbox": [300, 400, 600, 800]},
+          {"image_id": "prompt-1", "bbox": [50, 10, 550, 300]}
+        ],
+        "text_boxes": [[55, 340, 545, 760]]
+      },
+      {
+        "page_bbox": [0, 0, 600, 800],
+        "images": [
+          {"image_id": "bg", "bbox": [0, 0, 300, 400]},
+          {"image_id": "bg", "bbox": [300, 0, 600, 400]},
+          {"image_id": "bg", "bbox": [0, 400, 300, 800]},
+          {"image_id": "bg", "bbox": [300, 400, 600, 800]}
+        ],
+        "text_boxes": [[55, 20, 545, 760]]
+      },
+      {
+        "page_bbox": [0, 0, 600, 800],
+        "images": [
+          {"image_id": "bg", "bbox": [0, 0, 300, 400]},
+          {"image_id": "bg", "bbox": [300, 0, 600, 400]},
+          {"image_id": "bg", "bbox": [0, 400, 300, 800]},
+          {"image_id": "bg", "bbox": [300, 400, 600, 800]},
+          {"image_id": "prompt-2", "bbox": [50, 100, 550, 250]}
+        ],
+        "text_boxes": [[55, 10, 545, 80], [55, 280, 545, 760]]
+      }
+    ]
+  },
+  "expected": {
+    "1.1.2": {"chapter": 1, "source_pages": [2]},
+    "1.2.1": {"chapter": 1, "source_pages": [4]}
+  }
+}

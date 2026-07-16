@@ -26,6 +26,12 @@ class CapabilityMatrix(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_control_quality_reason_aliases_are_artifact_high_risk(self):
+        self.assertTrue({
+            "nul_or_replacement_char", "nul_byte", "control_character",
+            "replacement_character",
+        }.issubset(readiness.HIGH_RISK_ARTIFACT_REASONS))
+
     def _json(self, relative, value):
         path = os.path.join(self.ws, *relative.split("/"))
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -168,6 +174,56 @@ class CapabilityMatrix(unittest.TestCase):
         self.assertEqual(1, artifact["counts"]["chapter_high_risk_review_issues"])
         self.assertEqual(0, artifact["counts"]["global_unbound_high_risk_review_issues"])
         self.assertEqual({"source_page": 1}, artifact["counts"]["review_attribution"])
+
+    def test_pending_roster_visual_mapping_blocks_artifact_until_resolved(self):
+        self._json("notebook/ch01.guide.json", {"schema_version": 1, "chapter": 1})
+        self._jsonl(".ingest/content_units.jsonl", [{
+            "unit_id": "question_hw_1", "source_id": "src_hw", "page": 2,
+            "chapter_id": "ch01",
+        }])
+        review = {
+            "status": "pending", "severity": "warning",
+            "source_id": "src_hw", "pages": [1, 2],
+            "reason_codes": ["homework_roster_visual_mapping_unverified"],
+            "target_unit_ids": ["question_hw_1"],
+        }
+        self._jsonl(".ingest/review_queue.jsonl", [review])
+        with self._validated_manifest():
+            matrix = readiness.capability_readiness(self.ws, chapter=1)
+        self.assertEqual("blocked", matrix["artifact_ready"]["status"])
+        self.assertIn(
+            "chapter_source_recovery_pending",
+            matrix["artifact_ready"]["reason_codes"],
+        )
+        self.assertEqual(
+            {"homework_roster_visual_mapping_unverified": 1},
+            matrix["artifact_ready"]["counts"]["chapter_high_risk_review_reasons"],
+        )
+
+        review["status"] = "resolved"
+        self._jsonl(".ingest/review_queue.jsonl", [review])
+        with self._validated_manifest():
+            matrix = readiness.capability_readiness(self.ws, chapter=1)
+        self.assertEqual("ready", matrix["artifact_ready"]["status"])
+
+    def test_unsafe_roster_prompt_crop_review_blocks_artifacts_globally(self):
+        self._json("notebook/ch01.guide.json", {"schema_version": 1, "chapter": 1})
+        self._jsonl(".ingest/content_units.jsonl", [])
+        self._jsonl(".ingest/review_queue.jsonl", [{
+            "status": "pending", "severity": "blocking",
+            "source_id": "src_hw_scan", "pages": [1, 2, 3],
+            "reason_codes": ["homework_prompt_crop_unsafe_leakage"],
+            "target_unit_ids": [],
+        }])
+        with self._validated_manifest():
+            matrix = readiness.capability_readiness(self.ws, chapter=1)
+        artifact = matrix["artifact_ready"]
+        self.assertEqual("blocked", artifact["status"])
+        self.assertIn("unbound_high_risk_review_pending", artifact["reason_codes"])
+        self.assertEqual(
+            {"homework_prompt_crop_unsafe_leakage": 1},
+            artifact["counts"]["global_unbound_high_risk_review_reasons"],
+        )
 
     def test_targetless_other_chapter_high_risk_does_not_block_selected_chapter(self):
         self._json("notebook/ch01.guide.json", {"schema_version": 1, "chapter": 1})

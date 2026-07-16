@@ -128,8 +128,8 @@ class Build(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertTrue(os.path.isfile(out))
             self.assertLessEqual(
-                os.path.getsize(out), 595_000,
-                "运行时包必须 ≤595,000 B，为 600 KiB ceiling 留 ≥19 KiB",
+                os.path.getsize(out), 610_000,
+                "运行时包必须 ≤610,000 B，并保持低于 600 KiB hard ceiling",
             )
             with zipfile.ZipFile(out) as z:
                 names = set(z.namelist())

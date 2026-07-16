@@ -24,6 +24,7 @@ from .models import (
     ReviewPatch,
     SchemaValidationError,
     SourceRecord,
+    canonicalize_source_revisions,
     render_answer_value,
 )
 
@@ -38,6 +39,29 @@ class SourceDriftError(RuntimeError):
 
 class PatchApplicationError(RuntimeError):
     """A valid patch cannot safely be applied to the current ingestion state."""
+
+
+def _contains_unsafe_control_text(value):
+    if isinstance(value, str):
+        return any(
+            char == "\ufffd"
+            or ((ord(char) < 32 and char not in "\t\n\r") or ord(char) == 0x7F)
+            for char in value
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_unsafe_control_text(item) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_unsafe_control_text(item) for item in value.values())
+    return False
+
+
+def _unit_contains_unsafe_control_text(unit):
+    return unit is not None and any(
+        _contains_unsafe_control_text(value)
+        for value in (
+            unit.text, unit.html, unit.latex, unit.metadata, unit.section_path,
+        )
+    )
 
 
 @contextmanager
@@ -869,14 +893,26 @@ class IngestionStore:
     def _ledger(self):
         result = {}
         for raw in read_jsonl(self.ledger_path, default=[]):
-            expected = {"patch_id", "fingerprint", "issue_id", "source_id", "source_sha256", "patch"}
-            if not isinstance(raw, dict) or set(raw) != expected:
+            legacy = {
+                "patch_id", "fingerprint", "issue_id", "source_id",
+                "source_sha256", "patch",
+            }
+            current = legacy.union({"source_revisions"})
+            if not isinstance(raw, dict) or set(raw) not in (legacy, current):
                 raise SchemaValidationError("patch ledger entry has an invalid schema")
             patch = ReviewPatch.from_dict(raw["patch"])
             if patch.patch_id != raw["patch_id"]:
                 raise SchemaValidationError("patch ledger ID does not match embedded patch")
             if raw["fingerprint"] != self._patch_fingerprint(patch):
                 raise SchemaValidationError("patch ledger fingerprint does not match embedded patch")
+            if "source_revisions" in raw:
+                revisions = canonicalize_source_revisions(
+                    raw["source_revisions"], "patch ledger source_revisions"
+                )
+                if revisions != self._declared_patch_source_revisions(patch):
+                    raise SchemaValidationError(
+                        "patch ledger source revisions disagree with the embedded patch"
+                    )
             if raw["patch_id"] in result:
                 raise SchemaValidationError("patch ledger contains duplicate patch_id")
             result[raw["patch_id"]] = raw
@@ -892,6 +928,24 @@ class IngestionStore:
             "evidence": [item.to_dict() for item in patch.evidence],
         }
         return hashlib.sha256(canonical_json(logical).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _declared_patch_source_revisions(patch):
+        revisions = {
+            patch.source_id: patch.source_sha256,
+        }
+        for operation in patch.operations:
+            for row in operation.get("source_revisions") or ():
+                current = revisions.get(row["source_id"])
+                if current is not None and current != row["source_sha256"]:
+                    raise SchemaValidationError(
+                        "patch declares conflicting hashes for one source"
+                    )
+                revisions[row["source_id"]] = row["source_sha256"]
+        return [
+            {"source_id": source_id, "source_sha256": revisions[source_id]}
+            for source_id in sorted(revisions)
+        ]
 
     def ledger_entries(self):
         return list(self._ledger().values())
@@ -917,7 +971,9 @@ class IngestionStore:
             return {operation["question_unit_id"], operation["answer_unit_id"]}
         return set()
 
-    def _validate_patch_context(self, patch, issue, allow_terminal=False, units=None):
+    def _validate_patch_context(
+            self, patch, issue, allow_terminal=False, units=None,
+            allow_legacy_cross_source=False):
         record = self.manifest.verify_current(patch.source_id, patch.source_sha256)
         if issue is None:
             raise PatchApplicationError("patch issue is absent from the review queue")
@@ -989,6 +1045,41 @@ class IngestionStore:
             outside -= allowed_cross_source_answers
         if declared_targets and outside:
             raise PatchApplicationError("patch mutates a unit outside issue.target_unit_ids")
+
+        units = self.units() if units is None else units
+        proposed_by_id = {}
+        for operation in patch.operations:
+            if operation["op"] in ("add_unit", "replace_unit"):
+                proposed = ContentUnit.from_dict(operation["unit"])
+                proposed_by_id[proposed.unit_id] = proposed
+        for operation in patch.operations:
+            if operation["op"] != "pair_qa":
+                continue
+            question = proposed_by_id.get(
+                operation["question_unit_id"], units.get(operation["question_unit_id"])
+            )
+            answer = proposed_by_id.get(
+                operation["answer_unit_id"], units.get(operation["answer_unit_id"])
+            )
+            if question is None or answer is None:
+                raise PatchApplicationError("pair_qa target does not exist")
+            actual = [
+                {"source_id": source_id, "source_sha256": source_hash}
+                for source_id, source_hash in sorted({
+                    question.source_id: question.source_sha256,
+                    answer.source_id: answer.source_sha256,
+                }.items())
+            ]
+            declared = operation.get("source_revisions")
+            if declared is None:
+                if len(actual) > 1 and not allow_legacy_cross_source:
+                    raise PatchApplicationError(
+                        "cross-source pair_qa must bind every touched source revision"
+                    )
+            elif list(declared) != actual:
+                raise SourceDriftError(
+                    "pair_qa source revision binding does not match its current units"
+                )
         return record
 
     @staticmethod
@@ -1005,6 +1096,38 @@ class IngestionStore:
     ):
         if final_status == "unrecoverable":
             return
+        reasons = set(issue.reason_codes)
+        scoped_units = [
+            unit for unit in units.values()
+            if unit.source_id == issue.source_id
+            and unit.source_sha256 == issue.source_sha256
+            and (not issue.pages or unit.page in issue.pages)
+        ]
+        if "formula_hint" in reasons:
+            formulas = [
+                unit for unit in scoped_units
+                if unit.kind == "formula"
+                and unit.provenance in ("material", "ai_recovered")
+                and isinstance(unit.latex, str) and unit.latex.strip()
+                and not _unit_contains_unsafe_control_text(unit)
+            ]
+            if not formulas:
+                raise PatchApplicationError(
+                    "formula_hint postcondition requires a same-source/page "
+                    "evidence-backed formula unit with non-empty LaTeX"
+                )
+        if reasons & {
+                "nul_or_replacement_char", "nul_byte", "control_character",
+        }:
+            unresolved = [
+                unit.unit_id for unit in scoped_units
+                if _unit_contains_unsafe_control_text(unit)
+            ]
+            if unresolved:
+                raise PatchApplicationError(
+                    "unsafe control-text postcondition failed for %s"
+                    % ", ".join(unresolved)
+                )
         if final_status == "resolved":
             if issue.severity == "blocking":
                 raise PatchApplicationError(
@@ -1016,7 +1139,6 @@ class IngestionStore:
             raise PatchApplicationError(
                 "patch made no material change and cannot close a review issue"
             )
-        reasons = set(issue.reason_codes)
         targets = [units.get(unit_id) for unit_id in issue.target_unit_ids]
         if "missing_answer" in reasons:
             questions = [unit for unit in targets if unit is not None and unit.kind == "question"]
@@ -1101,6 +1223,8 @@ class IngestionStore:
     def _apply_operations_to_state(self, patch, units, mappings, record):
         changed = 0
         final_status = "applied"
+        chapter_assignments = {}
+        paired_question_ids = set()
         for operation in patch.operations:
             name = operation["op"]
             changed_this_operation = False
@@ -1159,6 +1283,7 @@ class IngestionStore:
                 if current_mapping is None or current_mapping.to_dict() != mapping.to_dict():
                     mappings[unit.unit_id] = mapping
                     changed_this_operation = True
+                chapter_assignments[unit.unit_id] = operation
 
             elif name == "pair_qa":
                 question = units.get(operation["question_unit_id"])
@@ -1192,6 +1317,7 @@ class IngestionStore:
                 if answer.to_dict() != paired_answer.to_dict():
                     units[answer.unit_id] = paired_answer
                     changed_this_operation = True
+                paired_question_ids.add(question.unit_id)
 
             elif name == "classify_asset":
                 unit = units.get(operation["unit_id"])
@@ -1214,6 +1340,77 @@ class IngestionStore:
 
             if changed_this_operation:
                 changed += 1
+
+        # A question and its source-backed answer are one chapter-level teaching
+        # item.  Apply inheritance only after every operation so an assign_chapter
+        # followed by pair_qa in the same patch is deterministic and order-safe.
+        for unit_id in set(chapter_assignments) | paired_question_ids:
+            question = units.get(unit_id)
+            if question is None or question.kind != "question" or not question.paired_unit_id:
+                continue
+            question_mapping = mappings.get(question.unit_id)
+            if question_mapping is not None and (
+                    question_mapping.source_id != question.source_id
+                    or question_mapping.source_sha256 != question.source_sha256
+                    or question_mapping.chapter_id != question.chapter_id
+                    or question_mapping.phase_id != question.phase_id):
+                raise SourceDriftError(
+                    "paired question chapter mapping disagrees with its content unit"
+                )
+            answer = units.get(question.paired_unit_id)
+            if answer is None or answer.kind != "answer":
+                raise PatchApplicationError(
+                    "assigned question paired_unit_id does not refer to an answer"
+                )
+            if (answer.paired_unit_id != question.unit_id
+                    or not question.external_id
+                    or answer.external_id != question.external_id):
+                raise PatchApplicationError(
+                    "assigned question/answer pairing must be reciprocal with the same external_id"
+                )
+            answer_record = self.manifest.verify_current(
+                answer.source_id, answer.source_sha256
+            )
+            if answer.source_file != answer_record.path:
+                raise SourceDriftError(
+                    "paired answer source_file disagrees with the source manifest"
+                )
+            chapter_id = question.chapter_id
+            phase_id = question.phase_id
+            if chapter_id is None and phase_id is None:
+                continue
+            if (answer.chapter_id not in (None, chapter_id)
+                    or answer.phase_id not in (None, phase_id)):
+                raise ConflictError(
+                    "paired answer has a conflicting chapter/phase assignment"
+                )
+            inherited = answer.with_chapter(chapter_id, phase_id)
+            current_mapping = mappings.get(answer.unit_id)
+            inherited_mapping = None
+            if question_mapping is not None:
+                inherited_mapping = ChapterPhaseMapping.create(
+                    answer.unit_id,
+                    answer.source_id,
+                    answer.source_sha256,
+                    question_mapping.chapter,
+                    question_mapping.phase,
+                    chapter_id,
+                    phase_id,
+                )
+                if (current_mapping is not None
+                        and current_mapping.to_dict() != inherited_mapping.to_dict()):
+                    raise ConflictError(
+                        "paired answer has a conflicting chapter/phase mapping"
+                    )
+            inherited_changed = False
+            if answer.to_dict() != inherited.to_dict():
+                units[answer.unit_id] = inherited
+                inherited_changed = True
+            if inherited_mapping is not None and current_mapping is None:
+                mappings[answer.unit_id] = inherited_mapping
+                inherited_changed = True
+            if inherited_changed:
+                changed += 1
         self._validate_unit_metadata_context(units)
         self._validate_question_identities(units)
         return changed, final_status
@@ -1231,9 +1428,55 @@ class IngestionStore:
                 )
             question_external_ids[unit.external_id] = unit.unit_id
 
-    def _expected_compiled_state(self):
+    @staticmethod
+    def _patch_pair_units(patch, units):
+        proposed = {}
+        for operation in patch.operations:
+            if operation["op"] in ("add_unit", "replace_unit"):
+                unit = ContentUnit.from_dict(operation["unit"])
+                proposed[unit.unit_id] = unit
+        pairs = []
+        for operation in patch.operations:
+            if operation["op"] != "pair_qa":
+                continue
+            question = proposed.get(
+                operation["question_unit_id"], units.get(operation["question_unit_id"])
+            )
+            answer = proposed.get(
+                operation["answer_unit_id"], units.get(operation["answer_unit_id"])
+            )
+            pairs.append((question, answer))
+        return pairs
+
+    @classmethod
+    def _legacy_cross_source_replay_is_safe(cls, patch, units, compiled_before):
+        """Prove a legacy unbound pair has not crossed a source revision."""
+
+        has_cross_source_pair = False
+        for question, answer in cls._patch_pair_units(patch, units):
+            if question is None or answer is None:
+                return True, False
+            if question.source_id == answer.source_id:
+                continue
+            has_cross_source_pair = True
+            previous_question = compiled_before.get(question.unit_id)
+            previous_answer = compiled_before.get(answer.unit_id)
+            if (previous_question is None or previous_answer is None
+                    or previous_question.source_id != question.source_id
+                    or previous_question.source_sha256 != question.source_sha256
+                    or previous_answer.source_id != answer.source_id
+                    or previous_answer.source_sha256 != answer.source_sha256
+                    or previous_question.paired_unit_id != previous_answer.unit_id
+                    or previous_answer.paired_unit_id != previous_question.unit_id):
+                return True, False
+        return has_cross_source_pair, True
+
+    def _expected_compiled_state(self, reopen_stale=False):
         units = dict(self.base_units())
         mappings = dict(self.base_mappings())
+        compiled_before = dict(self.units())
+        stale_issue_ids = set()
+        replayed_issue_ids = set()
         for mapping in mappings.values():
             unit = units.get(mapping.unit_id)
             if unit is None:
@@ -1251,9 +1494,33 @@ class IngestionStore:
             # never replays it onto the new bytes.
             if record is None or record.sha256 != patch.source_sha256:
                 continue
+            allow_legacy_cross_source = False
+            revisions = entry.get("source_revisions")
+            if revisions is not None:
+                stale_revision = False
+                for revision in revisions:
+                    try:
+                        self.manifest.verify_current(
+                            revision["source_id"], revision["source_sha256"]
+                        )
+                    except SourceDriftError:
+                        stale_revision = True
+                        break
+                if stale_revision:
+                    stale_issue_ids.add(patch.issue_id)
+                    continue
+            else:
+                has_cross_source, legacy_safe = self._legacy_cross_source_replay_is_safe(
+                    patch, units, compiled_before
+                )
+                if has_cross_source and not legacy_safe:
+                    stale_issue_ids.add(patch.issue_id)
+                    continue
+                allow_legacy_cross_source = has_cross_source and legacy_safe
             issue = self.review_queue.get(patch.issue_id)
             record = self._validate_patch_context(
-                patch, issue, allow_terminal=True, units=units
+                patch, issue, allow_terminal=True, units=units,
+                allow_legacy_cross_source=allow_legacy_cross_source,
             )
             _changed, expected_status = self._apply_operations_to_state(
                 patch, units, mappings, record
@@ -1266,12 +1533,20 @@ class IngestionStore:
                 raise PatchApplicationError(
                     "ledger patch status disagrees with review issue: %s" % patch.issue_id
                 )
+            replayed_issue_ids.add(patch.issue_id)
+        if reopen_stale:
+            for issue_id in sorted(stale_issue_ids - replayed_issue_ids):
+                issue = self.review_queue.get(issue_id)
+                if issue is not None and issue.status in ("applied", "resolved"):
+                    self.review_queue.replace(issue.with_status("pending"))
+            if stale_issue_ids - replayed_issue_ids:
+                self.refresh_source_statuses()
         self._validate_unit_metadata_context(units)
         self._validate_question_identities(units)
         return units, mappings
 
     def rebuild_compiled_from_ledger(self):
-        units, mappings = self._expected_compiled_state()
+        units, mappings = self._expected_compiled_state(reopen_stale=True)
         self._write_units(units)
         self._write_mappings(mappings)
         return units, mappings
@@ -1292,11 +1567,28 @@ class IngestionStore:
 
     def ledger_touched_unit_ids(self):
         touched = set()
+        base_units = self.base_units()
+        compiled_units = self.units()
         for entry in self._ledger().values():
             patch = ReviewPatch.from_dict(entry["patch"])
             record = self.manifest.get(patch.source_id)
             if record is None or record.sha256 != patch.source_sha256:
                 continue
+            revisions = entry.get("source_revisions")
+            if revisions is not None:
+                try:
+                    for revision in revisions:
+                        self.manifest.verify_current(
+                            revision["source_id"], revision["source_sha256"]
+                        )
+                except SourceDriftError:
+                    continue
+            else:
+                has_cross_source, legacy_safe = self._legacy_cross_source_replay_is_safe(
+                    patch, base_units, compiled_units
+                )
+                if has_cross_source and not legacy_safe:
+                    continue
             for operation in patch.operations:
                 if operation["op"] in ("add_unit", "replace_unit"):
                     touched.add(operation["unit"].get("unit_id"))
@@ -1441,6 +1733,7 @@ class IngestionStore:
                 "issue_id": patch.issue_id,
                 "source_id": patch.source_id,
                 "source_sha256": patch.source_sha256,
+                "source_revisions": self._declared_patch_source_revisions(patch),
                 "patch": patch.to_dict(),
             }
             atomic_write_jsonl(self.ledger_path, list(ledger.values()) + [entry])

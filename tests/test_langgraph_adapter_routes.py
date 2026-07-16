@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts.host_adapters import command_core
 from scripts.host_adapters import langgraph_exam as adapter
@@ -94,6 +95,23 @@ def completion_snapshot(validation_receipt, progress_receipt):
 def with_tutor_handoff(state):
     state["tutor_handoff"] = adapter.hint_receipt(state, "tutor_notebook")
     return state
+
+
+def guide_gate(stage, artifact_mode="visual", chapter=1, page_hash="b" * 64):
+    page_stage = artifact_mode == "visual" and stage in ("inspection", "ready")
+    return adapter.validate_study_guide_gate_receipt({
+        "schema_version": 1,
+        "chapter": chapter,
+        "artifact_mode": artifact_mode,
+        "stage": stage,
+        "pdf_sha256": "a" * 64 if page_stage else None,
+        "render_manifest_sha256": "c" * 64 if page_stage else None,
+        "pages": ([{
+            "page": 1,
+            "png": "study_guide/qa/ch%02d_p001.png" % chapter,
+            "png_sha256": page_hash,
+        }] if page_stage else []),
+    })
 
 
 class StartAndIngestRoutesTest(unittest.TestCase):
@@ -195,7 +213,7 @@ class ReadinessRoutesTest(unittest.TestCase):
                 "ready", artifact="blocked",
                 artifact_reasons=["chapter_teaching_manifest_missing"]),
         })
-        self.assertEqual("guide_interrupt", adapter.route_after_validation(state))
+        self.assertEqual("study_guide_rehydrate", adapter.route_after_validation(state))
 
     def test_visual_mode_needs_visual_qa_receipt(self):
         state = with_tutor_handoff({
@@ -204,7 +222,7 @@ class ReadinessRoutesTest(unittest.TestCase):
                 "ready", artifact="blocked", artifact_mode="visual",
                 artifact_reasons=["chapter_visual_qa_not_ready"]),
         })
-        self.assertEqual("visual_interrupt", adapter.route_after_validation(state))
+        self.assertEqual("study_guide_rehydrate", adapter.route_after_validation(state))
 
     def test_artifact_ready_moves_only_to_completion_command_gate(self):
         state = with_tutor_handoff({
@@ -228,6 +246,149 @@ class ReadinessRoutesTest(unittest.TestCase):
             "hint_dependency_sha256": "c" * 64,
         }
         self.assertEqual("tutor_interrupt", adapter.route_after_validation(state))
+
+
+class StudyGuideSubgraphPureRoutesTest(unittest.TestCase):
+    def test_each_canonical_stage_routes_to_one_explicit_interrupt(self):
+        routes = {
+            "claim_create": "guide_claim_create_interrupt",
+            "claim_attach": "guide_claim_attach_interrupt",
+            "claim_verify": "guide_claim_verify_interrupt",
+            "typed_validate": "guide_typed_validate_interrupt",
+            "import": "guide_import_interrupt",
+            "preflight": "guide_preflight_interrupt",
+            "html": "guide_html_interrupt",
+            "pdf": "guide_pdf_interrupt",
+            "qa_render": "guide_qa_render_interrupt",
+            "inspection": "guide_inspection_interrupt",
+        }
+        for stage, expected in routes.items():
+            with self.subTest(stage=stage):
+                state = {"chapter": 1, "study_guide_gate_receipt": guide_gate(stage)}
+                self.assertEqual(expected, adapter.route_after_study_guide_gate(state))
+
+    def test_ready_receipt_returns_to_fresh_workspace_validation(self):
+        state = {"chapter": 1, "study_guide_gate_receipt": guide_gate("ready")}
+        self.assertEqual("validate", adapter.route_after_study_guide_gate(state))
+        chat = {"chapter": 1, "study_guide_gate_receipt": guide_gate(
+            "ready", artifact_mode="chat")}
+        self.assertEqual("validate", adapter.route_after_study_guide_gate(chat))
+
+    def test_checkpoint_acknowledgements_cannot_skip_a_canonical_stage(self):
+        state = {
+            "chapter": 1,
+            "last_resume": {"imported": True, "accepted": True},
+            "study_guide_gate_receipt": guide_gate("claim_create"),
+        }
+        self.assertEqual(
+            "guide_claim_create_interrupt", adapter.route_after_study_guide_gate(state))
+
+    def test_stage_transition_allows_one_step_or_regression_but_not_a_jump(self):
+        first = guide_gate("claim_create")
+        self.assertEqual(
+            "claim_attach", adapter.validate_study_guide_gate_transition(
+                first, guide_gate("claim_attach"))["stage"])
+        self.assertEqual(
+            "claim_create", adapter.validate_study_guide_gate_transition(
+                guide_gate("typed_validate"), first)["stage"])
+        self.assertEqual(
+            "html", adapter.validate_study_guide_gate_transition(
+                guide_gate("preflight"), guide_gate("html"))["stage"])
+        with self.assertRaisesRegex(adapter.LangGraphAdapterError, "skipped"):
+            adapter.validate_study_guide_gate_transition(first, guide_gate("pdf"))
+        chat_import = guide_gate("import", artifact_mode="chat")
+        self.assertEqual(
+            "ready", adapter.validate_study_guide_gate_transition(
+                chat_import, guide_gate("ready", artifact_mode="chat"))["stage"])
+        malformed = dict(first, schema_version=2)
+        with self.assertRaisesRegex(adapter.LangGraphAdapterError, "schema"):
+            adapter.validate_study_guide_gate_transition(malformed, first)
+
+    def test_stage_transition_remounts_after_chapter_or_mode_change(self):
+        chapter_mount = adapter.validate_study_guide_gate_transition(
+            guide_gate("ready", chapter=1),
+            guide_gate("claim_create", chapter=2),
+            {"chapter": 2},
+        )
+        self.assertEqual((2, "visual", "claim_create"), (
+            chapter_mount["chapter"], chapter_mount["artifact_mode"],
+            chapter_mount["stage"],
+        ))
+
+        mode_mount = adapter.validate_study_guide_gate_transition(
+            guide_gate("inspection", artifact_mode="visual"),
+            guide_gate("claim_create", artifact_mode="chat"),
+            {"chapter": 1},
+        )
+        self.assertEqual((1, "chat", "claim_create"), (
+            mode_mount["chapter"], mode_mount["artifact_mode"], mode_mount["stage"],
+        ))
+
+        with self.assertRaisesRegex(adapter.LangGraphAdapterError, "skipped"):
+            adapter.validate_study_guide_gate_transition(
+                guide_gate("claim_create", chapter=2),
+                guide_gate("pdf", chapter=2),
+                {"chapter": 2},
+            )
+
+    def test_malformed_or_identity_drifted_gate_receipt_fails_closed(self):
+        optimistic = dict(guide_gate("claim_create"))
+        optimistic["ready"] = True
+        self.assertEqual("operation_error", adapter.route_after_study_guide_gate({
+            "chapter": 1, "study_guide_gate_receipt": optimistic,
+        }))
+        drifted = guide_gate("claim_attach", chapter=2)
+        self.assertEqual("operation_error", adapter.route_after_study_guide_gate({
+            "chapter": 1, "study_guide_gate_receipt": drifted,
+        }))
+        unbounded = dict(guide_gate("claim_attach"), pdf_sha256="x" * 10000)
+        with self.assertRaisesRegex(adapter.LangGraphAdapterError, "binding"):
+            adapter.validate_study_guide_gate_receipt(unbounded)
+
+    def test_all_page_inspection_hint_is_hash_bound_and_only_routes_to_accept(self):
+        gate = guide_gate("inspection")
+        response = {
+            "inspected_pages": "all",
+            "reviewer": "codex-visual-review",
+            "reviewer_kind": "agent",
+            "page_verdicts": ["1=pass:formula and layout checked"],
+        }
+        hint = adapter.create_study_guide_inspection_hint(response, gate)
+        state = {
+            "chapter": 1,
+            "study_guide_gate_receipt": gate,
+            "study_guide_inspection_hint": hint,
+        }
+        self.assertEqual(
+            "guide_accept_interrupt", adapter.route_after_study_guide_gate(state))
+        self.assertTrue(adapter.study_guide_inspection_hint_is_current(hint, gate))
+
+        changed = guide_gate("inspection", page_hash="d" * 64)
+        changed_state = dict(state, study_guide_gate_receipt=changed)
+        self.assertFalse(adapter.study_guide_inspection_hint_is_current(hint, changed))
+        self.assertEqual(
+            "guide_inspection_interrupt",
+            adapter.route_after_study_guide_gate(changed_state),
+        )
+
+    def test_missing_non_pass_or_partial_page_verdicts_are_rejected(self):
+        gate = guide_gate("inspection")
+        base = {
+            "inspected_pages": "all", "reviewer": "reviewer",
+            "reviewer_kind": "agent", "page_verdicts": [],
+        }
+        with self.assertRaisesRegex(adapter.LangGraphAdapterError, "every page"):
+            adapter.create_study_guide_inspection_hint(base, gate)
+        base["page_verdicts"] = ["1=fail:clipped"]
+        with self.assertRaisesRegex(adapter.LangGraphAdapterError, "verdict is invalid"):
+            adapter.create_study_guide_inspection_hint(base, gate)
+        base.update(reviewer="r" * 201, page_verdicts=["1=pass"])
+        with self.assertRaisesRegex(adapter.LangGraphAdapterError, "every page"):
+            adapter.create_study_guide_inspection_hint(base, gate)
+
+    def test_chat_mode_cannot_claim_a_visual_stage(self):
+        with self.assertRaisesRegex(adapter.LangGraphAdapterError, "identity"):
+            guide_gate("pdf", artifact_mode="chat")
 
 
 class CompletionAndDependencyBoundaryTest(unittest.TestCase):
@@ -402,6 +563,18 @@ class CompletionAndDependencyBoundaryTest(unittest.TestCase):
         with self.assertRaisesRegex(adapter.LangGraphAdapterError, "checkpointer"):
             adapter.build_exam_graph(None)
 
+    def test_graph_factory_reports_optional_dependency_when_langgraph_is_absent(self):
+        original_import = __import__
+
+        def without_langgraph(name, *args, **kwargs):
+            if name == "langgraph" or name.startswith("langgraph."):
+                raise ImportError("simulated optional dependency absence")
+            return original_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=without_langgraph):
+            with self.assertRaises(adapter.OptionalDependencyUnavailable):
+                adapter.build_exam_graph(object())
+
     def test_graph_really_compiles_when_optional_langgraph_is_installed(self):
         try:
             from langgraph.checkpoint.memory import MemorySaver
@@ -511,6 +684,8 @@ class CompletionAndDependencyBoundaryTest(unittest.TestCase):
             "tutor_notebook": "persisted",
             "typed_guide": "imported",
             "visual_qa": "accepted",
+            "study_guide_stage": "completed",
+            "guide_accept": "accepted",
             "phase_completion": "progress_updated",
         }
         for gate, field in contracts.items():

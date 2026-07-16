@@ -29,7 +29,7 @@ from .models import (
     SourceRecord,
     render_answer_value,
 )
-from .quality import assess_page
+from .quality import REASON_ORDER, assess_page
 from .dedup import (
     CANONICAL_GROUPS_PATH,
     DUPLICATE_CANDIDATES_PATH,
@@ -58,10 +58,82 @@ BUILD_MANIFEST_PATH = ".ingest/build_manifest.json"
 UNBOUND_REVIEW_PATH = ".ingest/unbound_review.json"
 
 _FORMULA_RE = re.compile(
-    r"(?:\$[^$]+\$|\\(?:frac|sum|int|sqrt|begin)\b|[A-Za-z0-9)]\s*[=≈≤≥]\s*[A-Za-z0-9(])"
+    r"(?:"
+    r"\$[^$\n]+\$|"
+    r"\\(?:frac|dfrac|tfrac|sum|prod|int|sqrt|begin|left|right)\b|"
+    r"\bP\s*[\[(][^\])\n]{1,80}[\])]|"
+    r"[∪∩∈∉⊂⊆⊃⊇∅∀∃±×÷≠≤≥≈]|"
+    r"[A-Za-z0-9)\]}]\s*(?:=|<|>)\s*(?:[A-Za-z0-9({\[+\-]|\\)|"
+    r"(?<!\w)\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?(?!\w)"
+    r")"
 )
 _REASON_SAFE_RE = re.compile(r"[^a-z0-9_.-]+")
 _ACTIVE_REVIEW_STATUSES = frozenset(("pending", "claimed", "validated", "blocked"))
+
+
+def _structured_multi_column_hint(elements):
+    """Recognize only two clearly separated, vertically overlapping text columns."""
+
+    boxes = []
+    for element in elements:
+        if not isinstance(element, dict) or element.get("kind") not in (
+                "title", "heading", "text", "list", "caption", "code"):
+            continue
+        bbox = element.get("bbox")
+        if (not isinstance(bbox, (list, tuple)) or len(bbox) != 4
+                or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                       for value in bbox)):
+            continue
+        x0, y0, x1, y1 = (float(value) for value in bbox)
+        if x1 > x0 and y1 > y0:
+            boxes.append((x0, y0, x1, y1))
+    if len(boxes) < 4:
+        return False
+    boxes.sort(key=lambda box: (box[0], box[2], box[1], box[3]))
+    total_width = max(box[2] for box in boxes) - min(box[0] for box in boxes)
+    if total_width <= 0:
+        return False
+    for split in range(2, len(boxes) - 1):
+        left, right = boxes[:split], boxes[split:]
+        gap = min(box[0] for box in right) - max(box[2] for box in left)
+        if gap < total_width * 0.03:
+            continue
+        left_y = (min(box[1] for box in left), max(box[3] for box in left))
+        right_y = (min(box[1] for box in right), max(box[3] for box in right))
+        overlap = min(left_y[1], right_y[1]) - max(left_y[0], right_y[0])
+        if overlap >= 0.25 * min(left_y[1] - left_y[0], right_y[1] - right_y[0]):
+            return True
+    return False
+
+
+def _valid_supplied_quality(value):
+    if (not isinstance(value, dict)
+            or set(value) != {"score", "route", "reason_codes"}
+            or value.get("route") not in ("fast", "recover", "review")
+            or not isinstance(value.get("reason_codes"), list)
+            or not all(isinstance(reason, str) and reason for reason in value["reason_codes"])
+            or isinstance(value.get("score"), bool)
+            or not isinstance(value.get("score"), (int, float))):
+        return False
+    score = float(value["score"])
+    return score == score and 0.0 <= score <= 1.0
+
+
+def _merge_page_quality(supplied, local):
+    """Keep adapter facts while never allowing them to erase local risk evidence."""
+
+    if not _valid_supplied_quality(supplied):
+        return local
+    route_rank = {"fast": 0, "recover": 1, "review": 2}
+    route = max((supplied["route"], local["route"]), key=route_rank.__getitem__)
+    reasons = set(supplied["reason_codes"]) | set(local["reason_codes"])
+    ordered = [reason for reason in REASON_ORDER if reason in reasons]
+    ordered.extend(sorted(reasons - set(ordered)))
+    return {
+        "score": round(min(float(supplied["score"]), float(local["score"])), 4),
+        "route": route,
+        "reason_codes": ordered,
+    }
 
 
 def _relative(path, root):
@@ -163,6 +235,7 @@ def normalize_review_candidates(report, quiz_items=()):
             "%s: %s" % (kind, entry.get("file") or "unbound material"),
             entry.get("action") or "Inspect the source and add evidence-backed content units.",
             entry.get("pages") or (),
+            external_ids=entry.get("external_ids") or (),
         )
 
     ai_kinds = {
@@ -358,6 +431,31 @@ def _deduplicate_bound_candidates(candidates):
     return output
 
 
+def _contains_unsafe_control_text(value):
+    """Return whether a strict-JSON value contains text unsafe for derivatives."""
+
+    if isinstance(value, str):
+        return any(
+            char == "\ufffd"
+            or ((ord(char) < 32 and char not in "\t\n\r") or ord(char) == 0x7F)
+            for char in value
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_unsafe_control_text(item) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_unsafe_control_text(item) for item in value.values())
+    return False
+
+
+def _unit_contains_unsafe_control_text(unit):
+    return any(
+        _contains_unsafe_control_text(value)
+        for value in (
+            unit.text, unit.html, unit.latex, unit.metadata, unit.section_path,
+        )
+    )
+
+
 def _question_text(item):
     text = str(item.get("question") or "").strip()
     options = item.get("options")
@@ -399,6 +497,12 @@ def _quiz_metadata(item, answer_record=None, answer_value_marker=False):
         ("source", "source"),
         ("requires_assets", "requires_assets"),
         ("maybe_requires_assets", "maybe_requires_assets"),
+        ("gradable", "gradable"),
+        ("question_text_status", "question_text_status"),
+        ("diagram_type", "diagram_type"),
+        ("language", "language"),
+        ("expected_behavior", "expected_behavior"),
+        ("tests", "tests"),
     )
     for source_key, target_key in direct:
         value = item.get(source_key)
@@ -565,6 +669,7 @@ def build_payload(
     current_heading = {}
     current_sections = {}
     quality_candidates = []
+    page_quality_candidates = []
 
     ordered_pages = sorted(
         (page for page in pages if isinstance(page, dict)),
@@ -590,23 +695,26 @@ def build_payload(
         table_hint = any(isinstance(e, dict) and e.get("kind") == "table" for e in elements)
         formula_hint = any(isinstance(e, dict) and e.get("kind") == "formula" for e in elements)
         formula_hint = formula_hint or bool(_FORMULA_RE.search(text))
+        page_metadata = page.get("metadata") if isinstance(page.get("metadata"), dict) else {}
+        multi_column_hint = (
+            page_metadata.get("multi_column_hint") is True
+            or _structured_multi_column_hint(elements)
+        )
+        local_quality = assess_page({
+            "page": page_number,
+            "text": text,
+            "image_count": len(set(asset for asset in image_assets if asset)),
+            "image_area_ratio": (
+                0.5 if image_assets and len(text.strip()) < 120
+                else (0.2 if image_assets else 0.0)
+            ),
+            "vector_count": 0,
+            "multi_column_hint": multi_column_hint,
+            "table_hint": table_hint or "\t" in text,
+            "formula_hint": formula_hint,
+        })
         supplied_quality = page.get("quality_signals")
-        if (isinstance(supplied_quality, dict)
-                and set(supplied_quality) == {"score", "route", "reason_codes"}
-                and supplied_quality.get("route") in ("fast", "recover", "review")
-                and isinstance(supplied_quality.get("reason_codes"), list)):
-            quality = supplied_quality
-        else:
-            quality = assess_page({
-                "page": page_number,
-                "text": text,
-                "image_count": len(set(asset for asset in image_assets if asset)),
-                "image_area_ratio": 0.5 if image_assets and len(text.strip()) < 120 else (0.2 if image_assets else 0.0),
-                "vector_count": 0,
-                "multi_column_hint": False,
-                "table_hint": table_hint or "\t" in text,
-                "formula_hint": formula_hint,
-            })
+        quality = _merge_page_quality(supplied_quality, local_quality)
         page_quality.append({
             "source_file": record.path,
             "page": page_number,
@@ -615,17 +723,36 @@ def build_payload(
             "reason_codes": quality["reason_codes"],
         })
         if quality["route"] != "fast":
-            quality_candidates.append({
-                "reason_codes": quality["reason_codes"] or ["quality_recovery"],
-                "source_file": record.path,
-                "pages": [page_number],
-                "severity": "blocking" if quality["route"] == "review" else "warning",
-                "description": "Page %d was routed to %s extraction (quality %.4f)." % (
-                    page_number, quality["route"], quality["score"]
-                ),
-                "suggested_action": "Inspect the rendered source page and add or validate evidence-backed content units.",
-                "target_unit_ids": [],
-            })
+            reasons = list(quality["reason_codes"] or ["quality_recovery"])
+            reason_groups = []
+            if "formula_hint" in reasons:
+                # Formula recovery has a distinct semantic postcondition.  Do
+                # not let a control-byte repair on the same page close it.
+                reason_groups.append(["formula_hint"])
+                reasons = [reason for reason in reasons if reason != "formula_hint"]
+            if reasons:
+                reason_groups.append(reasons)
+            for reason_group in reason_groups:
+                formula_recovery = reason_group == ["formula_hint"]
+                quality_candidate = {
+                    "reason_codes": reason_group,
+                    "source_file": record.path,
+                    "pages": [page_number],
+                    "severity": "blocking" if quality["route"] == "review" else "warning",
+                    "description": "Page %d was routed to %s extraction (quality %.4f)." % (
+                        page_number, quality["route"], quality["score"]
+                    ),
+                    "suggested_action": (
+                        "Inspect the cited page and add or validate a material-provenance "
+                        "formula unit with non-empty LaTeX at this exact source location."
+                        if formula_recovery else
+                        "Inspect the rendered source page and add or validate evidence-backed "
+                        "content units."
+                    ),
+                    "target_unit_ids": [],
+                }
+                quality_candidates.append(quality_candidate)
+                page_quality_candidates.append(quality_candidate)
 
         phase = mapping_by_page.get((record.path, page_number))
         chapter, phase_label, chapter_id, phase_id = phase or (None, None, None, None)
@@ -880,6 +1007,7 @@ def build_payload(
 
     _validate_auxiliary_source_bindings(units, records.values())
     all_candidates = candidates + quality_candidates
+    page_quality_candidate_ids = {id(candidate) for candidate in page_quality_candidates}
     questions_by_external_id = {
         unit.external_id: unit for unit in units
         if unit.kind == "question" and unit.external_id
@@ -887,8 +1015,9 @@ def build_payload(
     bound, unbound = [], []
     records_by_id = {record.source_id: record for record in records.values()}
     unit_source_by_id = {unit.unit_id: unit.source_id for unit in units}
-    for candidate in all_candidates:
-        candidate = dict(candidate)
+    for raw_candidate in all_candidates:
+        is_page_quality_candidate = id(raw_candidate) in page_quality_candidate_ids
+        candidate = dict(raw_candidate)
         external_ids = candidate.pop("external_ids", [])
         resolved_targets = set(candidate.get("target_unit_ids") or ())
         resolved_targets.update(
@@ -900,8 +1029,45 @@ def build_payload(
             resolved_targets.update(
                 unit.unit_id for unit in units if unit.kind == "question"
             )
-        candidate["target_unit_ids"] = sorted(resolved_targets)
         record = _record_by_file(records, candidate.get("source_file"))
+        if record is not None and is_page_quality_candidate:
+            pages = {
+                page for page in candidate.get("pages") or ()
+                if type(page) is int and page >= 1
+            }
+            page_units = [
+                unit for unit in units
+                if unit.source_id == record.source_id and (not pages or unit.page in pages)
+            ]
+            reasons = set(candidate.get("reason_codes") or ())
+            if reasons == {"formula_hint"}:
+                # An unresolved formula page is intentionally unbound when no
+                # formula unit exists, so review may add one but cannot mutate
+                # arbitrary prose/question units merely to close the issue.
+                page_units = [unit for unit in page_units if unit.kind == "formula"]
+            unsafe_units = [
+                unit for unit in page_units if _unit_contains_unsafe_control_text(unit)
+            ]
+            if unsafe_units and reasons & {
+                    "nul_or_replacement_char", "nul_byte", "control_character",
+                    "garbled_text"}:
+                page_units = unsafe_units
+            resolved_targets.update(unit.unit_id for unit in page_units)
+        if (record is not None
+                and set(candidate.get("reason_codes") or ()) & {
+                    "nul_or_replacement_char", "nul_byte", "control_character", "garbled_text",
+                }):
+            pages = {
+                page for page in candidate.get("pages") or ()
+                if type(page) is int and page >= 1
+            }
+            resolved_targets.update(
+                unit.unit_id for unit in units
+                if unit.source_id == record.source_id
+                and (not pages or unit.page in pages)
+                and _unit_contains_unsafe_control_text(unit)
+            )
+        candidate["target_unit_ids"] = sorted(resolved_targets)
         if record is not None:
             row = dict(candidate)
             row["source_file"] = record.path
@@ -1814,10 +1980,13 @@ def _new_quiz_item(question, answer):
     }
     for key in (
         "options", "keywords", "knowledge_point", "knowledge_points", "source_type",
-        "requires_assets", "maybe_requires_assets",
+        "requires_assets", "maybe_requires_assets", "gradable",
+        "question_text_status", "diagram_type", "language", "expected_behavior", "tests",
     ):
         if key in metadata:
             item[key] = metadata[key]
+    if "source_language" in metadata:
+        item["source_language"] = metadata["source_language"]
     assets = _metadata_assets(question, answer)
     if assets:
         item["assets"] = assets
@@ -1830,6 +1999,8 @@ def _new_quiz_item(question, answer):
             answer_metadata.get("answer_source_pages") or [answer.page]
         )
         item["answer_provenance"] = answer.provenance
+        if "source_language" in answer_metadata:
+            item["answer_source_language"] = answer_metadata["source_language"]
         if answer.provenance == "ai_supplemented":
             item["source"] = "ai_generated"
     return item
@@ -1857,11 +2028,35 @@ def _update_quiz_item_from_units(item, question, answer, patched_unit_ids):
             "source_pages": "source_pages",
             "requires_assets": "requires_assets",
             "maybe_requires_assets": "maybe_requires_assets",
+            "gradable": "gradable",
+            "question_text_status": "question_text_status",
+            "diagram_type": "diagram_type",
+            "language": "language",
+            "expected_behavior": "expected_behavior",
+            "tests": "tests",
+            "source_language": "source_language",
         }
+        required_metadata = {"quiz_type", "source_pages"}
         for metadata_key, item_key in translated.items():
-            if metadata_key in metadata and item.get(item_key) != metadata[metadata_key]:
-                item[item_key] = metadata[metadata_key]
+            if metadata_key == "source_pages":
+                value = metadata.get(metadata_key) or [question.page]
+            elif metadata_key in metadata:
+                value = metadata[metadata_key]
+            elif metadata_key not in required_metadata:
+                if item_key in item:
+                    item.pop(item_key)
+                    updates += 1
+                continue
+            else:
+                # quiz type is required in the compiled bank.  A legacy unit
+                # without metadata.quiz_type cannot safely erase that identity.
+                continue
+            if item.get(item_key) != value:
+                item[item_key] = value
                 updates += 1
+        if item.get("source_file") != question.source_file:
+            item["source_file"] = question.source_file
+            updates += 1
         chapter = _chapter_number(question.chapter_id)
         if chapter is not None and item.get("chapter") != chapter:
             item["chapter"] = chapter
@@ -1887,22 +2082,24 @@ def _update_quiz_item_from_units(item, question, answer, patched_unit_ids):
         if item.get("answer_source_pages") != answer_pages:
             item["answer_source_pages"] = answer_pages
             updates += 1
+        if "source_language" in answer_metadata:
+            if item.get("answer_source_language") != answer_metadata["source_language"]:
+                item["answer_source_language"] = answer_metadata["source_language"]
+                updates += 1
+        elif "answer_source_language" in item:
+            item.pop("answer_source_language")
+            updates += 1
         if answer.provenance == "ai_supplemented" and item.get("source") != "ai_generated":
             item["source"] = "ai_generated"
             updates += 1
     if question_touched or answer_touched:
         assets = _metadata_assets(question, answer)
-        assets_declared = any(
-            unit is not None
-            and ("assets" in unit.metadata or (unit.asset_path and unit.asset_role))
-            for unit in (question if question_touched else None,
-                         answer if answer_touched else None)
-        )
-        if assets_declared and item.get("assets") != assets:
-            if assets:
+        if assets:
+            if item.get("assets") != assets:
                 item["assets"] = assets
-            else:
-                item.pop("assets", None)
+                updates += 1
+        elif "assets" in item:
+            item.pop("assets")
             updates += 1
     return updates
 

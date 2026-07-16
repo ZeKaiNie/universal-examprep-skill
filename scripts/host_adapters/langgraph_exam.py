@@ -48,6 +48,8 @@ class ExamGraphState(TypedDict, total=False):
     tutor_handoff_complete: bool
     warning_acknowledgement: Dict[str, Any]
     tutor_handoff: Dict[str, Any]
+    study_guide_gate_receipt: Dict[str, Any]
+    study_guide_inspection_hint: Dict[str, Any]
     terminal_status: str
     operation_error: str
 
@@ -61,6 +63,124 @@ def _canonical_sha256(value):
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         allow_nan=False).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+_GUIDE_STAGES = "claim_create claim_attach claim_verify typed_validate import preflight html pdf qa_render inspection ready".split()
+_GUIDE_GATE_FIELDS = {
+    "schema_version", "chapter", "artifact_mode", "stage", "pdf_sha256",
+    "render_manifest_sha256", "pages",
+}
+_GUIDE_PAGE_FIELDS = {"page", "png", "png_sha256"}
+_GUIDE_HINT_FIELDS = {"gate_sha256", "reviewer", "reviewer_kind", "page_verdicts"}
+
+
+def _hex_sha256(value):
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def validate_study_guide_gate_receipt(receipt, state=None):
+    """Validate a bounded result from the host's canonical-status callback."""
+
+    if (not isinstance(receipt, dict) or set(receipt) != _GUIDE_GATE_FIELDS
+            or receipt.get("schema_version") != 1):
+        raise LangGraphAdapterError("Study Guide gate receipt schema is invalid")
+    chapter, mode, stage = (
+        receipt.get("chapter"), receipt.get("artifact_mode"), receipt.get("stage"))
+    if (type(chapter) is not int or chapter < 1 or mode not in ("chat", "visual")
+            or stage not in _GUIDE_STAGES
+            or (state is not None and state.get("chapter") not in (None, chapter))
+            or (mode == "chat" and stage in _GUIDE_STAGES[5:-1])):
+        raise LangGraphAdapterError("Study Guide gate receipt identity is invalid")
+    pages = receipt.get("pages")
+    if not isinstance(pages, list) or len(pages) > 1000:
+        raise LangGraphAdapterError("Study Guide gate receipt is unbounded")
+    page_stage = mode == "visual" and stage in ("inspection", "ready")
+    if (page_stage != bool(pages) or (page_stage and (
+            not _hex_sha256(receipt.get("pdf_sha256"))
+            or not _hex_sha256(receipt.get("render_manifest_sha256"))))
+            or (not page_stage and (receipt.get("pdf_sha256") is not None
+                                    or receipt.get("render_manifest_sha256") is not None))):
+        raise LangGraphAdapterError("Study Guide render binding is incomplete")
+    for number, row in enumerate(pages, 1):
+        if (not isinstance(row, dict) or set(row) != _GUIDE_PAGE_FIELDS
+                or row.get("page") != number
+                or row.get("png") != "study_guide/qa/ch%02d_p%03d.png" % (chapter, number)
+                or not _hex_sha256(row.get("png_sha256"))):
+            raise LangGraphAdapterError("Study Guide page evidence is stale")
+    return receipt
+
+
+def validate_study_guide_gate_transition(previous, current, state=None):
+    current = validate_study_guide_gate_receipt(current, state)
+    if previous is None:
+        return current
+    # The checkpoint can legitimately carry the prior chapter/mode receipt when
+    # the canonical workspace state switches identity.  Validate that old value
+    # as a bounded receipt, but do not compare it to the new state's identity.
+    previous = validate_study_guide_gate_receipt(previous)
+    if (previous["chapter"], previous["artifact_mode"]) != (
+            current["chapter"], current["artifact_mode"]):
+        return current
+    stages = (_GUIDE_STAGES if current["artifact_mode"] == "visual"
+              else _GUIDE_STAGES[:5] + ["ready"])
+    if stages.index(current["stage"]) > stages.index(previous["stage"]) + 1:
+        raise LangGraphAdapterError("Study Guide stage skipped a canonical gate")
+    return current
+
+
+def create_study_guide_inspection_hint(response, gate_receipt):
+    """Bind one explicit pass verdict per page to the current render receipt."""
+
+    gate = validate_study_guide_gate_receipt(gate_receipt)
+    verdicts = response.get("page_verdicts") if isinstance(response, dict) else None
+    if (gate["stage"] != "inspection" or not isinstance(response, dict)
+            or set(response) != {
+                "inspected_pages", "reviewer", "reviewer_kind", "page_verdicts"}
+            or response.get("inspected_pages") != "all"
+            or not isinstance(response.get("reviewer"), str)
+            or re.fullmatch(r"[^\x00\r\n]{1,200}", response["reviewer"].strip()) is None
+            or response.get("reviewer_kind") not in ("agent", "user")
+            or not isinstance(verdicts, list) or len(verdicts) != len(gate["pages"])):
+        raise LangGraphAdapterError("Study Guide inspection must cover every page")
+    for page, verdict in zip(gate["pages"], verdicts):
+        if (not isinstance(verdict, str) or re.fullmatch(
+                r"%d=pass(?::[^\x00\r\n]{0,500})?" % page["page"], verdict) is None):
+            raise LangGraphAdapterError("Study Guide inspection verdict is invalid")
+    return {
+        "gate_sha256": _canonical_sha256(gate),
+        "reviewer": response["reviewer"].strip(),
+        "reviewer_kind": response["reviewer_kind"],
+        "page_verdicts": list(verdicts),
+    }
+
+
+def study_guide_inspection_hint_is_current(hint, gate_receipt):
+    try:
+        if not isinstance(hint, dict) or set(hint) != _GUIDE_HINT_FIELDS:
+            return False
+        response = {
+            "inspected_pages": "all", "reviewer": hint["reviewer"],
+            "reviewer_kind": hint["reviewer_kind"], "page_verdicts": hint["page_verdicts"],
+        }
+        return create_study_guide_inspection_hint(response, gate_receipt) == hint
+    except LangGraphAdapterError:
+        return False
+
+
+def route_after_study_guide_gate(state):
+    if state.get("operation_error"):
+        return "operation_error"
+    try:
+        receipt = validate_study_guide_gate_receipt(
+            state.get("study_guide_gate_receipt"), state)
+    except LangGraphAdapterError:
+        return "operation_error"
+    if receipt["stage"] == "ready":
+        return "validate"
+    if receipt["stage"] == "inspection" and study_guide_inspection_hint_is_current(
+            state.get("study_guide_inspection_hint"), receipt):
+        return "guide_accept_interrupt"
+    return "guide_%s_interrupt" % receipt["stage"]
 
 
 _CAPABILITY_STATUSES = {
@@ -313,6 +433,8 @@ _RESUME_ACK_FIELDS = {
     "tutor_notebook": "persisted",
     "typed_guide": "imported",
     "visual_qa": "accepted",
+    "study_guide_stage": "completed",
+    "guide_accept": "accepted",
     "phase_completion": "progress_updated",
 }
 
@@ -419,10 +541,12 @@ def _artifact_route(state, artifact):
         return "operation_error"
     if reasons.intersection(manifest_reasons) or artifact_counts.get(
             "manifest") is False:
-        return "guide_interrupt"
+        return "study_guide_rehydrate"
     mode = artifact_counts.get("artifact_mode") or state.get(
         "artifact_mode") or "chat"
-    return "visual_interrupt" if mode == "visual" else "guide_interrupt"
+    if mode not in ("chat", "visual"):
+        return "operation_error"
+    return "study_guide_rehydrate"
 
 
 def route_after_validation(state):
@@ -593,7 +717,8 @@ def build_exam_graph(checkpointer, command_api=None):
         try:
             return function(*args, **kwargs), None
         except Exception as exc:  # command_core already bounds subprocess details
-            return None, "%s: %s" % (function.__name__, str(exc)[:1000])
+            label = getattr(function, "__name__", function.__class__.__name__)
+            return None, "%s: %s" % (label, str(exc)[:1000])
 
     def resume_update(response, gate, **values):
         try:
@@ -743,34 +868,119 @@ def build_exam_graph(checkpointer, command_api=None):
             return {"operation_error": str(exc)}
         return resume_update(response, "tutor_notebook", tutor_handoff=handoff)
 
-    def guide_interrupt(state):
+    def study_guide_rehydrate(state):
+        context = _validation_context(state)
+        if context is None:
+            return {"operation_error": "Study Guide routing requires a current validator receipt"}
+        artifact = context["capabilities"].get("artifact_ready")
+        counts = _counts(artifact)
+        mode = counts.get("artifact_mode") if isinstance(counts, dict) else None
+        if mode not in ("chat", "visual"):
+            return {"operation_error": "validator omitted the canonical artifact_mode"}
+        status_function = getattr(api, "study_guide_status", None)
+        if not callable(status_function):
+            return {"operation_error": (
+                "the host must supply a read-only study_guide_status callback that rereads "
+                "canonical claim/content/render/QA receipts")}
+        draft = "notebook/ch%02d.guide.claim-draft.json" % context["chapter"]
+        receipt, error = safe_call(
+            status_function, state, state["workspace"], context["chapter"], mode,
+            draft)
+        if error:
+            return {"operation_error": error}
+        try:
+            validate_study_guide_gate_transition(
+                state.get("study_guide_gate_receipt"), receipt, state)
+            if receipt["artifact_mode"] != mode:
+                raise LangGraphAdapterError(
+                    "Study Guide gate receipt disagrees with canonical artifact_mode")
+        except LangGraphAdapterError as exc:
+            return {"operation_error": str(exc)}
+        return {"study_guide_gate_receipt": receipt, "operation_error": ""}
+
+    def current_guide_receipt(state, stage):
+        try:
+            receipt = validate_study_guide_gate_receipt(
+                state.get("study_guide_gate_receipt"), state)
+            if receipt["stage"] != stage:
+                raise LangGraphAdapterError("Study Guide stage drifted before interrupt")
+            return receipt, None
+        except LangGraphAdapterError as exc:
+            return None, str(exc)
+
+    def make_guide_interrupt(stage):
+        def node(state):
+            receipt, error = current_guide_receipt(state, stage)
+            if error:
+                return {"operation_error": error}
+            response = interrupt({
+                "gate": "study_guide_%s" % stage, "workspace": state["workspace"],
+                "chapter": receipt["chapter"], "draft_path":
+                    "notebook/ch%02d.guide.claim-draft.json" % receipt["chapter"],
+                "resume_contract": {"completed": True},
+                "instruction": "Complete this canonical stage using the documented command.",
+                "truth_boundary": "Resume is only a hint; canonical validators rerun next.",
+            })
+            return resume_update(response, "study_guide_stage")
+
+        return node
+
+    guide_command_nodes = {
+        "guide_%s_interrupt" % stage: make_guide_interrupt(stage)
+        for stage in _GUIDE_STAGES[:-2]
+    }
+    def guide_inspection_interrupt(state):
+        receipt, error = current_guide_receipt(state, "inspection")
+        if error:
+            return {"operation_error": error}
         response = interrupt({
-            "gate": "typed_guide",
+            "gate": "study_guide_all_pages_inspection",
             "workspace": state["workspace"],
-            "chapter": state.get("chapter"),
-            "resume_contract": {"imported": True},
+            "chapter": receipt["chapter"],
+            "pdf_sha256": receipt["pdf_sha256"],
+            "render_manifest_sha256": receipt["render_manifest_sha256"],
+            "pages": receipt["pages"],
+            "resume_contract": {
+                "inspected_pages": "all",
+                "reviewer": "<non-empty name>",
+                "reviewer_kind": "agent|user",
+                "page_verdicts": ["1=pass:<notes>"],
+            },
             "instruction": (
-                "Validate and import the full typed chapter guide. Resume only after the "
-                "canonical notebook/chNN.guide.json passes its existing validator."
+                "Actually open and visually inspect every listed current PNG in order. Check math, "
+                "glyphs, images, prompt/answer order, clipping, tables, margins, page breaks, page "
+                "numbers, orphan headings, and blank space. Return one hash-bound pass verdict per "
+                "page; any defect requires a fix, rerender, and a fresh inspection from page 1."
             ),
         })
-        return resume_update(response, "typed_guide")
+        try:
+            hint = create_study_guide_inspection_hint(response, receipt)
+        except LangGraphAdapterError as exc:
+            return {"operation_error": str(exc)}
+        return {"study_guide_inspection_hint": hint, "operation_error": ""}
 
-    def visual_interrupt(state):
-        payload = _payload(state.get("validation_receipt")) or {}
-        artifact = (payload.get("capabilities") or {}).get("artifact_ready") or {}
+    def guide_accept_interrupt(state):
+        receipt, error = current_guide_receipt(state, "inspection")
+        if error:
+            return {"operation_error": error}
+        hint = state.get("study_guide_inspection_hint")
+        if not study_guide_inspection_hint_is_current(hint, receipt):
+            return {"operation_error": "Study Guide inspection evidence is missing or stale"}
         response = interrupt({
-            "gate": "visual_qa",
+            "gate": "study_guide_qa_accept",
             "workspace": state["workspace"],
-            "chapter": state.get("chapter"),
-            "reason_codes": artifact.get("reason_codes") or [],
+            "chapter": receipt["chapter"],
+            "reviewer": hint["reviewer"],
+            "reviewer_kind": hint["reviewer_kind"],
+            "page_verdicts": hint["page_verdicts"],
             "resume_contract": {"accepted": True},
             "instruction": (
-                "Use the existing render route, render every PDF page, inspect every current "
-                "PNG, and run study_guide_qa accept with one passing verdict per page."
+                "Run study_guide_qa.py accept with --inspected-pages all and exactly these "
+                "hash-bound per-page pass verdicts. Resume only after the canonical receipt is "
+                "ready; acknowledgement alone cannot satisfy artifact readiness."
             ),
         })
-        return resume_update(response, "visual_qa")
+        return resume_update(response, "guide_accept")
 
     def completion_interrupt(state):
         response = interrupt({
@@ -807,12 +1017,15 @@ def build_exam_graph(checkpointer, command_api=None):
         ("rebuild_interrupt", rebuild_interrupt),
         ("warning_interrupt", warning_interrupt),
         ("tutor_interrupt", tutor_interrupt),
-        ("guide_interrupt", guide_interrupt),
-        ("visual_interrupt", visual_interrupt),
+        ("study_guide_rehydrate", study_guide_rehydrate),
+        ("guide_inspection_interrupt", guide_inspection_interrupt),
+        ("guide_accept_interrupt", guide_accept_interrupt),
         ("completion_interrupt", completion_interrupt),
         ("completion_check", completion_check),
         ("halt_operation", operation_error),
     ):
+        builder.add_node(name, node)
+    for name, node in guide_command_nodes.items():
         builder.add_node(name, node)
     builder.add_edge(START, "rehydrate")
     builder.add_conditional_edges("rehydrate", route_after_rehydrate, {
@@ -834,8 +1047,7 @@ def build_exam_graph(checkpointer, command_api=None):
         "rebuild_interrupt": "rebuild_interrupt",
         "warning_interrupt": "warning_interrupt",
         "tutor_interrupt": "tutor_interrupt",
-        "guide_interrupt": "guide_interrupt",
-        "visual_interrupt": "visual_interrupt",
+        "study_guide_rehydrate": "study_guide_rehydrate",
         "completion_interrupt": "completion_interrupt",
         "operation_error": "halt_operation",
     })
@@ -845,10 +1057,22 @@ def build_exam_graph(checkpointer, command_api=None):
     builder.add_conditional_edges("rebuild_interrupt", route_after_interrupt, {
         "continue": "validate", "operation_error": "halt_operation",
     })
-    for name in ("review_interrupt", "warning_interrupt", "tutor_interrupt",
-                 "guide_interrupt", "visual_interrupt"):
+    for name in ("review_interrupt", "warning_interrupt", "tutor_interrupt"):
         builder.add_conditional_edges(name, route_after_interrupt, {
             "continue": "validate", "operation_error": "halt_operation",
+        })
+    guide_routes = dict((name, name) for name in guide_command_nodes)
+    guide_routes.update({
+        "guide_inspection_interrupt": "guide_inspection_interrupt",
+        "guide_accept_interrupt": "guide_accept_interrupt",
+        "validate": "validate", "operation_error": "halt_operation",
+    })
+    builder.add_conditional_edges(
+        "study_guide_rehydrate", route_after_study_guide_gate, guide_routes)
+    for name in tuple(guide_command_nodes) + (
+            "guide_inspection_interrupt", "guide_accept_interrupt"):
+        builder.add_conditional_edges(name, route_after_interrupt, {
+            "continue": "study_guide_rehydrate", "operation_error": "halt_operation",
         })
     builder.add_conditional_edges("completion_interrupt", route_after_interrupt, {
         "continue": "completion_check", "operation_error": "halt_operation",
@@ -861,8 +1085,7 @@ def build_exam_graph(checkpointer, command_api=None):
         "rebuild_interrupt": "rebuild_interrupt",
         "warning_interrupt": "warning_interrupt",
         "tutor_interrupt": "tutor_interrupt",
-        "guide_interrupt": "guide_interrupt",
-        "visual_interrupt": "visual_interrupt",
+        "study_guide_rehydrate": "study_guide_rehydrate",
         "operation_error": "halt_operation",
     })
     builder.add_edge("halt_operation", END)
@@ -872,6 +1095,9 @@ def build_exam_graph(checkpointer, command_api=None):
 __all__ = [
     "ExamGraphState", "LangGraphAdapterError", "OptionalDependencyUnavailable",
     "build_exam_graph", "completed_phase_status", "completion_check_update",
+    "create_study_guide_inspection_hint",
+    "route_after_study_guide_gate", "study_guide_inspection_hint_is_current",
+    "validate_study_guide_gate_receipt", "validate_study_guide_gate_transition",
     "route_after_completion_check",
     "hint_receipt", "validate_resume", "validate_review_receipt",
     "route_after_confirm", "route_after_ingest", "route_after_interrupt",

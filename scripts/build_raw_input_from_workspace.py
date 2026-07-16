@@ -835,6 +835,363 @@ def _pages_for_span(bounds, a, b):
     return out
 
 
+_HW_ROSTER_LINE_RE = re.compile(
+    r"^[ \t]*\d+\s*[.)]\s*(?:Problem|Exercise|Question)\s*#?\s*"
+    + _HW_NUM_PAT
+    + r"\s*(?:\([^?\n]{0,200}\))?\s*$",
+    re.I,
+)
+
+
+def _page_for_stream_offset(bounds, offset):
+    """Return the physical page containing a concatenated-file offset."""
+    page = bounds[0][1] if bounds else None
+    for start, page_number in bounds:
+        if start > offset:
+            break
+        page = page_number
+    return page
+
+
+def _homework_roster(pages, source_file):
+    """Detect an enumerated assignment roster, not a page of real prompts.
+
+    A roster has at least two ``1. Problem X.Y``-style one-line entries and at
+    least 80 percent of its problem markers are bare list entries.  Requiring a
+    list ordinal separate from the textbook problem number prevents ordinary
+    ``Problem 1`` worksheets from entering this special route.
+    """
+    entries = []
+    roster_pages = []
+    for page in sorted(
+            (row for row in pages if row.get("file") == source_file),
+            key=lambda row: row.get("page", 0)):
+        text = page.get("text") or ""
+        markers = [
+            marker for marker in _hw_markers(text)
+            if marker.get("role") == "problem" and marker.get("num") is not None
+        ]
+        if len(markers) < 2 or any(
+                marker.get("role") == "solution" for marker in _hw_markers(text)):
+            continue
+        bare = 0
+        for marker in markers:
+            line_end = text.find("\n", marker["start"])
+            if line_end < 0:
+                line_end = len(text)
+            if _HW_ROSTER_LINE_RE.match(text[marker["start"]:line_end]):
+                bare += 1
+        if bare < 2 or bare * 5 < len(markers) * 4:
+            continue
+        roster_pages.append(page["page"])
+        entries.extend(marker["num"] for marker in markers)
+    if not entries:
+        return None
+    if len(set(entries)) != len(entries):
+        return {
+            "status": "review",
+            "pages": sorted(set(roster_pages)),
+            "entries": entries,
+            "reason": "duplicate problem numbers in assignment roster",
+        }
+    return {
+        "status": "detected",
+        "pages": sorted(set(roster_pages)),
+        "entries": entries,
+    }
+
+
+def _clip_bbox(bbox, page_bbox):
+    x0 = max(float(page_bbox[0]), float(bbox[0]))
+    y0 = max(float(page_bbox[1]), float(bbox[1]))
+    x1 = min(float(page_bbox[2]), float(bbox[2]))
+    y1 = min(float(page_bbox[3]), float(bbox[3]))
+    return [x0, y0, x1, y1] if x1 > x0 and y1 > y0 else None
+
+
+def _bbox_union(boxes):
+    return [
+        min(box[0] for box in boxes), min(box[1] for box in boxes),
+        max(box[2] for box in boxes), max(box[3] for box in boxes),
+    ]
+
+
+def _boxes_connected(left, right, gap):
+    horizontal_gap = max(0.0, max(left[0] - right[2], right[0] - left[2]))
+    vertical_gap = max(0.0, max(left[1] - right[3], right[1] - left[3]))
+    horizontal_overlap = min(left[2], right[2]) >= max(left[0], right[0])
+    vertical_overlap = min(left[3], right[3]) >= max(left[1], right[1])
+    return ((horizontal_gap <= gap and vertical_overlap)
+            or (vertical_gap <= gap and horizontal_overlap))
+
+
+def _prompt_image_cluster(layout):
+    """Find a separable upper-page prompt image cluster from PDF layout facts.
+
+    Repeated image motifs (tiled paper backgrounds and repeated answer-table
+    templates) are excluded.  The accepted cluster must be wide, start near
+    the top, and leave enough page area that it cannot be a whole-page scan
+    containing both prompt and handwritten answer.
+    """
+    if not isinstance(layout, dict):
+        return None
+    page_bbox = layout.get("page_bbox")
+    if not (isinstance(page_bbox, (list, tuple)) and len(page_bbox) == 4):
+        return None
+    width = float(page_bbox[2]) - float(page_bbox[0])
+    height = float(page_bbox[3]) - float(page_bbox[1])
+    if width <= 0 or height <= 0:
+        return None
+    grouped = {}
+    for image in layout.get("images") or ():
+        if not isinstance(image, dict):
+            continue
+        clipped = _clip_bbox(image.get("bbox") or (), page_bbox) \
+            if len(image.get("bbox") or ()) == 4 else None
+        if clipped is not None:
+            grouped.setdefault(str(image.get("image_id")), []).append(clipped)
+    eligible = []
+    for boxes in grouped.values():
+        # Three or more placements of one image are a repeated background or
+        # answer-area template, not independently evidenced prompt content.
+        if len(boxes) >= 3:
+            continue
+        for box in boxes:
+            box_width = box[2] - box[0]
+            box_height = box[3] - box[1]
+            area_ratio = box_width * box_height / (width * height)
+            if box_width >= 0.25 * width and 0.005 <= area_ratio <= 0.80:
+                eligible.append(box)
+    gap = max(8.0, 0.02 * height)
+    components = []
+    for box in eligible:
+        touching = [
+            index for index, component in enumerate(components)
+            if _boxes_connected(component, box, gap)
+        ]
+        if not touching:
+            components.append(list(box))
+            continue
+        base = touching[0]
+        components[base] = _bbox_union((components[base], box))
+        for index in reversed(touching[1:]):
+            components[base] = _bbox_union((components[base], components.pop(index)))
+    candidates = []
+    for component in components:
+        component_width = component[2] - component[0]
+        component_height = component[3] - component[1]
+        area_ratio = component_width * component_height / (width * height)
+        if (component_width >= 0.55 * width
+                and component[1] <= float(page_bbox[1]) + 0.25 * height
+                and area_ratio <= 0.80
+                and component[3] <= float(page_bbox[1]) + 0.90 * height):
+            candidates.append(component)
+    if not candidates:
+        return None
+    return min(candidates, key=lambda box: (box[1], -(box[2] - box[0])))
+
+
+def _bbox_has_text(layout, bbox):
+    for raw in (layout or {}).get("text_boxes") or ():
+        if not (isinstance(raw, (list, tuple)) and len(raw) == 4):
+            continue
+        if (min(float(raw[2]), float(bbox[2])) > max(float(raw[0]), float(bbox[0]))
+                and min(float(raw[3]), float(bbox[3])) > max(float(raw[1]), float(bbox[1]))):
+            return True
+    return False
+
+
+def _layout_has_scan_evidence(layout):
+    """Return whether image geometry makes extracted text unsafe by itself.
+
+    A PDF scan can carry an OCR text layer containing both the printed prompt
+    and an unlabeled handwritten response.  Matching problem numbers in that
+    text layer therefore do not prove prompt/answer separation.  One large
+    image, or images covering most of the page in aggregate, is enough to keep
+    a roster file on the visual/fail-closed route.
+    """
+    if not isinstance(layout, dict):
+        return False
+    page_bbox = layout.get("page_bbox")
+    if not (isinstance(page_bbox, (list, tuple)) and len(page_bbox) == 4):
+        return False
+    page_area = ((float(page_bbox[2]) - float(page_bbox[0]))
+                 * (float(page_bbox[3]) - float(page_bbox[1])))
+    if page_area <= 0:
+        return False
+    image_areas = []
+    for image in layout.get("images") or ():
+        raw = image.get("bbox") if isinstance(image, dict) else None
+        clipped = _clip_bbox(raw or (), page_bbox) if len(raw or ()) == 4 else None
+        if clipped is not None:
+            image_areas.append(
+                (clipped[2] - clipped[0]) * (clipped[3] - clipped[1])
+            )
+    return bool(image_areas) and (
+        max(image_areas) >= 0.40 * page_area
+        or sum(image_areas) >= 0.65 * page_area
+    )
+
+
+def _homework_roster_route(pages, source_file, backend):
+    """Resolve a roster to text prompts, safe image crops, or typed review."""
+    roster = _homework_roster(pages, source_file)
+    if roster is None:
+        return None
+    if roster.get("status") == "review":
+        return roster
+    roster_pages = set(roster["pages"])
+    source_pages = sorted(
+        (row for row in pages if row.get("file") == source_file),
+        key=lambda row: row.get("page", 0),
+    )
+    non_roster_numbers = []
+    for page in source_pages:
+        if page.get("page") in roster_pages:
+            continue
+        non_roster_numbers.extend(
+            marker["num"] for marker in _hw_markers(page.get("text") or "")
+            if marker.get("role") == "problem" and marker.get("num") is not None
+        )
+    # Equality must include cardinality and order.  Set equality hid duplicate
+    # OCR markers and allowed a different page sequence to masquerade as a
+    # one-to-one roster mapping.
+    text_markers_match = non_roster_numbers == roster["entries"]
+    if non_roster_numbers and not text_markers_match:
+        return {
+            "status": "review",
+            "pages": [page["page"] for page in source_pages],
+            "entries": roster["entries"],
+            "reason": "only some roster problems have independent text markers",
+        }
+    layout_reader = getattr(backend, "page_layout", None)
+    clip_renderer = getattr(backend, "render_page_clip_png", None)
+    if not callable(layout_reader):
+        return {
+            "status": "review",
+            "pages": [page["page"] for page in source_pages],
+            "entries": roster["entries"],
+            "reason": (
+                "PDF layout/crop capability is unavailable, so matching OCR/text "
+                "markers cannot prove that handwritten answers are absent"
+            ),
+        }
+    layouts = {}
+    anchors = []
+    scan_evidence = False
+    scan_pages = []
+    try:
+        for page in source_pages:
+            if page.get("page") in roster_pages:
+                continue
+            pdf_path = page.get("_pdf")
+            if not pdf_path:
+                raise ValueError("source page lacks its PDF revision path")
+            layout = layout_reader(pdf_path, page["page"] - 1)
+            if not isinstance(layout, dict):
+                raise ValueError("layout backend returned no page facts")
+            layouts[page["page"]] = layout
+            if _layout_has_scan_evidence(layout):
+                scan_evidence = True
+                scan_pages.append(page["page"])
+            crop = _prompt_image_cluster(layout)
+            if crop is not None:
+                scan_evidence = True
+                scan_pages.append(page["page"])
+                anchors.append({
+                    "page": page["page"], "crop": crop,
+                    "page_bbox": list(layout["page_bbox"]),
+                })
+    except Exception as exc:
+        return {
+            "status": "review",
+            "pages": [page["page"] for page in source_pages],
+            "entries": roster["entries"],
+            "reason": "layout inspection failed: %s" % exc,
+        }
+    # Native text pages may use the ordinary slicer.  OCR text over a scan is
+    # categorically different: it can contain an unlabeled handwritten answer,
+    # so its matching problem-number set is only a routing hint, never proof.
+    if text_markers_match and not scan_evidence:
+        return {
+            "status": "text", "pages": roster["pages"],
+            "entries": roster["entries"],
+        }
+    if scan_evidence and not callable(clip_renderer):
+        return {
+            "status": "review",
+            "pages": sorted(set(roster["pages"] + scan_pages)),
+            "entries": roster["entries"],
+            "reason": (
+                "scan/layout evidence makes OCR text unsafe and prompt-only "
+                "crop rendering is unavailable"
+            ),
+        }
+    if len(anchors) != len(roster["entries"]):
+        return {
+            "status": "review",
+            "pages": sorted(set(
+                roster["pages"] + scan_pages + [row["page"] for row in anchors]
+            )),
+            "entries": roster["entries"],
+            "reason": (
+                "roster has %d problems but scan/layout evidence proves %d "
+                "prompt-only image anchors"
+            ) % (len(roster["entries"]), len(anchors)),
+        }
+    page_positions = {page["page"]: index for index, page in enumerate(source_pages)}
+    plans = {}
+    for index, (number, anchor) in enumerate(zip(roster["entries"], anchors)):
+        start_index = page_positions[anchor["page"]]
+        next_anchor = anchors[index + 1] if index + 1 < len(anchors) else None
+        stop_index = (page_positions[next_anchor["page"]]
+                      if next_anchor is not None else len(source_pages))
+        covered_pages = [
+            page["page"] for page in source_pages[start_index:stop_index]
+            if page["page"] not in roster_pages
+        ]
+        answer_crops = []
+        page_bbox = anchor["page_bbox"]
+        if float(page_bbox[3]) - float(anchor["crop"][3]) >= 12.0:
+            answer_crops.append((
+                source_file, anchor["page"],
+                [page_bbox[0], anchor["crop"][3], page_bbox[2], page_bbox[3]],
+            ))
+        for page in source_pages[start_index + 1:stop_index]:
+            if page["page"] in roster_pages:
+                continue
+            current_bbox = layouts[page["page"]]["page_bbox"]
+            answer_crops.append((source_file, page["page"], list(current_bbox)))
+        if next_anchor is not None:
+            top_crop = [
+                next_anchor["page_bbox"][0], next_anchor["page_bbox"][1],
+                next_anchor["page_bbox"][2], next_anchor["crop"][1],
+            ]
+            if ((top_crop[3] - top_crop[1]) >= 12.0
+                    and _bbox_has_text(layouts[next_anchor["page"]], top_crop)):
+                answer_crops.append((source_file, next_anchor["page"], top_crop))
+                covered_pages.append(next_anchor["page"])
+        plans[number] = {
+            # Prompt provenance names only pages that contribute question-side
+            # pixels.  Handwriting continuations belong exclusively to the
+            # answer-side crop list below.
+            "source_pages": [anchor["page"]],
+            "question_crops": [(source_file, anchor["page"], anchor["crop"])],
+            "answer_crops": answer_crops,
+            "anchor_page": anchor["page"],
+        }
+    return {
+        "status": "visual", "pages": roster["pages"],
+        "entries": roster["entries"], "plans": plans,
+    }
+
+
+def _chapter_from_homework_number(number):
+    """Infer chapter only from a textbook-style dotted problem number."""
+    match = re.match(r"^(\d+)\.(?:\d+)(?:\.|$)", str(number or ""))
+    return int(match.group(1)) if match else None
+
+
 def _hw_num(s):
     """Problem number as int, or a normalized string for textbook decimals / lettered subparts
     （1.1 ≠ 1；1(a) 与 1a 同号，规范成 '1a'）."""
@@ -960,7 +1317,7 @@ def _hw_nonblank_slice(stream, bounds, fname, s_start, s_end):
     return None
 
 
-def extract_homework_items(pages, root_name="", exclude=frozenset()):
+def extract_homework_items(pages, root_name="", exclude=frozenset(), backend=None):
     """Extract homework problems (+ answers from paired solution files OR inline Solution blocks)
     into bank items with source_type='homework'. Returns (items, hw_report)."""
     files = sorted({pg["file"] for pg in pages})
@@ -986,7 +1343,9 @@ def extract_homework_items(pages, root_name="", exclude=frozenset()):
               "homework_files": hw_files,
               "homework_solution_files": sorted(pairing),
               "homework_pairs": sorted([s, h] for s, h in pairing.items() if h),
-              "homework_problems": 0, "homework_answered": 0, "warnings": _note_msgs}
+              "homework_problems": 0, "homework_answered": 0,
+              "homework_roster_files": 0, "homework_prompt_crops": 0,
+              "homework_answer_crops": 0, "ai_review": [], "warnings": _note_msgs}
     for sf, h in sorted(pairing.items()):
         if h is not None:
             continue
@@ -1183,6 +1542,44 @@ def extract_homework_items(pages, root_name="", exclude=frozenset()):
     for hf in hw_files:
         stream, bounds = _file_stream(pages, hf)
         marks = _hw_markers(stream)
+        roster_route = _homework_roster_route(pages, hf, backend)
+        roster_plans = {}
+        if roster_route is not None:
+            report["homework_roster_files"] += 1
+            if roster_route.get("status") == "review":
+                reason = roster_route.get("reason") or "prompt/answer separation is not proven"
+                review_pages = roster_route.get("pages") or []
+                report["warnings"].append(
+                    "homework_prompt_crop_unsafe_leakage: %s (%s)" % (hf, reason)
+                )
+                report["ai_review"].append({
+                    "kind": "homework_prompt_crop_unsafe_leakage",
+                    "file": hf,
+                    "pages": review_pages,
+                    "action": (
+                        "The assignment roster could not be mapped one-to-one to independently "
+                        "separable prompt image regions (%s). Inspect the cited pages, create one "
+                        "prompt-only crop per roster problem, attach handwriting/solutions only as "
+                        "answer-side evidence, and rebuild. Do not publish the roster page or a "
+                        "whole answer-bearing page as a question asset." % reason
+                    ),
+                })
+                continue
+            if roster_route.get("status") == "text":
+                roster_pages = set(roster_route.get("pages") or ())
+                marks = [
+                    marker for marker in marks
+                    if not (marker.get("role") == "problem"
+                            and _page_for_stream_offset(bounds, marker["start"]) in roster_pages)
+                ]
+            elif roster_route.get("status") == "visual":
+                roster_plans = roster_route.get("plans") or {}
+                report["homework_prompt_crops"] += sum(
+                    len(plan.get("question_crops") or ()) for plan in roster_plans.values()
+                )
+                report["homework_answer_crops"] += sum(
+                    len(plan.get("answer_crops") or ()) for plan in roster_plans.values()
+                )
         probs = [m for m in marks if m["role"] == "problem"]
         if not probs:
             if hf in exam_files:
@@ -1200,6 +1597,33 @@ def extract_homework_items(pages, root_name="", exclude=frozenset()):
                 report["warnings"].append("hw_no_markers: %s（识别为作业文件但没找到 Problem/第N题 标记）" % hf)
             continue
         stem = hw_stems[hf]
+        if roster_plans:
+            roster_entries = list(roster_route.get("entries") or ())
+            review_pages = sorted(set(
+                list(roster_route.get("pages") or ())
+                + [plan["anchor_page"] for plan in roster_plans.values()]
+            ))
+            report["warnings"].append(
+                "homework_roster_visual_mapping_unverified: %s" % hf
+            )
+            report["ai_review"].append({
+                "kind": "homework_roster_visual_mapping_unverified",
+                "file": hf,
+                "pages": review_pages,
+                "external_ids": [
+                    "%s_%s_%s" % (
+                        "exam" if hf in exam_files else "hw", stem,
+                        str(number).replace(".", "_"),
+                    )
+                    for number in roster_entries
+                ],
+                "action": (
+                    "The parser proved prompt-only geometry but not the semantic roster-to-crop "
+                    "labels. Visually compare every printed prompt crop with the roster in order; "
+                    "confirm each problem number and that no handwriting is question-side before "
+                    "resolving this artifact-critical review."
+                ),
+            })
         prob_nums = {m["num"] for m in probs if m["num"] is not None}
         seen_nums = set()
         dup_counts = {}
@@ -1288,6 +1712,12 @@ def extract_homework_items(pages, root_name="", exclude=frozenset()):
             if sol_title_start is not None and mk["start"] < sol_title_start < nxt:
                 nxt_q = sol_title_start
             q_text = stream[mk["start"]:nxt_q].strip()
+            visual_plan = roster_plans.get(mk["num"])
+            if visual_plan is not None:
+                q_text = (
+                    "Problem %s - see the attached prompt-only crop from %s p.%d."
+                    % (mk["num"], hf, visual_plan["anchor_page"])
+                )
             # inline solution: the next (non-continued) marker is an un/same-numbered Solution → the answer
             ans = None
             if k < len(marks) and marks[k]["role"] == "solution" \
@@ -1367,7 +1797,9 @@ def extract_homework_items(pages, root_name="", exclude=frozenset()):
             if ans is None:
                 got = sol_answers.get((hf, mk["num"]))
                 ans = got[:3] if got else None
-            q_pages = _pages_for_span(bounds, mk["start"], nxt_q)
+            q_pages = (list(visual_plan["source_pages"])
+                       if visual_plan is not None
+                       else _pages_for_span(bounds, mk["start"], nxt_q))
             # marker-only prompt: the heading is all the text extractor got — the real prompt is an
             # image on the page → page_reference（镜像 lecture 的 marker_only 语义），并渲染原页
             body_txt = q_text.split("\n", 1)[1] if "\n" in q_text else ""
@@ -1383,9 +1815,12 @@ def extract_homework_items(pages, root_name="", exclude=frozenset()):
             # 纯数字正文（如 "Problem 1\n12" 的页脚页码）没有字母/CJK/运算符，是抽取残渣 → 按图片题处理
             _mo_body = "\n".join(l for l in body_txt.splitlines()
                                   if not _PAGE_RESIDUE_RE.match(l.strip()))   # 页脚残渣行不算正文
-            marker_only = (len(re.findall(r"[0-9A-Za-z一-鿿]", _mo_body)) == 0
-                           or not re.search(r"[A-Za-z一-鿿+\-*/=^%<>?？()（）]", _mo_body))
-            # chapter：只在题文/文件名明说时才标（第N章 / Chapter N / chNN）——作业号 ≠ 章节号，不硬编
+            marker_only = (True if visual_plan is not None else (
+                len(re.findall(r"[0-9A-Za-z一-鿿]", _mo_body)) == 0
+                or not re.search(r"[A-Za-z一-鿿+\-*/=^%<>?？()（）]", _mo_body)
+            ))
+            # chapter：题文/文件名可明说；教材式 X.Y / X.Y.Z 题号的首段也是章节锚点。
+            # 单段作业序号（Problem 1）仍不是章节号，绝不据此猜测。
             chm = (re.search(r"(?:第\s*(\d+)\s*章|Chapter\s+(\d+))", q_text, re.I)
                    or re.search(r"(?:^|[\/_\-. ])ch\s*0*(\d+)", hf, re.I))
             _src = "exam" if hf in exam_files else "homework"
@@ -1401,6 +1836,8 @@ def extract_homework_items(pages, root_name="", exclude=frozenset()):
                 item["options"] = _opts
             if chm:
                 item["chapter"] = int(next(g for g in chm.groups() if g))
+            elif _chapter_from_homework_number(mk["num"]) is not None:
+                item["chapter"] = _chapter_from_homework_number(mk["num"])
             if ans:
                 sf, body, apages = ans
                 item["answer"] = body                     # 不静默截断
@@ -1413,6 +1850,19 @@ def extract_homework_items(pages, root_name="", exclude=frozenset()):
             else:
                 item["answer_status"] = "unknown"
                 report["warnings"].append("hw_unanswered: %s（没找到配对答案，考前需人工核对）" % item["id"])
+            if visual_plan is not None:
+                # The roster route has already proved a one-to-one prompt crop for this
+                # problem.  Bind only that crop as question-side evidence.  Handwriting
+                # below it and continuation pages stay answer-side and are rendered only
+                # after the question; never fall back to an answer-bearing whole page.
+                item["requires_assets"] = True
+                item["_render"] = True
+                item["_prompt_text"] = q_text
+                item["_question_crops"] = list(visual_plan["question_crops"])
+                item["_answer_crops"] = list(visual_plan["answer_crops"])
+                items.append(item)
+                report["homework_problems"] += 1
+                continue
             # visual dependence — same heuristic family as lecture items; renderable only for PDF sources
             # 题面图渲染整页：若该页同时含本题的 inline 答案文本，整页作 question_context 会在
             # 提问前泄答案（visual-first 契约）——这些页从题面图剔除；剔完没剩就 fail-loud 降级
@@ -1453,7 +1903,7 @@ def extract_homework_items(pages, root_name="", exclude=frozenset()):
                                       "解答区重复）" % (hf, "、".join("Problem %s×%d" % (n, c)
                                                                       for n, c in sorted(dup_counts.items(),
                                                                                          key=lambda kv: str(kv[0])))))
-        # chapter 只在题文/文件名明说时才标（作业号≠章节号，绝不猜）——但没章节的题 --chapter 过滤
+        # chapter 来自明示文本/文件名或教材式点号题号；单段作业号绝不当章节号。没章节的题 --chapter 过滤
         # 取不到，必须让用户知道并给出补标注的路径，而不是静默漏检索
         no_ch = sum(1 for it in items if it["source_file"] == hf and "chapter" not in it)
         if no_ch:
@@ -1745,6 +2195,50 @@ class RealBackend(object):
             finally:
                 doc.close()
         return None
+
+    def page_layout(self, pdf_path, page_index):
+        """Return local-only image/text geometry for deterministic crop gates."""
+        import fitz
+        doc = fitz.open(pdf_path)
+        try:
+            page = doc[page_index]
+            images = []
+            for image in page.get_images(full=True):
+                xref = image[0]
+                for rect in page.get_image_rects(xref):
+                    images.append({
+                        "image_id": str(xref),
+                        "bbox": [rect.x0, rect.y0, rect.x1, rect.y1],
+                        "pixel_width": image[2],
+                        "pixel_height": image[3],
+                    })
+            text_boxes = [
+                [block[0], block[1], block[2], block[3]]
+                for block in page.get_text("blocks")
+                if len(block) >= 5 and str(block[4]).strip()
+            ]
+            return {
+                "page_bbox": [page.rect.x0, page.rect.y0, page.rect.x1, page.rect.y1],
+                "images": images,
+                "text_boxes": text_boxes,
+            }
+        finally:
+            doc.close()
+
+    def render_page_clip_png(self, pdf_path, page_index, bbox):
+        """Render one proven PDF-point crop; never fall back to a whole page."""
+        import fitz
+        doc = fitz.open(pdf_path)
+        try:
+            page = doc[page_index]
+            clip = fitz.Rect(*bbox) & page.rect
+            if clip.is_empty or clip.is_infinite:
+                return None
+            return page.get_pixmap(
+                matrix=fitz.Matrix(2.0, 2.0), clip=clip, alpha=False
+            ).tobytes("png")
+        finally:
+            doc.close()
 
 
 def detect_backend():
@@ -2981,9 +3475,11 @@ def _run_unlocked(args, backend=None, adapter_runner=None):
 
     homework_items = []
     if getattr(args, "extract_homework", "auto") != "never":
-        homework_items, hw_rep = extract_homework_items(pages, _mat_root_name,
-                                                        exclude=exam_rerouted)
+        homework_items, hw_rep = extract_homework_items(
+            pages, _mat_root_name, exclude=exam_rerouted, backend=backend
+        )
         report["warnings"].extend(hw_rep.pop("warnings"))
+        report["ai_review"].extend(hw_rep.pop("ai_review", []))
         report.update(hw_rep)
     _annotate_source_languages(lecture_items + homework_items, report)
     # ---- render assets for figure-dependent items ----
@@ -3122,10 +3618,19 @@ def _run_unlocked(args, backend=None, adapter_runner=None):
                         if pg["file"] == f0 and pg["page"] == p0), "")
             return not re.search(r"(?im)^[ \t>*#]*(?:solutions?|answers?|解答|答案)\b", _t0)
         _adj = [(f, p) for (f, p) in _adj if (f, p) in page_pdf_all and _adj_ok(f, p)]
-        plan = ([("question_context", f, p, "") for (f, p) in it.get("_question_pages", [])]
-                + [("question_context", f, p, "_adj") for (f, p) in _adj]
-                + [("answer_context", f, p, "_sol") for (f, p) in it.get("_answer_pages", [])])
-        for role, file, page, suffix in plan:
+        # Crop plans are structurally distinct from legacy page plans: a proven
+        # question crop must never degrade to render_page_png(), because the
+        # rest of that homework page can contain the student's answer.
+        plan = ([("question_context", f, p, "_qcrop%d" % index, bbox, "crop_image")
+                 for index, (f, p, bbox) in enumerate(it.get("_question_crops", []), 1)]
+                + [("question_context", f, p, "", None, "page_image")
+                   for (f, p) in it.get("_question_pages", [])]
+                + [("question_context", f, p, "_adj", None, "page_image") for (f, p) in _adj]
+                + [("answer_context", f, p, "_acrop%d" % index, bbox, "crop_image")
+                   for index, (f, p, bbox) in enumerate(it.get("_answer_crops", []), 1)]
+                + [("answer_context", f, p, "_sol", None, "page_image")
+                   for (f, p) in it.get("_answer_pages", [])])
+        for role, file, page, suffix, bbox, asset_type in plan:
             wrote = False
             asset_sha256 = None
             pdf = page_pdf_all.get((file, page))
@@ -3142,7 +3647,14 @@ def _run_unlocked(args, backend=None, adapter_runner=None):
             rel_path = "references/assets/" + name
             if can_write and pdf is not None and source_sha256:
                 try:
-                    png = backend.render_page_png(pdf, page - 1)
+                    if bbox is None:
+                        png = backend.render_page_png(pdf, page - 1)
+                    else:
+                        crop_renderer = getattr(backend, "render_page_clip_png", None)
+                        # Deliberately no whole-page fallback: failing closed is
+                        # safer than exposing handwriting before the question.
+                        png = (crop_renderer(pdf, page - 1, bbox)
+                               if callable(crop_renderer) else None)
                 except Exception as e:   # a single malformed/encrypted page must not crash the whole run
                     png = None
                     report["skipped"].append({"file": file, "why": "渲染失败 p.%d: %s" % (page, e)})
@@ -3184,11 +3696,13 @@ def _run_unlocked(args, backend=None, adapter_runner=None):
             assets.append({
                 "path": rel_path,
                 "role": role,
-                "type": "page_image",
+                "type": asset_type,
                 "caption": "%s p.%d (%s)" % (file, page, role),
                 "sha256": asset_sha256,
                 "source_sha256": source_sha256,
             })
+            if bbox is not None:
+                assets[-1]["source_bbox_pdf_points"] = [float(value) for value in bbox]
         it["assets"] = assets
     report["pages_rendered"] = rendered
 

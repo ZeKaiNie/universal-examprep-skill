@@ -33,6 +33,27 @@ class FakeBackend(object):
         return PNG
 
 
+class LayoutBackend(FakeBackend):
+    """Fixture backend that proves crop calls stay distinct from whole pages."""
+
+    def __init__(self, fixture):
+        super().__init__(fixture["texts"])
+        self.layouts = fixture["layouts"]
+        self.clip_calls = []
+        self.page_calls = []
+
+    def page_layout(self, pdf_path, page_index):
+        return self.layouts[os.path.basename(pdf_path)][page_index]
+
+    def render_page_clip_png(self, pdf_path, page_index, bbox):
+        self.clip_calls.append((os.path.basename(pdf_path), page_index + 1, list(bbox)))
+        return PNG
+
+    def render_page_png(self, pdf_path, page_index):
+        self.page_calls.append((os.path.basename(pdf_path), page_index + 1))
+        return PNG
+
+
 HW1 = ["Problem 1\n求栈的出栈顺序。\n\nProblem 2\n给出队列复杂度并证明。",
        "Problem 3\nShade the region shown at right in the Venn diagram."]
 HW1_SOL = ["Problem 1\n答案：LIFO 顺序。\n\nProblem 2\n答案：O(1)，证明略。"]
@@ -3047,6 +3068,270 @@ class HomeworkIngest(unittest.TestCase):
         wiki_all = " ".join(ph.get("wiki_content", "") for ph in payload.get("phases", []))
         self.assertNotIn("本章图示页", wiki_all)
         self.assertFalse(any(name.endswith("_fig.png") for name in os.listdir(asset_root)))
+
+    def test_roster_pdf_uses_prompt_only_crops_and_delays_answers(self):
+        fixture_path = os.path.join(
+            ROOT, "tests", "fixtures", "homework_roster_layout_gold.json"
+        )
+        with open(fixture_path, encoding="utf-8") as stream:
+            fixture = json.load(stream)
+        tmp = tempfile.mkdtemp()
+        mat, _unused = _mk(tmp, fixture["texts"])
+        backend = LayoutBackend(fixture)
+        asset_root = os.path.join(tmp, "ws", "references", "assets")
+
+        code, payload, report = _run(mat, backend, ["--asset-root", asset_root])
+
+        self.assertEqual(code, 0, report)
+        homework = {
+            str(item["homework_number"]): item for item in payload["quiz_bank"]
+            if item.get("source_type") == "homework"
+        }
+        self.assertEqual(set(homework), set(fixture["expected"]))
+        for number, expected in fixture["expected"].items():
+            item = homework[number]
+            self.assertEqual(item["chapter"], expected["chapter"])
+            self.assertEqual(item["source_pages"], expected["source_pages"])
+            self.assertNotIn(1, item["source_pages"])  # roster is not a prompt page
+            self.assertNotIn("student answer", item["question"])
+            question_assets = [
+                asset for asset in item["assets"]
+                if asset["role"] == "question_context"
+            ]
+            answer_assets = [
+                asset for asset in item["assets"]
+                if asset["role"] == "answer_context"
+            ]
+            self.assertEqual(len(question_assets), 1)
+            self.assertTrue(answer_assets)
+            self.assertEqual(question_assets[0]["type"], "crop_image")
+            self.assertTrue(all(asset["type"] == "crop_image" for asset in answer_assets))
+            self.assertIn("source_bbox_pdf_points", question_assets[0])
+            self.assertFalse(
+                set(asset["path"] for asset in question_assets)
+                & set(asset["path"] for asset in answer_assets)
+            )
+            if number == "1.1.2":
+                # The continuation page is useful answer evidence, but it must
+                # never expand the question provenance beyond the prompt crop.
+                self.assertTrue(any("p.3" in asset["caption"] for asset in answer_assets))
+                self.assertNotIn(3, item["source_pages"])
+        self.assertEqual(report["homework_roster_files"], 1)
+        self.assertEqual(report["homework_prompt_crops"], 2)
+        self.assertEqual(report["homework_answer_crops"], 4)
+        self.assertEqual(len(backend.clip_calls), 6)
+        self.assertEqual(backend.page_calls, [])  # never fall back to an answer-bearing page
+        mapping_reviews = [
+            entry for entry in report["ai_review"]
+            if entry.get("kind") == "homework_roster_visual_mapping_unverified"
+        ]
+        self.assertEqual(len(mapping_reviews), 1)
+        self.assertEqual(mapping_reviews[0]["pages"], [1, 2, 4])
+        self.assertEqual(
+            set(mapping_reviews[0]["external_ids"]),
+            {"hw_homework_hw_scan_1_1_2", "hw_homework_hw_scan_1_2_1"},
+        )
+        self.assertIn("Visually compare every printed prompt crop", mapping_reviews[0]["action"])
+
+    def test_roster_ocr_problem_markers_do_not_leak_unlabelled_handwriting(self):
+        fixture_path = os.path.join(
+            ROOT, "tests", "fixtures", "homework_roster_layout_gold.json"
+        )
+        with open(fixture_path, encoding="utf-8") as stream:
+            fixture = json.load(stream)
+        # The OCR layer contains the right problem numbers, printed prompt text,
+        # and an unlabeled handwritten response.  Number equality alone used to
+        # select the ordinary text slicer and publish the response as the prompt.
+        fixture["texts"]["hw_scan.pdf"] = [
+            "Homework 1\n1. Problem 1.1.2\n2. Problem 1.2.1\n",
+            "Problem 1.1.2\nPrinted prompt one.\nstudent handwriting: x = 42",
+            "student handwriting continues with the final answer",
+            "Problem 1.2.1\nPrinted prompt two.\nstudent handwriting: choose B",
+        ]
+        tmp = tempfile.mkdtemp()
+        mat, _unused = _mk(tmp, fixture["texts"])
+        backend = LayoutBackend(fixture)
+        asset_root = os.path.join(tmp, "ws", "references", "assets")
+
+        code, payload, report = _run(mat, backend, ["--asset-root", asset_root])
+
+        self.assertEqual(code, 0, report)
+        homework = [
+            item for item in payload["quiz_bank"]
+            if item.get("source_type") == "homework"
+        ]
+        self.assertEqual(2, len(homework))
+        self.assertEqual({"1.1.2", "1.2.1"}, {
+            str(item["homework_number"]) for item in homework
+        })
+        for item in homework:
+            self.assertNotIn("student handwriting", item["question"])
+            self.assertEqual(
+                fixture["expected"][str(item["homework_number"])]["source_pages"],
+                item["source_pages"],
+            )
+            question_assets = [
+                asset for asset in item["assets"]
+                if asset.get("role") == "question_context"
+            ]
+            self.assertEqual(1, len(question_assets))
+            self.assertEqual("crop_image", question_assets[0]["type"])
+        self.assertEqual([], backend.page_calls)
+        mapping = [
+            row for row in report["ai_review"]
+            if row.get("kind") == "homework_roster_visual_mapping_unverified"
+        ]
+        self.assertEqual(1, len(mapping))
+        self.assertEqual(
+            {item["id"] for item in homework}, set(mapping[0]["external_ids"])
+        )
+
+    def test_roster_ocr_full_page_scan_without_safe_crops_blocks_for_review(self):
+        fixture_path = os.path.join(
+            ROOT, "tests", "fixtures", "homework_roster_layout_gold.json"
+        )
+        with open(fixture_path, encoding="utf-8") as stream:
+            fixture = json.load(stream)
+        fixture["texts"]["hw_scan.pdf"] = [
+            "Homework 1\n1. Problem 1.1.2\n2. Problem 1.2.1\n",
+            "Problem 1.1.2\nPrinted prompt one.\nhandwritten result 42",
+            "handwritten continuation",
+            "Problem 1.2.1\nPrinted prompt two.\nhandwritten result B",
+        ]
+        for layout in fixture["layouts"]["hw_scan.pdf"][1:]:
+            layout["images"] = [{
+                "image_id": "whole-page-scan",
+                "bbox": list(layout["page_bbox"]),
+            }]
+        tmp = tempfile.mkdtemp()
+        mat, _unused = _mk(tmp, fixture["texts"])
+        backend = LayoutBackend(fixture)
+
+        code, payload, report = _run(mat, backend)
+
+        self.assertEqual(0, code, report)
+        self.assertFalse([
+            item for item in payload["quiz_bank"]
+            if item.get("source_type") == "homework"
+        ])
+        reviews = [
+            row for row in report["ai_review"]
+            if row.get("kind") == "homework_prompt_crop_unsafe_leakage"
+        ]
+        self.assertEqual(1, len(reviews))
+        self.assertEqual([1, 2, 3, 4], reviews[0]["pages"])
+        self.assertIn("prompt-only image anchors", reviews[0]["action"])
+        self.assertIn("whole answer-bearing page", reviews[0]["action"])
+        self.assertEqual([], backend.clip_calls)
+        self.assertEqual([], backend.page_calls)
+
+    def test_roster_matching_text_without_layout_capability_fails_closed(self):
+        fixture_path = os.path.join(
+            ROOT, "tests", "fixtures", "homework_roster_layout_gold.json"
+        )
+        with open(fixture_path, encoding="utf-8") as stream:
+            fixture = json.load(stream)
+        fixture["texts"]["hw_scan.pdf"] = [
+            "Homework 1\n1. Problem 1.1.2\n2. Problem 1.2.1\n",
+            "Problem 1.1.2\nPrinted prompt or OCR handwriting.",
+            "continuation without an answer label",
+            "Problem 1.2.1\nPrinted prompt or OCR handwriting.",
+        ]
+        tmp = tempfile.mkdtemp()
+        mat, backend = _mk(tmp, fixture["texts"])
+
+        code, payload, report = _run(mat, backend)
+
+        self.assertEqual(0, code, report)
+        self.assertFalse([
+            item for item in payload["quiz_bank"]
+            if item.get("source_type") == "homework"
+        ])
+        reviews = [
+            row for row in report["ai_review"]
+            if row.get("kind") == "homework_prompt_crop_unsafe_leakage"
+        ]
+        self.assertEqual(1, len(reviews))
+        self.assertEqual([1, 2, 3, 4], reviews[0]["pages"])
+        self.assertIn("layout/crop capability is unavailable", reviews[0]["action"])
+
+    def test_roster_crop_count_mismatch_enters_typed_review(self):
+        fixture_path = os.path.join(
+            ROOT, "tests", "fixtures", "homework_roster_layout_gold.json"
+        )
+        with open(fixture_path, encoding="utf-8") as stream:
+            fixture = json.load(stream)
+        # Remove the second independently separable prompt.  The builder must
+        # emit no pseudo-question and must name the exact review condition.
+        fixture["layouts"]["hw_scan.pdf"][3]["images"] = [
+            image for image in fixture["layouts"]["hw_scan.pdf"][3]["images"]
+            if image["image_id"] != "prompt-2"
+        ]
+        tmp = tempfile.mkdtemp()
+        mat, _unused = _mk(tmp, fixture["texts"])
+        backend = LayoutBackend(fixture)
+
+        code, payload, report = _run(mat, backend)
+
+        self.assertEqual(code, 0, report)
+        self.assertFalse([
+            item for item in payload["quiz_bank"]
+            if item.get("source_type") == "homework"
+        ])
+        reviews = [
+            entry for entry in report["ai_review"]
+            if entry.get("kind") == "homework_prompt_crop_unsafe_leakage"
+        ]
+        self.assertEqual(len(reviews), 1)
+        self.assertIn("roster has 2 problems", reviews[0]["action"])
+        self.assertIn("whole answer-bearing page", reviews[0]["action"])
+
+    def test_roster_crop_render_failure_never_falls_back_to_whole_page(self):
+        fixture_path = os.path.join(
+            ROOT, "tests", "fixtures", "homework_roster_layout_gold.json"
+        )
+        with open(fixture_path, encoding="utf-8") as stream:
+            fixture = json.load(stream)
+
+        class BrokenCropBackend(LayoutBackend):
+            def render_page_clip_png(self, pdf_path, page_index, bbox):
+                self.clip_calls.append(
+                    (os.path.basename(pdf_path), page_index + 1, list(bbox))
+                )
+                return None
+
+        tmp = tempfile.mkdtemp()
+        mat, _unused = _mk(tmp, fixture["texts"])
+        backend = BrokenCropBackend(fixture)
+        asset_root = os.path.join(tmp, "ws", "references", "assets")
+
+        code, payload, report = _run(
+            mat, backend,
+            ["--asset-root", asset_root, "--render-pages", "required"],
+        )
+
+        self.assertEqual(code, 3)
+        self.assertIn("render-pages=required", payload["error"])
+        self.assertTrue(backend.clip_calls)
+        self.assertEqual(backend.page_calls, [])
+        self.assertTrue(any(
+            warning.startswith("likely_asset_required_but_no_image")
+            for warning in report["warnings"]
+        ))
+
+    def test_dotted_homework_number_infers_chapter(self):
+        tmp = tempfile.mkdtemp()
+        mat, backend = _mk(tmp, {
+            "hw132.pdf": ["Problem 3.2.1\nCompute the requested value and show all work."]
+        })
+
+        code, payload, report = _run(mat, backend)
+
+        self.assertEqual(code, 0, report)
+        item = next(
+            row for row in payload["quiz_bank"] if row.get("source_type") == "homework"
+        )
+        self.assertEqual(item["chapter"], 3)
 
     def test_no_network_or_llm(self):
 

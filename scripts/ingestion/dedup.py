@@ -37,6 +37,7 @@ from .models import (
     ReviewIssue,
     ReviewPatch,
     SourceRecord,
+    canonicalize_source_revisions,
 )
 from .storage import (
     IngestionStore,
@@ -1242,11 +1243,13 @@ def _stable_authoritative_inputs(store):
 
     ledger_rows, captures["review_patches"] = stable_read_jsonl(paths["review_patches"])
     ledger = {}
-    expected_ledger_fields = {
+    legacy_ledger_fields = {
         "patch_id", "fingerprint", "issue_id", "source_id", "source_sha256", "patch",
     }
+    current_ledger_fields = legacy_ledger_fields.union({"source_revisions"})
     for raw in ledger_rows:
-        if not isinstance(raw, dict) or set(raw) != expected_ledger_fields:
+        if (not isinstance(raw, dict)
+                or set(raw) not in (legacy_ledger_fields, current_ledger_fields)):
             raise FactValidationError("review patch ledger entry has an invalid exact schema")
         patch = ReviewPatch.from_dict(raw["patch"])
         if (raw["patch_id"] != patch.patch_id
@@ -1255,6 +1258,19 @@ def _stable_authoritative_inputs(store):
                 or raw["source_sha256"] != patch.source_sha256
                 or raw["fingerprint"] != store._patch_fingerprint(patch)):
             raise FactValidationError("review patch ledger binding is invalid")
+        if "source_revisions" in raw:
+            try:
+                revisions = canonicalize_source_revisions(
+                    raw["source_revisions"], "review ledger source_revisions"
+                )
+            except Exception as exc:
+                raise FactValidationError(
+                    "review patch ledger source revisions are invalid: %s" % exc
+                ) from exc
+            if revisions != store._declared_patch_source_revisions(patch):
+                raise FactValidationError(
+                    "review patch ledger source revisions disagree with the patch"
+                )
         if patch.patch_id in ledger:
             raise FactValidationError("review patch ledger contains duplicate patch_id")
         ledger[patch.patch_id] = raw

@@ -1,10 +1,10 @@
 # E2E Study Guide and Ingestion Remediation Plan
 
-Status: in progress
+Status: implementation complete through PR 3; final EEC 160 acceptance in progress
 
 Owner: Codex
 
-Baseline: `origin/main` at `85cf7473263aebcec75cbed226248ce10298aa1a` after PR 1
+Baseline: `origin/main` at `0622c8c30c2b63f5df2814890aa5a2ecfbd935b9` after PRs 1–3 and the EEC visual hotfix
 
 Primary audit: `D:\EEC 160\universal-examprep-e2e-audit-2026-07-14.md`
 
@@ -46,7 +46,19 @@ Base: updated `origin/main` after PR 1 merges
 
 Planned merge order: second
 
-No release is part of this request. Both PRs will be ready for review and may be merged without a separate approval round, as authorized by the maintainer.
+No release is part of this request. The maintainer authorized merge without a separate approval round.
+
+### Post-audit amendment — real EEC acceptance hotfixes
+
+The first clean EEC forward run exposed source-specific parser contracts that the synthetic
+fixtures did not exercise.  They are tracked as separate, independently tested changes instead
+of being hidden inside workspace-local patches:
+
+- PR #26: visual/source-page ingestion hotfix.
+- PR #27: replay-safe batch review and lettered `Quiz/Example N.N(A/B)` pairing.
+- Final acceptance PR (this branch): roster-driven prompt-only homework crops, strict typed-review
+  metadata/control-byte repairs, fail-closed supplied/local formula-quality merging, and a compact
+  optional LangGraph Study Guide stage guard.
 
 ## 3. PR 1 work breakdown
 
@@ -199,7 +211,12 @@ This run happens only after both PRs merge, using the merged `origin/main` code 
 | PR 1 merged | complete | upstream PR [#24](https://github.com/ZeKaiNie/universal-examprep-skill/pull/24), merge commit `85cf7473263aebcec75cbed226248ce10298aa1a`; Ubuntu/Windows × Python 3.8/3.12 CI all passed |
 | PR 2 implementation | complete | Gold fixtures, optional parser and LangGraph host adapters, dedicated XLSX/raster paths, canonical/conflict facts, exact-location claim receipts, evidence-gated retrieval, package cleanup, and coordinated publication/input snapshot hardening implemented; final adversarial review found P0=0 and residual P1=0 |
 | PR 2 tests | complete | final full suite: 1865 passed, 39 optional-platform skips; focused evidence: ingestion/retrieval/package 381 passed (7 skips), publication/registry/host/LangGraph 235 passed (5 skips), claim/host/LangGraph 70 passed; Python compile, 11 skill validations, `git diff --check`, and the 93-file 592,678-byte runtime package cap passed |
-| PR 2 merged | pending | — |
+| PR 2 merged | complete | upstream PR [#25](https://github.com/ZeKaiNie/universal-examprep-skill/pull/25), merge commit `d5a458626f79afd83b18b9110a0d1f233cb21695` |
+| EEC visual hotfix merged | complete | upstream PR [#26](https://github.com/ZeKaiNie/universal-examprep-skill/pull/26), merge commit `2d75c07d3d05c26e94e26f700e0c8a20e14f7487` |
+| Review batching/A-B pairing merged | complete | upstream PR [#27](https://github.com/ZeKaiNie/universal-examprep-skill/pull/27), merge commit `0622c8c30c2b63f5df2814890aa5a2ecfbd935b9`; Windows/Linux × Python 3.8/3.12 passed |
+| Final acceptance hotfix implementation | complete | roster-driven prompt-only crops and visual-review blockers; fail-closed formula/control obligations; typed metadata, chapter inheritance, and cross-source revision replay guards; optional canonical-receipt LangGraph stage guard |
+| Final acceptance hotfix tests | complete | full suite: 1,917 passed, 40 optional-platform skips; focused ingestion/homework/readiness/LangGraph matrix: 617 passed; 11 skill validations, Python compile, `git diff --check`, and runtime package test passed |
+| Runtime package budget | verified | 608,506-byte Windows build; cap adjusted from 595,000 to 610,000 bytes (+2.52%) for the evidence gates and optional adapter while remaining below the 600 KiB hard ceiling |
 | EEC 160 rebuilt | pending | — |
 | Chapter 1 full visual QA | pending | — |
 

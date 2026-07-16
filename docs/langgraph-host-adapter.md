@@ -1,43 +1,47 @@
 # Optional LangGraph host adapter
 
-`scripts/host_adapters/langgraph_exam.py` is opt-in/lazy-loaded. Defaults need no
-LangGraph; the host supplies a durable checkpointer; nothing is installed.
+`scripts/host_adapters/langgraph_exam.py` is opt-in/lazy-imported. Hosts supply a
+durable checkpointer; default runs need no LangGraph, install, or network.
+
+The adapter can wrap the full exam workflow without replacing its existing tools:
 
 ```text
 START -> rehydrate -> [confirm] -> ingest -> validate ->
 [reingest/rebuild/review/warnings/tutor/guide/visual QA/completion] ->
-atomic completion snapshot (fresh validate + progress + post-check) -> END
+atomic completion snapshot -> END
 ```
 
-- Guards read strict JSON/validator state, not checkpoints: unconfirmed
-  paths pause, ingestion exit 10 validates, and errors block.
-- Source/parser/runtime drift re-ingests; build drift rebuilds; active issues go
-  to review; visual completion needs `artifact_ready=ready`.
-- Truth is `study_state.json`, `.ingest/`, `exam_runtime_receipt.json`, Guide, and
-  render/QA receipts. Checkpoints are hints; every resume revalidates.
-- Completion resumes acquire one locked completion snapshot: fresh validation,
-  progress, and a post-read dependency check. Source, build, typed-review, warning,
-  tutor, artifact, or dependency drift returns to its gate and cannot reach END.
-  Validator receipts use a SHA-256 binding only when the bounded full dependency
-  digest is identical before and after all validator/capability reads; this is not
-  a cryptographic signature. A second content subdigest excludes only generated
-  `study_state.json`/`study_progress.md`, so a valid `complete-phase` write does not
-  stale teaching hints while every completion post-check still binds the full tree.
-- Every invoke and resume must reuse the same stable `thread_id`. LangGraph resumes
-  an interrupted node from that node's beginning, so interrupt nodes perform no
-  side effects before `interrupt`; command nodes must be idempotent or protected by
-  durable command receipts. A custom `command_api` is an at-least-once host boundary:
-  it must deduplicate a stable operation ID or persist an equivalent idempotency
-  receipt. Review only lists; evidence, `show/claim`,
-  patch/apply/rebuild, and validation stay in `ingest_review.py`. QA inspects every
-  page, records one pass each, and confirms hashes/readiness.
-- Each interrupt publishes a one-field `resume_contract`; the resume object must set
-  that exact field to `true` (for example `acknowledged`, `persisted`, or `accepted`).
-  This is an explicit sequencing acknowledgement, never a substitute for the fresh
-  command receipt and validator checks that follow it.
-- Warning/tutor hints fingerprint the chapter/content/validation/warning/dependency
-  binding; drift stales them. `{ "done": true }` proves nothing. Missing capabilities,
-  invalid JSON, or drift never triggers Markdown/no-Python fallback.
-- Host validation returns at most 200 errors and 200 warnings and accepts a warning
-  acknowledgement only when both truncation counts are zero. Resolve larger sets
-  directly with validator `--full`/`--details-file`; a partial list fails closed.
+Guards reread `study_state.json`, `.ingest/`, runtime, Guide, render, and QA
+receipts on every resume. Checkpoints are routing hints, never evidence. Source,
+parser, runtime, build, typed-review, warning, teaching, artifact, or dependency
+drift returns to its canonical gate. The completion node takes a locked fresh
+validation/progress snapshot and post-checks its dependency digest before END.
+Invalid or truncated facts fail closed; validator output is bounded and a partial
+warning list cannot be acknowledged.
+
+Every invoke/resume reuses one stable `thread_id`. Interrupt nodes perform no side
+effects before `interrupt`; command nodes are idempotent or protected by durable
+operation receipts. Review routing only lists work: evidence inspection,
+claim/patch/apply/rebuild, and validation remain in `ingest_review.py`.
+
+## Study Guide subgraph
+
+```text
+rehydrate -> claim_create -> claim_attach -> claim_verify -> typed_validate ->
+import -> preflight -> html -> pdf -> qa_render -> inspection -> accept -> validate
+```
+
+The host's read-only, local-only `command_api.study_guide_status(workspace,
+chapter, artifact_mode, draft_path)` reruns the existing validators and returns
+exactly `schema_version`, `chapter`, `artifact_mode`, `stage`, `pdf_sha256`,
+`render_manifest_sha256`, and `pages`. Preflight and HTML publication are separate
+gates; visual inspection/ready bind every ordered PNG hash.
+
+First mount reports current truth. Later same-mode reads may stay, regress, or
+advance one stage; chat goes `import` to `ready`, and v1 mounts after claim gates.
+Inspection exposes every current PNG and requires one `N=pass[:notes]` verdict per
+page. Only canonical `study_guide_qa.py accept` output advances to ready; any defect
+requires rerendering and a fresh first-to-last inspection.
+
+References: [interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts),
+[persistence](https://docs.langchain.com/oss/python/langgraph/persistence).

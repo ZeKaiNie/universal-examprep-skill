@@ -228,6 +228,55 @@ class IngestionCoreTest(unittest.TestCase):
                 [self.evidence],
             )
 
+    def test_quiz_metadata_extension_is_strict_and_round_trips(self):
+        metadata = {
+            "quiz_type": "code",
+            "gradable": True,
+            "question_text_status": "full",
+            "diagram_type": "control_flow",
+            "language": "python",
+            "expected_behavior": "Return the sorted values.",
+            "tests": ["assert solve([2, 1]) == [1, 2]"],
+        }
+        unit = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "question",
+            "Implement solve.",
+            1,
+            ordinal=7,
+            external_id="code-q1",
+            metadata=metadata,
+        )
+        self.assertEqual(metadata, ContentUnit.from_dict(unit.to_dict()).metadata)
+
+        invalid = (
+            ("gradable", 1),
+            ("question_text_status", "partial"),
+            ("diagram_type", " "),
+            ("language", ["python"]),
+            ("expected_behavior", " trailing "),
+            ("tests", []),
+            ("tests", ["  "]),
+        )
+        for field, value in invalid:
+            with self.subTest(field=field, value=value):
+                broken = dict(metadata)
+                broken[field] = value
+                with self.assertRaises(SchemaValidationError):
+                    ContentUnit.create(
+                        self.source.source_id,
+                        self.source.sha256,
+                        self.source.path,
+                        "question",
+                        "Implement solve.",
+                        1,
+                        ordinal=8,
+                        external_id="code-q2",
+                        metadata=broken,
+                    )
+
     def test_atomic_json_and_jsonl_round_trip(self):
         json_path = self.workspace / "scratch" / "atomic.json"
         jsonl_path = self.workspace / "scratch" / "atomic.jsonl"
@@ -320,14 +369,346 @@ class IngestionCoreTest(unittest.TestCase):
         self.assertEqual("question_context", units[question.unit_id].asset_role)
         self.assertEqual(answer.unit_id, units[question.unit_id].paired_unit_id)
         self.assertEqual(question.unit_id, units[answer.unit_id].paired_unit_id)
+        self.assertEqual("ch01", units[answer.unit_id].chapter_id)
+        self.assertEqual("phase01", units[answer.unit_id].phase_id)
         self.assertIn(added.unit_id, units)
         self.assertEqual("Chapter 1", self.store.mappings()[question.unit_id].chapter)
+        self.assertEqual("Chapter 1", self.store.mappings()[answer.unit_id].chapter)
         self.assertEqual("applied", self.store.review_queue.get(issue.issue_id).status)
 
         replay = self.store.apply_patch(patch)
         self.assertFalse(replay.applied)
         self.assertTrue(replay.replayed)
         self.assertEqual(1, len(read_jsonl(self.store.ledger_path)))
+
+    def test_assign_chapter_inherits_to_cross_source_paired_answer(self):
+        solution_path = self.workspace / "materials" / "solutions.pdf"
+        solution_path.write_bytes(b"official solution revision")
+        solution = SourceRecord.from_file(
+            self.workspace, "materials/solutions.pdf", "application/pdf", status="parsed"
+        )
+        self.store.manifest.upsert(solution)
+
+        question = self.unit("question", "Prompt", 1, 21, external_id="split-q1")
+        answer = ContentUnit.create(
+            solution.source_id,
+            solution.sha256,
+            solution.path,
+            "answer",
+            "Official answer",
+            3,
+            ordinal=22,
+            external_id="split-q1",
+        )
+        self.store.append_unit(question)
+        self.store.append_unit(answer)
+        issue = self.issue("chapter_ambiguous", [question.unit_id])
+        patch = ReviewPatch.create(
+            issue.issue_id,
+            self.source.source_id,
+            self.source.sha256,
+            [
+                {
+                    "op": "assign_chapter",
+                    "unit_id": question.unit_id,
+                    "chapter": "Chapter 1",
+                    "phase": "Phase 1",
+                    "chapter_id": "ch01",
+                    "phase_id": "phase01",
+                },
+                {
+                    "op": "pair_qa",
+                    "question_unit_id": question.unit_id,
+                    "answer_unit_id": answer.unit_id,
+                    "source_revisions": sorted([
+                        {
+                            "source_id": question.source_id,
+                            "source_sha256": question.source_sha256,
+                        },
+                        {
+                            "source_id": answer.source_id,
+                            "source_sha256": answer.source_sha256,
+                        },
+                    ], key=lambda row: row["source_id"]),
+                },
+            ],
+            [self.evidence],
+            status="validated",
+        )
+
+        self.store.apply_patch(patch)
+        stored_answer = self.store.units()[answer.unit_id]
+        answer_mapping = self.store.mappings()[answer.unit_id]
+        self.assertEqual(("ch01", "phase01"), (
+            stored_answer.chapter_id, stored_answer.phase_id,
+        ))
+        self.assertEqual(solution.source_id, answer_mapping.source_id)
+        self.assertEqual(solution.sha256, answer_mapping.source_sha256)
+
+    def test_cross_source_answer_drift_reopens_and_does_not_replay_pair(self):
+        solution_path = self.workspace / "materials" / "solutions-drift.pdf"
+        solution_path.write_bytes(b"official solution revision one")
+        solution_v1 = SourceRecord.from_file(
+            self.workspace, "materials/solutions-drift.pdf", "application/pdf",
+            status="parsed",
+        )
+        self.store.manifest.upsert(solution_v1)
+        question = self.unit(
+            "question", "Prompt", 1, 121, external_id="split-drift-q1"
+        )
+        answer_v1 = ContentUnit.create(
+            solution_v1.source_id,
+            solution_v1.sha256,
+            solution_v1.path,
+            "answer",
+            "Official answer v1",
+            3,
+            ordinal=122,
+            external_id="split-drift-q1",
+        )
+        self.store.append_unit(question)
+        self.store.append_unit(answer_v1)
+        issue = self.issue("chapter_ambiguous", [question.unit_id])
+
+        def pair_patch(answer, created_at):
+            return ReviewPatch.create(
+                issue.issue_id,
+                self.source.source_id,
+                self.source.sha256,
+                [
+                    {
+                        "op": "assign_chapter",
+                        "unit_id": question.unit_id,
+                        "chapter": "Chapter 1",
+                        "phase": "Phase 1",
+                        "chapter_id": "ch01",
+                        "phase_id": "phase01",
+                    },
+                    {
+                        "op": "pair_qa",
+                        "question_unit_id": question.unit_id,
+                        "answer_unit_id": answer.unit_id,
+                        "source_revisions": sorted([
+                            {"source_id": question.source_id,
+                             "source_sha256": question.source_sha256},
+                            {"source_id": answer.source_id,
+                             "source_sha256": answer.source_sha256},
+                        ], key=lambda row: row["source_id"]),
+                    },
+                ],
+                [self.evidence],
+                reviewer="test",
+                created_at=created_at,
+                status="validated",
+            )
+
+        unbound = pair_patch(answer_v1, "2026-07-15T12:09:59Z").to_dict()
+        unbound["operations"][1].pop("source_revisions")
+        unbound = ReviewPatch.create(
+            issue.issue_id,
+            self.source.source_id,
+            self.source.sha256,
+            unbound["operations"],
+            [self.evidence],
+            reviewer="test",
+            created_at="2026-07-15T12:09:59Z",
+            status="validated",
+        )
+        with self.assertRaisesRegex(
+                PatchApplicationError, "bind every touched source revision"):
+            self.store.apply_patch(unbound)
+
+        first_patch = pair_patch(answer_v1, "2026-07-15T12:10:00Z")
+        self.store.apply_patch(first_patch)
+        first_ledger = read_jsonl(self.store.ledger_path)
+        self.assertEqual(2, len(first_ledger[0]["source_revisions"]))
+
+        solution_path.write_bytes(b"official solution revision two")
+        solution_v2 = SourceRecord.from_file(
+            self.workspace, "materials/solutions-drift.pdf", "application/pdf",
+            status="parsed",
+        )
+        self.store.manifest.upsert(solution_v2)
+        answer_v2 = ContentUnit.create(
+            solution_v2.source_id,
+            solution_v2.sha256,
+            solution_v2.path,
+            "answer",
+            "Official answer v2",
+            3,
+            ordinal=122,
+            external_id="split-drift-q1",
+        )
+        self.assertEqual(answer_v1.unit_id, answer_v2.unit_id)
+        base_units = self.store.base_units()
+        base_units[answer_v2.unit_id] = answer_v2
+        self.store.sync_base(base_units.values(), self.store.base_mappings().values())
+
+        reopened = self.store.review_queue.get(issue.issue_id)
+        current = self.store.units()
+        self.assertEqual("pending", reopened.status)
+        self.assertIsNone(current[question.unit_id].paired_unit_id)
+        self.assertIsNone(current[answer_v2.unit_id].paired_unit_id)
+        self.assertEqual("Official answer v2", current[answer_v2.unit_id].text)
+        self.assertNotIn(question.unit_id, self.store.ledger_touched_unit_ids())
+
+        second_patch = pair_patch(answer_v2, "2026-07-15T12:10:01Z")
+        self.store.apply_patch(second_patch)
+        current = self.store.units()
+        self.assertEqual(answer_v2.unit_id, current[question.unit_id].paired_unit_id)
+        self.assertEqual(question.unit_id, current[answer_v2.unit_id].paired_unit_id)
+        self.assertEqual(2, len(read_jsonl(self.store.ledger_path)))
+
+    def test_standalone_pair_inherits_existing_question_mapping(self):
+        question = self.unit("question", "Prompt", 1, 23, external_id="later-pair-q1")
+        answer = self.unit("answer", "Official answer", 1, 24, external_id="later-pair-q1")
+        self.store.append_unit(question)
+        self.store.append_unit(answer)
+
+        chapter_issue = self.issue("chapter_ambiguous", [question.unit_id])
+        self.store.apply_patch(ReviewPatch.create(
+            chapter_issue.issue_id,
+            self.source.source_id,
+            self.source.sha256,
+            [{
+                "op": "assign_chapter",
+                "unit_id": question.unit_id,
+                "chapter": "Chapter 1",
+                "phase": "Phase 1",
+                "chapter_id": "ch01",
+                "phase_id": "phase01",
+            }],
+            [self.evidence],
+            status="validated",
+        ))
+
+        pair_issue = self.issue(
+            "visual_question", [question.unit_id, answer.unit_id]
+        )
+        self.store.apply_patch(ReviewPatch.create(
+            pair_issue.issue_id,
+            self.source.source_id,
+            self.source.sha256,
+            [{
+                "op": "pair_qa",
+                "question_unit_id": question.unit_id,
+                "answer_unit_id": answer.unit_id,
+            }],
+            [self.evidence],
+            status="validated",
+        ))
+
+        stored = self.store.units()
+        mappings = self.store.mappings()
+        self.assertEqual(("ch01", "phase01"), (
+            stored[answer.unit_id].chapter_id, stored[answer.unit_id].phase_id,
+        ))
+        self.assertEqual("Chapter 1", mappings[answer.unit_id].chapter)
+        self.assertEqual("Phase 1", mappings[answer.unit_id].phase)
+        self.assertEqual(2, len(read_jsonl(self.store.ledger_path)))
+
+    def test_standalone_pair_mapping_conflict_is_atomic(self):
+        question = self.unit("question", "Prompt", 1, 25, external_id="later-conflict-q1")
+        answer = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "answer",
+            "Official answer",
+            1,
+            ordinal=26,
+            external_id="later-conflict-q1",
+            chapter_id="ch02",
+            phase_id="phase02",
+        )
+        self.store.append_unit(question)
+        self.store.append_unit(answer)
+
+        chapter_issue = self.issue("chapter_ambiguous", [question.unit_id])
+        self.store.apply_patch(ReviewPatch.create(
+            chapter_issue.issue_id,
+            self.source.source_id,
+            self.source.sha256,
+            [{
+                "op": "assign_chapter",
+                "unit_id": question.unit_id,
+                "chapter": "Chapter 1",
+                "phase": "Phase 1",
+                "chapter_id": "ch01",
+                "phase_id": "phase01",
+            }],
+            [self.evidence],
+            status="validated",
+        ))
+        pair_issue = self.issue(
+            "visual_question", [question.unit_id, answer.unit_id]
+        )
+        pair_patch = ReviewPatch.create(
+            pair_issue.issue_id,
+            self.source.source_id,
+            self.source.sha256,
+            [{
+                "op": "pair_qa",
+                "question_unit_id": question.unit_id,
+                "answer_unit_id": answer.unit_id,
+            }],
+            [self.evidence],
+            status="validated",
+        )
+
+        with self.assertRaises(ConflictError):
+            self.store.apply_patch(pair_patch)
+        stored = self.store.units()
+        self.assertIsNone(stored[question.unit_id].paired_unit_id)
+        self.assertIsNone(stored[answer.unit_id].paired_unit_id)
+        self.assertEqual("ch02", stored[answer.unit_id].chapter_id)
+        self.assertNotIn(answer.unit_id, self.store.mappings())
+        self.assertEqual("pending", self.store.review_queue.get(pair_issue.issue_id).status)
+        self.assertEqual(1, len(read_jsonl(self.store.ledger_path)))
+
+    def test_assign_chapter_fails_closed_on_paired_answer_conflict(self):
+        question = self.unit("question", "Prompt", 1, 31, external_id="conflict-q1")
+        answer = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "answer",
+            "Official answer",
+            1,
+            ordinal=32,
+            external_id="conflict-q1",
+            chapter_id="ch02",
+            phase_id="phase02",
+        )
+        self.store.append_unit(question)
+        self.store.append_unit(answer)
+        issue = self.issue("chapter_ambiguous", [question.unit_id])
+        patch = ReviewPatch.create(
+            issue.issue_id,
+            self.source.source_id,
+            self.source.sha256,
+            [
+                {
+                    "op": "assign_chapter",
+                    "unit_id": question.unit_id,
+                    "chapter": "Chapter 1",
+                    "phase": "Phase 1",
+                    "chapter_id": "ch01",
+                    "phase_id": "phase01",
+                },
+                {
+                    "op": "pair_qa",
+                    "question_unit_id": question.unit_id,
+                    "answer_unit_id": answer.unit_id,
+                },
+            ],
+            [self.evidence],
+            status="validated",
+        )
+
+        with self.assertRaises(ConflictError):
+            self.store.apply_patch(patch)
+        self.assertIsNone(self.store.units()[question.unit_id].chapter_id)
 
     def test_patch_status_and_target_scope_are_checked(self):
         question = self.unit("question", "Prompt", 1, 1)
