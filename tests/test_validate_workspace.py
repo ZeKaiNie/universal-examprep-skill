@@ -716,6 +716,59 @@ class TestValidateWorkspace(unittest.TestCase):
         errors, _, _ = V.validate(self._ws_asset(item))
         self.assertEqual(V._exit_code(errors), 0, err_text(errors))
 
+    def test_falsely_full_truncated_lecture_prompt_fails_closed(self):
+        item = self._ok_item(
+            id="lecture_example_1_21",
+            type="subjective",
+            question=("Example 1.21 Problem Suppose that for the experiment monitoring "
+                      "three purchasing decisions in"),
+            answer="They are not independent.",
+            keywords=["independent"],
+            source="material",
+            source_type="example",
+            source_file="ch01.pdf",
+            source_pages=[77],
+            requires_assets=False,
+            question_text_status="full",
+        )
+        errors, _, _ = V.validate(self.make_ws([item]))
+        self.assertEqual(V._exit_code(errors), 1)
+        self.assertIn("交叉引用处被截断", err_text(errors))
+        self.assertIn("question_text_status=full", err_text(errors))
+
+    def test_complete_lecture_prompt_with_inline_quiz_reference_passes(self):
+        item = self._ok_item(
+            id="lecture_example_1_25",
+            type="subjective",
+            question=("Example 1.25 Problem Use Matlab to generate 12 random student test scores "
+                      "T as described in Quiz 1.3."),
+            answer="Use randi and shift the result.",
+            keywords=["randi"],
+            source="material",
+            source_type="example",
+            source_file="ch01.pdf",
+            source_pages=[91],
+            requires_assets=False,
+            question_text_status="full",
+        )
+        errors, _, _ = V.validate(self.make_ws([item]))
+        self.assertEqual(V._exit_code(errors), 0, err_text(errors))
+        self.assertNotIn("交叉引用处被截断", err_text(errors))
+
+    def test_falsely_full_truncated_teaching_example_fails_closed(self):
+        d = self.make_ws([self._ok_item()])
+        self.write_teaching_examples(d, [self.teaching_example(
+            id="lecture_example_1_25",
+            question=("Example 1.25 Problem Use Matlab to generate 12 random student test scores "
+                      "T as described in"),
+            requires_assets=False,
+            question_text_status="full",
+        )])
+        errors, _, _ = V.validate(d)
+        self.assertEqual(V._exit_code(errors), 1)
+        self.assertIn("教学例题[lecture_example_1_25]", err_text(errors))
+        self.assertIn("交叉引用处被截断", err_text(errors))
+
     def test_p0a_requires_true_on_non_diagram_type_is_valid(self):
         item = self._asset_item(type="subjective", keywords=["x"])   # not a diagram, but figure-dependent
         errors, _, _ = V.validate(self._ws_asset(item))

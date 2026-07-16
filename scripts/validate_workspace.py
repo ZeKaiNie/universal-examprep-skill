@@ -57,6 +57,21 @@ QUESTION_SIDE_ROLES = {"question_context", "figure", "diagram", "table"}
 ASSET_TYPES = {"page_image", "crop_image", "diagram", "table_image", "other_image"}
 QUESTION_TEXT_STATUS = {"full", "stub", "page_reference"}
 
+# A lecture prompt produced by the deterministic Example/Quiz parser normally retains its heading.
+# If such a prompt is labelled ``full`` but ends on a syntactic continuation cue, it is unsafe to
+# treat as self-contained: this is the signature left when a wrapped inline cross-reference was
+# mistaken for the next title boundary (for example ``... decisions in\nExample 1.9``).
+_LECTURE_PROMPT_HEAD_RE = re.compile(
+    r"^\s*(?:Example|Quiz)\s+\d+\s*\.\s*\d+(?:\s*\([A-Za-z]\))?\s+(?:Problems?\b\s*)?",
+    re.I,
+)
+_DANGLING_LECTURE_PROMPT_RE = re.compile(
+    r"(?:\b(?:as\s+)?(?:described|defined|shown|given|stated|proved|derived|illustrated|explained)\s+in"
+    r"|\b(?:according\s+to|based\s+on|refer(?:ring)?\s+to)"
+    r"|\b(?:in|from|of|with|for|by|and|or))\s*$",
+    re.I,
+)
+
 # Human-facing Markdown must not depend on a host-specific TeX extension.  Standard dollar
 # delimiters are accepted as the durable source form; the study-guide renderer turns them into
 # offline MathML.  A curated command vocabulary avoids treating Windows paths such as D:\\EEC as
@@ -84,6 +99,28 @@ def _unsafe_ref(s):
     if ".." in re.split(r"[\\/]", s):
         return ".. 穿越"
     return None
+
+
+def _looks_like_truncated_full_lecture_prompt(item):
+    """High-precision fail-closed audit for parser-produced, falsely-full lecture prompts."""
+    if not isinstance(item, dict):
+        return False
+    if item.get("question_text_status") != "full":
+        return False
+    if item.get("requires_assets") is True or item.get("maybe_requires_assets") is True:
+        return False
+    question = item.get("question")
+    if not isinstance(question, str):
+        return False
+    compact = " ".join(question.split())
+    head = _LECTURE_PROMPT_HEAD_RE.match(compact)
+    if not head:
+        return False
+    # Avoid diagnosing a heading-only/very short malformed record as this specific boundary bug;
+    # the ordinary question/content checks own those cases.
+    if len(re.findall(r"\b\w+\b", compact[head.end():])) < 5:
+        return False
+    return bool(_DANGLING_LECTURE_PROMPT_RE.search(compact))
 
 
 def _read(path):
@@ -1058,6 +1095,12 @@ def validate(ws):
                     "仅声明但缺失/不安全的 asset 也不算；否则题面无法独立成题）")
             if qts == "page_reference" and not has_src_ref:
                 err(f"{tag} question_text_status=page_reference 必须有非空字符串 source_file + source_pages（指向原始页）")
+            if _looks_like_truncated_full_lecture_prompt(q):
+                err(
+                    f"{tag} question_text_status=full 但题面以未完成的引用/连接词结尾，"
+                    "疑似在行首 Example/Quiz 交叉引用处被截断；不得与无题面 asset 的 "
+                    "requires_assets=false 状态一起静默通过，请重建入库或逐项审核"
+                )
 
             # provenance + answer presence
             src = q.get("source")
@@ -1158,6 +1201,12 @@ def validate(ws):
             question = ex.get("question")
             if not isinstance(question, str) or not question.strip():
                 err(f"{tag} 缺少非空教学内容 question")
+            if _looks_like_truncated_full_lecture_prompt(ex):
+                err(
+                    f"{tag} question_text_status=full 但题面以未完成的引用/连接词结尾，"
+                    "疑似在行首 Example/Quiz 交叉引用处被截断；不得与无题面 asset 的 "
+                    "requires_assets=false 状态一起静默通过，请重建入库或逐项审核"
+                )
             source_file = ex.get("source_file")
             if not isinstance(source_file, str) or not source_file.strip():
                 err(f"{tag} 缺少非空字符串 source_file")

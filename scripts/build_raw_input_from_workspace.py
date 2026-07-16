@@ -294,6 +294,17 @@ _ROLE_SUBPART_PREFIX_RE = re.compile(r"^\s*[\)\.:\-]?\s*\(\s*([A-Za-z])\s*\)\s*"
 _ROLE_CONTINUED_PREFIX_RE = re.compile(
     r"^\s*[\)\.:\-]?\s*\(?\s*continued\b\s*\d*\s*\)?[\s:.\-]*", re.I)
 _EXAMPLE_REFERENCE_TAIL_RE = re.compile(r"^\s*[\)\.:\-]?\s*(?:says|states)\s+that\b", re.I)
+# PDF text extraction preserves visual line wraps. A prose cross-reference can therefore land at
+# a physical line start and satisfy _EXAMPLE_RE/_QUIZ_RE even though it is not a title, for example
+# ``... decisions in\nExample 1.9, each outcome ...``. A bare marker after one of these continuation
+# cues has no reliable heading boundary; explicit ``Problem``/``Solution`` markers remain trusted.
+_WRAPPED_REFERENCE_LEAD_IN_RE = re.compile(
+    r"(?:\b(?:see|in|from|of|via|using|consult|review|recall|following)"
+    r"|\b(?:as\s+)?(?:described|defined|shown|given|stated|proved|derived|illustrated|explained)\s+in)"
+    r"\s*[:(]?\s*$",
+    re.I,
+)
+_REFERENCE_NUMBER_TAIL_RE = re.compile(r"^\s*[,.;](?:\s|$)")
 _TOC_RE = re.compile(r"\.{4,}")   # 4+ dot-leaders → a table-of-contents line, not a heading
 
 
@@ -332,6 +343,36 @@ def _heading_form_of_tail(tail):
     return "bare"
 
 
+def _has_lecture_heading_evidence(text, marker, tail):
+    """Return whether a line-start marker is structurally credible as a lecture title.
+
+    Line-start anchoring alone is insufficient for wrapped PDF prose. Explicit role words are
+    strong structure. A bare marker is accepted at a page/paragraph boundary, but rejected when
+    the preceding physical line is syntactically continuing into it or the number is immediately
+    punctuated like an inline citation.
+    """
+    if _heading_form_of_tail(tail) != "bare":
+        return True
+    label = re.search(r"\b(?:Example|Quiz)\b", marker.group(0), re.I)
+    if label and marker.group(0)[:label.start()].strip():
+        return True  # Markdown/list/blockquote prefix is explicit document structure.
+
+    before = text[:marker.start()]
+    if not before:
+        return True
+    # ``marker.start()`` is the beginning of its line, so ``before`` normally ends in that line's
+    # separator. Remove exactly that separator before asking for the preceding physical line.
+    previous_text = before[:-1] if before.endswith("\n") else before
+    previous_line = previous_text.rsplit("\n", 1)[-1].rstrip("\r").strip()
+    if not previous_line:  # blank-line / paragraph boundary
+        return True
+    if _WRAPPED_REFERENCE_LEAD_IN_RE.search(previous_line):
+        return False
+    if _REFERENCE_NUMBER_TAIL_RE.match(tail):
+        return False
+    return True
+
+
 def _iter_markers(text):
     """Return non-TOC lecture markers in text order."""
     text = text or ""
@@ -344,6 +385,8 @@ def _iter_markers(text):
                 continue
             tail = text[m.end():m.end() + 48]
             if kind == "example" and _EXAMPLE_REFERENCE_TAIL_RE.match(_normalized_role_tail(tail)):
+                continue
+            if not _has_lecture_heading_evidence(text, m, tail):
                 continue
             out.append({"start": m.start(), "kind": kind, "chapter": int(m.group(1)), "num": int(m.group(2)),
                         "variant": _variant_of_tail(tail),

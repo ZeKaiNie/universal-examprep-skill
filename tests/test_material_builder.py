@@ -418,6 +418,52 @@ class CoreExtraction(unittest.TestCase):
         pages = _pages("ch01.pdf", "Please review the proof. See Example 1.1 in the textbook for details.")
         self.assertEqual(B.extract_lecture_items(pages), [])
 
+    def test_wrapped_example_reference_does_not_cut_real_eec_prompt(self):
+        # Real EEC-160 p.77 extraction: the PDF line wrap puts an inline Example reference at column
+        # zero. It is still prose, not the next title/boundary.
+        text = (
+            "Example 1.21 Problem\n"
+            "Suppose that for the experiment monitoring three purchasing decisions in\n"
+            "Example 1.9, each outcome (a sequence of three decisions, each either\n"
+            "buy or not buy) is equally likely.\n"
+            "Are the events B2 that the second customer purchases a phone and N2 that the second\n"
+            "customer does not purchase a phone independent? Are the events B1 and B2 independent?"
+        )
+        items = B.extract_lecture_items(_pages("ch01.pdf", text))
+        self.assertEqual([item["id"] for item in items], ["lecture_example_1_21"])
+        self.assertIn("Example 1.9, each outcome", items[0]["question"])
+        self.assertTrue(items[0]["question"].endswith("Are the events B1 and B2 independent?"))
+
+    def test_wrapped_quiz_reference_does_not_cut_real_eec_prompt(self):
+        # Real EEC-160 p.91 extraction: Quiz 1.3 is the object of "described in", not a new Quiz.
+        text = (
+            "Example 1.25 Problem\n"
+            "Use Matlab to generate 12 random student test scores T as described in\n"
+            "Quiz 1.3."
+        )
+        items = B.extract_lecture_items(_pages("ch01.pdf", text))
+        self.assertEqual([item["id"] for item in items], ["lecture_example_1_25"])
+        self.assertEqual(
+            items[0]["question"],
+            "Example 1.25 Problem Use Matlab to generate 12 random student test scores T "
+            "as described in Quiz 1.3.",
+        )
+
+    def test_wrapped_unpunctuated_example_reference_is_not_a_boundary(self):
+        # Real EEC-160 ch.2 p.20: this inline reference has no comma/period after its number, so the
+        # preceding continuation line supplies the decisive structure signal.
+        text = (
+            "Example 2.9\n"
+            "The number of seven-card combinations is 133,784,560.\n"
+            "By contrast, we found in\n"
+            "Example 2.5 674,274,182,400 seven-permutations of 52 objects.\n"
+            "The ratio is 7! = 5040."
+        )
+        items = B.extract_lecture_items(_pages("ch02.pdf", text))
+        self.assertEqual([item["id"] for item in items], ["lecture_example_2_9"])
+        self.assertIn("Example 2.5 674,274,182,400", items[0]["question"])
+        self.assertTrue(items[0]["question"].endswith("The ratio is 7! = 5040."))
+
     def test_line_start_example_reference_inside_solution_is_not_bare_example(self):
         text = (
             "Example 6.13 Solution\n"
