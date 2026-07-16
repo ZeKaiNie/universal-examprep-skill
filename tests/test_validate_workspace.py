@@ -591,6 +591,39 @@ class TestValidateWorkspace(unittest.TestCase):
         errors, _, _ = V.validate(self._ws_asset(self._asset_item()))
         self.assertEqual(V._exit_code(errors), 0, err_text(errors))
 
+    def test_p0a_explicit_asset_source_overrides_answer_role_fallback(self):
+        item = self._asset_item(answer_source_file="official-solutions.pdf")
+        asset = {
+            "path": "references/assets/a.png",
+            "role": "answer_context",
+            "source_file": "submitted-homework.pdf",
+        }
+        field, source_file = V._asset_source_binding(
+            asset, asset["role"], item, 1
+        )
+        self.assertEqual("assets[1].source_file", field)
+        self.assertEqual("submitted-homework.pdf", source_file)
+
+    def test_p0a_legacy_answer_asset_uses_answer_source_fallback(self):
+        item = self._asset_item(answer_source_file="official-solutions.pdf")
+        asset = {"path": "references/assets/a.png", "role": "answer_context"}
+        field, source_file = V._asset_source_binding(
+            asset, asset["role"], item, 0
+        )
+        self.assertEqual("answer_source_file", field)
+        self.assertEqual("official-solutions.pdf", source_file)
+
+    def test_p0a_asset_source_file_escape_is_rejected(self):
+        item = self._asset_item(assets=[{
+            "path": "references/assets/a.png",
+            "role": "question_context",
+            "type": "page_image",
+            "source_file": "../outside.pdf",
+        }])
+        errors, _, _ = V.validate(self._ws_asset(item))
+        self.assertEqual(V._exit_code(errors), 1)
+        self.assertIn("source_file", err_text(errors))
+
     def test_p0a_requires_assets_but_none_fails(self):
         errors, _, _ = V.validate(self._ws_asset(self._asset_item(assets=[]), create=False))
         self.assertEqual(V._exit_code(errors), 1)

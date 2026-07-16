@@ -1691,6 +1691,36 @@ class IngestionPipelineTest(unittest.TestCase):
         self.assertNotIn("source_pages", stored_answer.metadata)
         self.assertEqual([3], stored_answer.metadata["answer_source_pages"])
 
+    def test_asset_source_file_survives_payload_normalization(self):
+        source_sha256 = hashlib.sha256(self.source.read_bytes()).hexdigest()
+        payload = build_payload(
+            str(self.materials),
+            [str(self.source)],
+            [{"file": "ch01.txt", "page": 1,
+              "text": "Chapter 1\nExplain the diagram."}],
+            sections=[{"chapter": 1, "page_keys": [("ch01.txt", 1)]}],
+            quiz_items=[{
+                "id": "asset-q1", "chapter": 1, "type": "subjective",
+                "question": "Explain the diagram.", "answer": "Explanation.",
+                "source": "material", "source_file": "ch01.txt",
+                "source_pages": [1], "answer_source_pages": [1],
+                "assets": [{
+                    "path": "references/assets/ch01-p1.png",
+                    "role": "answer_context",
+                    "source_file": "ch01.txt",
+                    "source_sha256": source_sha256,
+                }],
+            }],
+            report={"warnings": [], "skipped": [], "ai_review": []},
+        )
+        question = next(
+            row for row in payload["content_units"]
+            if row["kind"] == "question" and row["external_id"] == "asset-q1"
+        )
+        self.assertEqual(
+            "ch01.txt", question["metadata"]["assets"][0]["source_file"]
+        )
+
     def test_validated_answer_patch_compiles_and_survives_base_resync(self):
         payload = self.payload()
         persist_payload(self.workspace, payload)

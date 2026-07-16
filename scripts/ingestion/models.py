@@ -613,17 +613,22 @@ class ContentUnit:
                     _fail("ContentUnit.metadata.assets must be a list")
                 for index, asset in enumerate(assets):
                     required = {"path", "role"}
-                    optional = {"sha256", "source_sha256"}
+                    optional = {"sha256", "source_sha256", "source_file"}
                     if (not isinstance(asset, dict) or not required.issubset(asset)
                             or set(asset) - required - optional):
                         _fail(
-                            "ContentUnit.metadata.assets[%d] needs path/role and optional hashes"
+                            "ContentUnit.metadata.assets[%d] needs path/role and optional source/hashes"
                             % index
                         )
                     _path(asset["path"], "ContentUnit.metadata.assets[%d].path" % index)
                     _enum(asset["role"], ASSET_ROLES,
                           "ContentUnit.metadata.assets[%d].role" % index)
-                    for hash_field in optional:
+                    if "source_file" in asset:
+                        _path(
+                            asset["source_file"],
+                            "ContentUnit.metadata.assets[%d].source_file" % index,
+                        )
+                    for hash_field in ("sha256", "source_sha256"):
                         if hash_field in asset:
                             _sha(
                                 asset[hash_field],

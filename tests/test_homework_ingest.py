@@ -3106,6 +3106,16 @@ class HomeworkIngest(unittest.TestCase):
             self.assertTrue(answer_assets)
             self.assertEqual(question_assets[0]["type"], "crop_image")
             self.assertTrue(all(asset["type"] == "crop_image" for asset in answer_assets))
+            self.assertTrue(all(
+                asset["source_file"] == item["source_file"]
+                for asset in question_assets
+            ))
+            self.assertTrue(all(
+                asset["source_file"] in {
+                    item["source_file"], item.get("answer_source_file")
+                }
+                for asset in answer_assets
+            ))
             self.assertIn("source_bbox_pdf_points", question_assets[0])
             self.assertFalse(
                 set(asset["path"] for asset in question_assets)

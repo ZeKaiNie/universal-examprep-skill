@@ -3699,6 +3699,10 @@ def _run_unlocked(args, backend=None, adapter_runner=None):
                 "type": asset_type,
                 "caption": "%s p.%d (%s)" % (file, page, role),
                 "sha256": asset_sha256,
+                # An answer-side crop may legitimately come from the submitted
+                # homework while ``answer_source_file`` points at a separate
+                # official solution booklet. Bind each asset to its own source.
+                "source_file": file,
                 "source_sha256": source_sha256,
             })
             if bbox is not None:

@@ -169,6 +169,23 @@ def _asset_safety(ws, p):
     return full, None
 
 
+def _asset_source_binding(asset, role, item, index=0):
+    """Return the provenance field and file used to verify an asset hash.
+
+    Explicit per-asset provenance wins. The role-based inference remains only
+    for backward compatibility with banks written before asset.source_file.
+    """
+    explicit = asset.get("source_file") if isinstance(asset, dict) else None
+    if isinstance(explicit, str) and explicit.strip():
+        return "assets[%d].source_file" % index, explicit
+    source_field = (
+        "answer_source_file"
+        if role in ("answer_context", "worked_solution")
+        else "source_file"
+    )
+    return source_field, item.get(source_field) or item.get("source_file")
+
+
 def _md_anchors(path):
     """GitHub-style anchor set for every heading in a markdown file (fence-aware; duplicate
     headings get the -1/-2 suffixes GitHub assigns). Covers both notebook entry headings
@@ -961,6 +978,15 @@ def validate(ws):
                     err(f"{tag} assets[{ai}] role 非法: {role!r}（应为 {sorted(ASSET_ROLES)} 中的字符串）")
                 if atype is not None and (not isinstance(atype, str) or atype not in ASSET_TYPES):
                     err(f"{tag} assets[{ai}] type 非法: {atype!r}（应为 {sorted(ASSET_TYPES)} 中的字符串）")
+                asset_source_file = a.get("source_file")
+                if asset_source_file is not None:
+                    if not isinstance(asset_source_file, str) or not asset_source_file.strip():
+                        err(f"{tag} assets[{ai}] source_file 必须是非空字符串")
+                    elif _unsafe_ref(asset_source_file):
+                        err(
+                            f"{tag} assets[{ai}] source_file 路径不安全"
+                            f"（{_unsafe_ref(asset_source_file)}）: {asset_source_file!r}"
+                        )
                 full, unsafe = _asset_safety(ws, apath)
                 readable = full and os.path.isfile(full) and os.access(full, os.R_OK)
                 if unsafe:
@@ -993,12 +1019,9 @@ def validate(ws):
                             continue
                     expected_source_hash = a.get("source_sha256")
                     if expected_source_hash is not None:
-                        source_field = (
-                            "answer_source_file"
-                            if role in ("answer_context", "worked_solution")
-                            else "source_file"
+                        source_field, source_file = _asset_source_binding(
+                            a, role, q, ai
                         )
-                        source_file = q.get(source_field) or q.get("source_file")
                         if (not isinstance(expected_source_hash, str)
                                 or not re.fullmatch(r"[0-9a-f]{64}", expected_source_hash)
                                 or ingestion_source_hashes.get(source_file) != expected_source_hash):

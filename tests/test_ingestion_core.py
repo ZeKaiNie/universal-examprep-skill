@@ -237,6 +237,12 @@ class IngestionCoreTest(unittest.TestCase):
             "language": "python",
             "expected_behavior": "Return the sorted values.",
             "tests": ["assert solve([2, 1]) == [1, 2]"],
+            "assets": [{
+                "path": "references/assets/week01-p1.png",
+                "role": "question_context",
+                "source_file": "materials/week01.pdf",
+                "source_sha256": self.source.sha256,
+            }],
         }
         unit = ContentUnit.create(
             self.source.source_id,

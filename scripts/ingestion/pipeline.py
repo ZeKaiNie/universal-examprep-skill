@@ -541,6 +541,9 @@ def _quiz_metadata(item, answer_record=None, answer_value_marker=False):
         role = asset.get("role")
         if path and role in ASSET_ROLES:
             normalized = {"path": path, "role": role}
+            source_file = asset.get("source_file")
+            if isinstance(source_file, str) and source_file.strip():
+                normalized["source_file"] = source_file
             for hash_field in ("sha256", "source_sha256"):
                 value = asset.get(hash_field)
                 if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value):
