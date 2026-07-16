@@ -152,18 +152,34 @@ def _apply_patch_batch(workspace, store, patch_paths):
         issue_ids.add(patch.issue_id)
         patches.append((path, patch))
 
-    results = []
-    for index, (path, patch) in enumerate(patches):
+    applied_rows = None
+    batch_apply = getattr(store, "apply_patches", None)
+    if callable(batch_apply):
         try:
-            result = store.apply_patch(patch)
+            applied_rows = batch_apply([patch for _path, patch in patches])
         except Exception as exc:
-            message = "patch %d/%d failed after %d ledger entries: %s" % (
-                index + 1, len(patches), len(results), exc)
+            message = "batch apply failed; earlier ledger entries remain durable: %s" % exc
             try:
                 compile_review_outputs(workspace)
             except Exception as rebuild_exc:
                 message += "; rebuild failed: %s" % rebuild_exc
             _die(message, code=1)
+
+    results = []
+    for index, (path, patch) in enumerate(patches):
+        if applied_rows is not None:
+            result = applied_rows[index]
+        else:
+            try:
+                result = store.apply_patch(patch)
+            except Exception as exc:
+                message = "patch %d/%d failed after %d ledger entries: %s" % (
+                    index + 1, len(patches), len(results), exc)
+                try:
+                    compile_review_outputs(workspace)
+                except Exception as rebuild_exc:
+                    message += "; rebuild failed: %s" % rebuild_exc
+                _die(message, code=1)
         results.append({
             "patch_file": path,
             "patch_id": patch.patch_id,

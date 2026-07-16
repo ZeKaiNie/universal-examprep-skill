@@ -1739,3 +1739,121 @@ class IngestionStore:
             atomic_write_jsonl(self.ledger_path, list(ledger.values()) + [entry])
             self.pending_patch_path.unlink()
             return ApplyResult(True, False, changed, final_status)
+
+    def apply_patches(self, patches):
+        """Apply distinct validated patches with one ledger replay and one lock.
+
+        Every new patch still uses the existing single-patch write-ahead intent and
+        is committed to the queue and append-only ledger before the next patch is
+        considered.  The optimization is deliberately narrow: the expensive
+        base-plus-ledger reconstruction and compiled-state comparison happen once
+        for the batch instead of once per patch.  A pre-existing interrupted intent
+        must be recovered explicitly before starting a batch so resume semantics
+        remain unambiguous.
+        """
+
+        rows = []
+        patch_ids = set()
+        issue_ids = set()
+        for value in patches:
+            patch = (
+                value if isinstance(value, ReviewPatch)
+                else ReviewPatch.from_dict(value)
+            )
+            if patch.status != "validated":
+                raise PatchApplicationError("only validated patches may be batch-applied")
+            if patch.patch_id in patch_ids:
+                raise ConflictError("duplicate patch_id in batch: %s" % patch.patch_id)
+            if patch.issue_id in issue_ids:
+                raise ConflictError("duplicate issue_id in batch: %s" % patch.issue_id)
+            patch_ids.add(patch.patch_id)
+            issue_ids.add(patch.issue_id)
+            rows.append(patch)
+        if not rows:
+            raise PatchApplicationError("patch batch must not be empty")
+
+        with self.mutation_lock():
+            if read_json(self.pending_patch_path, default=None) is not None:
+                raise ConflictError(
+                    "an interrupted patch is pending; recover it before batch apply"
+                )
+
+            ledger = self._ledger()
+            units, mappings = self._expected_compiled_state()
+            if ({key: value.to_dict() for key, value in self.units().items()}
+                    != {key: value.to_dict() for key, value in units.items()}):
+                raise PatchApplicationError(
+                    "compiled content_units were modified outside the ledger; run rebuild"
+                )
+            if ({key: value.to_dict() for key, value in self.mappings().items()}
+                    != {key: value.to_dict() for key, value in mappings.items()}):
+                raise PatchApplicationError(
+                    "compiled chapter mappings were modified outside the ledger; run rebuild"
+                )
+
+            results = []
+            for patch in rows:
+                fingerprint = self._patch_fingerprint(patch)
+                prior = ledger.get(patch.patch_id)
+                if prior is not None:
+                    if prior["fingerprint"] != fingerprint:
+                        raise ConflictError(
+                            "patch ID is already recorded with a different fingerprint"
+                        )
+                    issue = self.review_queue.get(patch.issue_id)
+                    results.append(ApplyResult(
+                        False,
+                        True,
+                        0,
+                        issue.status if issue is not None else "applied",
+                    ))
+                    continue
+
+                issue = self.review_queue.get(patch.issue_id)
+                record = self._validate_patch_context(
+                    patch, issue, allow_terminal=False, units=units
+                )
+                candidate_units = dict(units)
+                candidate_mappings = dict(mappings)
+                changed, final_status = self._apply_operations_to_state(
+                    patch, candidate_units, candidate_mappings, record
+                )
+                self._validate_issue_postcondition(
+                    issue,
+                    patch,
+                    candidate_units,
+                    candidate_mappings,
+                    changed,
+                    final_status,
+                )
+
+                intent = {
+                    "schema_version": 1,
+                    "patch_id": patch.patch_id,
+                    "fingerprint": fingerprint,
+                    "patch": patch.to_dict(),
+                }
+                atomic_write_json(self.pending_patch_path, intent)
+                if candidate_units != units:
+                    self._write_units(candidate_units)
+                if candidate_mappings != mappings:
+                    self._write_mappings(candidate_mappings)
+                self.review_queue.replace(issue.with_status(final_status))
+                self.refresh_source_statuses()
+
+                entry = {
+                    "patch_id": patch.patch_id,
+                    "fingerprint": fingerprint,
+                    "issue_id": patch.issue_id,
+                    "source_id": patch.source_id,
+                    "source_sha256": patch.source_sha256,
+                    "source_revisions": self._declared_patch_source_revisions(patch),
+                    "patch": patch.to_dict(),
+                }
+                ledger[patch.patch_id] = entry
+                atomic_write_jsonl(self.ledger_path, list(ledger.values()))
+                self.pending_patch_path.unlink()
+                units = candidate_units
+                mappings = candidate_mappings
+                results.append(ApplyResult(True, False, changed, final_status))
+            return tuple(results)

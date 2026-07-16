@@ -155,6 +155,28 @@ class BatchReviewApply(unittest.TestCase):
         self.assertEqual(2, payload["applied_count"])
         self.assertEqual(1, payload["replayed_count"])
 
+    def test_batch_prefers_store_level_linear_apply(self):
+        patches = [self._patch(1), self._patch(2), self._patch(3)]
+        store = SimpleNamespace(
+            apply_patches=mock.Mock(return_value=(
+                self._result(), self._result(), self._result(False, True),
+            )),
+            apply_patch=mock.Mock(),
+        )
+        with mock.patch.object(
+                ingest_review, "_load_patch", side_effect=patches):
+            with mock.patch.object(
+                    ingest_review, "compile_review_outputs",
+                    return_value={"readiness": "ready"}) as compile_outputs:
+                payload = ingest_review._apply_patch_batch(
+                    self.workspace, store, ["one.json", "two.json", "three.json"]
+                )
+        store.apply_patches.assert_called_once_with(patches)
+        store.apply_patch.assert_not_called()
+        compile_outputs.assert_called_once_with(self.workspace)
+        self.assertEqual(2, payload["applied_count"])
+        self.assertEqual(1, payload["replayed_count"])
+
     def test_batch_failure_rebuilds_after_partial_ledger_progress(self):
         patches = [self._patch(1), self._patch(2)]
         store = SimpleNamespace(

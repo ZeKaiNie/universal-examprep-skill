@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.ingestion import (
     ChapterPhaseMapping,
@@ -386,6 +387,112 @@ class IngestionCoreTest(unittest.TestCase):
         self.assertFalse(replay.applied)
         self.assertTrue(replay.replayed)
         self.assertEqual(1, len(read_jsonl(self.store.ledger_path)))
+
+    def test_batch_apply_reconstructs_ledger_once_and_replays_idempotently(self):
+        originals = [
+            self.unit("text", "Old text one", 1, 31),
+            self.unit("text", "Old text two", 1, 32),
+        ]
+        for unit in originals:
+            self.store.append_unit(unit)
+
+        patches = []
+        for index, unit in enumerate(originals, 1):
+            issue = self.issue("garbled_text", [unit.unit_id])
+            replacement = ContentUnit.create(
+                self.source.source_id,
+                self.source.sha256,
+                self.source.path,
+                "text",
+                "Recovered text %d" % index,
+                1,
+                ordinal=unit.ordinal,
+                bbox=unit.bbox,
+            )
+            self.assertEqual(unit.unit_id, replacement.unit_id)
+            patches.append(ReviewPatch.create(
+                issue.issue_id,
+                self.source.source_id,
+                self.source.sha256,
+                [{
+                    "op": "replace_unit",
+                    "unit_id": unit.unit_id,
+                    "unit": replacement.to_dict(),
+                }],
+                [self.evidence],
+                status="validated",
+            ))
+
+        with mock.patch.object(
+                self.store, "_expected_compiled_state",
+                wraps=self.store._expected_compiled_state) as reconstruct:
+            results = self.store.apply_patches(patches)
+        self.assertEqual(1, reconstruct.call_count)
+        self.assertTrue(all(result.applied for result in results))
+        self.assertEqual(
+            ["Recovered text 1", "Recovered text 2"],
+            [self.store.units()[unit.unit_id].text for unit in originals],
+        )
+        self.assertEqual(2, len(read_jsonl(self.store.ledger_path)))
+
+        with mock.patch.object(
+                self.store, "_expected_compiled_state",
+                wraps=self.store._expected_compiled_state) as reconstruct:
+            replayed = self.store.apply_patches(patches)
+        self.assertEqual(1, reconstruct.call_count)
+        self.assertTrue(all(result.replayed for result in replayed))
+        self.assertEqual(2, len(read_jsonl(self.store.ledger_path)))
+
+    def test_batch_apply_keeps_prior_commits_when_a_later_patch_is_invalid(self):
+        first = self.unit("text", "First old value", 1, 41)
+        second = self.unit("text", "Second unchanged value", 1, 42)
+        self.store.append_unit(first)
+        self.store.append_unit(second)
+        first_issue = self.issue("garbled_text", [first.unit_id])
+        second_issue = self.issue("garbled_text", [second.unit_id])
+        recovered = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "text",
+            "First recovered value",
+            1,
+            ordinal=first.ordinal,
+            bbox=first.bbox,
+        )
+        first_patch = ReviewPatch.create(
+            first_issue.issue_id,
+            self.source.source_id,
+            self.source.sha256,
+            [{
+                "op": "replace_unit",
+                "unit_id": first.unit_id,
+                "unit": recovered.to_dict(),
+            }],
+            [self.evidence],
+            status="validated",
+        )
+        ineffective = ReviewPatch.create(
+            second_issue.issue_id,
+            self.source.source_id,
+            self.source.sha256,
+            [{
+                "op": "replace_unit",
+                "unit_id": second.unit_id,
+                "unit": second.to_dict(),
+            }],
+            [self.evidence],
+            status="validated",
+        )
+
+        with self.assertRaises(PatchApplicationError):
+            self.store.apply_patches([first_patch, ineffective])
+
+        self.assertEqual("First recovered value", self.store.units()[first.unit_id].text)
+        self.assertEqual("applied", self.store.review_queue.get(first_issue.issue_id).status)
+        self.assertEqual("pending", self.store.review_queue.get(second_issue.issue_id).status)
+        self.assertEqual(1, len(read_jsonl(self.store.ledger_path)))
+        self.assertFalse(self.store.pending_patch_path.exists())
 
     def test_assign_chapter_inherits_to_cross_source_paired_answer(self):
         solution_path = self.workspace / "materials" / "solutions.pdf"
