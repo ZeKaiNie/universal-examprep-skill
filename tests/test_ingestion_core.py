@@ -486,6 +486,28 @@ class IngestionCoreTest(unittest.TestCase):
                 status="validated",
             ))
 
+        truth_paths = (
+            self.store.units_path,
+            self.store.mappings_path,
+            self.store.ledger_path,
+            self.store.review_queue.path,
+            self.store.manifest.path,
+        )
+        before = {
+            path: path.read_bytes() if path.exists() else None
+            for path in truth_paths
+        }
+        with mock.patch.object(
+                self.store, "_expected_compiled_state",
+                wraps=self.store._expected_compiled_state) as reconstruct:
+            validated = self.store.validate_patches(patches)
+        self.assertEqual(tuple(patches), validated)
+        self.assertEqual(1, reconstruct.call_count)
+        self.assertEqual(before, {
+            path: path.read_bytes() if path.exists() else None
+            for path in truth_paths
+        })
+
         with mock.patch.object(
                 self.store, "_expected_compiled_state",
                 wraps=self.store._expected_compiled_state) as reconstruct:
@@ -548,6 +570,27 @@ class IngestionCoreTest(unittest.TestCase):
             status="validated",
         )
 
+        before = {
+            "units": self.store.units_path.read_bytes(),
+            "queue": self.store.review_queue.path.read_bytes(),
+            "ledger": (
+                self.store.ledger_path.read_bytes()
+                if self.store.ledger_path.exists() else None
+            ),
+        }
+        with self.assertRaises(PatchApplicationError):
+            self.store.validate_patches([first_patch, ineffective])
+        self.assertEqual(before, {
+            "units": self.store.units_path.read_bytes(),
+            "queue": self.store.review_queue.path.read_bytes(),
+            "ledger": (
+                self.store.ledger_path.read_bytes()
+                if self.store.ledger_path.exists() else None
+            ),
+        })
+        self.assertEqual("First old value", self.store.units()[first.unit_id].text)
+        self.assertEqual("pending", self.store.review_queue.get(first_issue.issue_id).status)
+
         with self.assertRaises(PatchApplicationError):
             self.store.apply_patches([first_patch, ineffective])
 
@@ -556,6 +599,80 @@ class IngestionCoreTest(unittest.TestCase):
         self.assertEqual("pending", self.store.review_queue.get(second_issue.issue_id).status)
         self.assertEqual(1, len(read_jsonl(self.store.ledger_path)))
         self.assertFalse(self.store.pending_patch_path.exists())
+
+    def test_batch_validation_detects_combined_identity_conflict_without_writes(self):
+        questions = [
+            self.unit("question", "First recovered prompt", 1, 61,
+                      external_id="shared-question-id"),
+            self.unit("question", "Second recovered prompt", 1, 62,
+                      external_id="shared-question-id"),
+        ]
+        issues = [self.issue("visual_question"), self.issue("no_text")]
+        patches = [
+            ReviewPatch.create(
+                issue.issue_id,
+                self.source.source_id,
+                self.source.sha256,
+                [{"op": "add_unit", "unit": question.to_dict()}],
+                [self.evidence],
+                status="validated",
+            )
+            for issue, question in zip(issues, questions)
+        ]
+
+        for patch in patches:
+            self.store.validate_patch(patch)
+        before_units = dict(self.store.units())
+        before_queue = self.store.review_queue.path.read_bytes()
+        with self.assertRaisesRegex(ConflictError, "external_id is not unique"):
+            self.store.validate_patches(patches)
+        self.assertEqual(before_units, self.store.units())
+        self.assertEqual(before_queue, self.store.review_queue.path.read_bytes())
+        self.assertFalse(self.store.ledger_path.exists())
+
+    def test_validation_never_recovers_pending_ingestion(self):
+        original = self.unit("text", "Unreadable value", 1, 71)
+        self.store.append_unit(original)
+        issue = self.issue("garbled_text", [original.unit_id])
+        recovered = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "text",
+            "Recovered value",
+            1,
+            ordinal=original.ordinal,
+            bbox=original.bbox,
+        )
+        patch = ReviewPatch.create(
+            issue.issue_id,
+            self.source.source_id,
+            self.source.sha256,
+            [{
+                "op": "replace_unit",
+                "unit_id": original.unit_id,
+                "unit": recovered.to_dict(),
+            }],
+            [self.evidence],
+            status="validated",
+        )
+        sentinel = self.workspace / "interrupted-target.json"
+        sentinel.write_text("must survive validation", encoding="utf-8")
+        transaction = self.workspace / ".ingest" / "transactions" / "pending-test"
+        transaction.mkdir(parents=True)
+        atomic_write_json(self.store.pending_ingest_path, {
+            "schema_version": 1,
+            "transaction_dir": ".ingest/transactions/pending-test",
+            "targets": [{"path": "interrupted-target.json", "backup": None}],
+        })
+
+        with self.assertRaisesRegex(ConflictError, "requires recovery before validation"):
+            self.store.validate_patch(patch)
+        with self.assertRaisesRegex(ConflictError, "requires recovery before validation"):
+            self.store.validate_patches([patch])
+        self.assertTrue(sentinel.exists())
+        self.assertTrue(self.store.pending_ingest_path.exists())
+        self.assertTrue(transaction.exists())
 
     def test_assign_chapter_inherits_to_cross_source_paired_answer(self):
         solution_path = self.workspace / "materials" / "solutions.pdf"

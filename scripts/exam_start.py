@@ -73,6 +73,7 @@ RUNTIME_FILE_EXCLUDES = frozenset((
     "scripts/build_dist.py",
     "scripts/retrieval_evaluation.py",
     "scripts/ingestion/evaluation.py",
+    "docs/formula-audit-importer.md",
     "docs/localization.md",
     "docs/retrieval-evaluation.md",
     "docs/skill-architecture.md",

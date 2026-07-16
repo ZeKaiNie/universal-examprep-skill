@@ -41,6 +41,39 @@ class PatchApplicationError(RuntimeError):
     """A valid patch cannot safely be applied to the current ingestion state."""
 
 
+FORMULA_FALSE_POSITIVE_REASON_PREFIX = "formula_hint_false_positive_v1"
+
+
+def _is_formula_false_positive_resolution(issue, patch):
+    """Recognize a narrowly evidence-bound visual false-positive decision.
+
+    Formula recovery normally requires a recovered ``formula`` unit.  A warning
+    can instead be closed only when a reviewer uses the versioned marker below,
+    binds the reason to the exact immutable issue/page set, and records a
+    substantive visual conclusion.  Source and issue-evidence hashes are still
+    checked by ``_validate_patch_context`` before this predicate is reached.
+    """
+
+    if (issue.severity != "warning"
+            or tuple(issue.reason_codes) != ("formula_hint",)
+            or not issue.pages
+            or len(patch.operations) != 1
+            or patch.operations[0]["op"] != "mark_resolved"
+            or tuple(patch.evidence) != tuple(issue.evidence)):
+        return False
+    pages = ",".join(str(page) for page in issue.pages)
+    prefix = "%s issue_id=%s pages=%s\n" % (
+        FORMULA_FALSE_POSITIVE_REASON_PREFIX,
+        issue.issue_id,
+        pages,
+    )
+    reason = patch.operations[0]["reason"]
+    if not reason.startswith(prefix):
+        return False
+    conclusion = reason[len(prefix):].strip()
+    return len(conclusion) >= 20
+
+
 def _contains_unsafe_control_text(value):
     if isinstance(value, str):
         return any(
@@ -717,6 +750,17 @@ class IngestionStore:
                 yield
         return locked()
 
+    def validation_lock(self):
+        @contextmanager
+        def locked():
+            with _exclusive_file_lock(self.lock_path):
+                if self.pending_ingest_path.exists():
+                    raise ConflictError(
+                        "an interrupted ingest transaction requires recovery before validation"
+                    )
+                yield
+        return locked()
+
     @contextmanager
     def ingest_transaction(self, relative_paths):
         """Make a bounded set of workspace files commit or roll back together.
@@ -1111,10 +1155,11 @@ class IngestionStore:
                 and isinstance(unit.latex, str) and unit.latex.strip()
                 and not _unit_contains_unsafe_control_text(unit)
             ]
-            if not formulas:
+            if not formulas and not _is_formula_false_positive_resolution(issue, patch):
                 raise PatchApplicationError(
                     "formula_hint postcondition requires a same-source/page "
-                    "evidence-backed formula unit with non-empty LaTeX"
+                    "evidence-backed formula unit with non-empty LaTeX, or a "
+                    "versioned evidence-bound warning false-positive decision"
                 )
         if reasons & {
                 "nul_or_replacement_char", "nul_byte", "control_character",
@@ -1657,7 +1702,7 @@ class IngestionStore:
             patch = ReviewPatch.from_dict(patch)
         if patch.status != "validated":
             raise PatchApplicationError("only a validated patch may pass contextual validation")
-        with self.mutation_lock():
+        with self.validation_lock():
             units, mappings = self._expected_compiled_state()
             issue = self.review_queue.get(patch.issue_id)
             record = self._validate_patch_context(
@@ -1673,6 +1718,73 @@ class IngestionStore:
                 require_change=True,
             )
         return patch
+
+    def _validated_batch_rows(self, patches):
+        rows = []
+        patch_ids = set()
+        issue_ids = set()
+        for value in patches:
+            patch = value if isinstance(value, ReviewPatch) else ReviewPatch.from_dict(value)
+            if patch.status != "validated":
+                raise PatchApplicationError("only validated patches may be processed in a batch")
+            if patch.patch_id in patch_ids or patch.issue_id in issue_ids:
+                raise ConflictError("duplicate patch or issue identity in batch")
+            patch_ids.add(patch.patch_id)
+            issue_ids.add(patch.issue_id)
+            rows.append(patch)
+        if not rows:
+            raise PatchApplicationError("patch batch must not be empty")
+        return rows
+
+    def _checked_batch_state(self):
+        if read_json(self.pending_patch_path, default=None) is not None:
+            raise ConflictError("recover the interrupted patch before processing a batch")
+        ledger = self._ledger()
+        units, mappings = self._expected_compiled_state()
+        current_units = {key: value.to_dict() for key, value in self.units().items()}
+        expected_units = {key: value.to_dict() for key, value in units.items()}
+        current_mappings = {key: value.to_dict() for key, value in self.mappings().items()}
+        expected_mappings = {key: value.to_dict() for key, value in mappings.items()}
+        if current_units != expected_units or current_mappings != expected_mappings:
+            raise PatchApplicationError("compiled state was modified outside the ledger; run rebuild")
+        return ledger, units, mappings
+
+    def validate_patches(self, patches):
+        """Validate ordered candidate effects against one read-only snapshot."""
+
+        rows = self._validated_batch_rows(patches)
+        with self.validation_lock():
+            ledger, units, mappings = self._checked_batch_state()
+            for patch in rows:
+                fingerprint = self._patch_fingerprint(patch)
+                prior = ledger.get(patch.patch_id)
+                if prior is not None:
+                    if prior["fingerprint"] != fingerprint:
+                        raise ConflictError(
+                            "patch ID is already recorded with a different fingerprint"
+                        )
+                    continue
+                issue = self.review_queue.get(patch.issue_id)
+                record = self._validate_patch_context(
+                    patch, issue, allow_terminal=False, units=units
+                )
+                candidate_units = dict(units)
+                candidate_mappings = dict(mappings)
+                changed, final_status = self._apply_operations_to_state(
+                    patch, candidate_units, candidate_mappings, record
+                )
+                self._validate_issue_postcondition(
+                    issue,
+                    patch,
+                    candidate_units,
+                    candidate_mappings,
+                    changed,
+                    final_status,
+                    require_change=True,
+                )
+                units = candidate_units
+                mappings = candidate_mappings
+        return tuple(rows)
 
     def apply_patch(self, patch):
         """Apply a validated patch under a process lock and write-ahead intent."""
@@ -1776,45 +1888,9 @@ class IngestionStore:
         remain unambiguous.
         """
 
-        rows = []
-        patch_ids = set()
-        issue_ids = set()
-        for value in patches:
-            patch = (
-                value if isinstance(value, ReviewPatch)
-                else ReviewPatch.from_dict(value)
-            )
-            if patch.status != "validated":
-                raise PatchApplicationError("only validated patches may be batch-applied")
-            if patch.patch_id in patch_ids:
-                raise ConflictError("duplicate patch_id in batch: %s" % patch.patch_id)
-            if patch.issue_id in issue_ids:
-                raise ConflictError("duplicate issue_id in batch: %s" % patch.issue_id)
-            patch_ids.add(patch.patch_id)
-            issue_ids.add(patch.issue_id)
-            rows.append(patch)
-        if not rows:
-            raise PatchApplicationError("patch batch must not be empty")
-
+        rows = self._validated_batch_rows(patches)
         with self.mutation_lock():
-            if read_json(self.pending_patch_path, default=None) is not None:
-                raise ConflictError(
-                    "an interrupted patch is pending; recover it before batch apply"
-                )
-
-            ledger = self._ledger()
-            units, mappings = self._expected_compiled_state()
-            if ({key: value.to_dict() for key, value in self.units().items()}
-                    != {key: value.to_dict() for key, value in units.items()}):
-                raise PatchApplicationError(
-                    "compiled content_units were modified outside the ledger; run rebuild"
-                )
-            if ({key: value.to_dict() for key, value in self.mappings().items()}
-                    != {key: value.to_dict() for key, value in mappings.items()}):
-                raise PatchApplicationError(
-                    "compiled chapter mappings were modified outside the ledger; run rebuild"
-                )
-
+            ledger, units, mappings = self._checked_batch_state()
             results = []
             for patch in rows:
                 fingerprint = self._patch_fingerprint(patch)

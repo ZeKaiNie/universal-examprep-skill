@@ -44,6 +44,7 @@ from .models import (
 from .storage import (
     ApplyResult,
     ConflictError,
+    FORMULA_FALSE_POSITIVE_REASON_PREFIX,
     IngestionStore,
     PatchApplicationError,
     ReviewQueue,
@@ -73,6 +74,7 @@ __all__ = [
     "ConflictError",
     "ContentUnit",
     "EvidenceRef",
+    "FORMULA_FALSE_POSITIVE_REASON_PREFIX",
     "IngestionStore",
     "PatchApplicationError",
     "ReviewIssue",
