@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 """v4-P6 — dist manifest stays honest: every runtime-referenced script ships, no dev dirs leak,
 the zip builds and preserves the ${CLAUDE_SKILL_DIR} layout. Stdlib only."""
+import ast
+import io
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import tokenize
 import unittest
 import zipfile
 
@@ -66,6 +69,7 @@ class Manifest(unittest.TestCase):
                   "locales/zh/messages.json", "locales/en/messages.json",
                   "scripts/update_progress.py", "scripts/notebook.py", "scripts/retrieve.py",
                   "scripts/asset_policy.py", "scripts/image_validation.py",
+                  "scripts/material_generation.py",
                   "scripts/cheatsheet_render.py", "prompts/web_prompt.md",
                   "docs/language-policy.md", "docs/pdf-capability-adapters.json",
                   "skills/exam-study-guide/SKILL.md", "scripts/exam_start.py",
@@ -171,6 +175,53 @@ class Build(unittest.TestCase):
         exec(compile(compact, "fixture.py", "exec"), namespace)
         self.assertEqual("", namespace["value"].__doc__)
         self.assertEqual(7, namespace["value"]())
+
+    def test_python_layout_compaction_preserves_significant_tokens_and_ast(self):
+        source = (
+            b"#!/usr/bin/env python\n"
+            b"# -*- coding: utf-8 -*-\n"
+            b"VALUE = (\n"
+            b"    1\n"
+            b"    + 2\n"
+            b")\n"
+            b"\n"
+            b'def text():\n    return "runtime\\nstring"\n'
+        )
+        stripped = build_dist._strip_python_comments(source)
+        compact = build_dist._compact_python_layout(stripped)
+        self.assertLess(len(compact), len(stripped))
+        self.assertTrue(compact.startswith(
+            b"#!/usr/bin/env python\n# -*- coding: utf-8 -*-\n"))
+
+        def significant(data):
+            return [
+                (token.type, token.string)
+                for token in tokenize.tokenize(io.BytesIO(data).readline)
+                if token.type != tokenize.NL
+            ]
+
+        self.assertEqual(significant(stripped), significant(compact))
+        self.assertEqual(
+            ast.dump(ast.parse(stripped), include_attributes=False),
+            ast.dump(ast.parse(compact), include_attributes=False),
+        )
+
+    def test_runtime_bytes_are_cross_checkout_line_ending_deterministic(self):
+        with tempfile.TemporaryDirectory(prefix="dist-eol-") as d:
+            fixture = os.path.join(d, "fixture.py")
+            with open(fixture, "wb") as stream:
+                stream.write(b"#!/usr/bin/env python\r\nvalue = 7\r\n")
+            original_root = build_dist.ROOT
+            try:
+                build_dist.ROOT = d
+                packed = build_dist._runtime_bytes("fixture.py")
+            finally:
+                build_dist.ROOT = original_root
+        self.assertNotIn(b"\r", packed)
+        self.assertTrue(packed.startswith(b"#!/usr/bin/env python\n"))
+        namespace = {}
+        exec(compile(packed, "fixture.py", "exec"), namespace)
+        self.assertEqual(7, namespace["value"])
 
     def test_zip_builds_and_preserves_layout(self):
         with tempfile.TemporaryDirectory(prefix="dist-") as d:

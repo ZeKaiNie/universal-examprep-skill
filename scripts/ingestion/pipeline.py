@@ -11,6 +11,7 @@ import json
 import mimetypes
 import os
 import re
+import sys
 from pathlib import Path
 
 try:
@@ -21,8 +22,10 @@ try:
         has_tainted_official_asset,
         is_student_attempt_tainted,
         iter_asset_declarations,
+        legacy_attempt_promotion_receipts,
         physical_asset_key,
         student_attempt_tainted_keys,
+        workspace_asset_identity_key,
     )
 except ImportError:  # imported as ``scripts.ingestion.pipeline``
     from scripts.asset_policy import (
@@ -32,8 +35,10 @@ except ImportError:  # imported as ``scripts.ingestion.pipeline``
         has_tainted_official_asset,
         is_student_attempt_tainted,
         iter_asset_declarations,
+        legacy_attempt_promotion_receipts,
         physical_asset_key,
         student_attempt_tainted_keys,
+        workspace_asset_identity_key,
     )
 
 from .identifiers import (
@@ -77,7 +82,42 @@ from .storage import (
     atomic_write_json,
     atomic_write_text,
     read_json,
+    read_jsonl,
+    stable_read_bytes,
 )
+
+try:
+    from material_generation import (
+        MATERIAL_BUILD_PENDING_PATH,
+        MATERIAL_BUILD_RECEIPT_PATH,
+        PARSE_REPORT_PATH,
+        SOURCE_RAW_INPUT_PATH,
+        abandon_latest_runtime_recovery,
+        asset_role_promotions,
+        candidate_asset_policy,
+        complete_generation,
+        complete_latest_runtime_recovery,
+        json_sha256,
+        material_recovery_path,
+        validate_generation,
+        validate_runtime_recovery_log,
+    )
+except ImportError:
+    from scripts.material_generation import (
+        MATERIAL_BUILD_PENDING_PATH,
+        MATERIAL_BUILD_RECEIPT_PATH,
+        PARSE_REPORT_PATH,
+        SOURCE_RAW_INPUT_PATH,
+        abandon_latest_runtime_recovery,
+        asset_role_promotions,
+        candidate_asset_policy,
+        complete_generation,
+        complete_latest_runtime_recovery,
+        json_sha256,
+        material_recovery_path,
+        validate_generation,
+        validate_runtime_recovery_log,
+    )
 
 
 PAYLOAD_VERSION = 2
@@ -1587,6 +1627,537 @@ def _existing_source_asset_layers(workspace):
     return tuple(layers)
 
 
+def _existing_content_asset_layer(workspace):
+    workspace_root = _workspace_root(workspace)
+    path = safe_workspace_entry(workspace_root, IngestionStore.UNITS_PATH)
+    if not path.exists():
+        return []
+    rows = read_jsonl(path)
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise ValueError("existing content unit policy must be an array of objects")
+    return rows
+
+
+def _audited_asset_policy(workspace, quiz_rows, teaching_rows, content_units,
+                          allow_compatibility_unassigned=False):
+    audit = audit_asset_policy(
+        quiz_rows=quiz_rows,
+        teaching_rows=teaching_rows,
+        content_units=content_units,
+        workspace=workspace,
+    )
+
+    def compatibility_unassigned(message):
+        return (
+            allow_compatibility_unassigned
+            and isinstance(message, str)
+            and message.startswith((
+                "references/quiz_bank.json[",
+                "references/teaching_examples.json[",
+            ))
+            and "has asset evidence but no stable chapter/phase locator" in message
+        )
+
+    problems = list(audit["invalid_declarations"])
+    problems.extend(
+        message for message in audit["conflicts"]
+        if not compatibility_unassigned(message)
+    )
+    if problems:
+        raise ValueError("asset policy failed: %s" % problems[0])
+    return {
+        "quiz_rows": list(quiz_rows or ()),
+        "teaching_rows": list(teaching_rows or ()),
+        "content_units": list(content_units or ()),
+        "item_groups": audit["item_groups"],
+    }
+
+
+def _policy_roles_by_identity(policy, workspace):
+    roles = {}
+    for name in ("quiz_rows", "teaching_rows", "content_units"):
+        for path, role in iter_asset_declarations(policy.get(name) or ()):
+            identity = workspace_asset_identity_key(path, workspace)
+            roles.setdefault(identity, set()).add(role)
+    return roles
+
+
+def _stable_json_with_sha256(path):
+    payload, _snapshot = stable_read_bytes(path)
+
+    def no_duplicate_keys(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON key: %s" % key)
+            value[key] = item
+        return value
+
+    def reject_constant(value):
+        raise ValueError("non-finite JSON constant: %s" % value)
+
+    try:
+        value = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=no_duplicate_keys,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("material generation input is not strict JSON: %s" % path) from exc
+    return value, hashlib.sha256(payload).hexdigest()
+
+
+def _optional_material_recovery_log(
+        workspace_root, generation_id, pending=None, pending_sha256=None):
+    relative = material_recovery_path(generation_id)
+    path = safe_workspace_entry(workspace_root, relative)
+    if not path.exists():
+        return None
+    value, _sha256 = _stable_json_with_sha256(path)
+    validate_runtime_recovery_log(
+        value, pending=pending, pending_sha256=pending_sha256
+    )
+    return {"path": relative, "log": value}
+
+
+def _material_recovery_ancestor_chain(workspace_root, pending, limit=64):
+    chain = []
+    root_generation = pending["generation_id"]
+    child_generation = root_generation
+    generation_id = pending.get("supersedes_generation_id")
+    seen = {root_generation}
+    while generation_id is not None:
+        if generation_id in seen or len(chain) >= limit:
+            raise ValueError("material recovery ancestor chain is cyclic or too deep")
+        seen.add(generation_id)
+        recovery = _optional_material_recovery_log(
+            workspace_root, generation_id
+        )
+        if recovery is None:
+            raise ValueError("material successor lacks an ancestor recovery audit")
+        latest = recovery["log"]["records"][-1]
+        authorization = latest["authorization"]
+        binding = authorization["pending"]
+        outcome = latest["outcome"]
+        if (authorization["action"] != "supersede"
+                or binding["generation_id"] != generation_id
+                or (outcome is not None and (
+                    outcome.get("status") != "abandoned"
+                    or outcome.get("replacement_generation_id")
+                    != child_generation))):
+            raise ValueError("material recovery ancestor audit is invalid")
+        recovery["generation_id"] = generation_id
+        recovery["child_generation_id"] = child_generation
+        chain.append(recovery)
+        child_generation = generation_id
+        generation_id = binding.get("supersedes_generation_id")
+    return chain
+
+
+def authorize_material_build_generation(workspace, raw_input):
+    """Authorize one hash-bound builder hand-off under the publication lock.
+
+    Without a pending generation, callers retain the ordinary stale-layer
+    policy gate.  A pending generation permits only an exact, receipt-backed
+    ``answer_context -> student_attempt`` correction for physical assets that
+    already exist in both generations.
+    """
+
+    workspace_root = _workspace_root(workspace)
+    pending_path = safe_workspace_entry(
+        workspace_root, MATERIAL_BUILD_PENDING_PATH
+    )
+    if not pending_path.exists():
+        return None
+    pending, pending_sha = _stable_json_with_sha256(pending_path)
+    validate_generation(pending, expected_status="pending")
+
+    recovery = _optional_material_recovery_log(
+        workspace_root,
+        pending["generation_id"],
+        pending=pending,
+        pending_sha256=pending_sha,
+    )
+    if recovery is not None:
+        latest = recovery["log"]["records"][-1]
+        if (latest["outcome"] is not None
+                or latest["authorization"]["action"] != "resume"):
+            raise ValueError(
+                "pending material generation lacks an active resume authorization"
+            )
+
+    ancestor_recoveries = _material_recovery_ancestor_chain(
+        workspace_root, pending
+    )
+
+    raw_path = safe_workspace_entry(workspace_root, SOURCE_RAW_INPUT_PATH)
+    report_path = safe_workspace_entry(workspace_root, PARSE_REPORT_PATH)
+    persisted_raw, raw_sha = _stable_json_with_sha256(raw_path)
+    parse_report, report_sha = _stable_json_with_sha256(report_path)
+    if persisted_raw != raw_input:
+        raise ValueError("pending material generation does not match compiler raw input")
+    if raw_sha != pending["raw_input"]["sha256"]:
+        raise ValueError("pending material raw-input hash drifted")
+    if report_sha != pending["parse_report"]["sha256"]:
+        raise ValueError("pending material parse-report hash drifted")
+
+    candidate_layers = candidate_asset_policy(raw_input)
+    promotions = asset_role_promotions(parse_report)
+    if json_sha256(candidate_layers) != pending["candidate_asset_policy_sha256"]:
+        raise ValueError("pending candidate asset policy hash drifted")
+    if (json_sha256(promotions) != pending["asset_role_promotions_sha256"]
+            or len(promotions) != pending["asset_role_promotion_count"]):
+        raise ValueError("pending asset-role promotion ledger drifted")
+
+    manifest_path = safe_workspace_entry(workspace_root, BUILD_MANIFEST_PATH)
+    if manifest_path.exists():
+        _manifest_bytes, _snapshot = stable_read_bytes(manifest_path)
+        previous_manifest_sha = hashlib.sha256(_manifest_bytes).hexdigest()
+    else:
+        previous_manifest_sha = None
+    if previous_manifest_sha != pending["previous_build_manifest_sha256"]:
+        raise ValueError("workspace build manifest changed after material preparation")
+
+    old_quiz, old_teaching = _existing_source_asset_layers(workspace_root)
+    old_policy = _audited_asset_policy(
+        workspace_root,
+        old_quiz,
+        old_teaching,
+        _existing_content_asset_layer(workspace_root),
+    )
+    candidate_policy = _audited_asset_policy(
+        workspace_root,
+        candidate_layers["quiz_rows"],
+        candidate_layers["teaching_rows"],
+        candidate_layers["content_units"],
+        allow_compatibility_unassigned=True,
+    )
+    old_roles = _policy_roles_by_identity(old_policy, workspace_root)
+    candidate_roles = _policy_roles_by_identity(candidate_policy, workspace_root)
+    changed = {
+        identity: (old_roles[identity], candidate_roles[identity])
+        for identity in old_roles.keys() & candidate_roles.keys()
+        if old_roles[identity] != candidate_roles[identity]
+    }
+
+    receipt_by_identity = {}
+    for receipt in promotions:
+        path = receipt.get("path")
+        identity = workspace_asset_identity_key(path, workspace_root)
+        if identity in receipt_by_identity:
+            raise ValueError("duplicate asset-role migration receipt")
+        receipt_by_identity[identity] = receipt
+    if set(receipt_by_identity) != set(changed):
+        raise ValueError("asset-role migration receipts do not match actual policy changes")
+    ordered = []
+    for identity, (before, after) in changed.items():
+        if before != {"answer_context"} or after != {STUDENT_ATTEMPT}:
+            raise ValueError(
+                "unsupported material asset-role migration: %s -> %s"
+                % (sorted(before), sorted(after))
+            )
+        ordered.append((identity, receipt_by_identity[identity]))
+    verified_receipts = legacy_attempt_promotion_receipts(
+        tuple((receipt.get("path"), receipt.get("sha256"))
+              for _identity, receipt in ordered),
+        old_policy,
+        candidate_policy,
+        workspace_root,
+    )
+    for (_identity, receipt), verified in zip(ordered, verified_receipts):
+        if verified != receipt:
+            raise ValueError("asset-role migration receipt does not match live evidence")
+
+    return {
+        "pending": pending,
+        "candidate_policy": candidate_policy,
+        "recovery": recovery,
+        "ancestor_recoveries": ancestor_recoveries,
+    }
+
+
+def _material_build_manifest_contract(receipt, receipt_sha256):
+    validate_generation(receipt, expected_status="complete")
+    contract = {
+        "protocol_version": 2 if receipt.get("completion") is not None else 1,
+        "generation_id": receipt["generation_id"],
+        "raw_input": dict(receipt["raw_input"]),
+        "parse_report": dict(receipt["parse_report"]),
+        "receipt": {
+            "path": MATERIAL_BUILD_RECEIPT_PATH,
+            "sha256": receipt_sha256,
+        },
+    }
+    if receipt.get("completion") is not None:
+        contract["completion"] = receipt["completion"]
+    return contract
+
+
+def verify_material_build_receipt(
+        workspace, raw_input=None, build_manifest=None,
+        require_manifest_binding=True, required=False):
+    """Verify a completed generation against immutable live source bytes."""
+
+    workspace_root = _workspace_root(workspace)
+    manifest_path = safe_workspace_entry(workspace_root, BUILD_MANIFEST_PATH)
+    if build_manifest is None and manifest_path.exists():
+        build_manifest = read_json(manifest_path)
+    if build_manifest is not None and (
+            not isinstance(build_manifest, dict)
+            or type(build_manifest.get("schema_version")) is not int
+            or build_manifest.get("schema_version") not in (1, 2)):
+        raise ValueError("build manifest has an invalid schema_version")
+    manifest_schema = (
+        build_manifest.get("schema_version")
+        if isinstance(build_manifest, dict) else None
+    )
+    artifacts = (
+        build_manifest.get("artifacts")
+        if isinstance(build_manifest, dict) else None
+    )
+    material_contract = (
+        build_manifest.get("material_build")
+        if isinstance(build_manifest, dict) else None
+    )
+    receipt_path = safe_workspace_entry(workspace_root, MATERIAL_BUILD_RECEIPT_PATH)
+    if not receipt_path.exists():
+        if (required or manifest_schema == 2 or material_contract is not None
+                or (isinstance(artifacts, dict)
+                    and "material_build_receipt" in artifacts)):
+            raise ValueError("required material build receipt is missing")
+        return None
+    receipt, receipt_sha = _stable_json_with_sha256(receipt_path)
+    validate_generation(receipt, expected_status="complete")
+    persisted_raw, raw_sha = _stable_json_with_sha256(
+        safe_workspace_entry(workspace_root, SOURCE_RAW_INPUT_PATH)
+    )
+    parse_report, report_sha = _stable_json_with_sha256(
+        safe_workspace_entry(workspace_root, PARSE_REPORT_PATH)
+    )
+    if raw_sha != receipt["raw_input"]["sha256"]:
+        raise ValueError("material build receipt raw-input hash is stale")
+    if report_sha != receipt["parse_report"]["sha256"]:
+        raise ValueError("material build receipt parse-report hash is stale")
+    policy = candidate_asset_policy(persisted_raw)
+    promotions = asset_role_promotions(parse_report)
+    if json_sha256(policy) != receipt["candidate_asset_policy_sha256"]:
+        raise ValueError("material build receipt candidate policy is stale")
+    if (json_sha256(promotions) != receipt["asset_role_promotions_sha256"]
+            or len(promotions) != receipt["asset_role_promotion_count"]):
+        raise ValueError("material build receipt promotion ledger is stale")
+    if raw_input is not None and persisted_raw != raw_input:
+        raise ValueError(
+            "completed material receipt belongs to different raw input; "
+            "rerun ingest_course.py"
+        )
+
+    completion = receipt.get("completion")
+    recovery_artifacts = {}
+    recovery_logs_by_generation = {}
+    if completion is not None:
+        for row in completion["recovery_logs"]:
+            recovery_path = safe_workspace_entry(workspace_root, row["path"])
+            recovery_log, recovery_sha = _stable_json_with_sha256(recovery_path)
+            validate_runtime_recovery_log(recovery_log)
+            latest = recovery_log["records"][-1]
+            authorization = latest["authorization"]
+            outcome = latest["outcome"]
+            if (recovery_log["generation_id"] != row["generation_id"]
+                    or authorization["pending"]["generation_id"]
+                    != row["generation_id"]
+                    or not isinstance(outcome, dict)
+                    or outcome.get("status") != row["outcome"]):
+                raise ValueError("material recovery completion audit is stale")
+            if row["outcome"] == "completed":
+                if (row["generation_id"] != receipt["generation_id"]
+                        or authorization["action"] != "resume"
+                        or outcome.get("material_build_receipt_sha256")
+                        != receipt_sha):
+                    raise ValueError("material resume completion audit is stale")
+            elif (authorization["action"] != "supersede"
+                    or outcome.get("replacement_generation_id")
+                    != row["replacement_generation_id"]):
+                raise ValueError("material supersede abandonment audit is stale")
+            recovery_artifacts[
+                "material_build_recovery:%s" % row["generation_id"]
+            ] = (row["path"], recovery_sha)
+            recovery_logs_by_generation[row["generation_id"]] = recovery_log
+    completion_rows = (completion or {}).get("recovery_logs", [])
+    completed_rows = [row for row in completion_rows
+                      if row["outcome"] == "completed"]
+    if len(completed_rows) > 1:
+        raise ValueError("material receipt has multiple resume completion audits")
+    abandoned_rows = {
+        row["generation_id"]: row for row in completion_rows
+        if row["outcome"] == "abandoned"
+    }
+    seen_ancestors = set()
+    child_generation = receipt["generation_id"]
+    predecessor_id = receipt.get("supersedes_generation_id")
+    while predecessor_id is not None:
+        if predecessor_id in seen_ancestors or len(seen_ancestors) >= 64:
+            raise ValueError("material receipt recovery ancestry is cyclic or too deep")
+        row = abandoned_rows.get(predecessor_id)
+        recovery_log = recovery_logs_by_generation.get(predecessor_id)
+        if (row is None or recovery_log is None
+                or row["replacement_generation_id"] != child_generation):
+            raise ValueError("material successor receipt has an incomplete recovery chain")
+        seen_ancestors.add(predecessor_id)
+        binding = recovery_log["records"][-1]["authorization"]["pending"]
+        child_generation = predecessor_id
+        predecessor_id = binding.get("supersedes_generation_id")
+    if set(abandoned_rows) != seen_ancestors:
+        raise ValueError("material receipt recovery chain has unrelated audit rows")
+
+    if isinstance(artifacts, dict):
+        reserved_recovery_artifacts = {
+            name for name in artifacts
+            if isinstance(name, str)
+            and name.startswith("material_build_recovery:")
+        }
+        if reserved_recovery_artifacts != set(recovery_artifacts):
+            raise ValueError(
+                "build manifest has unrelated material recovery artifacts"
+            )
+
+    if require_manifest_binding or manifest_schema == 2:
+        if not isinstance(artifacts, dict):
+            raise ValueError("build manifest does not bind material generation")
+        expected = {
+            "source_raw_input": (SOURCE_RAW_INPUT_PATH, raw_sha),
+            "parse_report": (PARSE_REPORT_PATH, report_sha),
+            "material_build_receipt": (
+                MATERIAL_BUILD_RECEIPT_PATH, receipt_sha
+            ),
+        }
+        expected.update(recovery_artifacts)
+        for name, (path, digest) in expected.items():
+            row = artifacts.get(name)
+            if (not isinstance(row, dict)
+                    or row.get("path") != path
+                    or row.get("sha256") != digest):
+                raise ValueError(
+                    "build manifest has a stale %s material binding" % name
+                )
+        if manifest_schema == 2:
+            if (not isinstance(material_contract, dict)
+                    or type(material_contract.get("protocol_version")) is not int
+                    or material_contract.get("protocol_version") not in (1, 2)):
+                raise ValueError(
+                    "build manifest material_build protocol_version is invalid"
+                )
+            expected_contract = _material_build_manifest_contract(
+                receipt, receipt_sha
+            )
+            if material_contract != expected_contract:
+                raise ValueError(
+                    "build manifest material_build contract is missing or stale"
+                )
+    return {
+        "receipt": receipt,
+        "receipt_sha256": receipt_sha,
+        "raw_input": persisted_raw,
+        "parse_report": parse_report,
+    }
+
+
+def finalize_material_build_generation(workspace, authorization):
+    """Publish a complete receipt, bind it, then remove the blocker last."""
+
+    if authorization is None:
+        return None
+    workspace_root = _workspace_root(workspace)
+    pending_path = safe_workspace_entry(
+        workspace_root, MATERIAL_BUILD_PENDING_PATH
+    )
+    pending, _pending_sha = _stable_json_with_sha256(pending_path)
+    if pending != authorization.get("pending"):
+        raise ValueError("material build generation changed before finalization")
+    validate_generation(pending, expected_status="pending")
+
+    for binding in (pending["raw_input"], pending["parse_report"]):
+        path = safe_workspace_entry(workspace_root, binding["path"])
+        payload, _snapshot = stable_read_bytes(path)
+        if hashlib.sha256(payload).hexdigest() != binding["sha256"]:
+            raise ValueError("material build source drifted before finalization")
+
+    receipt_path = safe_workspace_entry(
+        workspace_root, MATERIAL_BUILD_RECEIPT_PATH
+    )
+    recovery = authorization.get("recovery")
+    ancestor_recoveries = list(authorization.get("ancestor_recoveries") or ())
+    recovery_bindings = []
+    if recovery is not None:
+        recovery_bindings.append({
+            "path": recovery["path"],
+            "generation_id": pending["generation_id"],
+            "outcome": "completed",
+            "replacement_generation_id": None,
+        })
+    finalized_ancestors = []
+    for ancestor in ancestor_recoveries:
+        ancestor_log = ancestor["log"]
+        outcome = ancestor_log["records"][-1]["outcome"]
+        if outcome is None:
+            ancestor_log = abandon_latest_runtime_recovery(
+                ancestor_log, ancestor["child_generation_id"]
+            )
+            outcome = ancestor_log["records"][-1]["outcome"]
+            finalized_ancestors.append((ancestor, ancestor_log))
+        recovery_bindings.append({
+            "path": ancestor["path"],
+            "generation_id": ancestor["generation_id"],
+            "outcome": "abandoned",
+            "replacement_generation_id": ancestor["child_generation_id"],
+        })
+    receipt = complete_generation(pending, recovery_logs=recovery_bindings)
+    atomic_write_json(receipt_path, receipt)
+    receipt_sha = file_sha256(receipt_path)
+    if recovery is not None:
+        completed_recovery = complete_latest_runtime_recovery(
+            recovery["log"], receipt_sha
+        )
+        atomic_write_json(
+            safe_workspace_entry(workspace_root, recovery["path"]),
+            completed_recovery,
+        )
+    for ancestor, ancestor_log in finalized_ancestors:
+        atomic_write_json(
+            safe_workspace_entry(workspace_root, ancestor["path"]),
+            ancestor_log,
+        )
+    manifest_path = safe_workspace_entry(workspace_root, BUILD_MANIFEST_PATH)
+    manifest = read_json(manifest_path)
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise ValueError("build manifest artifacts are unavailable for finalization")
+    for name, relative in (
+            ("source_raw_input", SOURCE_RAW_INPUT_PATH),
+            ("parse_report", PARSE_REPORT_PATH),
+            ("material_build_receipt", MATERIAL_BUILD_RECEIPT_PATH)):
+        path = safe_workspace_entry(workspace_root, relative)
+        artifacts[name] = {
+            "path": relative,
+            "sha256": file_sha256(path),
+        }
+    for row in receipt["completion"]["recovery_logs"]:
+        path = safe_workspace_entry(workspace_root, row["path"])
+        artifacts["material_build_recovery:%s" % row["generation_id"]] = {
+            "path": row["path"],
+            "sha256": file_sha256(path),
+        }
+    manifest["schema_version"] = 2
+    manifest["material_build"] = _material_build_manifest_contract(
+        receipt, receipt_sha
+    )
+    atomic_write_json(manifest_path, manifest)
+    verify_material_build_receipt(
+        workspace_root, build_manifest=manifest, required=True
+    )
+    pending_path.unlink()
+    return manifest
+
+
 def _audit_payload_with_existing_source_layers(workspace, payload):
     """Fail closed on existing source rows plus the proposed raw unit slice."""
 
@@ -1598,7 +2169,9 @@ def _audit_payload_with_existing_source_layers(workspace, payload):
     )
 
 
-def _persist_payload_unlocked(workspace, payload):
+def _persist_payload_unlocked(
+        workspace, payload, material_generation=None,
+        extra_transaction_paths=(), transaction_holder=None):
     """Persist and reconcile a validated envelope into ``workspace/.ingest``."""
 
     _strict_payload(payload)
@@ -1606,7 +2179,25 @@ def _persist_payload_unlocked(workspace, payload):
     # source layers while that lock is held and combine them with the proposed
     # unit slice before constructing IngestionStore or mutating any artifact.
     # Missing layers are normal for a brand-new workspace.
-    _audit_payload_with_existing_source_layers(workspace, payload)
+    completed_material = None
+    if material_generation is None:
+        _audit_payload_with_existing_source_layers(workspace, payload)
+        completed_material = verify_material_build_receipt(
+            workspace, require_manifest_binding=False
+        )
+        if completed_material is not None:
+            persisted_ingestion = completed_material["raw_input"].get("ingestion")
+            if (not isinstance(persisted_ingestion, dict)
+                    or persisted_ingestion.get("content_units")
+                    != payload["content_units"]):
+                raise ValueError(
+                    "completed material receipt does not match ingestion payload"
+                )
+    else:
+        candidate = material_generation.get("candidate_policy")
+        if (not isinstance(candidate, dict)
+                or candidate.get("content_units") != payload["content_units"]):
+            raise ValueError("authorized material generation does not match payload")
     workspace = os.path.abspath(workspace)
     source_root = os.path.abspath(payload["source_root"])
     store = IngestionStore(workspace, source_root=source_root)
@@ -1752,6 +2343,24 @@ def _persist_payload_unlocked(workspace, payload):
         "review_patches": store.ledger_path,
         "unbound_review": unbound_path,
     }
+    if completed_material is not None:
+        artifact_paths.update({
+            "source_raw_input": safe_workspace_entry(
+                workspace_root, SOURCE_RAW_INPUT_PATH
+            ),
+            "parse_report": safe_workspace_entry(
+                workspace_root, PARSE_REPORT_PATH
+            ),
+            "material_build_receipt": safe_workspace_entry(
+                workspace_root, MATERIAL_BUILD_RECEIPT_PATH
+            ),
+        })
+        for row in (
+                completed_material["receipt"].get("completion") or {}
+                ).get("recovery_logs", []):
+            artifact_paths[
+                "material_build_recovery:%s" % row["generation_id"]
+            ] = safe_workspace_entry(workspace_root, row["path"])
     if parser_receipts is not None:
         artifact_paths["parser_receipts"] = parser_receipts_path
         artifact_paths.update(fact_paths)
@@ -1767,8 +2376,16 @@ def _persist_payload_unlocked(workspace, payload):
             transaction_paths.append(relative)
     transaction_paths.append(BUILD_MANIFEST_PATH)
     transaction_paths.extend(relative for relative, _payload in evidence_specs)
+    transaction_paths.extend(extra_transaction_paths or ())
 
-    with store.ingest_transaction(transaction_paths):
+    if transaction_holder is not None and (
+            not isinstance(transaction_holder, dict) or transaction_holder):
+        raise ValueError("transaction_holder must be an empty mutable object")
+    transaction_context = store.ingest_transaction(transaction_paths)
+    transaction_context.__enter__()
+    if transaction_holder is not None:
+        transaction_holder["context"] = transaction_context
+    try:
         store.manifest.replace_all(sources)
         store.sync_base(units, mappings)
         for evidence_rel, evidence_payload in evidence_specs:
@@ -1821,7 +2438,7 @@ def _persist_payload_unlocked(workspace, payload):
                     fact_path.unlink()
 
         build_manifest = {
-            "schema_version": 1,
+            "schema_version": 2 if completed_material is not None else 1,
             "pipeline_version": (
                 "ingestion-v2" if parser_receipts is not None else "ingestion-v1"
             ),
@@ -1841,7 +2458,19 @@ def _persist_payload_unlocked(workspace, payload):
                 for name, path in sorted(artifact_paths.items())
             },
         }
+        if completed_material is not None:
+            build_manifest["material_build"] = _material_build_manifest_contract(
+                completed_material["receipt"],
+                completed_material["receipt_sha256"],
+            )
         atomic_write_json(manifest_path, build_manifest)
+    except BaseException:
+        if transaction_holder is not None:
+            transaction_holder.pop("context", None)
+        transaction_context.__exit__(*sys.exc_info())
+        raise
+    if transaction_holder is None:
+        transaction_context.__exit__(None, None, None)
     return build_manifest
 
 
@@ -1888,8 +2517,19 @@ def refresh_build_manifest(workspace, derived_artifacts=None, fact_summary=None)
         )
     artifacts = manifest.get("artifacts")
     if isinstance(artifacts, dict):
-        for row in artifacts.values():
+        immutable_generation_artifacts = {
+            "source_raw_input",
+            "parse_report",
+            "material_build_receipt",
+        }
+        for name, row in artifacts.items():
             if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+                continue
+            # These three hashes are an immutable generation receipt, not a
+            # cache.  Refreshing them from live bytes would bless tampering and
+            # erase the builder/compiler hand-off evidence.
+            if (name in immutable_generation_artifacts
+                    or name.startswith("material_build_recovery:")):
                 continue
             absolute = safe_workspace_entry(workspace_path, row["path"])
             if absolute.is_file() and not absolute.is_symlink():
@@ -2661,6 +3301,17 @@ def _compile_review_outputs_unlocked(workspace):
         integrity["teaching_examples"] = {
             "file": "references/teaching_examples.json",
             "sha256": file_sha256(teaching_path),
+        }
+    terms_path = safe_workspace_entry(workspace_path, "references/terms.json")
+    if terms_path.exists():
+        if not terms_path.is_file():
+            raise ValueError("references/terms.json is not a safe regular file")
+        # Query expansion is part of retrieval behavior even though glossary
+        # tokens are not embedded in the BM25 postings.  A review rebuild must
+        # therefore preserve the compiler's exact glossary-byte binding.
+        integrity["terms"] = {
+            "file": "references/terms.json",
+            "sha256": file_sha256(terms_path),
         }
     integrity = {key: value for key, value in integrity.items() if value is not None}
     index = retrieve_module.build_index(chunks, integrity=integrity)

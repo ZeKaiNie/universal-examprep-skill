@@ -58,6 +58,7 @@ from .storage import (
     stable_read_bytes,
     workspace_publication_lock,
     workspace_state_lock,
+    workspace_validation_lock,
 )
 
 __all__ = [
@@ -106,4 +107,5 @@ __all__ = [
     "source_language_evidence",
     "workspace_publication_lock",
     "workspace_state_lock",
+    "workspace_validation_lock",
 ]

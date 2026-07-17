@@ -31,17 +31,30 @@ import update_progress  # noqa: E402
 try:  # noqa: E402
     from ingestion import (
         ConflictError,
+        IngestionStore,
         is_link_or_reparse,
         safe_workspace_entry,
+        stable_read_bytes,
         workspace_publication_lock,
     )
     from ingestion.identifiers import canonical_json, file_sha256, normalize_workspace_path
     from ingestion.storage import atomic_write_json, read_json
+    from material_generation import (
+        MATERIAL_BUILD_PENDING_PATH,
+        append_runtime_recovery,
+        build_runtime_recovery_from_binding,
+        expire_latest_runtime_recovery,
+        material_recovery_path,
+        validate_generation,
+        validate_runtime_recovery_log,
+    )
 except ImportError:  # pragma: no cover - package import fallback
     from scripts.ingestion import (
         ConflictError,
+        IngestionStore,
         is_link_or_reparse,
         safe_workspace_entry,
+        stable_read_bytes,
         workspace_publication_lock,
     )
     from scripts.ingestion.identifiers import (
@@ -50,6 +63,15 @@ except ImportError:  # pragma: no cover - package import fallback
         normalize_workspace_path,
     )
     from scripts.ingestion.storage import atomic_write_json, read_json
+    from scripts.material_generation import (
+        MATERIAL_BUILD_PENDING_PATH,
+        append_runtime_recovery,
+        build_runtime_recovery_from_binding,
+        expire_latest_runtime_recovery,
+        material_recovery_path,
+        validate_generation,
+        validate_runtime_recovery_log,
+    )
 
 
 CHOICE_FIELDS = ("mode", "time_budget", "language")
@@ -349,26 +371,137 @@ def _validate_runtime_receipt_schema(receipt):
     return receipt
 
 
+def _runtime_receipt_document_bytes(receipt):
+    return (
+        json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
+
+
+def _build_runtime_receipt(identity=None):
+    receipt = dict(identity or _capture_runtime_identity())
+    receipt.update({
+        "schema_version": RUNTIME_RECEIPT_SCHEMA,
+        "receipt_type": "exam_runtime",
+        "created_at": _utc_now(),
+    })
+    return _validate_runtime_receipt_schema(receipt)
+
+
 def _write_runtime_receipt(workspace):
     # Runtime hashing can be comparatively expensive and touches only the
     # installed package.  Keep it outside the workspace critical section, then
     # serialize only the validator-visible atomic publication.  In particular,
     # _confirm must never hold this lock while its update_progress subprocesses
     # run: those commands acquire the same state->ingestion lock themselves.
-    identity = _capture_runtime_identity()
-    receipt = dict(identity)
-    receipt.update({
-        "schema_version": RUNTIME_RECEIPT_SCHEMA,
-        "receipt_type": "exam_runtime",
-        "created_at": _utc_now(),
-    })
-    _validate_runtime_receipt_schema(receipt)
+    receipt = _build_runtime_receipt()
     with workspace_publication_lock(workspace):
         destination = safe_workspace_entry(workspace, RUNTIME_RECEIPT_NAME)
         atomic_write_json(destination, receipt)
         if is_link_or_reparse(destination) or not os.path.isfile(destination):
             raise RuntimeReceiptError("runtime receipt write did not produce a regular file")
     return receipt
+
+
+def _strict_json_payload(payload, label):
+    def no_duplicates(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON key: %s" % key)
+            value[key] = item
+        return value
+
+    def reject_constant(value):
+        raise ValueError("non-finite JSON constant: %s" % value)
+
+    try:
+        return json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=no_duplicates,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeReceiptError("%s is not strict JSON" % label) from exc
+
+
+def _stable_pending_generation(workspace, require_complete_sources=True):
+    path = safe_workspace_entry(workspace, MATERIAL_BUILD_PENDING_PATH)
+    if not os.path.isfile(path) or is_link_or_reparse(path):
+        if os.path.lexists(str(path)):
+            raise RuntimeReceiptError("material build pending marker is unsafe")
+        return None
+    payload, _snapshot = stable_read_bytes(path)
+    pending = _strict_json_payload(payload, "material build pending marker")
+    validate_generation(pending, expected_status="pending")
+    sources_complete = True
+    for binding in (pending["raw_input"], pending["parse_report"]):
+        try:
+            source = safe_workspace_entry(workspace, binding["path"])
+            source_payload, _source_snapshot = stable_read_bytes(source)
+            matches = hashlib.sha256(source_payload).hexdigest() == binding["sha256"]
+        except (OSError, TypeError, ValueError):
+            matches = False
+        if not matches:
+            sources_complete = False
+            if require_complete_sources:
+                raise RuntimeReceiptError(
+                    "material build pending source hash is stale: %s" % binding["path"]
+                )
+    return {
+        "document": pending,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "path": path,
+        "sources_complete": sources_complete,
+    }
+
+
+def _recovery_target(workspace, pending_snapshot, action):
+    """Resolve the generation whose authorization must be refreshed."""
+
+    pending = pending_snapshot["document"]
+    return {
+        "pending_binding": {
+            "path": MATERIAL_BUILD_PENDING_PATH,
+            "sha256": pending_snapshot["sha256"],
+            "generation_id": pending["generation_id"],
+            "supersedes_generation_id": pending.get("supersedes_generation_id"),
+        },
+        "path": material_recovery_path(pending["generation_id"]),
+        "existing_log": None,
+        "interrupted_successor": not pending_snapshot["sources_complete"],
+    }
+
+
+def _runtime_binding_for_recovery(workspace):
+    path = safe_workspace_entry(workspace, RUNTIME_RECEIPT_NAME)
+    if not os.path.lexists(str(path)):
+        return {
+            "path": RUNTIME_RECEIPT_NAME,
+            "state": "missing",
+            "sha256": None,
+            "runtime_digest": None,
+        }
+    if not os.path.isfile(path) or is_link_or_reparse(path):
+        raise RuntimeReceiptError("existing runtime receipt is unsafe")
+    payload, _snapshot = stable_read_bytes(path)
+    digest = hashlib.sha256(payload).hexdigest()
+    try:
+        receipt = _validate_runtime_receipt_schema(
+            _strict_json_payload(payload, "runtime receipt")
+        )
+    except RuntimeReceiptError:
+        return {
+            "path": RUNTIME_RECEIPT_NAME,
+            "state": "invalid",
+            "sha256": digest,
+            "runtime_digest": None,
+        }
+    return {
+        "path": RUNTIME_RECEIPT_NAME,
+        "state": "valid",
+        "sha256": digest,
+        "runtime_digest": receipt["runtime_digest"],
+    }
 
 
 def _runtime_receipt_status(workspace):
@@ -752,6 +885,171 @@ def _run_progress(arguments):
     )
 
 
+def _recovery_start_preconditions(workspace, materials):
+    try:
+        registry = update_progress.load_registry()
+        confirmation = update_progress.workspace_confirmation_status(
+            workspace, materials, registry=registry
+        )
+    except (SystemExit, OSError, TypeError, ValueError) as exc:
+        raise RuntimeReceiptError(
+            "workspace registry is unavailable during material recovery"
+        ) from exc
+    if not confirmation.get("confirmed"):
+        raise RuntimeReceiptError(
+            "material recovery requires the already-confirmed workspace/materials pair"
+        )
+    choices = _load_state_status(workspace)
+    if not choices.get("ready"):
+        raise RuntimeReceiptError(
+            "material recovery requires the existing canonical learning choices"
+        )
+    if _path_is_same_or_inside(PACKAGE_ROOT, workspace):
+        raise RuntimeReceiptError("workspace is inside the installed runtime package")
+    return confirmation, choices
+
+
+def _recover_material_build(args):
+    """Rebind runtime provenance without weakening a material blocker."""
+
+    workspace_lexical = os.path.abspath(args.workspace)
+    materials_lexical = os.path.abspath(args.materials)
+    base = {
+        "process_success": False,
+        "ready_to_ingest": False,
+        "workspace": workspace_lexical,
+        "materials": materials_lexical,
+        "action": args.action,
+    }
+    if not os.path.isdir(workspace_lexical):
+        base["error"] = "workspace directory does not exist"
+        return 2, base
+    if not os.path.isdir(materials_lexical):
+        base["error"] = "materials directory does not exist"
+        return 2, base
+    if (_path_has_link_or_reparse(workspace_lexical)
+            or _path_has_link_or_reparse(materials_lexical)):
+        base["error"] = "workspace/materials path must not be link-backed"
+        return 2, base
+    workspace = _resolved_path(workspace_lexical)
+    materials = _resolved_path(materials_lexical)
+    base["workspace"] = workspace
+    base["materials"] = materials
+    try:
+        _recovery_start_preconditions(workspace, materials)
+        pending_snapshot = _stable_pending_generation(
+            workspace, require_complete_sources=False
+        )
+        if pending_snapshot is None:
+            raise RuntimeReceiptError(
+                "no pending material generation exists; ordinary confirm is sufficient"
+            )
+        recovery_target = _recovery_target(
+            workspace, pending_snapshot, args.action
+        )
+        replacement_receipt = _build_runtime_receipt()
+        replacement_bytes = _runtime_receipt_document_bytes(replacement_receipt)
+        replacement_binding = {
+            "path": RUNTIME_RECEIPT_NAME,
+            "state": "valid",
+            "sha256": hashlib.sha256(replacement_bytes).hexdigest(),
+            "runtime_digest": replacement_receipt["runtime_digest"],
+        }
+        with workspace_publication_lock(
+                workspace, allow_material_generation=True):
+            locked_pending = _stable_pending_generation(
+                workspace, require_complete_sources=False
+            )
+            if (locked_pending is None
+                    or locked_pending["sha256"] != pending_snapshot["sha256"]
+                    or locked_pending["document"] != pending_snapshot["document"]
+                    or locked_pending["sources_complete"]
+                    != pending_snapshot["sources_complete"]):
+                raise ConflictError(
+                    "pending material generation changed before recovery publication"
+                )
+            locked_target = _recovery_target(
+                workspace, locked_pending, args.action
+            )
+            if (locked_target["pending_binding"]
+                    != recovery_target["pending_binding"]
+                    or locked_target["path"] != recovery_target["path"]):
+                raise ConflictError(
+                    "material recovery predecessor changed before publication"
+                )
+            confirmation, choices = _recovery_start_preconditions(
+                workspace, materials
+            )
+            previous_binding = _runtime_binding_for_recovery(workspace)
+            recovery = build_runtime_recovery_from_binding(
+                locked_target["pending_binding"],
+                args.action,
+                previous_binding,
+                replacement_binding,
+                _utc_now(),
+            )
+            recovery_relative = locked_target["path"]
+            recovery_path = safe_workspace_entry(workspace, recovery_relative)
+            recovery_log = None
+            if os.path.lexists(str(recovery_path)):
+                if not os.path.isfile(recovery_path) or is_link_or_reparse(recovery_path):
+                    raise RuntimeReceiptError("material recovery log is unsafe")
+                log_payload, _log_snapshot = stable_read_bytes(recovery_path)
+                recovery_log = _strict_json_payload(
+                    log_payload, "material recovery log"
+                )
+                validate_runtime_recovery_log(recovery_log)
+                latest = recovery_log["records"][-1]
+                if (latest["authorization"]["authorization_id"]
+                        == recovery["authorization"]["authorization_id"]
+                        and latest["outcome"] is None):
+                    recovery = None
+                else:
+                    recovery_log = expire_latest_runtime_recovery(recovery_log)
+            if recovery is not None:
+                recovery_log = append_runtime_recovery(recovery_log, recovery)
+            store = IngestionStore(workspace)
+            with store.ingest_transaction((
+                    RUNTIME_RECEIPT_NAME, recovery_relative)):
+                atomic_write_json(recovery_path, recovery_log)
+                atomic_write_json(
+                    safe_workspace_entry(workspace, RUNTIME_RECEIPT_NAME),
+                    replacement_receipt,
+                )
+    except (ConflictError, OSError, RuntimeReceiptError, UnicodeDecodeError,
+            TypeError, ValueError) as exc:
+        base["error"] = "material build recovery failed: %s" % _bounded_text(exc)
+        base["failed_step"] = "material_build_recovery"
+        base["next_action"] = "inspect the pending generation and retry explicit recovery"
+        return 1, base
+
+    gate = check_start_gate(workspace, materials)
+    base.update({
+        "process_success": gate["ready_to_ingest"],
+        "ready_to_ingest": gate["ready_to_ingest"],
+        "generation_id": pending_snapshot["document"]["generation_id"],
+        "authorization_generation_id": recovery_target["pending_binding"][
+            "generation_id"
+        ],
+        "interrupted_successor": recovery_target["interrupted_successor"],
+        "pending_sha256": pending_snapshot["sha256"],
+        "recovery_record": recovery_relative,
+        "workspace_confirmation": confirmation,
+        "learning_choices": choices,
+        "runtime_provenance": gate["runtime_provenance"],
+        "runtime_receipt": _runtime_receipt_summary(replacement_receipt),
+        "ingestion_permission": gate["ingestion_permission"],
+        "next_action": "ingest_course",
+    })
+    if not gate["ready_to_ingest"]:
+        base["error"] = (
+            "runtime recovery was recorded, but the exact start gate changed; "
+            "inspect status before retrying"
+        )
+        return 1, base
+    return 0, base
+
+
 def _confirm(args):
     workspace_lexical = os.path.abspath(args.workspace)
     materials_lexical = os.path.abspath(args.materials)
@@ -807,6 +1105,26 @@ def _confirm(args):
     materials = _resolved_path(materials_lexical)
     base["workspace"] = workspace
     base["materials"] = materials
+
+    try:
+        pending_snapshot = _stable_pending_generation(
+            workspace, require_complete_sources=False
+        )
+    except (OSError, RuntimeReceiptError, TypeError, ValueError) as exc:
+        base["error"] = "pending material generation is invalid: %s" % _bounded_text(exc)
+        base["failed_step"] = "material_build_recovery"
+        return 1, base
+    if pending_snapshot is not None:
+        base["error"] = (
+            "ordinary confirm cannot replace runtime provenance while a material "
+            "generation is pending"
+        )
+        base["failed_step"] = "material_build_recovery"
+        base["generation_id"] = pending_snapshot["document"]["generation_id"]
+        base["next_action"] = (
+            "exam_start recover-material-build --action resume|supersede"
+        )
+        return 2, base
 
     state_path = os.path.join(workspace, update_progress.STATE_NAME)
     if not os.path.isfile(state_path):
@@ -895,6 +1213,24 @@ def build_parser():
         help="explicitly apply the <=1-day exception; defaults mode/time only",
     )
     confirm.add_argument("--json", action="store_true", dest="as_json")
+
+    recover = sub.add_parser(
+        "recover-material-build",
+        help=(
+            "explicitly rebind runtime provenance for one exact pending material "
+            "generation"
+        ),
+    )
+    recover.add_argument("--workspace", required=True)
+    recover.add_argument("--materials", required=True)
+    recover.add_argument(
+        "--action", choices=("resume", "supersede"), required=True,
+        help=(
+            "resume compiles the bound generation; supersede abandons it only "
+            "when a successor is atomically published"
+        ),
+    )
+    recover.add_argument("--json", action="store_true", dest="as_json")
     return parser
 
 
@@ -904,7 +1240,10 @@ def run(argv=None):
         payload = check_start_gate(args.workspace, args.materials)
         _emit(payload, args.as_json)
         return 0 if payload.get("process_success") else 1
-    code, payload = _confirm(args)
+    if args.command == "recover-material-build":
+        code, payload = _recover_material_build(args)
+    else:
+        code, payload = _confirm(args)
     _emit(payload, args.as_json)
     return code
 

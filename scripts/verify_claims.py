@@ -31,6 +31,7 @@ try:
     )
     from .ingestion.identifiers import file_sha256, is_link_or_reparse, safe_workspace_entry
     from .ingestion.models import ContentUnit, SchemaValidationError, SourceRecord
+    from .ingestion.pipeline import verify_material_build_receipt
     from .ingestion.storage import (
         ConflictError, atomic_write_json, read_jsonl,
         workspace_publication_lock,
@@ -57,6 +58,7 @@ except ImportError:
     )
     from ingestion.identifiers import file_sha256, is_link_or_reparse, safe_workspace_entry
     from ingestion.models import ContentUnit, SchemaValidationError, SourceRecord
+    from ingestion.pipeline import verify_material_build_receipt
     from ingestion.storage import (
         ConflictError,
         atomic_write_json,
@@ -110,8 +112,20 @@ def _pipeline_version(root):
     document = _read_strict_json(
         _entry(root, BUILD_MANIFEST_PATH, "ingestion build manifest")
     )
-    if not isinstance(document, dict) or document.get("schema_version") != 1:
+    if (not isinstance(document, dict)
+            or type(document.get("schema_version")) is not int
+            or document.get("schema_version") not in (1, 2)):
         raise ClaimValidationError("ingestion build manifest has an invalid schema_version")
+    try:
+        verify_material_build_receipt(
+            root,
+            build_manifest=document,
+            required=document["schema_version"] == 2,
+        )
+    except Exception as exc:
+        raise ClaimValidationError(
+            "ingestion material generation is invalid: %s" % exc
+        ) from exc
     version = document.get("pipeline_version")
     if version not in ("ingestion-v1", "ingestion-v2"):
         raise ClaimValidationError("ingestion build manifest pipeline_version is unsupported")

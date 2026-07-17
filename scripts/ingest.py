@@ -50,7 +50,10 @@ try:
         _persist_payload_unlocked,
         _phase_inventory,
         _strict_payload,
+        authorize_material_build_generation,
+        finalize_material_build_generation,
         refresh_build_manifest,
+        verify_material_build_receipt,
     )
     from ingestion.identifiers import (
         UnsafePathError,
@@ -71,7 +74,10 @@ except ImportError:  # imported as scripts.ingest in unit tests
         _persist_payload_unlocked,
         _phase_inventory,
         _strict_payload,
+        authorize_material_build_generation,
+        finalize_material_build_generation,
         refresh_build_manifest,
+        verify_material_build_receipt,
     )
     from scripts.ingestion.identifiers import (
         UnsafePathError,
@@ -490,6 +496,30 @@ def validate(data):
             if ex.get("assets") is not None and not isinstance(ex.get("assets"), list):
                 errors.append(f"{tag} 的 assets 必须是数组。")
 
+    # The glossary is a live retrieval input, not decorative metadata.  Reject
+    # malformed producer output instead of silently dropping part/all of query
+    # expansion while still claiming a successful generation.  An explicit
+    # empty object is the canonical "no glossary" snapshot.
+    if "terms" in data:
+        terms = data.get("terms")
+        if not isinstance(terms, dict):
+            errors.append("terms 必须是 {术语: [对应术语, ...]} 对象。")
+        else:
+            for term, equivalents in terms.items():
+                if (not isinstance(term, str) or not term.strip()
+                        or term != term.strip()):
+                    errors.append("terms 的术语键必须是无首尾空白的非空字符串。")
+                    continue
+                if (not isinstance(equivalents, list) or not equivalents
+                        or any(not isinstance(value, str) or not value.strip()
+                               or value != value.strip()
+                               for value in equivalents)
+                        or len(set(equivalents)) != len(equivalents)):
+                    errors.append(
+                        "terms[%r] 必须是非空、无重复、无首尾空白的字符串数组。"
+                        % term
+                    )
+
     if errors:
         fail(errors)
 
@@ -676,6 +706,40 @@ def _before_publication_lock(_args, _output_dir):
     """No-op test seam for exercising input replacement immediately before lock acquisition."""
 
 
+def _material_compiler_transaction_paths(data, phases, material_generation=None):
+    """Return every mutable compiler target outside the structured fact plan."""
+
+    paths = {
+        ".ingest/material_build_pending.json",
+        ".ingest/material_build_receipt.json",
+        "references/quiz_bank.json",
+        "references/teaching_examples.json",
+        "references/teaching_baseline.json",
+        "references/retrieval_index.json",
+        "ingest_report.json",
+        "study_plan.md",
+        "study_progress.md",
+    }
+    for phase in phases:
+        paths.add(
+            "references/wiki/" + os.path.basename(
+                phase["wiki_filename"].strip()
+            )
+        )
+    # A material generation is a complete producer snapshot.  Even when its
+    # raw input omits/empties `terms`, the old glossary must be transactionally
+    # removed so query expansion cannot leak across generations.
+    paths.add("references/terms.json")
+    if isinstance(material_generation, dict):
+        recovery = material_generation.get("recovery")
+        if isinstance(recovery, dict) and isinstance(recovery.get("path"), str):
+            paths.add(recovery["path"])
+        for ancestor in material_generation.get("ancestor_recoveries") or ():
+            if isinstance(ancestor, dict) and isinstance(ancestor.get("path"), str):
+                paths.add(ancestor["path"])
+    return sorted(paths)
+
+
 def _main_unlocked(args, prepared):
     """Publish one validated input while the caller holds the required workspace locks."""
 
@@ -739,6 +803,17 @@ def _main_unlocked(args, prepared):
     except (TypeError, ValueError) as exc:
         fail(["asset policy failed before publication: %s" % exc])
 
+    try:
+        material_generation = authorize_material_build_generation(
+            args.output_dir, data
+        )
+        if material_generation is None:
+            verify_material_build_receipt(
+                args.output_dir, raw_input=data, require_manifest_binding=False
+            )
+    except Exception as exc:
+        fail(["material build generation authorization failed: %s" % exc])
+
     print(f"[+] 识别到科目: {course_name}")
     print(f"[+] 阶段数量: {len(phases)} 个")
     print(f"[+] 题目数量: {len(quiz_bank)} 道")
@@ -757,9 +832,29 @@ def _main_unlocked(args, prepared):
     print(f"[+] 创建 Wiki 目录: {wiki_dir}")
 
     if ingestion_payload is not None:
+        transaction_holder = None
+        extra_transaction_paths = ()
+        if material_generation is not None:
+            if args.force:
+                fail([
+                    "--force is not supported during a pending material generation; "
+                    "preserve canonical learner state and retry without --force"
+                ])
+            transaction_holder = getattr(
+                args, "_material_transaction_holder", None
+            )
+            if not isinstance(transaction_holder, dict):
+                fail(["material generation compiler transaction is unavailable"])
+            extra_transaction_paths = _material_compiler_transaction_paths(
+                data, phases, material_generation=material_generation
+            )
         try:
             ingestion_build_manifest = _persist_payload_unlocked(
-                output_dir, ingestion_payload
+                output_dir,
+                ingestion_payload,
+                material_generation=material_generation,
+                extra_transaction_paths=extra_transaction_paths,
+                transaction_holder=transaction_holder,
             )
         except Exception as exc:
             fail([f"结构化 ingestion envelope 校验/持久化失败：{exc}"])
@@ -954,6 +1049,34 @@ def _main_unlocked(args, prepared):
                 "sha256": hashlib.sha256(stream.read()).hexdigest(),
             }
 
+    # A glossary changes query expansion even though its terms are not embedded
+    # in the BM25 postings.  Bind the exact bytes that will coexist with this
+    # index so a later edit cannot silently change retrieval semantics.  Legacy
+    # inputs that omit ``terms`` preserve and bind an existing safe glossary;
+    # material generations that omit/empty it intentionally publish no binding
+    # because the same transaction removes the old file below.
+    terms = data.get("terms")
+    terms_path = os.path.join(output_dir, "references", "terms.json")
+    if os.path.lexists(terms_path) and (
+            is_link_or_reparse(terms_path) or not os.path.isfile(terms_path)):
+        fail([f"术语索引目标是符号链接或特殊文件，拒绝读取/覆盖：{terms_path}"])
+    terms_payload = None
+    terms_integrity = None
+    if isinstance(terms, dict) and terms:
+        terms_payload = (
+            json.dumps(terms, indent=2, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+        terms_integrity = {
+            "file": "references/terms.json",
+            "sha256": hashlib.sha256(terms_payload).hexdigest(),
+        }
+    elif material_generation is None and os.path.isfile(terms_path):
+        with open(terms_path, "rb") as stream:
+            terms_integrity = {
+                "file": "references/terms.json",
+                "sha256": hashlib.sha256(stream.read()).hexdigest(),
+            }
+
     integrity = {
         "wiki": [
             {
@@ -984,6 +1107,8 @@ def _main_unlocked(args, prepared):
     }
     if teaching_integrity is not None:
         integrity["teaching_examples"] = teaching_integrity
+    if terms_integrity is not None:
+        integrity["terms"] = terms_integrity
     for key, relative in (
         ("source_manifest", ".ingest/source_manifest.json"),
         ("content_units", ".ingest/content_units.jsonl"),
@@ -1006,14 +1131,19 @@ def _main_unlocked(args, prepared):
         )
         print(f"[+] 已建检索索引: references/retrieval_index.json（{len(all_chunks)} 块 / {len(phases)} 章）")
     # 术语对照（跨语言检索桥）：raw_input.json 可带顶层 "terms"（AI 建库时产出、可人工校对）
-    terms = data.get("terms")
     if isinstance(terms, dict) and terms:
         _atomic_json(
-            os.path.join(output_dir, "references", "terms.json"),
+            terms_path,
             terms,
             "术语索引",
         )
         print(f"[+] 已写入术语对照: references/terms.json（{len(terms)} 组）")
+    elif material_generation is not None and os.path.lexists(terms_path):
+        _guard_write_target(terms_path, "术语索引")
+        if not os.path.isfile(terms_path):
+            fail(["references/terms.json 不是可安全移除的常规文件"])
+        os.unlink(terms_path)
+        print("[+] 本代未声明术语对照；已移除上一代 references/terms.json")
 
     # 2. 写入题库 JSON
     quiz_file_path = os.path.join(output_dir, "references", "quiz_bank.json")
@@ -1092,6 +1222,8 @@ def _main_unlocked(args, prepared):
             "retrieval_index": "references/retrieval_index.json",
             "ingest_report": "ingest_report.json",
         }
+        if isinstance(terms, dict) and terms:
+            derived["terms"] = "references/terms.json"
         for phase in phases:
             derived["wiki:%s" % phase["chapter_id"]] = (
                 "references/wiki/" + os.path.basename(phase["wiki_filename"].strip())
@@ -1171,8 +1303,13 @@ def _main_unlocked(args, prepared):
         _atomic_text(progress_out_path, prog_content, "复习进度")
         print("[+] 已生成: study_progress.md")
 
-    print(f"\n[+] 《{course_name}》工作区工程编译完成。")
-    print("[!] 编译成功不等于教学就绪；请运行 validate_workspace.py，或使用 ingest_course.py 的 readiness 结果。")
+    if material_generation is not None:
+        try:
+            finalize_material_build_generation(output_dir, material_generation)
+        except Exception as exc:
+            fail(["material build generation finalization failed: %s" % exc])
+
+    return course_name
 
 
 def main():
@@ -1182,23 +1319,38 @@ def main():
     ingest_preexisting = os.path.lexists(ingest_path)
     _before_publication_lock(args, output_dir)
 
+    material_transaction_holder = {}
+    args._material_transaction_holder = material_transaction_holder
+    compiled_course_name = None
     try:
-        with workspace_publication_lock(output_dir):
-            prepared = _prepare_cli_input(args)
-            data = prepared[0]
-            structured = data.get("ingestion") is not None
-            if ingest_preexisting and not os.path.lexists(ingest_path):
-                raise ConflictError(".ingest changed while acquiring the publication lock")
-            if structured and not ingest_preexisting:
-                # A brand-new structured workspace has no ingestion lock for
-                # workspace_publication_lock to acquire.  Create and hold it under
-                # the already-held state lock before the first validator-visible write.
-                with IngestionStore(output_dir).mutation_lock():
-                    _main_unlocked(args, prepared)
-            else:
-                _main_unlocked(args, prepared)
+        with workspace_publication_lock(
+                output_dir, allow_material_generation=True):
+            try:
+                prepared = _prepare_cli_input(args)
+                data = prepared[0]
+                structured = data.get("ingestion") is not None
+                if ingest_preexisting and not os.path.lexists(ingest_path):
+                    raise ConflictError(".ingest changed while acquiring the publication lock")
+                if structured and not ingest_preexisting:
+                    # A brand-new structured workspace has no ingestion lock for
+                    # workspace_publication_lock to acquire.  Create and hold it under
+                    # the already-held state lock before the first validator-visible write.
+                    with IngestionStore(output_dir).mutation_lock():
+                        compiled_course_name = _main_unlocked(args, prepared)
+                else:
+                    compiled_course_name = _main_unlocked(args, prepared)
+                transaction = material_transaction_holder.pop("context", None)
+                if transaction is not None:
+                    transaction.__exit__(None, None, None)
+            except BaseException:
+                transaction = material_transaction_holder.pop("context", None)
+                if transaction is not None:
+                    transaction.__exit__(*sys.exc_info())
+                raise
     except ConflictError as exc:
         fail([f"工作区发布冲突，未写入任何课程产物：{exc}"])
+    print(f"\n[+] 《{compiled_course_name}》工作区工程编译完成。")
+    print("[!] 编译成功不等于教学就绪；请运行 validate_workspace.py，或使用 ingest_course.py 的 readiness 结果。")
 
 
 if __name__ == "__main__":

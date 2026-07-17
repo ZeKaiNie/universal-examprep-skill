@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -52,6 +53,25 @@ def validator_payload(workspace, chapter=1, readiness="ready"):
         "errors": [],
         "truncated": {"errors": 0, "warnings": 0},
         "dependency_snapshot": snapshot,
+    }
+
+
+def complete_progress_state():
+    return {
+        "version": 1,
+        "current_phase": 1,
+        "scope": None,
+        "mode": None,
+        "time_budget": None,
+        "language": None,
+        "artifact_mode": "chat",
+        "preferences": {},
+        "mistake_archive": [],
+        "confusion_log": [],
+        "knowledge_window": [],
+        "phase_checklist": [],
+        "phase_evidence": {},
+        "last_updated": None,
     }
 
 
@@ -126,6 +146,49 @@ class CommandCoreTest(unittest.TestCase):
                 "workspace dependencies changed"):
             command_core.validate_workspace(
                 self.workspace, chapter=1, runner=MutatingRunner(payload))
+
+    def test_validator_endpoint_never_recovers_interrupted_ingest(self):
+        ingest = os.path.join(self.workspace, ".ingest")
+        os.makedirs(ingest)
+        pending = os.path.join(ingest, "pending_ingest.json")
+        with open(pending, "w", encoding="utf-8") as stream:
+            json.dump({
+                "schema_version": 1,
+                "transaction_dir": ".ingest/transactions/interrupted",
+                "targets": [],
+            }, stream)
+
+        with self.assertRaisesRegex(
+                command_core.CommandCoreError,
+                "interrupted ingest transaction requires recovery"):
+            command_core.validate_workspace(self.workspace, chapter=1)
+        self.assertTrue(os.path.isfile(pending))
+
+    def test_validator_rejects_aba_replacement_with_identical_final_bytes(self):
+        target = os.path.join(self.workspace, "dependency.json")
+        state_a = b'{"state":"A"}\n'
+        with open(target, "wb") as stream:
+            stream.write(state_a)
+        replacement_b = os.path.join(self.workspace, "replacement-b.tmp")
+        replacement_a = os.path.join(self.workspace, "replacement-a.tmp")
+        with open(replacement_b, "wb") as stream:
+            stream.write(b'{"state":"B"}\n')
+        with open(replacement_a, "wb") as stream:
+            stream.write(state_a)
+        payload = validator_payload(self.workspace, chapter=1)
+
+        class AbaRunner(FakeRunner):
+            def __call__(inner_self, argv, **kwargs):
+                os.replace(replacement_b, target)
+                os.replace(replacement_a, target)
+                return super().__call__(argv, **kwargs)
+
+        with self.assertRaisesRegex(
+                command_core.CommandCoreError, "possible ABA rewrite"):
+            command_core.validate_workspace(
+                self.workspace, chapter=1, runner=AbaRunner(payload))
+        with open(target, "rb") as stream:
+            self.assertEqual(state_a, stream.read())
 
     def test_validator_host_receipt_cannot_acknowledge_truncated_warnings(self):
         payload = validator_payload(self.workspace, chapter=1)
@@ -350,6 +413,35 @@ class CommandCoreTest(unittest.TestCase):
                 command_core.CommandCoreError, "progress payload disagrees"):
             command_core.completion_snapshot(
                 self.workspace, chapter=1, runner=AbaRunner())
+
+    def test_completion_snapshot_real_subprocess_does_not_self_conflict(self):
+        target = os.path.join(self.workspace, "study_state.json")
+        with open(target, "w", encoding="utf-8") as stream:
+            json.dump(complete_progress_state(), stream, ensure_ascii=False)
+
+        def bounded_real_runner(argv, **kwargs):
+            # This is intentionally the real subprocess boundary.  A short
+            # timeout turns any future parent/child lock inversion into a
+            # bounded regression failure instead of a hung test worker.
+            kwargs["timeout"] = 20
+            return subprocess.run(argv, **kwargs)
+
+        receipt = command_core.completion_snapshot(
+            self.workspace, chapter=1, runner=bounded_real_runner)
+        validation = receipt["validation_receipt"]
+        messages = "\n".join(
+            row.get("msg", "") for row in validation["payload"]["errors"])
+
+        self.assertNotEqual(2, validation["exit_code"])
+        self.assertNotIn("workspace validation snapshot is unavailable", messages)
+        self.assertEqual(
+            receipt["dependency_snapshot"],
+            validation["payload"]["dependency_snapshot"],
+        )
+        self.assertEqual(
+            receipt["dependency_snapshot"]["snapshot_sha256"],
+            receipt["binding"]["dependency_snapshot_sha256"],
+        )
 
     def test_progress_only_files_change_full_digest_not_hint_content_digest(self):
         state_path = os.path.join(self.workspace, "study_state.json")

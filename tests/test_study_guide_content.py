@@ -873,6 +873,38 @@ class StudyGuideContentTest(unittest.TestCase):
         self._write_json(".ingest/build_manifest.json", {"schema_version": 1})
         self.assertInvalid(manifest, "pipeline_version is unsupported")
 
+    def test_current_material_manifest_is_accepted_only_with_live_receipt(self):
+        self._enable_structured()
+        current = {
+            "schema_version": 2,
+            "pipeline_version": "ingestion-v2",
+            "material_build": {"protocol_version": 1},
+        }
+        self._write_json(".ingest/build_manifest.json", current)
+
+        with mock.patch.object(
+                sgc, "verify_material_build_receipt", return_value={}):
+            self.assertEqual(
+                "ingestion-v2", sgc._ingestion_pipeline_version(self.ws)
+            )
+        with mock.patch.object(
+                sgc, "verify_material_build_receipt",
+                side_effect=ValueError("required material build receipt is missing")):
+            with self.assertRaisesRegex(
+                    sgc.ContentError, "required material build receipt is missing"):
+                sgc._ingestion_pipeline_version(self.ws)
+
+        self._write_json(".ingest/build_manifest.json", {
+            "schema_version": 1,
+            "pipeline_version": "ingestion-v1",
+        })
+        with mock.patch.object(
+                sgc, "verify_material_build_receipt",
+                side_effect=ValueError("stale legacy material receipt")):
+            with self.assertRaisesRegex(
+                    sgc.ContentError, "stale legacy material receipt"):
+                sgc._ingestion_pipeline_version(self.ws)
+
     def test_structured_question_units_require_unique_valid_external_ids(self):
         manifest = self._structured_manifest()
 

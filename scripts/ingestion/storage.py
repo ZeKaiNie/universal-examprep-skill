@@ -142,7 +142,7 @@ def workspace_state_lock(workspace):
 
 
 @contextmanager
-def workspace_publication_lock(workspace):
+def workspace_publication_lock(workspace, allow_material_generation=False):
     """Serialize coordinated state/artifact publishers in state->ingestion order."""
 
     root = _workspace_root(workspace)
@@ -153,7 +153,35 @@ def workspace_publication_lock(workspace):
             return
         if not ingest.is_dir():
             raise ConflictError(".ingest must be a real workspace directory")
-        with IngestionStore(root).mutation_lock():
+        with IngestionStore(root).mutation_lock(
+                allow_material_generation=allow_material_generation):
+            yield
+
+
+@contextmanager
+def workspace_validation_lock(workspace):
+    """Hold one state->ingestion snapshot across validation/readiness reads."""
+
+    root = _workspace_root(workspace)
+    state_lock = root / ".study_state.lock"
+    if os.path.lexists(str(state_lock)) and (
+            is_link_or_reparse(state_lock) or not state_lock.is_file()):
+        raise ConflictError(
+            ".study_state.lock must be a regular non-link file"
+        )
+    with _exclusive_file_lock(state_lock):
+        # Use the lexical fixed child first so an unsafe `.ingest` leaf can be
+        # reported by the validator instead of being traversed by the lock.
+        ingest = root / ".ingest"
+        if not os.path.lexists(str(ingest)):
+            yield
+            return
+        if is_link_or_reparse(ingest) or not ingest.is_dir():
+            # Let the validator report the unsafe tree without constructing a
+            # store whose lock path would traverse it.
+            yield
+            return
+        with IngestionStore(root).validation_lock():
             yield
 
 
@@ -419,7 +447,9 @@ def _workspace_root(workspace):
     lexical = Path(os.path.abspath(str(workspace)))
     if os.path.lexists(str(lexical)) and is_link_or_reparse(lexical):
         raise ValueError("workspace/source root must not be a symlink or junction: %s" % lexical)
-    root = lexical.resolve()
+    # Use the string API so validator tests/hosts that interpose realpath do
+    # not need to emulate pathlib's version-specific ``strict=`` keyword.
+    root = Path(os.path.realpath(str(lexical)))
     if not root.is_dir():
         raise ValueError("workspace must already exist and be a directory: %s" % root)
     return root
@@ -877,6 +907,7 @@ class IngestionStore:
     LEDGER_PATH = ".ingest/review_patches.jsonl"
     PENDING_PATCH_PATH = ".ingest/pending_patch.json"
     PENDING_INGEST_PATH = ".ingest/pending_ingest.json"
+    MATERIAL_BUILD_PENDING_PATH = ".ingest/material_build_pending.json"
     TRANSACTIONS_PATH = ".ingest/transactions"
     LOCK_PATH = ".ingest/mutation.lock"
 
@@ -892,6 +923,9 @@ class IngestionStore:
         self.ledger_path = safe_workspace_entry(self.workspace, self.LEDGER_PATH)
         self.pending_patch_path = safe_workspace_entry(self.workspace, self.PENDING_PATCH_PATH)
         self.pending_ingest_path = safe_workspace_entry(self.workspace, self.PENDING_INGEST_PATH)
+        self.material_build_pending_path = safe_workspace_entry(
+            self.workspace, self.MATERIAL_BUILD_PENDING_PATH
+        )
         self.transactions_path = safe_workspace_entry(self.workspace, self.TRANSACTIONS_PATH)
         self.lock_path = safe_workspace_entry(self.workspace, self.LOCK_PATH)
 
@@ -940,11 +974,17 @@ class IngestionStore:
         shutil.rmtree(transaction_dir, ignore_errors=True)
         return True
 
-    def mutation_lock(self):
+    def mutation_lock(self, allow_material_generation=False):
         @contextmanager
         def locked():
             with _exclusive_file_lock(self.lock_path):
                 self._recover_interrupted_ingest()
+                if (not allow_material_generation
+                        and os.path.lexists(str(self.material_build_pending_path))):
+                    raise ConflictError(
+                        ".ingest/material_build_pending.json is present; "
+                        "ordinary mutation is blocked"
+                    )
                 yield
         return locked()
 
@@ -955,6 +995,11 @@ class IngestionStore:
                 if self.pending_ingest_path.exists():
                     raise ConflictError(
                         "an interrupted ingest transaction requires recovery before validation"
+                    )
+                if os.path.lexists(str(self.material_build_pending_path)):
+                    raise ConflictError(
+                        ".ingest/material_build_pending.json is present; "
+                        "validation is blocked"
                     )
                 yield
         return locked()

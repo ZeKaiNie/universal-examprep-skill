@@ -53,6 +53,7 @@ try:
         SourceRecord,
         UNIT_KINDS,
     )
+    from ingestion.pipeline import verify_material_build_receipt
     from ingestion.storage import ConflictError, workspace_publication_lock
 except ImportError:  # imported as ``scripts.study_guide_content`` from the repo root
     from scripts.ingestion.claims import (
@@ -80,6 +81,7 @@ except ImportError:  # imported as ``scripts.study_guide_content`` from the repo
         SourceRecord,
         UNIT_KINDS,
     )
+    from scripts.ingestion.pipeline import verify_material_build_receipt
     from scripts.ingestion.storage import ConflictError, workspace_publication_lock
 
 try:
@@ -2226,8 +2228,21 @@ def _ingestion_pipeline_version(ws):
         )
     _guard_workspace_child(ws, path, ".ingest/build_manifest.json", require_file=True)
     document = _read_json(path, ".ingest/build_manifest.json")
-    if not isinstance(document, dict) or document.get("schema_version") != 1:
+    if (not isinstance(document, dict)
+            or type(document.get("schema_version")) is not int
+            or document.get("schema_version") not in (1, 2)):
         raise ContentError(".ingest/build_manifest.json has an invalid schema_version")
+    try:
+        verify_material_build_receipt(
+            ws,
+            build_manifest=document,
+            required=document["schema_version"] == 2,
+        )
+    except Exception as exc:
+        raise ContentError(
+            ".ingest/build_manifest.json material generation is invalid: %s"
+            % exc
+        ) from exc
     version = document.get("pipeline_version")
     if version not in ("ingestion-v1", "ingestion-v2"):
         raise ContentError(".ingest/build_manifest.json pipeline_version is unsupported")

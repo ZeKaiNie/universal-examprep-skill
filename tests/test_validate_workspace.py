@@ -14,7 +14,7 @@ import shutil
 import tempfile
 import unittest
 from unittest import mock
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -64,6 +64,125 @@ def warn_text(warnings):
 
 
 class TestValidateWorkspace(unittest.TestCase):
+
+    def test_material_build_pending_blocks_even_without_build_manifest(self):
+        d = self.make_ws([])
+        ingest = os.path.join(d, ".ingest")
+        os.makedirs(ingest)
+        with open(os.path.join(ingest, "material_build_pending.json"), "w",
+                  encoding="utf-8") as stream:
+            json.dump({"status": "pending"}, stream)
+
+        errors, _warnings, _stats = V.validate(d)
+
+        self.assertEqual(2, V._exit_code(errors))
+        self.assertIn("material_build_pending.json", err_text(errors))
+
+    def test_non_directory_ingest_leaf_is_reported_without_lock_crash(self):
+        d = self.make_ws([])
+        with open(os.path.join(d, ".ingest"), "w", encoding="utf-8") as stream:
+            stream.write("unsafe leaf")
+
+        errors, _warnings, _stats = V.validate(d)
+
+        self.assertTrue(errors)
+        self.assertIn(".ingest/", err_text(errors))
+
+    def test_validation_lock_failure_never_falls_back_to_unlocked_reads(self):
+        d = self.make_ws([])
+        with mock.patch.object(
+                V, "workspace_validation_lock",
+                side_effect=ValueError("unsafe workspace root")), mock.patch.object(
+                    V, "_validate_unlocked") as unlocked:
+            errors, warnings, stats = V.validate(d)
+
+        unlocked.assert_not_called()
+        self.assertEqual([], warnings)
+        self.assertEqual({}, stats)
+        self.assertEqual(2, V._exit_code(errors))
+        self.assertIn("unsafe workspace root", err_text(errors))
+
+    def test_non_regular_state_lock_fails_closed(self):
+        d = self.make_ws([])
+        os.mkdir(os.path.join(d, ".study_state.lock"))
+
+        errors, warnings, stats = V.validate(d)
+
+        self.assertEqual([], warnings)
+        self.assertEqual({}, stats)
+        self.assertEqual(2, V._exit_code(errors))
+        self.assertIn("regular non-link file", err_text(errors))
+
+    def test_cli_holds_validation_lock_through_capability_snapshot(self):
+        d = self.make_ws([])
+        held = {"value": False}
+        snapshot = V._collect_dependency_snapshot(d)
+
+        @contextmanager
+        def snapshot_lock(_workspace):
+            self.assertFalse(held["value"])
+            held["value"] = True
+            try:
+                yield
+            finally:
+                held["value"] = False
+
+        def validate_while_locked(_workspace):
+            self.assertTrue(held["value"])
+            return [], [], {}
+
+        def capabilities_while_locked(*_args, **_kwargs):
+            self.assertTrue(held["value"])
+            return {
+                "chapter": 1,
+                "workspace_structural": {"status": "ready", "ready": True,
+                                         "reason_codes": [], "counts": {}},
+                "teaching_ready": {"status": "ready", "ready": True,
+                                   "reason_codes": [], "counts": {}},
+                "quiz_ready": {"status": "ready", "ready": True,
+                               "reason_codes": [], "counts": {}},
+                "artifact_ready": {"status": "ready", "ready": True,
+                                   "reason_codes": [], "counts": {}},
+            }
+
+        def snapshot_while_locked(_workspace):
+            self.assertTrue(held["value"])
+            return snapshot
+
+        with mock.patch.object(V, "workspace_validation_lock", snapshot_lock), \
+                mock.patch.object(V, "_validate_unlocked", validate_while_locked), \
+                mock.patch.object(
+                    V, "_collect_dependency_snapshot",
+                    side_effect=snapshot_while_locked) as collect, \
+                mock.patch.object(
+                    V._readiness_matrix, "capability_readiness",
+                    side_effect=capabilities_while_locked), \
+                redirect_stdout(io.StringIO()):
+            code = V.main([d, "--json", "--dependency-snapshot"])
+
+        self.assertEqual(0, code)
+        self.assertEqual(2, collect.call_count)
+        self.assertFalse(held["value"])
+
+    def test_cli_rejects_generation_aba_with_identical_public_snapshot(self):
+        d = self.make_ws([])
+        snapshot_a = V._collect_dependency_snapshot(d)
+        snapshot_b = dict(snapshot_a, _generation_sha256="f" * 64)
+        output = io.StringIO()
+
+        with mock.patch.object(
+                V, "_collect_dependency_snapshot",
+                side_effect=(snapshot_a, snapshot_b)), redirect_stdout(output):
+            code = V.main([d, "--json", "--dependency-snapshot"])
+
+        document = json.loads(output.getvalue())
+        self.assertEqual(2, code)
+        self.assertIsNone(document["dependency_snapshot"])
+        self.assertIn("possible ABA rewrite", err_text(document["errors"]))
+        for name, capability in document["capabilities"].items():
+            if name != "chapter":
+                self.assertEqual(
+                    ["dependency_snapshot_drift"], capability["reason_codes"])
 
     def test_valid_workspace_returns_0(self):
         errors, warnings, stats, code = run("valid_workspace")

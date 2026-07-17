@@ -12,3 +12,6 @@ spike/
 
 # v4-P6: built runtime bundles (attached to releases, never committed)
 dist/
+
+# Persistent cross-process lock metadata created while validating workspaces.
+.study_state.lock
