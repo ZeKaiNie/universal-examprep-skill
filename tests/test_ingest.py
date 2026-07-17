@@ -525,8 +525,11 @@ class IngestEndToEndTest(unittest.TestCase):
 
         def crash_after_completed_log(path, value):
             result = original_atomic_write(path, value)
-            if (os.path.normcase(os.path.abspath(str(path)))
-                    == os.path.normcase(os.path.abspath(recovery_path))
+            # GitHub Windows TEMP may expose one physical file through an
+            # 8.3/reparse alias while the finalizer uses its resolved path.
+            # Compare file identity so the injected crash cannot miss there.
+            is_recovery_path = os.path.samefile(path, recovery_path)
+            if (is_recovery_path
                     and isinstance(value, dict)
                     and value.get("records")
                     and (value["records"][-1].get("outcome") or {}).get(
