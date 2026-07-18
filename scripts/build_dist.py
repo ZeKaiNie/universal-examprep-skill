@@ -73,7 +73,16 @@ PATH_EXCLUDES = (
     # Maintainer-facing audit JSON reference; the shipped exam-ingest skill
     # carries the complete runtime command and fail-closed handoff contract.
     "docs/formula-audit-importer.md",
+    # Build-only source for the compact student copy of docs/file-format.md.
+    "docs/runtime-file-contract.md",
 )
+
+RUNTIME_SUBSTITUTES = {
+    # Keep every established runtime link stable while avoiding the exhaustive
+    # contributor/audit schema in each student install.  Exact validation lives
+    # in shipped scripts; this compact reference retains the agent-facing rules.
+    "docs/file-format.md": "docs/runtime-file-contract.md",
+}
 
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _CODING_COOKIE = re.compile(
@@ -211,7 +220,8 @@ def _compact_python_layout(data):
 
 
 def _runtime_bytes(rel):
-    with open(os.path.join(ROOT, *rel.split("/")), "rb") as stream:
+    source_rel = RUNTIME_SUBSTITUTES.get(rel, rel)
+    with open(os.path.join(ROOT, *source_rel.split("/")), "rb") as stream:
         data = stream.read()
     # Git checkouts may expose text as LF, CRLF, or a mixture after a partial
     # edit.  Ship one canonical byte form so the package budget and release

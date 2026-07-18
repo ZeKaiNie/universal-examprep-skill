@@ -115,6 +115,17 @@ git clone https://github.com/ZeKaiNie/universal-examprep-skill .claude/skills/un
 
 **偏好**（记住你的习惯）：讲解模板要不要带【易错点】/【3 分钟速记】收尾块、回复语言（中文 / English / 双语）、明确的 `no_questions` 请求（不再输出互动题，阶段最高为 `covered_unverified`）、每章的知识点掌握窗口（`window-add` / `window-set-status`）——都持久化，随时说一句就改。详见 [`docs/language-policy.md`](docs/language-policy.md) 与 [`docs/skill-architecture.md`](docs/skill-architecture.md)。
 
+**可选的普通教学节奏：**新旧状态都默认 `batch`（批量讲解）。在明确启用完整建库模式后，可选 `step_by_step`，让智能体严格按 `teaching_examples.json` 清单顺序，每轮完整讲完一道题的七步精讲：
+
+```bash
+python scripts/update_progress.py --workspace <工作区> set --interaction-style step_by_step
+# 也可以在 exam_start.py confirm 时附加 --interaction-style step_by_step。
+```
+
+它是普通功能中的可选偏好，不是第四项启动必答题；只有 `processing_mode=full` 且 `no_questions=false` 时才有效，否则保留已存选择并报告为 dormant，当前有效节奏为 `batch`。`≤1天` 档不会主动询问。选择器只覆盖完整模式的教学例题，并在同一个 workspace 锁定快照中读取 manifest、state、baseline 与 notebook；回复“继续”不是完成证据。一次 `record-taught-example` 必须绑定当前 manifest 顺序里的第一道 pending 题，并把保留 marker 的 walkthrough 固化为 `{id, notebook_ref, notebook_block_sha256, manifest_item_sha256}`。quiz/teaching/notebook/Guide 共用 1–200 字符的安全 Unicode ID 规范，拒绝空白、Markdown/路径分隔符、控制/格式/代理/替换字符和 Unicode noncharacter；两个 binding 也不得复用同一 `notebook_ref`。未绑定的旧 ID 仍是合法 batch 历史；一旦有 binding，即使切换节奏也必须持续通过 live 校验。只有文件/条目缺失以及 anchor、marker、hash、revision 漂移可重新变成 pending；重解析点、非目录/非普通文件、越界、非法 UTF-8、未闭围栏、坏 block、重复或越出 roster 的证据都保持 fail closed。已完成 full 章节若只出现结构合法的新 roster 项或上述可修复 stale 项，挂载时降为 `usable_with_gaps` 以便按顺序重讲；Guide 与阶段完成仍严格失效，记录第一道 pending 后须重建 Guide 并重新完成。保留基线中的每个 ID 都必须在同一 canonical chapter 拥有当前 teaching snapshot，且 `policy` 必须精确为 `append_only`；只有 quiz_bank 副本不能替代。章节原有门禁仍全部生效，`teaching_example_roster_exhausted=true` 即使在零例题时也不等于章节完成；切换回复语言不会自动把已记录题目重新排入队列。
+
+> 过渡兼容：该 PR 所在的上游基线尚未引入显式处理模式选择器，因此缺少 `processing_mode` 会被视为旧版隐式 `full`；若宿主已显式写入非 `full` 值，逐题偏好仍休眠。后续处理模式迁移会接管缺字段默认语义。
+
 ---
 
 ## 安装

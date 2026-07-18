@@ -25,6 +25,10 @@ for _stream in ("stdout", "stderr"):
 
 import i18n
 try:
+    from stable_ids import stable_item_id_problem
+except ImportError:  # imported as scripts.ingest in unit tests
+    from scripts.stable_ids import stable_item_id_problem
+try:
     from asset_policy import (
         STUDENT_ATTEMPT,
         audit_asset_policy,
@@ -246,8 +250,13 @@ def _merge_teaching_baseline(path, current_by_chapter):
                 payload = strict_json.load(stream)
         except (OSError, UnicodeDecodeError, ValueError) as exc:
             fail([f"教学例题保留基线无法读取，拒绝用较小快照覆盖：{exc}"])
-        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
-            fail(["references/teaching_baseline.json 结构或 schema_version 无效，拒绝缩减基线"])
+        if (not isinstance(payload, dict)
+                or payload.get("schema_version") != 1
+                or payload.get("policy") != "append_only"):
+            fail([
+                "references/teaching_baseline.json 必须精确为 "
+                "schema_version=1、policy=append_only，拒绝缩减基线"
+            ])
         raw_map = payload.get("teaching_example_ids_by_chapter")
         raw_ids = payload.get("teaching_example_ids")
         if not isinstance(raw_map, dict) or not isinstance(raw_ids, list):
@@ -255,14 +264,15 @@ def _merge_teaching_baseline(path, current_by_chapter):
         for chapter, values in raw_map.items():
             if (not isinstance(chapter, str) or not chapter.strip()
                     or not isinstance(values, list)
-                    or not all(isinstance(value, str) and value.strip() for value in values)
+                    or not all(stable_item_id_problem(value) is None
+                               for value in values)
                     or len(values) != len(set(values))):
                 fail([f"teaching_baseline 的章节 {chapter!r} 含无效或重复 ID"])
-            previous[chapter.strip()] = set(value.strip() for value in values)
+            previous[chapter.strip()] = set(values)
         flattened = set().union(*previous.values()) if previous else set()
-        if (not all(isinstance(value, str) and value.strip() for value in raw_ids)
+        if (not all(stable_item_id_problem(value) is None for value in raw_ids)
                 or len(raw_ids) != len(set(raw_ids))
-                or flattened != set(value.strip() for value in raw_ids)):
+                or flattened != set(raw_ids)):
             fail(["teaching_baseline 的逐章映射与 ID 全集不一致，拒绝缩减基线"])
 
     merged = {chapter: set(values) for chapter, values in previous.items()}
@@ -418,8 +428,12 @@ def validate(data):
                 errors.append(f"题目 {tag} 的 id 必须是有限数字或非空字符串。")
             else:
                 canonical_id = str(raw_id).strip()
-                if not canonical_id or any(char in canonical_id for char in ("\x00", "\n", "\r")):
-                    errors.append(f"题目 {tag} 的 id 必须是非空单行标识。")
+                id_problem = stable_item_id_problem(canonical_id)
+                if id_problem:
+                    errors.append(
+                        f"题目 {tag} 的 id 不符合稳定 notebook/Guide 契约："
+                        f"{id_problem}"
+                    )
                 elif canonical_id in seen_quiz_ids:
                     errors.append(
                         f"题目 id「{canonical_id}」在第 {seen_quiz_ids[canonical_id]} "
@@ -427,11 +441,7 @@ def validate(data):
                     )
                 else:
                     seen_quiz_ids[canonical_id] = i + 1
-                    # Preserve a caller's finite numeric identifier in the
-                    # public quiz bank.  Canonical string identity is used only
-                    # for duplicate detection and the structured IR link.
-                    if isinstance(raw_id, str):
-                        q["id"] = canonical_id
+                    q["id"] = canonical_id
         qtype = q.get("type")
         if qtype not in VALID_QUIZ_TYPES:
             errors.append(f"题目 {tag} 的 type 必须是 {'/'.join(sorted(VALID_QUIZ_TYPES))} 之一（当前为 {qtype!r}）。")
@@ -464,11 +474,20 @@ def validate(data):
             ex_id = ex.get("id")
             if not isinstance(ex_id, str) or not ex_id.strip():
                 errors.append(f"{tag} 缺少非空字符串 id。")
-            elif ex_id in seen_teaching_ids:
-                errors.append(f"重复的教学例题 id: {ex_id}")
             else:
-                seen_teaching_ids.add(ex_id)
-                tag = f"教学例题 {ex_id}"
+                canonical_ex_id = ex_id.strip()
+                id_problem = stable_item_id_problem(canonical_ex_id)
+                if id_problem:
+                    errors.append(
+                        f"{tag} id violates the stable notebook/Guide contract: "
+                        f"{id_problem}"
+                    )
+                elif canonical_ex_id in seen_teaching_ids:
+                    errors.append(f"重复的教学例题 id: {canonical_ex_id}")
+                else:
+                    ex["id"] = canonical_ex_id
+                    seen_teaching_ids.add(canonical_ex_id)
+                    tag = f"教学例题 {canonical_ex_id}"
             role = ex.get("teaching_role")
             if role not in VALID_TEACHING_ROLES:
                 errors.append(

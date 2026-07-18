@@ -1009,7 +1009,7 @@ class IngestEndToEndTest(unittest.TestCase):
         self.assertNotIn("q2", auto_ids, f"撞号: {ids}")
         self.assertEqual(len(set(ids)), 3, f"ID 重复: {ids}")
 
-    def test_auto_ids_preserve_zero_id(self):
+    def test_auto_ids_preserve_zero_id_as_stable_string(self):
         data = {
             "course_name": "测试",
             "phases": [{"phase_num": 1, "phase_name": "P", "wiki_filename": "a.md", "wiki_content": "x"}],
@@ -1021,7 +1021,7 @@ class IngestEndToEndTest(unittest.TestCase):
         r = run_ingest(data, self.tmp)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         bank = json.loads(read(self.tmp, "references", "quiz_bank.json"))
-        self.assertEqual(bank[0]["id"], 0)
+        self.assertEqual(bank[0]["id"], "0")
         self.assertEqual(len({q["id"] for q in bank}), 2, f"ID 重复: {[q['id'] for q in bank]}")
 
     # ---------- 回归：true_false 中英文规范化 ----------

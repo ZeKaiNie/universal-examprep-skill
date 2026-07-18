@@ -24,12 +24,54 @@ Use when `exam-cram` routes the current phase to teaching, or the student asks t
 
 ## Workflow
 
-1. **Load one slice.** Read exactly one current `references/wiki/chN_*.md`. Missing file means abstain, name it, and never improvise. If teaching examples exist, run `python "${CLAUDE_SKILL_DIR}/scripts/list_teaching_examples.py" --workspace <ws> --chapter <N> --json` and use only its returned slice. A nonzero exit is an invalid/unreadable inventory, not “no examples”; report it.
+1. **Load one slice.** Read exactly one current `references/wiki/chN_*.md`. Missing file means abstain, name it, and never improvise. If teaching examples exist, run `python "${CLAUDE_SKILL_DIR}/scripts/list_teaching_examples.py" --workspace <ws> --chapter <N> --json` and use only its returned slice; when step 3 selects effective `step_by_step`, use its `--next-pending` form instead of loading the whole chapter example slice. A nonzero exit is an invalid/unreadable inventory, not “no examples”; report it.
 
 2. **Teach reproducibly.** Give each concept one concrete metaphor. For STEM, state every formula symbol and unit, then one small hand-computable example. Persist math as `$...$` or `$$...$$`; never leave raw `\frac`, `\sum`, or other TeX as the final reading view.
 
-3. **Use every walkthrough block in order** for every stored/teacher-flagged question and every linked question in zero-basic mode:
+3. **Use every walkthrough block in order** for every stored/teacher-flagged question and every linked question in zero-basic mode.
+   
+   **Pacing and interaction style:** read the stored preference and the runtime's
+   reported effective value. `study_state.json.preferences.interaction_style` is
+   `batch` and `step_by_step`; missing legacy state means `batch`. Do not accept
+   display aliases or add this optional preference to the three required startup
+   choices. Persist an explicit change only through
+   `update_progress.py --workspace <ws> set --interaction-style <batch|step_by_step>`.
 
+   This pacing option applies only to full-mode `teaching_examples.json` items.
+   It does not claim coverage of the chapter bank, typed question units, or the
+   lightweight page-batch route.
+
+   - Effective `batch`: explain the current chapter's remaining selected examples
+     with the normal flow. Missing/legacy preference uses this value. A stored
+     `step_by_step` is dormant unless the full route is active and
+     `preferences.no_questions=false`; do not overwrite the stored choice.
+   - Effective `step_by_step`: run
+     `python "${CLAUDE_SKILL_DIR}/scripts/list_teaching_examples.py" --workspace <ws> --chapter <N> --next-pending --json`.
+     The command must match `current_phase`, require the full route, and
+     read manifest/state/baseline/notebook under one validation lock, and select
+     the first manifest-ordered item without valid evidence. Never infer progress from notebook
+     files or from a student's “I understand” / `Continue` message. A missing
+     manifest, malformed state, or nonzero selector exit is a blocked pacing
+     decision; report it and do not guess another item. On this
+     pre-processing-selector baseline, absent `processing_mode` means the
+     historical implicit full route; an explicitly present non-`full` value
+     keeps the preference dormant. Schema, duplicate,
+     shared `notebook_ref`, out-of-roster evidence, link/reparse topology,
+     unsafe file types/escapes, invalid UTF-8, an unterminated fence, or a
+     malformed parsed block are fatal. Only a missing entry or
+     anchor/marker/hash/revision drift is returned as pending with bounded
+     `stale_binding_ids` / problems so the same ordered teaching path can repair
+     it. A completed full phase with only such stale evidence or a structurally
+     valid appended roster item mounts `usable_with_gaps`; Guide and completion
+     remain strict and must be rebuilt/recompleted after recording resumes.
+   - In one turn, teach exactly the returned `next` item with the complete seven
+     blocks below. Never split one walkthrough across turns. If `next=null`,
+     `teaching_example_roster_exhausted=true` means only that this roster has no
+     pending item (including an empty roster); do not auto-complete the phase:
+     all existing Guide, asset, notebook, checkpoint, and `complete-phase` gates
+     still apply.
+
+   For each active question to be explained:
    - **① 题面图**: satisfy the visual gate in step 4 first; without a figure say 「本题无图，直接看题干条件」.
    - **② 这题在问什么**: explain the ask and `考点` in plain language. Never jump from the prompt to ④.
    - **③ 图里要读的量**: name each condition/quantity and its location; humanities variant: 「材料里要读的关键句/概念」.
@@ -44,7 +86,8 @@ Use when `exam-cram` routes the current phase to teaching, or the student asks t
 
    Honor a stored `讲解模板` preference. If absent and the tier is not `≤1天`, ask once for `七步精讲` (STEM default) or `文科变体`, then persist it with `python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace <ws> set --pref 讲解模板=<七步精讲|文科变体>`. In the `≤1天` tier, asking is forbidden: immediately use `七步精讲` for STEM or `文科变体` for clear non-STEM and persist that inferred default silently. Neither variant may remove a block or source line. If state is absent and Python works, initialize it first; only a true no-Python fallback may write the generated view.
 
-   Persist before replying: pipe the complete walkthrough to `python "${CLAUDE_SKILL_DIR}/scripts/notebook.py" --workspace <ws> add-entry --chapter <N> --type walkthrough --id <qid> --title <gist>`. The same chapter/id replaces in place and rebuilds `notebook/index.md`. Then reply with a 3–5 line digest and the language-pack link. A failed write must be reported and followed by the full chat content; file-less clients use chat plus a text breakpoint.
+   Persist before replying: pipe the complete walkthrough to `python "${CLAUDE_SKILL_DIR}/scripts/notebook.py" --workspace <ws> add-entry --chapter <N> --type walkthrough --id <qid> --title <gist>`. Quiz/teaching/notebook/Guide IDs share the safe-Unicode 1–200-character contract; if an otherwise valid symbol-only ID generates an empty Markdown slug, supply a descriptive title. The same chapter/id replaces in place and rebuilds `notebook/index.md`. For effective `step_by_step`, add `--teaching-example`; this writes a reserved ID-bound marker. After that succeeds, use only `update_progress.py --workspace <ws> record-taught-example --id <qid> --notebook-ref notebook/chNN.md#<anchor>`. The command requires the current first-pending item and atomically stores the ID/notebook evidence plus exact `teaching_example_bindings` fields `id`, `notebook_ref`, `notebook_block_sha256`, and `manifest_item_sha256`. Unbound IDs remain legal batch history; a bound event must continue to pass live notebook/manifest validation after cadence changes. Every retained baseline ID must have a current teaching snapshot in the same canonical chapter under exact `policy=append_only`; quiz-only evidence is forbidden. Never use two loose `record-phase-evidence` calls for this route. If either write fails, report it and do not claim the item complete. A student's acknowledgement or `Continue` is routing input only, never completion evidence. Then reply with a 3–5 line digest and the language-pack link. In effective `step_by_step`, append the active-language continuation wording after the digest, outside the persisted seven-step walkthrough; under `le1d` it must be a non-reflective continue/reteach prompt, and an unstored style must not trigger a preference question. A failed notebook write must be reported and followed by the full chat content; file-less clients use chat plus a text breakpoint.
+   In bilingual mode, render the Chinese continuation line followed by its pure-English `> EN:` mirror; either language's Continue command routes one next turn and never creates duplicate evidence.
 
 4. **Show question assets first.** Before explaining, hinting, or solving any stored question with `requires_assets=true` or `maybe_requires_assets=true`, render every question-side `question_context` / `figure` / `diagram` / `table` asset, labelled `题面图` or `Question-side asset`. Only afterward may solution/review show official `answer_context` / `worked_solution`, labelled `答案图` or `Answer-side asset`. Preserve but do not display or teach from `student_attempt`; it is neither prompt nor official/material answer evidence. Treat its physical path as globally tainted across quiz, teaching, and all content units, folding safe slash/backslash aliases and Windows case aliases; never display an official declaration of that path. Reject same-item prompt/answer reuse. Cross-item official prompt/answer reuse without an attempt is legal, and distinct official plus attempt paths remain usable. Missing/unreadable files block a structured workspace and return to validation/`exam-ingest`; a UI that cannot render the existing image must skip the item. A path is not an image. Prefer `python <package-root>/scripts/show_question_assets.py --workspace <ws> --id <qid> --lang <zh|en>`; exit 1 means skip. Apply the same gate to `stub` / `page_reference` prompts.
 
@@ -52,7 +95,7 @@ Use when `exam-cram` routes the current phase to teaching, or the student asks t
 
 6. **Track state and provenance.** Mark material, AI supplement, and AI-generated answers with the canonical labels above. Why/what/how-derived follow-ups invoke `confusion-tracker` and `python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace <ws> add-confusion`; initialize missing state when Python works.
 
-7. **Record evidence; complete only through the gate.** Use `record-phase-evidence` for wiki, visual, teaching-example, notebook, and bank checkpoint evidence (`--kind checkpoint --ref <qid> --outcome passed|wrong|skipped`). `verified` requires at least two handled bank items and one pass. `set --phase <N>` is only explicit navigation/repair, never completion.
+7. **Record evidence; complete only through the gate.** Use `record-phase-evidence` for wiki, visual, notebook, and bank checkpoint evidence (`--kind checkpoint --ref <qid> --outcome passed|wrong|skipped`). Batch-mode teaching examples may use its ordinary teaching-example kind; effective `step_by_step` must instead use the marker-bound `record-taught-example` path in step 3. `verified` requires at least two handled bank items and one pass. `set --phase <N>` is only explicit navigation/repair, never completion.
 
    After all current-chapter material has persisted walkthroughs, invoke `exam-study-guide` to build, validate, and import the `profile=full` `notebook/chNN.guide.json`. Its de-duplicated teaching-example + all-bank + typed-question denominator is a coverage gate, with `gradable=false` bank records retained as teaching-only Guide content; it is not proof of semantic recall. Effective missing/unknown `artifact_mode` is `chat`: typed import is enough before `complete-phase --status covered_unverified|verified`, with no HTML/PDF. Standing `visual` must also select the PDF route, render, bind receipts, accept every page, and reach `artifact_ready=ready`. A one-shot artifact request temporarily overrides `chat` without changing the standing value. Never infer a subscription or install dependencies silently. Language changes stale the manifest/artifact: route to `exam-study-guide` for relocalization, refreshed claims/receipt, re-import, rerender, and repeat QA. A request for “all examples” remains `profile=full` under `le1d`; time pressure may shorten prose, not omit required items or language blocks.
 
@@ -66,6 +109,7 @@ Use when `exam-cram` routes the current phase to teaching, or the student asks t
 ## Output Contract
 
 - Default output is the persisted ①–⑦ walkthrough and source line, represented in chat by a concise 3–5 line digest, notebook link, and refreshed progress panel. Do not add unsolicited closers.
+- With effective `step_by_step`, the language-pack continuation prompt follows the chat digest, not the persisted walkthrough. It routes the next turn only; it does not certify understanding, add evidence, or bypass completion gates.
 - After each learning/checkpoint event, update via `update_progress.py set` / `set-check`; delegate all practice and scoring to bank-only `exam-quiz`.
 - Student prose follows `study_state.json.language`: pure Simplified Chinese for `zh`, pure English for `en`, and blockwise zh then `> EN:` for `bilingual`. Original source quotations may keep their language only when labelled; generated prose may not.
 
@@ -85,3 +129,4 @@ Display aliases are normalized to `zh`, `en`, or `bilingual`; unset language def
 - The default pool is mixed. A stored restricted scope excludes/counts items without `source_type`; announce before overriding it: 「⚠️ 临时覆盖你的 <scope> 范围偏好」 / `⚠️ Temporarily overriding your <scope> scope preference`. Use `scripts/select_questions.py`.
 - Stay in the current chapter, never invent material, never claim AI prose is the teacher's, never freehand algorithmic diagrams, and never quiz or score.
 - Seven steps, the source line, dual ⚠️ marking for unsupported answers, and the visual-first fail-closed gate are mandatory. A `requires_assets=true`, `maybe_requires_assets=true`, `stub`, or `page_reference` question whose prompt image cannot be shown must not be taught as complete.
+- `interaction_style` is a full-mode teaching-example cadence only. Missing means `batch`; any non-full mode or `no_questions=true` makes effective cadence `batch` without rewriting the stored choice. Never infer item completion from notebook presence, language-specific prose, or a `Continue` acknowledgement.

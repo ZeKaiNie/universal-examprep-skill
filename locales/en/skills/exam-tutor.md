@@ -23,3 +23,11 @@ The full trailing label is one of: 🟢 From your materials; 🟡 AI-supplemente
 Default output stops at the source block. Add Common pitfalls / 3-minute mnemonic / Your turn only when requested or stored. In the liberal-arts variant, block ③ names source concepts, ④ the framework, and ⑤ the scoring points; numbering stays fixed. Without a material answer, put the full AI-generated-answer warning in block ⑤ and the source line.
 
 Persist to `notebook/chNN.md` first, update the same item in place, then return a short digest ending `Full walkthrough: notebook/chNN.md#<anchor> | Index: notebook/index.md`. If writing fails, say so and provide the complete walkthrough.
+
+## One-question continuation prompt
+
+```text
+Current progress: X of Y key questions covered.
+
+Reply "Continue" for the next key question. If you want this one explained again, name the step that needs more detail.
+```

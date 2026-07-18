@@ -27,6 +27,7 @@ import i18n as _i18n
 import retrieve as _retrieve
 import strict_json as _strict_json
 import readiness as _readiness_matrix
+from stable_ids import stable_item_id_problem
 from image_validation import (
     ImageValidationError as _ImageValidationError,
     validate_image_blob as _validate_image_blob,
@@ -1130,13 +1131,21 @@ def _validate_unlocked(ws):
             # id/type must be SCALAR before being used as set/dict keys: a malformed list/object id or
             # type would raise TypeError (unhashable) and crash before any structured error is returned.
             qid = q.get("id")
-            if qid is not None and not isinstance(qid, (str, int, float, bool)):
-                err(f"{tag} 的 id 必须是标量（字符串/数字），当前为 {type(qid).__name__}")
+            if (qid is not None
+                    and (isinstance(qid, bool)
+                         or not isinstance(qid, (str, int)))):
+                err(f"{tag} 的 id 必须是稳定字符串（旧整数可读），当前为 {type(qid).__name__}")
                 qid = None
             if qid is not None:
-                if qid in seen:
-                    err(f"重复的题目 id: {qid}")
-                seen.add(qid)
+                canonical_qid = str(qid)
+                id_problem = stable_item_id_problem(canonical_qid)
+                if id_problem:
+                    err(f"{tag} 的 id 不符合稳定 notebook/Guide 契约：{id_problem}")
+                    qid = None
+                elif canonical_qid in seen:
+                    err(f"重复的题目 id: {canonical_qid}")
+                else:
+                    seen.add(canonical_qid)
             gradable_raw = q.get("gradable")
             if gradable_raw is not None and not isinstance(gradable_raw, bool):
                 err(f"{tag} gradable 必须是布尔型 true/false，当前 {gradable_raw!r}")
@@ -1352,7 +1361,7 @@ def _validate_unlocked(ws):
     # deliberately overlap quiz_bank.  ingest_report.teaching_example_ids is the durable baseline
     # that lets us warn if later AI review removes an Example from BOTH layers.
     teaching_path = os.path.join(ws, "references", "teaching_examples.json")
-    teaching_items, teaching_ids = [], set()
+    teaching_items, teaching_ids, teaching_scope_by_id = [], set(), {}
     teaching_exists = os.path.exists(teaching_path)
     if teaching_exists:
         teaching_link = _is_symlink(teaching_path)
@@ -1383,12 +1392,25 @@ def _validate_unlocked(ws):
                 continue
             ex_id = ex.get("id")
             tag = f"教学例题[{ex_id if ex_id is not None else i}]"
-            if not isinstance(ex_id, str) or not ex_id.strip():
-                err(f"{tag} 缺少非空字符串 id")
+            unique_teaching_id = False
+            teaching_id_problem = stable_item_id_problem(ex_id)
+            if teaching_id_problem:
+                err(
+                    f"{tag} id violates the stable notebook/Guide contract: "
+                    f"{teaching_id_problem}"
+                )
             elif ex_id in teaching_ids:
                 err(f"重复的教学例题 id: {ex_id}")
             else:
                 teaching_ids.add(ex_id)
+                unique_teaching_id = True
+            chapter_scope = _scope_number(ex.get("chapter"))
+            phase_scope = _scope_number(ex.get("phase"))
+            if chapter_scope and phase_scope and chapter_scope != phase_scope:
+                err(f"{tag} chapter={chapter_scope} 与 phase={phase_scope} 冲突")
+            canonical_scope = chapter_scope or phase_scope
+            if unique_teaching_id and canonical_scope:
+                teaching_scope_by_id[ex_id] = canonical_scope
             role = ex.get("teaching_role")
             if role not in role_counts:
                 err(f"{tag} teaching_role 非法: {role!r}（应为 paired_problem/worked_example）")
@@ -1399,6 +1421,8 @@ def _validate_unlocked(ws):
                 err(f"{tag} gradable 必须是布尔型 true/false，当前 {teaching_gradable!r}")
             if ex.get("chapter") in (None, "") and ex.get("phase") in (None, ""):
                 err(f"{tag} 缺少 chapter 或 phase（无法按当前章惰性列举）")
+            elif canonical_scope is None:
+                err(f"{tag} chapter/phase 无法规范为 canonical positive chapter")
             question = ex.get("question")
             if not isinstance(question, str) or not question.strip():
                 err(f"{tag} 缺少非空教学内容 question")
@@ -1542,10 +1566,15 @@ def _validate_unlocked(ws):
                 and isinstance(ingest_report, dict)
                 and ingest_report.get("schema_version") != 1):
             err("references/teaching_baseline.json schema_version 必须为 1")
+        if (baseline_name == "references/teaching_baseline.json"
+                and isinstance(ingest_report, dict)
+                and ingest_report.get("policy") != "append_only"):
+            err("references/teaching_baseline.json policy 必须为 append_only")
         raw_expected = ingest_report.get("teaching_example_ids") if isinstance(ingest_report, dict) else None
         if raw_expected is not None:
             if not (isinstance(raw_expected, list)
-                    and all(isinstance(x, str) and x.strip() for x in raw_expected)
+                    and all(stable_item_id_problem(x) is None
+                            for x in raw_expected)
                     and len(raw_expected) == len(set(raw_expected))):
                 err(f"{baseline_name} 的 teaching_example_ids 不是非空字符串数组，不能核对保留性")
             else:
@@ -1562,16 +1591,24 @@ def _validate_unlocked(ws):
                 valid_map = True
                 for raw_chapter, raw_ids in raw_by_chapter.items():
                     chapter = _scope_number(raw_chapter)
-                    if chapter is None or not (isinstance(raw_ids, list)
-                                               and all(isinstance(x, str) and x.strip()
-                                                       for x in raw_ids)):
+                    if (not isinstance(raw_chapter, str)
+                            or chapter is None
+                            or raw_chapter != chapter
+                            or not (isinstance(raw_ids, list)
+                                               and all(stable_item_id_problem(x) is None
+                                                       for x in raw_ids))):
                         err(f"{baseline_name} teaching_example_ids_by_chapter[{raw_chapter!r}] "
                              "必须是可解析章节对应的字符串数组")
                         valid_map = False
                         continue
-                    values = {x.strip() for x in raw_ids}
+                    values = set(raw_ids)
                     if len(values) != len(raw_ids):
                         err(f"{baseline_name} teaching_example_ids_by_chapter[{raw_chapter!r}] 含重复 ID")
+                        valid_map = False
+                    overlap = mapped & values
+                    if overlap:
+                        err(f"{baseline_name} 把同一教学例题 ID 分配到多个章节: "
+                            f"{', '.join(sorted(overlap))}")
                         valid_map = False
                     expected_teaching_by_chapter[chapter] = values
                     mapped.update(values)
@@ -1579,18 +1616,31 @@ def _validate_unlocked(ws):
                     err(f"{baseline_name} 的逐章教学例题 ID 与 teaching_example_ids 全集不一致")
         elif baseline_name == "references/teaching_baseline.json":
             err("references/teaching_baseline.json 缺少 teaching_example_ids_by_chapter")
-    # A legacy ``gradable=false`` record is not a quiz, but it still prevents a
-    # false data-loss alarm while a workspace is being migrated into the
-    # dedicated teaching manifest.
-    missing_from_both = expected_teaching_ids - teaching_ids - reachable_quiz_ids
+    missing_from_teaching = expected_teaching_ids - teaching_ids
+    quiz_only = missing_from_teaching & reachable_quiz_ids
+    missing_from_both = missing_from_teaching - reachable_quiz_ids
+    chapter_drift = []
+    for expected_chapter, expected_ids in expected_teaching_by_chapter.items():
+        for ident in expected_ids:
+            actual_chapter = teaching_scope_by_id.get(ident)
+            if actual_chapter is not None and actual_chapter != expected_chapter:
+                chapter_drift.append((ident, expected_chapter, actual_chapter))
     stats["teaching_examples_expected"] = len(expected_teaching_ids)
     stats["teaching_example_baseline_chapters"] = len(expected_teaching_by_chapter)
     stats["teaching_examples_retained"] = len(expected_teaching_ids & teaching_ids)
+    stats["teaching_examples_missing_from_teaching"] = len(missing_from_teaching)
+    stats["teaching_examples_quiz_only"] = len(quiz_only)
     stats["teaching_examples_missing_from_both"] = len(missing_from_both)
-    if missing_from_both:
-        err("教学例题保留基线同时从 canonical bank 与 teaching_examples.json 消失: %s——"
-            "阶段教学证据已不可达，必须恢复或重新导入，不能把 worked example 静默排除"
-            % "、".join(sorted(missing_from_both)))
+    stats["teaching_example_chapter_drift"] = len(chapter_drift)
+    if missing_from_teaching:
+        err("教学例题保留基线缺少当前 teaching_examples.json 快照: %s——"
+            "即使题目仍在 quiz_bank，quiz-only 也不能替代教学 roster；必须恢复快照或重新导入"
+            % "、".join(sorted(missing_from_teaching)))
+    if chapter_drift:
+        labels = [f"{ident}: baseline ch{expected} -> manifest ch{actual}"
+                  for ident, expected, actual in chapter_drift[:16]]
+        err("教学例题保留基线发生 canonical chapter 漂移: %s%s" %
+            ("；".join(labels), "；其余已截断" if len(chapter_drift) > 16 else ""))
 
     # ---- study_progress consistency (best-effort, lenient → warnings only) ----
     prog_path = os.path.join(ws, "study_progress.md")
@@ -1741,8 +1791,26 @@ def _validate_unlocked(ws):
                     if x.get("done") is not None and not isinstance(x["done"], bool):
                         err(f"study_state.json 的 phase_checklist 行 done 必须是布尔: {x!r}")
             prefs = st.get("preferences")
-            if prefs is not None and not isinstance(prefs, dict):
+            if prefs is None:
+                pass
+            elif not isinstance(prefs, dict):
                 err(f"study_state.json 的 preferences 必须是对象，当前 {type(prefs).__name__}")
+            else:
+                interaction_style = prefs.get("interaction_style", "batch")
+                if interaction_style not in _progress.INTERACTION_STYLES:
+                    err("study_state.json 的 preferences.interaction_style 必须是 "
+                        f"batch|step_by_step，当前 {interaction_style!r}")
+            stats["interaction_style_preference"] = (
+                _progress.interaction_style_preference(st))
+            stats["interaction_style_effective"] = (
+                _progress.effective_interaction_style(st))
+            stats["interaction_style_dormant"] = (
+                _progress.interaction_style_dormant(st))
+            if stats["interaction_style_dormant"]:
+                stats["interaction_style_dormant_reason"] = (
+                    "processing_mode_not_full"
+                    if not _progress.interaction_style_full_route(st)
+                    else "no_questions")
             artifact = st.get("artifact_mode")
             if artifact is not None and not isinstance(artifact, str):
                 err(f"study_state.json 的 artifact_mode 必须是字符串，当前 {type(artifact).__name__}")
@@ -1762,15 +1830,23 @@ def _validate_unlocked(ws):
                 for row in (st.get("phase_checklist") or ())
             )
             evidence_started = isinstance(pe, dict) and bool(pe)
+            phase_stale_warnings = []
             if (checklist_started or evidence_started
                     or _i18n.workspace_artifact_mode(st) == "visual"):
                 phase_problems = _progress.phase_evidence_errors(
-                    ws, st, enforce_manifest_gate=True
+                    ws, st, enforce_manifest_gate=True,
+                    recoverable_stale=phase_stale_warnings,
                 )
             else:
                 phase_problems = _progress._phase_evidence_shape_errors(st)
             for problem in phase_problems:
                 err("study_state.json phase_evidence：" + problem)
+            for problem in phase_stale_warnings:
+                warn(
+                    "study_state.json phase_evidence requires manifest-order "
+                    "step-by-step re-teaching before Guide/completion reuse: "
+                    + problem
+                )
             if isinstance(pe, dict):
                 stats["phases_covered_unverified"] = sum(
                     1 for x in pe.values() if isinstance(x, dict)

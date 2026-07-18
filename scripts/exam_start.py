@@ -7,6 +7,8 @@ create a user-confirmed workspace, initialize progress state, set all three
 learning choices in one update, and bind an exact workspace/materials receipt
 in the global registry.  Ingestion imports :func:`check_start_gate` and fails
 closed unless that receipt and the three canonical choices are present.
+The optional interaction cadence is passed through only when explicitly set;
+it is not a fourth readiness choice.
 """
 
 import argparse
@@ -98,6 +100,7 @@ RUNTIME_FILE_EXCLUDES = frozenset((
     "docs/formula-audit-importer.md",
     "docs/localization.md",
     "docs/retrieval-evaluation.md",
+    "docs/runtime-file-contract.md",
     "docs/skill-architecture.md",
 ))
 RUNTIME_DIFF_LIMIT = 20
@@ -613,6 +616,15 @@ def _emit(payload, as_json):
         print("ready_to_ingest=%s" % str(payload.get("ready_to_ingest", False)).lower())
         print("workspace=%s" % payload.get("workspace"))
         print("materials=%s" % payload.get("materials"))
+        print("interaction_style_preference=%s" %
+              payload.get("interaction_style_preference", "batch"))
+        print("interaction_style_effective=%s" %
+              payload.get("interaction_style_effective", "batch"))
+        print("interaction_style_dormant=%s" %
+              str(bool(payload.get("interaction_style_dormant"))).lower())
+        if payload.get("interaction_style_dormant_reason"):
+            print("interaction_style_dormant_reason=%s" %
+                  payload["interaction_style_dormant_reason"])
     else:
         print("exam_start failed: %s" % payload.get("error", "unknown error"))
 
@@ -674,6 +686,16 @@ def _load_state_status(workspace):
         field: value for field, value in values.items()
         if value and value not in allowed[field]
     }
+    preferences = state.get("preferences")
+    if preferences is not None and not isinstance(preferences, dict):
+        invalid["preferences"] = type(preferences).__name__
+    elif isinstance(preferences, dict):
+        raw_style = preferences.get("interaction_style", "batch")
+        if raw_style not in update_progress.INTERACTION_STYLES:
+            invalid["interaction_style"] = raw_style
+    style_preference = update_progress.interaction_style_preference(state)
+    style_effective = update_progress.effective_interaction_style(state)
+    style_dormant = update_progress.interaction_style_dormant(state)
     ready = not missing and not invalid
     return {
         "ready": ready,
@@ -683,6 +705,14 @@ def _load_state_status(workspace):
         "missing": missing,
         "invalid": invalid,
         "values": values,
+        "interaction_style_preference": style_preference,
+        "interaction_style_effective": style_effective,
+        "interaction_style_dormant": style_dormant,
+        "interaction_style_dormant_reason": (
+            "processing_mode_not_full"
+            if style_dormant
+            and not update_progress.interaction_style_full_route(state)
+            else ("no_questions" if style_dormant else None)),
     }
 
 
@@ -744,6 +774,14 @@ def check_start_gate(workspace, materials):
         "learning_choices": choices,
         "runtime_provenance": runtime,
         "workspace_location": workspace_location,
+        "interaction_style_preference": choices.get(
+            "interaction_style_preference", "batch"),
+        "interaction_style_effective": choices.get(
+            "interaction_style_effective", "batch"),
+        "interaction_style_dormant": bool(choices.get(
+            "interaction_style_dormant")),
+        "interaction_style_dormant_reason": choices.get(
+            "interaction_style_dormant_reason"),
         "ingestion_permission": {
             "allowed": allowed,
             "blockers": blockers,
@@ -802,6 +840,16 @@ def check_registered_workspace_gate(workspace):
     attempts = []
     for row in rows[:RUNTIME_DIFF_LIMIT]:
         gate = check_start_gate(workspace_lexical, row["materials"])
+        blocked.update({
+            "interaction_style_preference": gate.get(
+                "interaction_style_preference", "batch"),
+            "interaction_style_effective": gate.get(
+                "interaction_style_effective", "batch"),
+            "interaction_style_dormant": bool(gate.get(
+                "interaction_style_dormant")),
+            "interaction_style_dormant_reason": gate.get(
+                "interaction_style_dormant_reason"),
+        })
         if gate.get("ready_to_ingest"):
             gate = dict(gate)
             gate["ready_to_use"] = True
@@ -1142,6 +1190,8 @@ def _confirm(args):
     ]
     if args.artifact_mode is not None:
         set_args.extend(("--artifact-mode", args.artifact_mode))
+    if getattr(args, "interaction_style", None) is not None:
+        set_args.extend(("--interaction-style", args.interaction_style))
     selected = _run_progress(set_args)
     if selected.returncode != 0:
         base["error"] = (selected.stderr or selected.stdout).strip()
@@ -1179,6 +1229,10 @@ def _confirm(args):
         "workspace_confirmation": gate["workspace_confirmation"],
         "runtime_provenance": gate["runtime_provenance"],
         "runtime_receipt": _runtime_receipt_summary(runtime_receipt),
+        "interaction_style_preference": gate["interaction_style_preference"],
+        "interaction_style_effective": gate["interaction_style_effective"],
+        "interaction_style_dormant": gate["interaction_style_dormant"],
+        "interaction_style_dormant_reason": gate["interaction_style_dormant_reason"],
         "ingestion_permission": gate["ingestion_permission"],
         "next_action": gate["next_action"],
     })
@@ -1208,6 +1262,10 @@ def build_parser():
     confirm.add_argument("--time-budget", dest="time_budget")
     confirm.add_argument("--language")
     confirm.add_argument("--artifact-mode", choices=i18n.ARTIFACT_MODES, default=None)
+    confirm.add_argument(
+        "--interaction-style", choices=update_progress.INTERACTION_STYLES, default=None,
+        help="optional teaching cadence; omission preserves the existing preference",
+    )
     confirm.add_argument(
         "--urgent", action="store_true",
         help="explicitly apply the <=1-day exception; defaults mode/time only",

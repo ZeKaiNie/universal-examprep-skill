@@ -60,6 +60,35 @@ class ExamStartTest(unittest.TestCase):
         (package / "scripts" / "entry.py").write_text("VALUE = 1\n", encoding="utf-8")
         return package
 
+    def test_state_status_reports_transition_interaction_style_semantics(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp) / "workspace"
+            workspace.mkdir()
+            state = {
+                "current_phase": 1,
+                "mode": "from_scratch",
+                "time_budget": "le1d",
+                "language": "en",
+                "preferences": {"interaction_style": "step_by_step"},
+            }
+            self._write_json(workspace / "study_state.json", state)
+
+            historical = exam_start._load_state_status(str(workspace))
+            self.assertTrue(historical["ready"])
+            self.assertEqual(
+                historical["interaction_style_effective"], "step_by_step")
+            self.assertFalse(historical["interaction_style_dormant"])
+
+            state["processing_mode"] = "lightweight"
+            self._write_json(workspace / "study_state.json", state)
+            dormant = exam_start._load_state_status(str(workspace))
+            self.assertEqual(dormant["interaction_style_preference"],
+                             "step_by_step")
+            self.assertEqual(dormant["interaction_style_effective"], "batch")
+            self.assertTrue(dormant["interaction_style_dormant"])
+            self.assertEqual(dormant["interaction_style_dormant_reason"],
+                             "processing_mode_not_full")
+
     def test_status_is_read_only_and_blocked_without_confirmation(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

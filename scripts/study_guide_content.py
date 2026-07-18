@@ -28,6 +28,11 @@ import unicodedata
 from contextlib import contextmanager
 
 try:
+    from .stable_ids import stable_item_id_problem
+except (ImportError, ValueError):
+    from stable_ids import stable_item_id_problem
+
+try:
     from ingestion.claims import (
         CLAIM_RECORDS_PATH,
         CLAIM_RECEIPTS_DIR,
@@ -164,7 +169,6 @@ MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_JSONL_BYTES = 128 * 1024 * 1024
 MAX_NOTEBOOK_BLOCK_CHARS = 8 * 1024 * 1024
 MARKER_PREFIX = "EXAMPREP-STUDY-GUIDE-CONTENT:"
-_ID_RE = re.compile(r"^[^\s\[\]#|`/\\]+$")
 _DRIVE_RE = re.compile(r"^[A-Za-z]:")
 _SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 _CLAIM_ID_RE = re.compile(r"^claim_[0-9a-f]{64}$")
@@ -370,8 +374,9 @@ def _text(value, path):
 
 def _identifier(value, path):
     value = _text(value, path)
-    if len(value) > 200 or not _ID_RE.match(value):
-        raise ContentError("%s is not a safe stable identifier" % path)
+    problem = stable_item_id_problem(value)
+    if problem:
+        raise ContentError("%s is not a safe stable identifier: %s" % (path, problem))
     return value
 
 

@@ -241,6 +241,10 @@ class Build(unittest.TestCase):
                 self.assertIn("skills/exam-tutor/SKILL.md", names)
                 self.assertIn("scripts/update_progress.py", names)
                 self.assertIn("locales/zh/skills/exam-tutor.md", names)
+                self.assertIn("docs/file-format.md", names)
+                self.assertNotIn("docs/runtime-file-contract.md", names)
+                compact_contract = z.read("docs/file-format.md").decode("utf-8")
+                self.assertIn("Runtime workspace contract", compact_contract)
                 for name in sorted(n for n in names if n.endswith(".py")):
                     compile(z.read(name), name, "exec")
                 bad = z.testzip()

@@ -16,6 +16,8 @@ silently deleted. A write failure is FAIL-LOUD (non-zero exit) — never silentl
 
     python scripts/notebook.py --workspace <ws> add-entry --chapter 2 --type walkthrough \
         --id q13 --title "Venn 图判断" < body.md      # body via STDIN; rebuilds notebook/index.md
+    python scripts/notebook.py --workspace <ws> add-entry --chapter 2 --type walkthrough \
+        --id ex13 --teaching-example < body.md        # explicit step-by-step evidence marker
     python scripts/notebook.py --workspace <ws> add-entry --chapter 2 --type feedback \
         --id q13 --mistake < body.md                  # also mirrors into mistakes/ + its index
     python scripts/notebook.py --workspace <ws> rebuild              # regenerate both index.md
@@ -29,6 +31,7 @@ block boundary. Exit codes: 0 ok · 1 read/write failure · 2 bad input/usage.
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -41,7 +44,8 @@ for _s in ("stdin", "stdout", "stderr"):
         pass
 
 import i18n
-from ingestion import workspace_publication_lock
+from ingestion import is_link_or_reparse, workspace_publication_lock
+from stable_ids import STABLE_ITEM_ID_RE, stable_item_id_problem
 
 NOTEBOOK_DIR = "notebook"
 MISTAKES_DIR = "mistakes"
@@ -58,7 +62,9 @@ _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 # 章文件名：chNN.md（生成时 NN 补零到 2 位；回读容忍手写的 ch3.md）
 _CH_FILE_RE = re.compile(r"^ch(\d+)\.md$")
 # 条目 id：进标题的 [#id] 与锚点，禁空白与破坏解析/链接的字符
-_ID_RE = re.compile(r"^[^\s\[\]#|`]+$")
+_ID_RE = STABLE_ITEM_ID_RE
+_TEACHING_EXAMPLE_MARKER_RE = re.compile(
+    r"^<!-- exam-cram-teaching-example-id-sha256: ([0-9a-f]{64}) -->$")
 
 
 def _die(msg, code=2):
@@ -70,8 +76,8 @@ def _die(msg, code=2):
 
 def _read_regular(path):
     """Read a UTF-8 regular file; symlinks are refused (they can point outside the workspace)."""
-    if os.path.islink(path):
-        _die("%s 是符号链接——可能指向工作区外，拒绝读取（请替换为真实文件）" % path, 1)
+    if is_link_or_reparse(path):
+        _die("%s 是 link/reparse point——可能指向工作区外，拒绝读取（请替换为真实文件）" % path, 1)
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
@@ -85,15 +91,24 @@ def _guard_dir(ws, name, create=False):
     """notebook/ 与 mistakes/ 必须是工作区内的真实目录：符号链接目录或经链接逃出工作区都拒绝
     （load_state 同款口径）——否则每次落盘都在往用户不知道的地方写。"""
     d = os.path.join(ws, name)
-    if os.path.islink(d):
-        _die("%s 是符号链接目录——可能指向工作区外，拒绝读写（请替换为真实目录）" % d, 1)
-    if create and not os.path.isdir(d):
+    if os.path.lexists(d) and is_link_or_reparse(d):
+        _die("%s 是 link/reparse point——可能指向工作区外，拒绝读写（请替换为真实目录）" % d, 1)
+    if os.path.lexists(d) and not os.path.isdir(d):
+        _die("%s 已存在但不是目录——拒绝读写，请先修复工作区结构" % d, 1)
+    if create and not os.path.lexists(d):
         try:
             os.makedirs(d)
         except OSError as e:
             _die("无法创建目录 %s（%s）" % (d, e), 1)
-    if os.path.isdir(d) and not os.path.realpath(d).startswith(os.path.realpath(ws) + os.sep):
-        _die("%s 经符号链接逃出工作区——拒绝读写" % d, 1)
+    if os.path.isdir(d):
+        ws_real = os.path.normcase(os.path.realpath(ws))
+        d_real = os.path.normcase(os.path.realpath(d))
+        try:
+            contained = os.path.commonpath((ws_real, d_real)) == ws_real
+        except ValueError:
+            contained = False
+        if not contained:
+            _die("%s 经链接或重解析点逃出工作区——拒绝读写" % d, 1)
     return d
 
 
@@ -103,13 +118,13 @@ def _save_files(plan, note):
     (worst case an index is stale; `rebuild` repairs it). Same conventions as
     update_progress.save: O_EXCL tmp creation, symlink-tmp refusal, fail-loud."""
     for path, _content in plan:
-        if os.path.islink(path):
-            _die("%s 是符号链接——可能指向工作区外，拒绝写入（请替换为真实文件）" % path, 1)
+        if os.path.lexists(path) and is_link_or_reparse(path):
+            _die("%s 是 link/reparse point——可能指向工作区外，拒绝写入（请替换为真实文件）" % path, 1)
         if os.path.lexists(path) and not os.path.isfile(path):
             _die("%s 已存在但不是常规文件（目录/特殊文件）——拒绝写入，请先手动清理" % path, 1)
         tmp = path + ".tmp"
-        if os.path.islink(tmp):
-            _die("检测到符号链接临时文件 %s——可能指向工作区外，拒绝写入（请手动清理后重试）" % tmp, 1)
+        if os.path.lexists(tmp) and is_link_or_reparse(tmp):
+            _die("检测到 link/reparse 临时文件 %s——可能指向工作区外，拒绝写入（请手动清理后重试）" % tmp, 1)
     tmps = []
     try:
         for path, content in plan:
@@ -137,8 +152,10 @@ def _save_files(plan, note):
 def _load_state(ws):
     """study_state.json（可缺省）——只为读语言偏好与错题状态；load_state 同款 fail-loud。"""
     path = os.path.join(ws, STATE_NAME)
-    if os.path.islink(path):
-        _die("study_state.json 是符号链接——事实源可能指向工作区外，拒绝读取（请替换为真实文件）", 1)
+    if os.path.lexists(path) and is_link_or_reparse(path):
+        _die("study_state.json 是 link/reparse point——事实源可能指向工作区外，拒绝读取（请替换为真实文件）", 1)
+    if os.path.lexists(path) and not os.path.isfile(path):
+        _die("study_state.json 已存在但不是普通文件——拒绝把它当作缺失状态", 1)
     if not os.path.isfile(path):
         return None
     try:
@@ -197,6 +214,10 @@ def parse_chapter(text):
                 blocks.append(cur)
                 continue
         (cur["lines"] if cur else pre).append(line)
+    if fence is not None:
+        raise ValueError(
+            "notebook chapter contains an unterminated fenced code block"
+        )
     return pre, blocks
 
 
@@ -224,9 +245,38 @@ def github_slug(text):
     return "".join(out)
 
 
-def make_entry_lines(eid, title, type_label, ts, body):
+def teaching_example_marker(eid):
+    digest = hashlib.sha256(eid.encode("utf-8")).hexdigest()
+    return "<!-- exam-cram-teaching-example-id-sha256: %s -->" % digest
+
+
+def block_has_teaching_example_marker(block, eid):
+    expected = hashlib.sha256(eid.encode("utf-8")).hexdigest()
+    lines = block.get("lines") or []
+    markers = []
+    for line in lines:
+        match = _TEACHING_EXAMPLE_MARKER_RE.match(line)
+        if match:
+            markers.append(match.group(1))
+    return (len(lines) > 4
+            and lines[4] == teaching_example_marker(eid)
+            and markers == [expected])
+
+
+def block_sha256(block):
+    """Hash one parsed entry in the canonical form used by progress bindings."""
+    lines = block.get("lines") if isinstance(block, dict) else None
+    if not isinstance(lines, list) or any(not isinstance(line, str) for line in lines):
+        raise ValueError("notebook block lines must be a string array")
+    rendered = "\n".join(lines).rstrip() + "\n"
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
+def make_entry_lines(eid, title, type_label, ts, body, teaching_example=False):
     """One entry block: heading + one-line meta (type · timestamp) + body + trailing ---."""
     lines = ["## [#%s] %s" % (eid, title), "", "> %s · %s" % (type_label, ts), ""]
+    if teaching_example:
+        lines += [teaching_example_marker(eid), ""]
     lines += body.splitlines()
     lines += ["", "---"]
     return lines
@@ -366,6 +416,8 @@ def _read_body():
     # 未闭合围栏会把后续条目整个吞进围栏——两种都在写入前拒绝，保住章文件永远可解析
     fence = None
     for line in body.splitlines():
+        if _TEACHING_EXAMPLE_MARKER_RE.match(line):
+            _die("正文包含保留的 teaching-example evidence 标记；请删掉，改用 --teaching-example")
         fence, marker = _fence_step(fence, line)
         if marker:
             continue
@@ -404,15 +456,25 @@ def cmd_add_entry(ws, args):
     if args.chapter < 1:
         _die("--chapter 必须 ≥ 1，当前 %d" % args.chapter)
     eid = (args.id or "").strip()
-    if not _ID_RE.match(eid):
-        _die("--id 非法：%r——id 进标题锚点 [#id]，不能为空、含空白或 []#|` 字符" % (args.id or ""))
+    id_problem = stable_item_id_problem(eid)
+    if id_problem:
+        _die("--id 非法：%r——%s" % (args.id or "", id_problem))
     title = re.sub(r"\s*[\r\n]+\s*", " ", args.title or "").strip() or eid
+    if not entry_anchor(eid, title):
+        _die(
+            "--id/--title 生成的 Markdown anchor 为空；当 ID 只含标点或符号时，"
+            "请提供至少含一个字母、数字、中文字符、下划线或连字符的 --title"
+        )
+    teaching_example = bool(getattr(args, "teaching_example", False))
+    if teaching_example and args.type != "walkthrough":
+        _die("--teaching-example requires --type walkthrough")
     body = _read_body()
     state = _load_state(ws)
     lang = _resolve_lang(args.lang, state)
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     label = i18n.display("notebook_type", args.type, lang)
-    new_lines = make_entry_lines(eid, title, label, ts, body)
+    new_lines = make_entry_lines(
+        eid, title, label, ts, body, teaching_example=teaching_example)
     ch_name = "ch%02d.md" % args.chapter
 
     plan, overrides = [], {ch_name: None}
@@ -505,6 +567,11 @@ def run(argv=None):
     p_add.add_argument("--mistake", action="store_true",
                        help="also mirror the entry into mistakes/ch<NN>.md and rebuild "
                             "mistakes/index.md")
+    p_add.add_argument(
+        "--teaching-example", action="store_true",
+        help="mark this walkthrough as an explicitly taught manifest example; required by "
+             "update_progress record-taught-example",
+    )
     p_add.add_argument("--lang", choices=["zh", "en"], default=None,
                        help="heading language (default: study_state.json language, "
                             "falling back to zh)")

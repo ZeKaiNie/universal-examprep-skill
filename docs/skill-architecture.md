@@ -98,6 +98,7 @@ Docling/MinerU 只提供给显式 host integration 的可选 runner contract；p
 - 知识来源透明：🟢 来自资料 / 🟡 AI补充，可能与你老师讲的不完全一致 / ⚠️ AI生成答案，非老师/教材提供。
 - 测验只来自 `quiz_bank.json`；没有题库或题面资产不可见时失败关闭。
 - 学习模式和时间档位影响节奏，但不解除来源、状态或资产门禁。
+- `preferences.interaction_style` 只存 `batch|step_by_step`，缺失按 `batch`；只有 full 且允许提问时 `step_by_step` 才有效，否则保留偏好并报告 dormant。该过渡基线未定义 processing selector，缺少 `processing_mode` 因此是旧版隐式 full；显式非 `full` 仍 dormant。逐题完成来自 manifest-first 顺序与 `{id, notebook_ref, notebook_block_sha256, manifest_item_sha256}` binding；quiz/teaching/notebook/Guide 共用安全 Unicode ≤200 ID 契约，两个 binding 不得共享 ref。未绑定 ID 是合法 batch 历史，已绑定 ID 在节奏切换后仍 live 校验。只有缺失与 anchor/marker/hash/revision 漂移可进入 pending；不安全路径、非法 UTF-8/围栏/block、schema/重复/unexpected 失败关闭。已完成 full phase 的结构合法新项/可修复 stale 仅在 mount 降级为 `usable_with_gaps`，Guide/完成仍严格。baseline ID 必须在同一 canonical chapter 保有教学快照且 policy 精确为 `append_only`，quiz-only 不可替代。
 - 图结构题先运行确定性算法，再渲染。
 - 教学、判分、疑难和复盘先写 notebook，再返回对话摘要。
 - 结构化工作区在阶段完成前必须验证当前章 `profile=full` typed manifest；`artifact_mode=chat` 到此停止，不要求 HTML/PDF。

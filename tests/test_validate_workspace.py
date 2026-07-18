@@ -664,8 +664,44 @@ class TestValidateWorkspace(unittest.TestCase):
                            "question": "q", "answer": "a", "source": "teacher"}])
         errors, _, _ = V.validate(d)   # must not raise
         self.assertEqual(V._exit_code(errors), 1)
-        self.assertTrue(any("id 必须是标量" in e["msg"] for e in errors))
+        self.assertTrue(any(
+            "id 必须是稳定字符串（旧整数可读）" in e["msg"]
+            for e in errors
+        ))
         self.assertTrue(any("type 必须是字符串" in e["msg"] for e in errors))
+
+    def test_interaction_style_stats_report_saved_but_dormant_preference(self):
+        d = self.make_ws([])
+        state = {
+            "version": 1,
+            "current_phase": 1,
+            "scope": None,
+            "mode": "from_scratch",
+            "time_budget": "le1d",
+            "language": "en",
+            "artifact_mode": "chat",
+            "processing_mode": "lightweight",
+            "preferences": {"interaction_style": "step_by_step"},
+            "mistake_archive": [],
+            "confusion_log": [],
+            "knowledge_window": [],
+            "phase_checklist": [],
+            "phase_evidence": {},
+            "last_updated": None,
+        }
+        with open(os.path.join(d, "study_state.json"), "w",
+                  encoding="utf-8") as stream:
+            json.dump(state, stream, ensure_ascii=False)
+
+        _errors, _warnings, stats = V.validate(d)
+
+        self.assertEqual(stats["interaction_style_preference"], "step_by_step")
+        self.assertEqual(stats["interaction_style_effective"], "batch")
+        self.assertTrue(stats["interaction_style_dormant"])
+        self.assertEqual(
+            stats["interaction_style_dormant_reason"],
+            "processing_mode_not_full",
+        )
 
     def test_current_phase_not_in_plan_warns(self):
         d = self.make_ws([{"id": "x", "chapter": 1, "type": "choice", "question": "q",

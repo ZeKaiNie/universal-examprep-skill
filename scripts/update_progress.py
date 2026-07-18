@@ -10,10 +10,12 @@ view from it. A write failure is FAIL-LOUD (non-zero exit + message) — never s
 
     python scripts/update_progress.py --workspace <ws> init                # migrate md → json (once)
     python scripts/update_progress.py --workspace <ws> set --phase 3
+    python scripts/update_progress.py --workspace <ws> set --interaction-style step_by_step
     python scripts/update_progress.py --workspace <ws> set --scope homework-only --mode 查缺补漏
     python scripts/update_progress.py --workspace <ws> add-mistake --id hw_hw1_3 --chapter 2 --note "Venn 阴影判断错"
     python scripts/update_progress.py --workspace <ws> add-confusion --chapter 1 --note "循环队列取模"
     python scripts/update_progress.py --workspace <ws> record-phase-evidence --kind wiki --ref references/wiki/ch1.md
+    python scripts/update_progress.py --workspace <ws> record-taught-example --id ex1 --notebook-ref notebook/ch01.md#ex1
     python scripts/update_progress.py --workspace <ws> complete-phase --status covered_unverified
     python scripts/update_progress.py --workspace <ws> render               # json → md（修复被手改的 md）
     python scripts/update_progress.py --workspace <ws> show                 # 打印当前状态 JSON
@@ -45,6 +47,8 @@ for _s in ("stdout", "stderr"):
 
 import i18n
 import notebook as _notebook
+import list_teaching_examples as _teaching_examples
+from stable_ids import stable_item_id_problem
 from ingestion import workspace_publication_lock
 from ingestion.storage import _exclusive_file_lock
 try:
@@ -73,6 +77,10 @@ LEARNING_MODES = i18n.MODES
 TIME_TIERS = i18n.TIERS
 LANGUAGES = i18n.LANGS
 ARTIFACT_MODES = i18n.ARTIFACT_MODES
+INTERACTION_STYLES = ("batch", "step_by_step")
+TEACHING_EXAMPLE_BINDING_FIELDS = frozenset((
+    "id", "notebook_ref", "notebook_block_sha256", "manifest_item_sha256",
+))
 
 _normalize_mode = i18n.canon_mode
 _normalize_tier = i18n.canon_tier
@@ -90,9 +98,23 @@ def _die(msg, code=2):
     raise SystemExit(code)
 
 
+def _validated_interaction_style(value):
+    """Return one canonical tutoring cadence or fail before state is written.
+
+    Interaction cadence deliberately has no display aliases.  Keeping this small
+    preference canonical prevents a generic ``--pref`` write from bypassing the
+    dedicated CLI's validation.
+    """
+    if not isinstance(value, str) or value not in INTERACTION_STYLES:
+        _die("interaction_style must be exactly one of: %s; got %r"
+             % ("|".join(INTERACTION_STYLES), value))
+    return value
+
+
 def default_state():
     return {"version": SCHEMA_VERSION, "current_phase": 1, "scope": None, "mode": None,
-            "time_budget": None, "language": None, "artifact_mode": "chat", "preferences": {},
+            "time_budget": None, "language": None, "artifact_mode": "chat",
+            "preferences": {"interaction_style": "batch"},
             "mistake_archive": [], "confusion_log": [], "knowledge_window": [],
             "phase_checklist": [], "phase_evidence": {}, "last_updated": None}
 
@@ -365,18 +387,86 @@ def _phase_evidence_shape_errors(state):
                 errors.append("phase_evidence[%s].%s 必须是数组" % (key, field))
                 continue
             if field == "checkpoint":
+                checkpoint_ids = set()
                 for item in refs:
                     if not isinstance(item, dict):
                         errors.append("phase_evidence[%s].checkpoint 必须是 {id,outcome} 对象数组；"
                                       "只有 ID 不能证明答对" % key)
                         continue
-                    if not isinstance(item.get("id"), str) or not item["id"].strip():
-                        errors.append("phase_evidence[%s].checkpoint[].id 必须是非空字符串" % key)
+                    ident = item.get("id")
+                    if stable_item_id_problem(ident):
+                        errors.append("phase_evidence[%s].checkpoint[].id 必须是规范非空字符串" % key)
+                    elif ident in checkpoint_ids:
+                        errors.append("phase_evidence[%s].checkpoint[] 含重复 id %s" %
+                                      (key, ident))
+                    else:
+                        checkpoint_ids.add(ident)
                     if item.get("outcome") not in CHECKPOINT_OUTCOMES:
                         errors.append("phase_evidence[%s].checkpoint[].outcome 必须是 %s"
                                       % (key, "/".join(CHECKPOINT_OUTCOMES)))
-            elif any(not isinstance(x, str) or not x.strip() for x in refs):
-                errors.append("phase_evidence[%s].%s 必须是非空字符串数组" % (key, field))
+            else:
+                if any(
+                    not isinstance(value, str)
+                    or not value.strip()
+                    or value != value.strip()
+                    for value in refs
+                ):
+                    errors.append("phase_evidence[%s].%s 必须是规范非空字符串数组" %
+                                  (key, field))
+                elif len(refs) != len(set(refs)):
+                    errors.append("phase_evidence[%s].%s 含重复值" % (key, field))
+                elif field == "teaching_examples" and any(
+                        stable_item_id_problem(value) is not None for value in refs):
+                    errors.append(
+                        "phase_evidence[%s].teaching_examples 含不符合共享 "
+                        "notebook/Guide 稳定 ID 规范的值" % key)
+        bindings = record.get("teaching_example_bindings")
+        if bindings is not None:
+            if not isinstance(bindings, list):
+                errors.append("phase_evidence[%s].teaching_example_bindings 必须是数组" % key)
+            else:
+                seen_binding_ids = set()
+                seen_notebook_refs = set()
+                for binding in bindings:
+                    if (not isinstance(binding, dict)
+                            or set(binding) != TEACHING_EXAMPLE_BINDING_FIELDS):
+                        errors.append(
+                            "phase_evidence[%s].teaching_example_bindings[] 必须精确包含 "
+                            "id/notebook_ref/notebook_block_sha256/manifest_item_sha256" % key)
+                        continue
+                    binding_id = binding.get("id")
+                    if stable_item_id_problem(binding_id):
+                        errors.append(
+                            "phase_evidence[%s].teaching_example_bindings[].id "
+                            "必须是规范非空单行字符串" % key)
+                    elif binding_id in seen_binding_ids:
+                        errors.append(
+                            "phase_evidence[%s].teaching_example_bindings 含重复 id %s" %
+                            (key, binding_id))
+                    else:
+                        seen_binding_ids.add(binding_id)
+                    notebook_ref = binding.get("notebook_ref")
+                    if (not isinstance(notebook_ref, str)
+                            or not notebook_ref.strip()
+                            or notebook_ref != notebook_ref.strip()
+                            or any(char in notebook_ref for char in ("\x00", "\r", "\n"))):
+                        errors.append(
+                            "phase_evidence[%s].teaching_example_bindings[].notebook_ref "
+                            "必须是规范非空单行字符串" % key)
+                    elif notebook_ref in seen_notebook_refs:
+                        errors.append(
+                            "phase_evidence[%s].teaching_example_bindings 含重复 "
+                            "notebook_ref %s" % (key, notebook_ref))
+                    else:
+                        seen_notebook_refs.add(notebook_ref)
+                    for digest_field in (
+                        "notebook_block_sha256", "manifest_item_sha256",
+                    ):
+                        if not re.fullmatch(
+                                r"[0-9a-f]{64}", str(binding.get(digest_field) or "")):
+                            errors.append(
+                                "phase_evidence[%s].teaching_example_bindings[].%s "
+                                "必须是 lowercase SHA-256" % (key, digest_field))
         status = record.get("status")
         if status is not None and status not in PHASE_EVIDENCE_STATUSES:
             errors.append("phase_evidence[%s].status 必须是 %s，当前 %r"
@@ -402,12 +492,19 @@ def _local_evidence_ref(ws, ref):
         return None, None, None, "路径不得为空或含 .. 路径穿越"
     rel = "/".join(segs)
     full = os.path.join(ws, *segs)
+    current = os.path.abspath(ws)
+    for segment in segs:
+        current = os.path.join(current, segment)
+        if os.path.lexists(current) and _is_link_or_reparse(current):
+            return None, None, None, "证据路径的父目录或文件不得是链接/重解析点"
     ws_real = os.path.normcase(os.path.realpath(ws))
     full_real = os.path.normcase(os.path.realpath(full))
-    if full_real != ws_real and not full_real.startswith(ws_real + os.sep):
+    try:
+        contained = os.path.commonpath((ws_real, full_real)) == ws_real
+    except ValueError:
+        contained = False
+    if not contained:
         return None, None, None, "路径经符号链接逃出工作区"
-    if os.path.islink(full):
-        return None, None, None, "证据文件不得是符号链接"
     if not os.path.isfile(full):
         return None, None, None, "证据文件不存在: %s" % rel
     return rel, unquote(fragment) if sep else "", full, None
@@ -427,6 +524,8 @@ def _markdown_anchors(path):
             n = counts.get(slug, 0)
             counts[slug] = n + 1
             anchors.add(slug if n == 0 else "%s-%d" % (slug, n))
+    if fence is not None:
+        raise ValueError("notebook contains an unterminated fenced code block")
     return anchors
 
 
@@ -738,18 +837,21 @@ def _teaching_baseline_for_phase(ws, chapter_keys, teaching, quiz):
         return set(), ["教学例题保留基线无法读取：%s" % error]
     if not isinstance(report, dict):
         return set(), ["%s 顶层必须是对象，无法核对教学例题保留基线" % source_name]
-    if source_name.endswith("teaching_baseline.json") and report.get("schema_version") != 1:
-        return set(), ["references/teaching_baseline.json schema_version 必须为 1"]
+    if source_name.endswith("teaching_baseline.json"):
+        if report.get("schema_version") != 1:
+            return set(), ["references/teaching_baseline.json schema_version 必须为 1"]
+        if report.get("policy") != "append_only":
+            return set(), ["references/teaching_baseline.json policy 必须精确为 append_only"]
     raw_ids = report.get("teaching_example_ids")
     if raw_ids is None and source_name.endswith("teaching_baseline.json"):
         return set(), ["references/teaching_baseline.json 缺少 teaching_example_ids"]
     if raw_ids is None:                         # pre-baseline legacy report
         return set(), []
     if not (isinstance(raw_ids, list)
-            and all(isinstance(x, str) and x.strip() for x in raw_ids)
-            and len({x.strip() for x in raw_ids}) == len(raw_ids)):
-        return set(), ["%s.teaching_example_ids 必须是无重复的非空字符串数组" % source_name]
-    baseline = {x.strip() for x in raw_ids}
+            and all(stable_item_id_problem(x) is None for x in raw_ids)
+            and len(set(raw_ids)) == len(raw_ids)):
+        return set(), ["%s.teaching_example_ids 必须遵循共享稳定 ID 契约且不得重复" % source_name]
+    baseline = set(raw_ids)
     expected = set()
     problems = []
     mapped_ids = set()
@@ -761,12 +863,12 @@ def _teaching_baseline_for_phase(ws, chapter_keys, teaching, quiz):
             for raw_scope, raw_values in raw_map.items():
                 scope = _scope_number(raw_scope)
                 if scope is None or not (isinstance(raw_values, list)
-                                         and all(isinstance(x, str) and x.strip()
+                                         and all(stable_item_id_problem(x) is None
                                                  for x in raw_values)):
-                    problems.append("teaching_example_ids_by_chapter[%r] 必须是可解析章节对应的字符串数组"
+                    problems.append("teaching_example_ids_by_chapter[%r] 必须是可解析章节对应的稳定 ID 数组"
                                     % raw_scope)
                     continue
-                values = {x.strip() for x in raw_values}
+                values = set(raw_values)
                 if len(values) != len(raw_values):
                     problems.append("teaching_example_ids_by_chapter[%r] 含重复 ID" % raw_scope)
                 mapped_ids.update(values)
@@ -858,7 +960,7 @@ def _phase_scope_context(ws, record, phase):
     return problems, wiki_names, chapter_keys
 
 
-def _phase_manifest_content(ws, record, phase):
+def _phase_manifest_content(ws, state, record, phase):
     """Return (problems, teaching_required, chapter_keys) for the v4.1 manifest trio."""
     problems, wiki_names, chapter_keys = _phase_scope_context(ws, record, phase)
     if not phase_manifest_present(ws):
@@ -870,6 +972,22 @@ def _phase_manifest_content(ws, record, phase):
     quiz, qerr = _read_json_value(os.path.join(refs, "quiz_bank.json"))
     problems.extend(x for x in (ferr, ierr, terr, qerr) if x)
     if any((ferr, ierr, terr, qerr)):
+        return problems, True, chapter_keys
+    if not isinstance(figure, dict):
+        problems.append("figure_page_index.json 顶层必须是对象")
+    if not isinstance(image, dict):
+        problems.append("image_question_index.json 顶层必须是对象")
+    if not isinstance(teaching, list):
+        problems.append("teaching_examples.json 顶层必须是数组")
+    if not isinstance(quiz, list):
+        problems.append("quiz_bank.json 顶层必须是数组")
+    if problems:
+        return problems, True, chapter_keys
+    teaching_structure_problems = (
+        _teaching_examples.pending_manifest_structure_problems(teaching)
+    )
+    if teaching_structure_problems:
+        problems.extend(teaching_structure_problems)
         return problems, True, chapter_keys
 
     # Zero suspects is meaningful only when the recall net actually ran with all needed backends and
@@ -883,8 +1001,15 @@ def _phase_manifest_content(ws, record, phase):
         "integrity_input_unreadable", "integrity_material_unreadable",
     )
     blocked_warnings = []
-    for manifest in (figure, image):
-        for warning in manifest.get("warnings") or []:
+    for name, manifest in (("figure_page_index", figure),
+                           ("image_question_index", image)):
+        warnings = manifest.get("warnings")
+        if warnings is None:
+            warnings = []
+        if not isinstance(warnings, list):
+            problems.append("%s.warnings 必须是数组" % name)
+            continue
+        for warning in warnings:
             text = str(warning)
             if text.startswith(recall_blockers) and text not in blocked_warnings:
                 blocked_warnings.append(text)
@@ -896,7 +1021,10 @@ def _phase_manifest_content(ws, record, phase):
     problems.extend(_declared_prompt_asset_problems(
         ws, (("quiz_bank", quiz), ("teaching_examples", teaching)), chapter_keys))
 
-    coverage = figure.get("wiki_visual_coverage") or {}
+    coverage = figure.get("wiki_visual_coverage")
+    if not isinstance(coverage, dict):
+        problems.append("figure_page_index.wiki_visual_coverage 必须是对象")
+        coverage = {}
     per_chapter = coverage.get("per_chapter")
     pages = coverage.get("pages")
     manual_answer_rows = coverage.get("manual_answer_exposure_pages")
@@ -941,7 +1069,9 @@ def _phase_manifest_content(ws, record, phase):
             elif counts["missing"] != 0:
                 problems.append("%s 仍有 %d 个 wiki 视觉页 missing（必须为 0）"
                                 % (wiki_name, counts["missing"]))
-    if isinstance(pages, list):
+    if not isinstance(pages, list):
+        problems.append("wiki_visual_coverage.pages 不是数组")
+    else:
         missing_rows = [p for p in pages if isinstance(p, dict)
                         and p.get("wiki_file") in wiki_names and p.get("status") == "missing"]
         if missing_rows and not any("wiki 视觉页 missing" in p for p in problems):
@@ -989,11 +1119,21 @@ def _phase_manifest_content(ws, record, phase):
     if unscoped_teaching:
         problems.append("teaching_examples 含无可解析 chapter/phase 的条目，不能从阶段全集静默排除: %s"
                         % ", ".join(unscoped_teaching[:8]))
+    teaching_manifest_expected = set(expected)
     baseline_expected, baseline_problems = _teaching_baseline_for_phase(
         ws, chapter_keys, teaching, quiz)
+    baseline_only = baseline_expected - teaching_manifest_expected
+    if baseline_only:
+        problems.append(
+            "教学例题保留基线中的题目缺少当前 teaching_examples.json 快照: %s；"
+            "quiz-only 条目不能替代教学 roster，请恢复教学快照或重新导入"
+            % ", ".join(sorted(baseline_only)))
     expected.update(baseline_expected)
     problems.extend(baseline_problems)
-    recorded = set(record.get("teaching_examples") or [])
+    problems.extend(_step_roster_baseline_problems(ws, phase, teaching))
+    binding_status = _step_teaching_binding_status(ws, state, phase, teaching)
+    problems.extend(binding_status["problems"])
+    recorded = set(binding_status["completed_ids"])
     missing_examples = expected - recorded
     if missing_examples:
         problems.append("教学例题 evidence 未覆盖本阶段 manifest 全集: %s"
@@ -1139,7 +1279,7 @@ def phase_evidence_ref_error(ws, field, ref, asset_policy=_COMPLETION_ASSET_POLI
             try:
                 if fragment not in _markdown_anchors(full):
                     return "notebook 证据锚点不存在: %s#%s" % (rel, fragment)
-            except (OSError, UnicodeDecodeError) as e:
+            except (OSError, UnicodeDecodeError, ValueError) as e:
                 return "notebook 证据无法读取: %s" % e
         return None
 
@@ -1149,22 +1289,23 @@ def phase_evidence_ref_error(ws, field, ref, asset_policy=_COMPLETION_ASSET_POLI
             or any(c in ident_value for c in ("\x00", "\r", "\n"))):
         return "%s 证据 ID 必须是非空单行字符串" % field
     ident = ident_value.strip()
+    if checkpoint:
+        id_problem = stable_item_id_problem(ident)
+        if id_problem:
+            return "checkpoint ID 不符合共享稳定 ID 规范: %s" % id_problem
     if field == "teaching_examples":
+        id_problem = stable_item_id_problem(ident)
+        if id_problem:
+            return "教学例题 ID 不符合共享 notebook/Guide 规范: %s" % id_problem
         teaching_path = os.path.join(ws, "references", "teaching_examples.json")
-        if os.path.isfile(teaching_path):
-            ids, error = _json_ids(teaching_path)
-            # A baseline item may intentionally remain only in the canonical bank.  The teaching
-            # manifest is a reachability snapshot, not a second answer source, so accept the union.
-            legacy_ids, legacy_error = _json_ids(
-                os.path.join(ws, "references", "quiz_bank.json"), teaching_only=True)
-            if not legacy_error:
-                ids = (ids or set()) | legacy_ids
-        else:
-            ids, error = _json_ids(os.path.join(ws, "references", "quiz_bank.json"), teaching_only=True)
+        if not os.path.isfile(teaching_path):
+            return ("教学例题证据要求 references/teaching_examples.json；"
+                    "quiz-only 条目不能替代教学 roster")
+        ids, error = _json_ids(teaching_path)
         if error:
             return error
         if ident not in ids:
-            return "教学例题 ID 不在 teaching_examples/legacy example bank 中: %s" % ident
+            return "教学例题 ID 不在 teaching_examples manifest 中: %s" % ident
         candidates = [
             row for row in asset_policy["teaching_rows"] + asset_policy["quiz_rows"]
             if isinstance(row, dict) and str(row.get("id")) == ident
@@ -1191,6 +1332,8 @@ def phase_evidence_ref_error(ws, field, ref, asset_policy=_COMPLETION_ASSET_POLI
 
 def _no_questions_preference(state):
     prefs = state.get("preferences") or {}
+    if not isinstance(prefs, dict):
+        return False
     for key in ("no_questions", "no-questions", "不要出题", "不要问我"):
         if key not in prefs:
             continue
@@ -1198,6 +1341,44 @@ def _no_questions_preference(state):
         if value in ("1", "true", "yes", "on", "是", "不出题", "不要问"):
             return True
     return False
+
+
+def interaction_style_preference(state):
+    """Return the persisted canonical preference, defaulting legacy state to batch."""
+    prefs = state.get("preferences") if isinstance(state, dict) else None
+    raw = prefs.get("interaction_style", "batch") if isinstance(prefs, dict) else "batch"
+    return raw if raw in INTERACTION_STYLES else "batch"
+
+
+def interaction_style_full_route(state):
+    """Return whether this runtime's existing material route is full.
+
+    PR #41 targets a baseline that predates the explicit lightweight/full
+    selector.  On that baseline a missing field is the historical implicit
+    full route; an explicitly present non-full value still keeps paced tutoring
+    dormant.  The later processing-mode migration replaces this compatibility
+    seam with its own missing->lightweight rule.
+    """
+
+    return (
+        isinstance(state, dict)
+        and state.get("processing_mode", "full") == "full"
+    )
+
+
+def effective_interaction_style(state):
+    """Step cadence is active only for full mode with questions enabled."""
+    if (isinstance(state, dict)
+            and interaction_style_full_route(state)
+            and not _no_questions_preference(state)
+            and interaction_style_preference(state) == "step_by_step"):
+        return "step_by_step"
+    return "batch"
+
+
+def interaction_style_dormant(state):
+    return (interaction_style_preference(state) == "step_by_step"
+            and effective_interaction_style(state) != "step_by_step")
 
 
 def _phase_completion_problems(record, status, teaching_required=True):
@@ -1218,8 +1399,15 @@ def _phase_completion_problems(record, status, teaching_required=True):
     return problems
 
 
-def phase_evidence_errors(ws, state, enforce_manifest_gate=True):
-    """Shared validator surface used by validate_workspace.py and the mutation commands."""
+def phase_evidence_errors(
+        ws, state, enforce_manifest_gate=True, recoverable_stale=None):
+    """Return strict phase errors, optionally separating mount-only repairs.
+
+    ``recoverable_stale`` may be a caller-owned list.  When supplied, a
+    structurally sound completed full phase whose current roster has an
+    append-only new item or a stale live/revision binding is reported there.
+    Completion and Guide callers omit the list and therefore stay strict.
+    """
     errors = _phase_evidence_shape_errors(state)
     if errors:
         return errors
@@ -1230,16 +1418,132 @@ def phase_evidence_errors(ws, state, enforce_manifest_gate=True):
     asset_policy, asset_policy_error = _completion_asset_policy(ws)
     for phase, record in evidence.items():
         status = record.get("status")
+        recoverable_notebook_refs = set()
         if status:
-            for problem in _phase_record_problems(ws, state, int(phase), status):
-                errors.append("phase_evidence[%s] 状态 %s：%s" % (phase, status, problem))
-        else:
-            for field in PHASE_EVIDENCE_FIELDS:
-                for ref in record.get(field) or []:
-                    problem = phase_evidence_ref_error(
-                        ws, field, ref, asset_policy, asset_policy_error)
-                    if problem:
-                        errors.append("phase_evidence[%s].%s 引用无效：%s" % (phase, field, problem))
+            recoverable_step_problems = set()
+            reopenable_pending_ids = set()
+            if interaction_style_full_route(state):
+                teaching, teaching_error = _read_json_value(
+                    os.path.join(ws, "references", "teaching_examples.json"))
+                if not teaching_error:
+                    binding_status = _step_teaching_binding_status(
+                        ws, state, int(phase), teaching)
+                    direct_recoverable = {
+                        "教学事件 %s：%s" % (ident, problem)
+                        for ident, problem
+                        in binding_status["repairable_binding_problems"].items()
+                    }
+                    fatal_step_problems = [
+                        problem for problem in binding_status["problems"]
+                        if problem not in direct_recoverable
+                    ]
+                    baseline_problems = _step_roster_baseline_problems(
+                        ws, int(phase), teaching)
+                    if not fatal_step_problems and not baseline_problems:
+                        reopenable_pending_ids = {
+                            item["id"] for item
+                            in binding_status["pending_items"]
+                        }
+                    if reopenable_pending_ids:
+                        recoverable_step_problems = direct_recoverable
+                        stale_binding_ids = set(
+                            binding_status["repairable_binding_problems"])
+                        recoverable_notebook_refs = {
+                            binding.get("notebook_ref")
+                            for binding in (
+                                record.get("teaching_example_bindings") or []
+                            )
+                            if isinstance(binding, dict)
+                            and binding.get("id") in stale_binding_ids
+                            and isinstance(binding.get("notebook_ref"), str)
+                        }
+            phase_record_problems = _phase_record_problems(
+                ws, state, int(phase), status)
+            repairable_phase_problems = set(recoverable_step_problems)
+            if reopenable_pending_ids:
+                for notebook_ref in recoverable_notebook_refs:
+                    notebook_problem = phase_evidence_ref_error(
+                        ws, "notebook", notebook_ref,
+                        asset_policy, asset_policy_error)
+                    if notebook_problem:
+                        repairable_phase_problems.add(
+                            "notebook 引用无效：%s" % notebook_problem)
+                missing_problem = (
+                    "教学例题 evidence 未覆盖本阶段 manifest 全集: "
+                    + ", ".join(sorted(reopenable_pending_ids))
+                )
+                if missing_problem in phase_record_problems:
+                    repairable_phase_problems.add(missing_problem)
+                _scope_problems, _wiki_names, chapter_keys = (
+                    _phase_scope_context(ws, record, int(phase)))
+                repairable_phase_problems.update(
+                    _structured_study_guide_problems(
+                        ws, state, chapter_keys))
+            for problem in phase_record_problems:
+                formatted = "phase_evidence[%s] 状态 %s：%s" % (
+                    phase, status, problem)
+                if (recoverable_stale is not None
+                        and problem in repairable_phase_problems):
+                    recoverable_stale.append(formatted)
+                else:
+                    errors.append(formatted)
+            continue
+
+        # A persisted binding keeps its stronger live contract after a cadence
+        # or no_questions switch. Active step mode also requires the baseline.
+        if (record.get("teaching_example_bindings")
+                or effective_interaction_style(state) == "step_by_step"):
+            teaching, teaching_error = _read_json_value(
+                os.path.join(ws, "references", "teaching_examples.json"))
+            if teaching_error:
+                errors.append(
+                    "phase_evidence[%s] teaching roster 无法读取：%s" %
+                    (phase, teaching_error))
+            else:
+                if effective_interaction_style(state) == "step_by_step":
+                    for problem in _step_roster_baseline_problems(
+                            ws, int(phase), teaching):
+                        errors.append(
+                            "phase_evidence[%s] step_by_step roster：%s" %
+                            (phase, problem))
+                binding_status = _step_teaching_binding_status(
+                    ws, state, int(phase), teaching)
+                direct_recoverable = {
+                    "教学事件 %s：%s" % (ident, problem)
+                    for ident, problem
+                    in binding_status["repairable_binding_problems"].items()
+                }
+                stale_binding_ids = set(
+                    binding_status["repairable_binding_problems"])
+                recoverable_notebook_refs = {
+                    binding.get("notebook_ref")
+                    for binding in (record.get("teaching_example_bindings") or [])
+                    if isinstance(binding, dict)
+                    and binding.get("id") in stale_binding_ids
+                    and isinstance(binding.get("notebook_ref"), str)
+                }
+                for problem in binding_status["problems"]:
+                    formatted = (
+                        "phase_evidence[%s] teaching evidence：%s"
+                        % (phase, problem))
+                    if (recoverable_stale is not None
+                            and problem in direct_recoverable):
+                        recoverable_stale.append(formatted)
+                    else:
+                        errors.append(formatted)
+        for field in PHASE_EVIDENCE_FIELDS:
+            for ref in record.get(field) or []:
+                problem = phase_evidence_ref_error(
+                    ws, field, ref, asset_policy, asset_policy_error)
+                if problem:
+                    formatted = "phase_evidence[%s].%s 引用无效：%s" % (
+                        phase, field, problem)
+                    if (recoverable_stale is not None
+                            and field == "notebook"
+                            and ref in recoverable_notebook_refs):
+                        recoverable_stale.append(formatted)
+                    else:
+                        errors.append(formatted)
     if enforce_manifest_gate and manifest_state == "ready":
         for row in state.get("phase_checklist") or []:
             phase = phase_number_from_check(row.get("text") or "")
@@ -1476,6 +1780,8 @@ def cmd_init(ws, args):
             st[k] = prefs[k]
     if prefs.get("preferences"):                    # ⚙️ 偏好区（讲解风格等）同理——恢复路径不丢偏好
         st["preferences"].update(prefs["preferences"])
+    _validated_interaction_style(st["preferences"].get("interaction_style", "batch"))
+    st["preferences"].setdefault("interaction_style", "batch")
     save(ws, st, "init：从 %s 迁移（阶段 %d，错题 %d，疑难 %d，打卡 %d）"
          % (MD_NAME if os.path.isfile(md_path) else "空白", phase, len(mistakes), len(confusions),
             len(checklist)))
@@ -1538,7 +1844,7 @@ def _migrate_enums(ws, st):
     return changed
 
 
-def _require_state(ws, repairing_phase=False):
+def _require_state(ws, repairing_phase=False, repairing_interaction_style=False):
     st = load_state(ws)
     if st is None:
         _die("尚无 study_state.json——先跑 `update_progress.py --workspace <ws> init` 迁移")
@@ -1585,6 +1891,14 @@ def _require_state(ws, repairing_phase=False):
     elif not isinstance(st["preferences"], dict):
         _die("study_state.json 损坏：preferences 必须是对象，当前 %s"
              % type(st["preferences"]).__name__, 1)
+    # Missing means batch for legacy state. Invalid stored values fail loudly;
+    # aliases such as ``step-by-step`` never silently change semantics.
+    raw_interaction_style = st["preferences"].get("interaction_style", "batch")
+    if raw_interaction_style not in INTERACTION_STYLES and repairing_interaction_style:
+        st["preferences"]["interaction_style"] = "batch"
+    else:
+        st["preferences"]["interaction_style"] = _validated_interaction_style(
+            raw_interaction_style)
     if st.get("artifact_mode") is None:
         # Additive state field: v3 and early-v4 workspaces keep their chat-only behavior.
         st["artifact_mode"] = "chat"
@@ -1660,7 +1974,15 @@ def _plan_phase_wikis(ws):
 
 def cmd_set(ws, args):
     # 提供 --phase 时豁免陈旧断点检查（这是修复路径；新值下面自行对照计划校验）
-    st = _require_state(ws, repairing_phase=args.phase is not None)
+    pref_repairs_style = any(
+        "=" in value and value.split("=", 1)[0].strip() == "interaction_style"
+        for value in (args.pref or []))
+    st = _require_state(
+        ws,
+        repairing_phase=args.phase is not None,
+        repairing_interaction_style=(
+            args.interaction_style is not None or pref_repairs_style),
+    )
     changed = []
     if args.phase is not None:
         if args.phase < 1:
@@ -1723,14 +2045,23 @@ def cmd_set(ws, args):
             changed.append("artifact_mode=%s" % _disp("artifact", artifact_mode))
             if awarn:
                 sys.stderr.write("update_progress[warn]: " + awarn + "\n")
+    if args.interaction_style is not None:
+        st.setdefault("preferences", {})["interaction_style"] = (
+            _validated_interaction_style(args.interaction_style))
+        changed.append("interaction_style=%s" % args.interaction_style)
     for kv in (args.pref or []):
         if "=" not in kv:
             _die("--pref 需要 key=value 形式，当前 %r" % kv)
         k, v = kv.split("=", 1)
-        st.setdefault("preferences", {})[k.strip()] = v.strip()
-        changed.append("pref %s" % k.strip())
+        key, value = k.strip(), v.strip()
+        if not key:
+            _die("--pref key must not be empty")
+        if key == "interaction_style":
+            value = _validated_interaction_style(value)
+        st.setdefault("preferences", {})[key] = value
+        changed.append("pref %s" % key)
     if not changed:
-        _die("set 没有任何改动参数（--phase/--scope/--mode/--time-budget/--language/--artifact-mode/--pref）")
+        _die("set 没有任何改动参数（--phase/--scope/--mode/--time-budget/--language/--artifact-mode/--interaction-style/--pref）")
     save(ws, st, "set：" + "、".join(changed))
     return 0
 
@@ -1871,7 +2202,8 @@ def _phase_record_problems(ws, state, phase, status):
                 ws, field, ref, asset_policy, asset_policy_error)
             if problem:
                 problems.append("%s 引用无效：%s" % (field, problem))
-    content_problems, teaching_required, chapter_keys = _phase_manifest_content(ws, record, phase)
+    content_problems, teaching_required, chapter_keys = _phase_manifest_content(
+        ws, state, record, phase)
     problems.extend(content_problems)
     problems.extend(_structured_study_guide_problems(ws, state, chapter_keys))
     problems.extend(_phase_completion_problems(record, status, teaching_required=teaching_required))
@@ -1890,6 +2222,429 @@ def _complete_phase_in_state(ws, state, phase, status, row=None):
     (row or _phase_check_row(state, phase))["done"] = True
 
 
+def _teaching_manifest_item_sha256(item):
+    try:
+        payload = json.dumps(
+            item, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        return None, "teaching manifest item 不是严格 JSON：%s" % exc
+    return hashlib.sha256(payload).hexdigest(), None
+
+
+def _teaching_example_notebook_snapshot(ws, phase, example_id, notebook_ref):
+    """Return ``(snapshot, problem, recoverable)`` for one notebook binding.
+
+    Missing/replaced entry content is recoverable by writing a fresh marked
+    walkthrough. Unsafe topology, invalid UTF-8/Markdown, or an impossible
+    parsed block is structural and must keep mount validation blocked.
+    """
+
+    expected_rel = "notebook/ch%02d.md" % phase
+    if (
+        not isinstance(notebook_ref, str)
+        or notebook_ref != notebook_ref.strip()
+        or notebook_ref.count("#") != 1
+        or any(char in notebook_ref for char in ("\x00", "\r", "\n"))
+    ):
+        return None, "notebook binding 必须是规范的单一 path#anchor", False
+    rel, raw_fragment = notebook_ref.split("#", 1)
+    fragment = unquote(raw_fragment)
+    if (
+        rel != expected_rel
+        or not fragment
+        or any(char in fragment for char in ("\x00", "\r", "\n"))
+    ):
+        return None, (
+            "record-taught-example 的 notebook 必须是当前章 %s#<anchor>"
+            % expected_rel), False
+    notebook_dir = os.path.join(ws, "notebook")
+    full = os.path.join(ws, *rel.split("/"))
+    if os.path.lexists(notebook_dir) and _is_link_or_reparse(notebook_dir):
+        return None, "workspace notebook 目录不得是 link/reparse point", False
+    if os.path.lexists(notebook_dir) and not os.path.isdir(notebook_dir):
+        return None, "workspace notebook 目标存在但不是目录", False
+    if os.path.lexists(full) and _is_link_or_reparse(full):
+        return None, "教学 notebook 文件不得是 link/reparse point", False
+    workspace_real = os.path.normcase(os.path.realpath(ws))
+    full_real = os.path.normcase(os.path.realpath(full))
+    try:
+        contained = os.path.commonpath((workspace_real, full_real)) == workspace_real
+    except ValueError:
+        contained = False
+    if not contained:
+        return None, "教学 notebook 路径解析后逃出工作区", False
+    if not os.path.lexists(full):
+        return None, "教学 notebook 文件不存在，必须重新精讲并记录", True
+    if not os.path.isfile(full):
+        return None, "教学 notebook 目标不是普通文件", False
+    try:
+        with open(full, "r", encoding="utf-8") as stream:
+            pre, blocks = _notebook.parse_chapter(stream.read())
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        return None, "record-taught-example notebook 结构不可安全读取：%s" % exc, False
+    matches = [block for block, anchor in zip(blocks, _notebook.anchors_for(pre, blocks))
+               if anchor == fragment]
+    if len(matches) != 1:
+        return None, "notebook anchor 必须唯一定位一个条目，当前命中 %d 个" % len(matches), True
+    block = matches[0]
+    if block.get("id") != example_id:
+        return None, "notebook anchor 对应 ID %r，不是教学例题 %r" % (
+            block.get("id"), example_id), True
+    label, _timestamp = _notebook._block_meta(block.get("lines") or [])
+    if _notebook._label_to_type().get(label) != "walkthrough":
+        return None, "notebook anchor 必须对应 notebook.py walkthrough 条目", True
+    if not _notebook.block_has_teaching_example_marker(block, example_id):
+        return None, (
+            "notebook walkthrough 缺少本题 teaching-example marker；请先用 "
+            "notebook.py add-entry --type walkthrough --teaching-example 重写该条目"), True
+    try:
+        block_digest = _notebook.block_sha256(block)
+    except ValueError as exc:
+        return None, "notebook walkthrough 结构无效：%s" % exc, False
+    return {
+        "id": example_id,
+        "notebook_ref": "%s#%s" % (rel, fragment),
+        "notebook_block_sha256": block_digest,
+    }, None, False
+
+
+def _teaching_example_binding_structure_problem(binding, phase):
+    if not isinstance(binding, dict) or set(binding) != TEACHING_EXAMPLE_BINDING_FIELDS:
+        return (
+            "teaching_example_bindings 条目必须精确包含 "
+            "id/notebook_ref/notebook_block_sha256/manifest_item_sha256"
+        )
+    ident = binding.get("id")
+    if stable_item_id_problem(ident):
+        return "binding ID 不符合共享 notebook/Guide 稳定 ID 规范"
+    notebook_ref = binding.get("notebook_ref")
+    expected_prefix = "notebook/ch%02d.md#" % phase
+    raw_fragment = (
+        notebook_ref[len(expected_prefix):]
+        if isinstance(notebook_ref, str)
+        and notebook_ref.startswith(expected_prefix)
+        else ""
+    )
+    decoded_fragment = unquote(raw_fragment)
+    if (
+        not isinstance(notebook_ref, str)
+        or notebook_ref != notebook_ref.strip()
+        or not notebook_ref.startswith(expected_prefix)
+        or notebook_ref.count("#") != 1
+        or not decoded_fragment
+        or any(char in notebook_ref for char in ("\x00", "\r", "\n"))
+        or any(char in decoded_fragment for char in ("\x00", "\r", "\n"))
+    ):
+        return "binding notebook_ref 必须规范定位当前章 notebook 的唯一 anchor"
+    for field in ("notebook_block_sha256", "manifest_item_sha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(binding.get(field) or "")):
+            return "binding %s 必须是 lowercase SHA-256" % field
+    return None
+
+
+def _teaching_example_binding_problem(ws, phase, binding, item, notebook_refs):
+    if binding.get("id") != item.get("id"):
+        return "binding ID 与 manifest item 不一致", False
+    if binding.get("notebook_ref") not in notebook_refs:
+        return "binding notebook_ref 未同时出现在 phase notebook evidence", False
+    manifest_digest, error = _teaching_manifest_item_sha256(item)
+    if error:
+        return error, False
+    if binding.get("manifest_item_sha256") != manifest_digest:
+        return "manifest item revision 已变化，必须重新精讲并记录", True
+    snapshot, error, repairable = _teaching_example_notebook_snapshot(
+        ws, phase, binding["id"], binding["notebook_ref"])
+    if error:
+        return error, repairable
+    if snapshot["notebook_block_sha256"] != binding.get("notebook_block_sha256"):
+        return "已记录的教学 walkthrough 块被改写，必须重新精讲并记录", True
+    return None, False
+
+
+def _step_teaching_binding_status(ws, state, phase, items):
+    """Validate batch IDs plus any stronger step bindings in manifest order."""
+    record = (state.get("phase_evidence") or {}).get(str(phase), {})
+    manifest_problems = (
+        _teaching_examples.pending_manifest_structure_problems(items)
+    )
+    if manifest_problems:
+        return {
+            "problems": manifest_problems,
+            "binding_problems": {},
+            "repairable_binding_problems": {},
+            "completed_ids": [],
+            "completed_id_set": set(),
+            "valid_bound_id_set": set(),
+            "pending_items": [],
+            "next": None,
+            "items": [],
+        }
+    chapter = str(phase)
+    problems = []
+    hits = [item for item in items
+            if chapter in _teaching_examples._chapter_keys(item)]
+    item_by_id = {item["id"]: item for item in hits}
+    binding_problems = {}
+    repairable_binding_problems = {}
+    recorded = record.get("teaching_examples") or []
+    if len(recorded) != len(set(recorded)):
+        problems.append("teaching_examples evidence 含重复 ID")
+    bindings = record.get("teaching_example_bindings") or []
+    binding_by_id = {}
+    binding_ids_by_ref = {}
+    for binding in bindings:
+        structure_problem = _teaching_example_binding_structure_problem(
+            binding, phase)
+        if structure_problem:
+            problems.append(
+                "teaching_example_bindings 结构损坏：%s" % structure_problem)
+            continue
+        ident = binding["id"]
+        if ident in binding_by_id:
+            problems.append("teaching_example_bindings 含重复 ID %s" % ident)
+        else:
+            binding_by_id[ident] = binding
+            notebook_ref = binding["notebook_ref"]
+            previous = binding_ids_by_ref.get(notebook_ref)
+            if previous is not None:
+                problems.append(
+                    "teaching_example_bindings 的 %s 与 %s 复用同一 notebook_ref"
+                    % (previous, ident))
+            else:
+                binding_ids_by_ref[notebook_ref] = ident
+    missing_ids = set(binding_by_id) - set(recorded)
+    if missing_ids:
+        problems.append("teaching_example_bindings 缺对应 teaching_examples ID：%s" %
+                        ", ".join(sorted(missing_ids)))
+    notebook_refs = set(record.get("notebook") or [])
+    unexpected = set(recorded) - set(item_by_id)
+    if unexpected:
+        problems.append("teaching_examples evidence 不在当前章 manifest：%s" %
+                        ", ".join(sorted(unexpected)))
+    # Unbound strings are legal evidence created in batch mode. Once an ID has a
+    # binding, that stronger live contract remains active after cadence changes.
+    valid = (set(recorded) & set(item_by_id)) - set(binding_by_id)
+    valid_bound = set()
+    for ident, binding in binding_by_id.items():
+        item = item_by_id.get(ident)
+        if item is None:
+            problems.append("教学事件 ID 不在当前章 manifest：%s" % ident)
+            continue
+        problem, repairable = _teaching_example_binding_problem(
+            ws, phase, binding, item, notebook_refs)
+        if problem:
+            if repairable:
+                binding_problems[ident] = problem
+                repairable_binding_problems[ident] = problem
+                problems.append("教学事件 %s：%s" % (ident, problem))
+            else:
+                problems.append("教学事件 %s 结构损坏：%s" % (ident, problem))
+        else:
+            valid.add(ident)
+            valid_bound.add(ident)
+    completed_ids = [item["id"] for item in hits if item["id"] in valid]
+    pending_items = [item for item in hits if item["id"] not in valid]
+    return {
+        "problems": problems,
+        "binding_problems": binding_problems,
+        "repairable_binding_problems": repairable_binding_problems,
+        "completed_ids": completed_ids,
+        "completed_id_set": valid,
+        "valid_bound_id_set": valid_bound,
+        "pending_items": pending_items,
+        "next": pending_items[0] if pending_items else None,
+        "items": hits,
+    }
+
+
+def _step_roster_baseline_problems(ws, phase, items):
+    """Require every retained baseline ID to have a current teaching snapshot."""
+    manifest_problems = (
+        _teaching_examples.pending_manifest_structure_problems(items)
+    )
+    if manifest_problems:
+        return manifest_problems
+    path = os.path.join(ws, "references", "teaching_baseline.json")
+    if not os.path.lexists(path):
+        return []
+    if _is_link_or_reparse(path) or not os.path.isfile(path):
+        return ["references/teaching_baseline.json 必须是安全的普通文件"]
+    payload, error = _read_json_value(path)
+    if error:
+        return ["无法读取 teaching baseline：%s" % error]
+    if (not isinstance(payload, dict)
+            or payload.get("schema_version") != 1
+            or payload.get("policy") != "append_only"):
+        return ["teaching_baseline 必须是 schema_version=1 的 append_only 基线"]
+    mapping = payload.get("teaching_example_ids_by_chapter")
+    flat = payload.get("teaching_example_ids")
+    if not isinstance(mapping, dict) or not isinstance(flat, list):
+        return ["teaching_baseline 必须包含逐章映射与 ID 全集"]
+    mapped = set()
+    baseline_scope_by_id = {}
+    problems = []
+    for raw_scope, values in mapping.items():
+        scope = _scope_number(raw_scope)
+        if (not isinstance(raw_scope, str) or scope is None or raw_scope != scope
+                or not isinstance(values, list)
+                or any(stable_item_id_problem(value) is not None
+                       for value in values)
+                or len(values) != len(set(values))):
+            problems.append("teaching_baseline 章节 %r 的 ID 映射无效" % raw_scope)
+            continue
+        overlap = mapped & set(values)
+        if overlap:
+            problems.append("teaching_baseline ID 被分配到多个章节：%s" %
+                            ", ".join(sorted(overlap)))
+        mapped.update(values)
+        for value in values:
+            baseline_scope_by_id[value] = scope
+    if (any(stable_item_id_problem(value) is not None for value in flat)
+            or len(flat) != len(set(flat))
+            or mapped != set(flat)):
+        problems.append("teaching_baseline 的逐章映射与 ID 全集不一致")
+    manifest_scope_by_id = {}
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        chapter_scope = _scope_number(item.get("chapter"))
+        phase_scope = _scope_number(item.get("phase"))
+        if chapter_scope and phase_scope and chapter_scope != phase_scope:
+            problems.append("teaching_examples[%s] chapter/phase 冲突" % item["id"])
+            continue
+        actual_scope = chapter_scope or phase_scope
+        if actual_scope is not None:
+            manifest_scope_by_id[item["id"]] = actual_scope
+    missing = sorted(set(flat) - set(manifest_scope_by_id)) if not problems else []
+    if missing:
+        problems.append(
+            "teaching roster 缺保留基线题目 %s；quiz-only 条目不能替代 "
+            "teaching_examples.json，请先恢复完整 roster" % ", ".join(missing))
+    drifted = sorted(
+        ident for ident, baseline_scope in baseline_scope_by_id.items()
+        if ident in manifest_scope_by_id
+        and manifest_scope_by_id[ident] != baseline_scope
+    ) if not problems else []
+    if drifted:
+        problems.append(
+            "teaching roster 章节漂移：基线题目在当前 teaching_examples.json 中不再属于"
+            "同一 canonical chapter：%s" % ", ".join(drifted))
+    return problems
+
+
+def _taught_example_notebook_binding(ws, phase, example_id, notebook_ref, item):
+    snapshot, error, _repairable = _teaching_example_notebook_snapshot(
+        ws, phase, example_id, notebook_ref)
+    if error:
+        _die("拒绝记录 taught example notebook evidence：%s" % error)
+    manifest_digest, error = _teaching_manifest_item_sha256(item)
+    if error:
+        _die("拒绝记录 taught example manifest evidence：%s" % error)
+    snapshot["manifest_item_sha256"] = manifest_digest
+    return snapshot
+
+
+def cmd_record_taught_example(ws, args):
+    """Atomically bind one explicit tutoring walkthrough to both evidence lists."""
+    st = _require_state(ws)
+    if effective_interaction_style(st) != "step_by_step":
+        _die("record-taught-example 只用于有效的 step_by_step：必须为完整路线"
+             "（该过渡版缺 processing_mode 即旧版隐式 full），且 "
+             "no_questions 必须为 false")
+    phase = st["current_phase"]
+    example_id = (args.id or "").strip()
+    example_id_problem = stable_item_id_problem(example_id)
+    if example_id_problem:
+        _die("--id 不符合共享 notebook/Guide 稳定 ID 规范：%s" % example_id_problem)
+
+    items, missing = _teaching_examples.load_manifest(ws)
+    if missing:
+        _die("record-taught-example 需要 references/teaching_examples.json")
+    _teaching_examples._validate_pending_scopes(items)
+    chapter = str(phase)
+    matches = [item for item in items
+               if item.get("id") == example_id
+               and chapter in _teaching_examples._chapter_keys(item)]
+    if len(matches) != 1:
+        _die("教学例题 %r 必须在 current_phase=%d 的 manifest 中唯一存在，当前命中 %d 个"
+             % (example_id, phase, len(matches)))
+
+    baseline_problems = _step_roster_baseline_problems(ws, phase, items)
+    if baseline_problems:
+        _die(baseline_problems[0])
+    status = _step_teaching_binding_status(ws, st, phase, items)
+    stale_messages = {
+        "教学事件 %s：%s" % (ident, problem)
+        for ident, problem in status["repairable_binding_problems"].items()
+    }
+    blocking_problems = [
+        problem for problem in status["problems"]
+        if problem not in stale_messages
+    ]
+    if blocking_problems:
+        _die("现有 step_by_step 教学证据无效：%s" % "；".join(blocking_problems))
+    next_item = status["next"]
+    if next_item is None or next_item.get("id") != example_id:
+        _die("教学证据必须绑定 manifest 顺序中的当前第一道 pending %r，不能记录 %r" %
+             (next_item.get("id") if next_item else None, example_id))
+
+    notebook_binding = _taught_example_notebook_binding(
+        ws, phase, example_id, (args.notebook_ref or "").strip(), matches[0])
+    notebook_ref = notebook_binding["notebook_ref"]
+    problem = phase_evidence_ref_error(ws, "teaching_examples", example_id)
+    if problem:
+        _die("拒绝记录 teaching-example evidence：%s" % problem)
+
+    record = st.setdefault("phase_evidence", {}).setdefault(str(phase), {})
+    notebooks = record.get("notebook")
+    if notebooks is None:
+        notebooks = record["notebook"] = []
+    examples = record.get("teaching_examples")
+    if examples is None:
+        examples = record["teaching_examples"] = []
+    if notebook_ref not in notebooks:
+        notebooks.append(notebook_ref)
+    if example_id not in examples:
+        examples.append(example_id)
+    bindings = record.get("teaching_example_bindings")
+    if bindings is None:
+        bindings = record["teaching_example_bindings"] = []
+    existing_binding = next(
+        (binding for binding in bindings
+         if isinstance(binding, dict) and binding.get("id") == example_id),
+        None,
+    )
+    if existing_binding is None:
+        bindings.append(notebook_binding)
+    else:
+        old_notebook_ref = existing_binding.get("notebook_ref")
+        if old_notebook_ref != notebook_ref and old_notebook_ref in notebooks:
+            still_referenced = any(
+                binding is not existing_binding
+                and isinstance(binding, dict)
+                and binding.get("notebook_ref") == old_notebook_ref
+                for binding in bindings
+            )
+            if not still_referenced:
+                notebooks.remove(old_notebook_ref)
+        existing_binding.clear()
+        existing_binding.update(notebook_binding)
+    record["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    # The marked walkthrough may have been rewritten in place while retaining
+    # the same anchor. Re-evaluate phase completion even when both refs already
+    # existed; a same-ID re-teach must not preserve a stale completion badge.
+    record.pop("status", None)
+    record.pop("completed_at", None)
+    for row in st.get("phase_checklist") or []:
+        if phase_number_from_check(row.get("text") or "") == phase:
+            row["done"] = False
+    save(ws, st, "taught example：阶段 %d #%s + notebook anchor + teaching evidence"
+         % (phase, example_id))
+    return 0
+
+
 def cmd_record_phase_evidence(ws, args):
     st = _require_state(ws)
     manifest_state, manifest_reason = phase_manifest_status(ws)
@@ -1902,6 +2657,10 @@ def cmd_record_phase_evidence(ws, args):
     if plan and phase not in plan:
         _die("--phase %d 不在 study_plan.md 的阶段列表 %s 中" % (phase, sorted(plan)))
     field = "teaching_examples" if args.kind == "teaching-example" else args.kind
+    if (field == "teaching_examples"
+            and effective_interaction_style(st) == "step_by_step"):
+        _die("step_by_step 教学例题必须使用 record-taught-example --id <id> "
+             "--notebook-ref notebook/chNN.md#anchor 原子绑定，不能分开写 evidence")
     if field == "checkpoint":
         if not args.outcome:
             _die("checkpoint evidence 必须带 --outcome passed|wrong|skipped；只有题目 ID 不能证明答对")
@@ -2368,6 +3127,9 @@ def run(argv=None):
     p_set.add_argument("--language", default=None)
     p_set.add_argument("--artifact-mode", dest="artifact_mode", default=None,
                        help="output resources: chat/visual (explicit choice; never inferred from subscription)")
+    p_set.add_argument("--interaction-style", dest="interaction_style",
+                       choices=INTERACTION_STYLES, default=None,
+                       help="optional teaching cadence: batch or step_by_step")
     p_set.add_argument("--pref", action="append", default=None, help="key=value; repeatable")
     # A6：window 子命令——知识点窗口进出（3-7 天/>7 天档的窗口系统落点）
     p_wa = sub.add_parser("window-add")
@@ -2408,6 +3170,16 @@ def run(argv=None):
                             help="workspace-relative path, teaching example ID, or quiz ID")
     p_evidence.add_argument("--outcome", choices=CHECKPOINT_OUTCOMES, default=None,
                             help="required for checkpoint: passed/wrong/skipped")
+    p_taught = sub.add_parser(
+        "record-taught-example",
+        help=("effective step_by_step only: bind the current first-pending item to its "
+              "marked notebook block and manifest revision"),
+    )
+    p_taught.add_argument("--id", required=True, help="current-phase teaching example ID")
+    p_taught.add_argument(
+        "--notebook-ref", required=True,
+        help="exact notebook/chNN.md#anchor produced by a marked walkthrough write",
+    )
     p_complete = sub.add_parser(
         "complete-phase",
         help="evidence-gated completion: covered_unverified or verified")
@@ -2491,6 +3263,8 @@ def run(argv=None):
             return cmd_set_check(ws, args)
         if args.cmd == "record-phase-evidence":
             return cmd_record_phase_evidence(ws, args)
+        if args.cmd == "record-taught-example":
+            return cmd_record_taught_example(ws, args)
         if args.cmd == "complete-phase":
             return cmd_complete_phase(ws, args)
         return cmd_render(ws, args)
