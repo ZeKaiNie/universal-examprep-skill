@@ -15,3 +15,14 @@ dist/
 
 # Persistent cross-process lock metadata created while validating workspaces.
 .study_state.lock
+
+# Local provider credentials (never commit).
+.env.local
+
+# Local linked worktrees and review scratch (never package or commit).
+.tmp/
+
+# Test-created workspaces and temporary typed-Guide fixtures.
+.test-tmp/
+test-sandbox-write/
+study-guide-content-*/

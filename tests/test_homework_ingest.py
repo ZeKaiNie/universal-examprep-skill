@@ -2,15 +2,20 @@
 """A3 tests — homework/solution ingest: file classification, Q/A pairing across separate PDFs,
 inline solutions, provenance, source_type tagging, visual dependence, fail-loud orphans."""
 import json
+import io
+import hashlib
 import os
 import re
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import build_raw_input_from_workspace as B   # noqa: E402
+from material_generation import build_pending_generation  # noqa: E402
 
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
@@ -36,6 +41,21 @@ class FakeBackend(object):
     def render_page_png(self, pdf_path, page_index):
         return PNG
 
+    def page_layout(self, pdf_path, page_index):
+        """Minimal one-item geometry for strict crop-only asset fixtures."""
+        text = self.page_texts(pdf_path)[page_index]
+        return {
+            "page_bbox": [0.0, 0.0, 612.0, 792.0],
+            "text_blocks": [{
+                "bbox": [36.0, 36.0, 576.0, 756.0],
+                "text": text,
+            }],
+            "images": [],
+        }
+
+    def render_page_clip_png(self, pdf_path, page_index, bbox):
+        return PNG
+
 
 class LayoutBackend(FakeBackend):
     """Fixture backend that proves crop calls stay distinct from whole pages."""
@@ -47,7 +67,10 @@ class LayoutBackend(FakeBackend):
         self.page_calls = []
 
     def page_layout(self, pdf_path, page_index):
-        return self.layouts[os.path.basename(pdf_path)][page_index]
+        layouts = self.layouts.get(os.path.basename(pdf_path))
+        if layouts is None:
+            return super().page_layout(pdf_path, page_index)
+        return layouts[page_index]
 
     def render_page_clip_png(self, pdf_path, page_index, bbox):
         self.clip_calls.append((os.path.basename(pdf_path), page_index + 1, list(bbox)))
@@ -78,20 +101,54 @@ def _mk(tmp, names_texts):
     return mat, FakeBackend(fake)
 
 
+_RUNTIME_IDENTITY = B.exam_start._capture_runtime_identity()
+_CONFIRMED_FULL_PAIRS = set()
+
+
+def _confirm_full_workspace(workspace, materials):
+    """Authorize the exact pair used by an in-process material-builder fixture."""
+    workspace = os.path.abspath(workspace)
+    materials = os.path.abspath(materials)
+    home = os.path.join(os.path.dirname(workspace), ".examprep-home")
+    key = (os.path.normcase(workspace), os.path.normcase(materials))
+    environment = {"EXAMPREP_HOME": home}
+    if key in _CONFIRMED_FULL_PAIRS:
+        return environment
+    output = io.StringIO()
+    with mock.patch.dict(os.environ, environment), mock.patch.object(
+            B.exam_start, "_capture_runtime_identity",
+            return_value=_RUNTIME_IDENTITY), redirect_stdout(output):
+        code = B.exam_start.run([
+            "confirm", "--course", "homework-ingest-fixture",
+            "--materials", materials, "--workspace", workspace,
+            "--mode", "from_scratch", "--time-budget", "le1d",
+            "--language", "en", "--processing-mode", "full", "--json",
+        ])
+    if code != 0:
+        raise AssertionError(output.getvalue())
+    _CONFIRMED_FULL_PAIRS.add(key)
+    return environment
+
+
 def _run(mat, backend, extra=None):
     extra = list(extra or [])
     if "--asset-root" in extra:
         asset_root = extra[extra.index("--asset-root") + 1]
         workspace = os.path.dirname(os.path.dirname(os.path.abspath(asset_root)))
-        out = os.path.join(workspace, ".ingest", "source_raw_input.json")
-        report_path = os.path.join(workspace, ".ingest", "parse_report.json")
     else:
-        out = os.path.join(mat, "..", "raw.json")
-        report_path = os.path.join(mat, "..", "rep.json")
+        workspace = os.path.join(os.path.dirname(os.path.abspath(mat)), "workspace")
+    out = os.path.join(workspace, ".ingest", "source_raw_input.json")
+    report_path = os.path.join(workspace, ".ingest", "parse_report.json")
+    environment = _confirm_full_workspace(workspace, mat)
     argv = ["--materials", mat, "--out", out,
             "--report", report_path] + extra
     args = B.build_arg_parser().parse_args(argv)
-    code, payload, report = B.run(args, backend=backend)
+    with mock.patch.dict(os.environ, environment), mock.patch.object(
+            B.exam_start, "_capture_runtime_identity",
+            return_value=_RUNTIME_IDENTITY):
+        code, payload, report = B.run(
+            args, backend=backend, publication_workspace=workspace,
+        )
     return code, payload, report
 
 
@@ -280,21 +337,34 @@ class HomeworkIngest(unittest.TestCase):
         })
         ws = os.path.join(tmp, "ws")
         raw = os.path.join(ws, ".ingest", "source_raw_input.json")
+        asset_root = os.path.join(ws, "references", "assets")
+        code, payload, report = _run(
+            mat, be, ["--asset-root", asset_root]
+        )
+        self.assertEqual(code, 0, report)
         report_path = os.path.join(ws, ".ingest", "parse_report.json")
-        args = B.build_arg_parser().parse_args(["--materials", mat, "--out", raw,
-                                                "--report", report_path,
-                                                "--asset-root", os.path.join(ws, "references", "assets")])
-        code, payload, report = B.run(args, backend=be)
-        os.makedirs(os.path.dirname(raw), exist_ok=True)
-        json.dump(payload, open(raw, "w", encoding="utf-8"), ensure_ascii=False)
+        pending = build_pending_generation(
+            hashlib.sha256(B._publication_json_bytes(payload)).hexdigest(),
+            hashlib.sha256(B._publication_json_bytes(report)).hexdigest(),
+            payload, report, None,
+        )
+        B._publish_builder_transaction((
+            (report_path, report),
+            (raw, payload),
+            (os.path.join(ws, ".ingest", "material_build_pending.json"), pending),
+        ))
+        environment = _confirm_full_workspace(ws, mat)
         r1 = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "ingest.py"),
-                             "-i", raw, "-o", ws], capture_output=True, text=True, encoding="utf-8")
+                             "-i", raw, "-o", ws], capture_output=True,
+                            text=True, encoding="utf-8",
+                            env={**os.environ, **environment})
         self.assertEqual(r1.returncode, 0, r1.stdout + r1.stderr)
         bank = json.load(open(os.path.join(ws, "references", "quiz_bank.json"), encoding="utf-8"))
         hw = [q for q in bank if q.get("source_type") == "homework"]
         self.assertEqual(len(hw), 3)                              # source_type 穿 ingest 存活
         r2 = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "validate_workspace.py"), ws],
-                            capture_output=True, text=True, encoding="utf-8")
+                            capture_output=True, text=True, encoding="utf-8",
+                            env={**os.environ, **environment})
         self.assertEqual(r2.returncode, 1, r2.stdout + r2.stderr)
         self.assertIn("blocked", r2.stdout.lower())
 
@@ -3010,7 +3080,12 @@ class HomeworkIngest(unittest.TestCase):
         code, payload, report = _run(mat, be, ["--asset-root", asset_root])
         hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
         paths = [a.get("path", "") for a in hw[0].get("assets", [])]
-        self.assertTrue(any("p002" in pth for pth in paths), paths)          # 下页图一并渲染
+        self.assertFalse(any("p002" in pth for pth in paths), paths)
+        self.assertTrue(any(
+            row.get("kind") == "item_asset_crop_not_materialized"
+            and row.get("pages") == [2]
+            for row in report["ai_review"]
+        ))  # markerless adjacent pages require an explicit target crop
 
     def test_builder_retires_caption_only_wiki_gallery(self):
         tmp = tempfile.mkdtemp()
@@ -3055,7 +3130,12 @@ class HomeworkIngest(unittest.TestCase):
         code, payload, report = _run(mat, be, ["--asset-root", asset_root])
         hw = [q for q in payload["quiz_bank"] if q.get("source_type") == "homework"]
         paths = [a.get("path", "") for a in hw[0].get("assets", [])]
-        self.assertTrue(any("p002" in pth for pth in paths), paths)   # 残渣图页照样能当相邻图渲
+        self.assertFalse(any("p002" in pth for pth in paths), paths)
+        self.assertTrue(any(
+            row.get("kind") == "item_asset_crop_not_materialized"
+            and row.get("pages") == [2]
+            for row in report["ai_review"]
+        ))  # numeric residue is not proof of target-only visual content
 
     def test_lecture_needs_item_uses_original_prompt_for_adjacent(self):
         tmp = tempfile.mkdtemp()
@@ -3068,7 +3148,10 @@ class HomeworkIngest(unittest.TestCase):
         code, payload, report = _run(mat, be, ["--asset-root", asset_root])
         lec = [q for q in payload["quiz_bank"] if q["id"].startswith("lecture_quiz")]
         paths = [a.get("path", "") for a in lec[0].get("assets", [])]
-        self.assertTrue(any("p002" in pth for pth in paths), paths)   # 指引句替换不吞跨页线索
+        self.assertFalse(any("p002" in pth for pth in paths), paths)
+        self.assertIs(lec[0].get("requires_assets"), True)
+        # The cue remains a fail-closed visual dependency, but an unscoped
+        # adjacent page is not published as target evidence.
         self.assertNotIn("_prompt_text", lec[0])                      # 内部字段不出库
 
     def test_collapsed_multi_footer_still_marker_only(self):
@@ -3133,7 +3216,10 @@ class HomeworkIngest(unittest.TestCase):
         code, payload, report = _run(mat, be, ["--asset-root", asset_root])
         lec = [q for q in payload["quiz_bank"] if q["id"].startswith("lecture_quiz")]
         paths = [a.get("path", "") for a in lec[0].get("assets", [])]
-        self.assertTrue(any("p003" in pth for pth in paths), paths)   # 续页上的跨页线索也生效
+        self.assertFalse(any("p003" in pth for pth in paths), paths)
+        self.assertIs(lec[0].get("requires_assets"), True)
+        # Cross-page dependence remains fail-closed; markerless page 3 is not
+        # silently promoted to a target-only asset.
 
     def test_cn_caption_without_punct_remains_text_without_gallery(self):
         tmp = tempfile.mkdtemp()
@@ -3244,7 +3330,7 @@ class HomeworkIngest(unittest.TestCase):
             self.assertTrue(attempt_assets)
             self.assertEqual(question_assets[0]["type"], "crop_image")
             self.assertTrue(all(asset["type"] == "crop_image" for asset in attempt_assets))
-            self.assertTrue(all(asset["type"] == "page_image" for asset in answer_assets))
+            self.assertTrue(all(asset["type"] == "crop_image" for asset in answer_assets))
             self.assertTrue(all(
                 asset["source_file"] == item["source_file"]
                 for asset in question_assets
@@ -3307,11 +3393,8 @@ class HomeworkIngest(unittest.TestCase):
         self.assertEqual(report["homework_roster_files"], 1)
         self.assertEqual(report["homework_prompt_crops"], 2)
         self.assertEqual(report["homework_answer_crops"], 4)
-        self.assertEqual(len(backend.clip_calls), 6)
-        self.assertEqual(
-            [("hw_scan_sol.pdf", 1), ("hw_scan_sol.pdf", 1)],
-            backend.page_calls,
-        )
+        self.assertEqual(len(backend.clip_calls), 8)
+        self.assertEqual([], backend.page_calls)
         mapping_reviews = [
             entry for entry in report["ai_review"]
             if entry.get("kind") == "homework_roster_visual_mapping_unverified"
@@ -3617,6 +3700,8 @@ class HomeworkIngest(unittest.TestCase):
         ]
         tmp = tempfile.mkdtemp()
         mat, backend = _mk(tmp, fixture["texts"])
+        backend.page_layout = None
+        backend.render_page_clip_png = None
 
         code, payload, report = _run(mat, backend)
 

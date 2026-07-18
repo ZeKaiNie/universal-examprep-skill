@@ -13,24 +13,24 @@ import json
 import os
 import re
 
+try:
+    from .math_text_policy import count_standard_math_spans
+except ImportError:  # pragma: no cover - standalone script entrypoint
+    from math_text_policy import count_standard_math_spans
+
 try:  # package import in tests; script-directory import in CLI entrypoints
-    from . import study_guide_content, study_guide_qa
+    from . import i18n, study_guide_content, study_guide_qa
     from .asset_policy import (
-        collect_asset_roles,
-        has_tainted_official_asset,
-        iter_asset_declarations,
-        physical_asset_key,
-        student_attempt_tainted_keys,
+        quiz_bank_stat_baseline,
+        quiz_runtime_eligibility,
     )
 except ImportError:  # pragma: no cover - exercised by standalone script entrypoints
+    import i18n
     import study_guide_content
     import study_guide_qa
     from asset_policy import (
-        collect_asset_roles,
-        has_tainted_official_asset,
-        iter_asset_declarations,
-        physical_asset_key,
-        student_attempt_tainted_keys,
+        quiz_bank_stat_baseline,
+        quiz_runtime_eligibility,
     )
 
 
@@ -43,8 +43,6 @@ HIGH_RISK_ARTIFACT_REASONS = frozenset((
     "homework_roster_visual_mapping_unverified",
 ))
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
-PROMPT_ASSET_ROLES = frozenset(("question_context", "figure", "diagram", "table"))
-ANSWER_ASSET_ROLES = frozenset(("answer_context", "worked_solution"))
 
 
 def _load_json(path, default=None):
@@ -106,17 +104,6 @@ def _current_chapter(workspace, requested=None):
     state = _load_json(os.path.join(workspace, "study_state.json"), {})
     return _chapter_number(state.get("current_chapter")) or _chapter_number(
         state.get("current_phase")) or 1
-
-
-def _chapter_matches(item, chapter):
-    return isinstance(item, dict) and _chapter_number(
-        item.get("chapter_id") or item.get("chapter") or item.get("phase")) == chapter
-
-
-def _has_answer(value):
-    if value in (None, "", [], {}):
-        return False
-    return not (isinstance(value, str) and not value.strip())
 
 
 def _unsafe_text_counts(text):
@@ -366,23 +353,36 @@ def chapter_math_readiness(workspace, chapter):
 
     formula_count = 0
     substitution_count = 0
+    symbol_count = 0
+    delimited_span_count = 0
     if isinstance(manifest, dict):
-        for point in manifest.get("knowledge_points") or []:
-            if isinstance(point, dict):
-                formula_count += sum(
-                    1 for formula in (point.get("formulas") or [])
-                    if isinstance(formula, dict) and str(formula.get("latex") or "").strip()
-                )
-        for walkthrough in manifest.get("walkthroughs") or []:
-            if not isinstance(walkthrough, dict):
-                continue
-            substitution_count += sum(
-                1 for use in (walkthrough.get("formula_uses") or [])
-                if isinstance(use, dict) and str(use.get("substitution") or "").strip()
-            )
+        # The renderer accepts durable math in every localized student-facing
+        # field, not only in the top-level formula catalogue.  Traverse the
+        # validated typed manifest once so dependency preflight cannot report
+        # ``none`` while an answer explanation or worked step still needs the
+        # math renderer.  Structured math fields count even when their content
+        # is a simple symbol without a TeX command.
+        stack = [(None, manifest)]
+        while stack:
+            key, value = stack.pop()
+            if isinstance(value, dict):
+                stack.extend((child_key, child) for child_key, child in value.items())
+            elif isinstance(value, list):
+                stack.extend((key, child) for child in value)
+            elif isinstance(value, str):
+                text = value.strip()
+                delimited_span_count += count_standard_math_spans(value)
+                if text and key == "latex":
+                    formula_count += 1
+                elif text and key == "substitution":
+                    substitution_count += 1
+                elif text and key == "symbol":
+                    symbol_count += 1
 
     status = "needs_recovery" if reasons else (
-        "standard" if formula_count or substitution_count else "none"
+        "standard" if (
+            formula_count or substitution_count or symbol_count or delimited_span_count
+        ) else "none"
     )
     return {
         "status": status,
@@ -390,6 +390,8 @@ def chapter_math_readiness(workspace, chapter):
         "counts": {
             "formulas": formula_count,
             "substitutions": substitution_count,
+            "symbols": symbol_count,
+            "delimited_math_spans": delimited_span_count,
             "control_characters": unsafe["control_characters"],
             "replacement_characters": unsafe["replacement_characters"],
             "active_review_issues": len(review_rows),
@@ -413,12 +415,9 @@ def chapter_math_readiness(workspace, chapter):
 
 
 def _artifact_mode(state):
-    raw = state.get("artifact_mode") if isinstance(state, dict) else None
-    aliases = {
-        "visual": "visual", "chat": "chat", "视觉": "visual",
-        "视觉教材": "visual", "可打印教材": "visual",
-    }
-    return aliases.get(raw, "chat")
+    """Compatibility helper returning the mode that may execute now."""
+
+    return i18n.workspace_effective_artifact_mode(state)
 
 
 def _validate_visual_receipt(workspace, chapter):
@@ -562,6 +561,103 @@ def capability_readiness(workspace, errors=(), warnings=(), stats=None, chapter=
     workspace = os.path.abspath(workspace)
     chapter = _current_chapter(workspace, chapter)
     stats = stats or {}
+    state = _load_json(os.path.join(workspace, "study_state.json"), {})
+    if i18n.workspace_processing_mode(state) == "lightweight":
+        if "lightweight_session" in stats:
+            health = {"errors": [], "warnings": [], "stats": stats}
+        else:
+            try:
+                try:
+                    from . import lightweight_session as _lightweight
+                except ImportError:  # pragma: no cover - standalone script imports
+                    import lightweight_session as _lightweight
+                health = _lightweight.workspace_health(workspace, state)
+            except (OSError, TypeError, ValueError) as exc:
+                health = {
+                    "errors": [str(exc)], "warnings": [],
+                    "stats": {"lightweight_session": "invalid"},
+                }
+        health_errors = list(health.get("errors") or [])
+        health_warnings = list(health.get("warnings") or [])
+        health_stats = health.get("stats") if isinstance(health.get("stats"), dict) else {}
+        structural_reasons = []
+        if errors:
+            structural_reasons.append("workspace_validation_error")
+        if health_errors:
+            structural_reasons.append("lightweight_session_invalid")
+        structural = _result(
+            "blocked" if structural_reasons else "ready", structural_reasons,
+            errors=len(errors) + len(health_errors),
+            warnings=len(warnings) + len(health_warnings),
+            lightweight_session=health_stats.get("lightweight_session"),
+        )
+        current = health_stats.get("lightweight_current_phase_batches") or {}
+        teaching_reasons = []
+        if structural["status"] == "blocked":
+            teaching_reasons.append("workspace_validation_error")
+            teaching_status = "blocked"
+        elif current.get("planned", 0) > 0:
+            teaching_reasons.append("lightweight_visual_batch_not_ready")
+            teaching_status = "usable_with_gaps"
+        elif current.get("visual_ready", 0) > 0:
+            teaching_status = "ready"
+        elif current.get("taught", 0) > 0:
+            teaching_status = "ready"
+        else:
+            teaching_reasons.append("lightweight_current_batch_not_planned")
+            teaching_status = "usable_with_gaps"
+        teaching = _result(
+            teaching_status, teaching_reasons, chapter=chapter,
+            current_phase_batches=current,
+            process_scope="current_phase_selected_pages_only",
+        )
+        # Routine mount/capability checks must remain cheap: capture filesystem
+        # metadata only.  Parsing, hashing, asset decoding, and eligibility run
+        # only when the learner explicitly starts a quiz or records/completes a
+        # checkpoint.
+        try:
+            bank_stat = quiz_bank_stat_baseline(workspace)
+            bank_stat_error = None
+        except (OSError, ValueError) as exc:
+            bank_stat = None
+            bank_stat_error = str(exc)[:500]
+        if bank_stat_error:
+            quiz_status = "blocked"
+            quiz_reasons = ["lightweight_quiz_bank_stat_unsafe"]
+        elif bank_stat["exists"]:
+            quiz_status = "usable_with_gaps"
+            quiz_reasons = ["lightweight_quiz_runtime_validation_deferred"]
+        else:
+            quiz_status = "usable_with_gaps"
+            quiz_reasons = ["lightweight_quiz_bank_not_loaded"]
+        quiz = _result(
+            quiz_status, quiz_reasons,
+            chapter=chapter, candidate_items=None,
+            selection_gate="deferred_until_explicit_quiz_transition",
+            bank_present=bool(bank_stat and bank_stat["exists"]),
+            bank_size_bytes=(bank_stat or {}).get("size_bytes"),
+            bank_mtime_ns=(bank_stat or {}).get("mtime_ns"),
+            exclusion_counts=None,
+            stat_error=bank_stat_error,
+        )
+        artifact = _result(
+            "blocked", ("lightweight_artifact_generation_disabled",),
+            chapter=chapter, language=(state or {}).get("language"),
+            processing_mode="lightweight", artifact_mode="chat",
+            artifact_mode_preference=i18n.workspace_artifact_mode(state),
+            artifact_mode_effective="chat",
+            artifact_mode_dormant=i18n.workspace_artifact_mode_dormant(state),
+            answer_explanation_mode=i18n.workspace_answer_explanation_mode(state),
+            generation_enabled=False,
+            reason="Study Guide/PDF generation is intentionally disabled in lightweight mode",
+        )
+        return {
+            "chapter": chapter,
+            "workspace_structural": structural,
+            "teaching_ready": teaching,
+            "quiz_ready": quiz,
+            "artifact_ready": artifact,
+        }
     try:
         # Lazy import avoids the module cycle: validate_workspace imports this readiness matrix,
         # while direct readiness callers still need the exact same three-layer asset snapshot.
@@ -622,54 +718,31 @@ def capability_readiness(workspace, errors=(), warnings=(), stats=None, chapter=
         review_reasons=review_reasons,
     )
 
-    bank = _load_json(os.path.join(workspace, "references", "quiz_bank.json"), [])
-    chapter_items = [row for row in (bank if isinstance(bank, list) else [])
-                     if _chapter_matches(row, chapter) and row.get("gradable") is not False]
-    invalid = collections.Counter()
-    valid = 0
-    for item in chapter_items:
-        if not _has_answer(item.get("answer")):
-            invalid["missing_answer"] += 1
-            continue
-        if item.get("type") == "subjective" and not (
-                isinstance(item.get("keywords"), list)
-                and any(isinstance(value, str) and value.strip()
-                        for value in item.get("keywords"))):
-            invalid["subjective_keywords_missing"] += 1
-            continue
-        visual_dependent = (
-            item.get("requires_assets") is True
-            or item.get("maybe_requires_assets") is True
-            or item.get("question_text_status") in ("stub", "page_reference")
-        )
-        if visual_dependent:
-            prompt_assets = [
-                asset for asset in (item.get("assets") or [])
-                if (isinstance(asset, dict)
-                    and asset.get("role") in PROMPT_ASSET_ROLES
-                    and physical_asset_key(asset.get("path")) not in asset_policy["tainted_keys"])
-            ]
-            if not prompt_assets:
-                invalid["question_asset_unavailable"] += 1
-                continue
-        valid += 1
+    runtime_quiz = quiz_runtime_eligibility(
+        workspace, asset_policy, chapter=chapter
+    )
+    valid = len(runtime_quiz["eligible_items"])
+    scoped_items = runtime_quiz["scoped_items"]
+    invalid = runtime_quiz["exclusion_counts"]
     quiz_reasons = []
     if errors:
         quiz_reasons.append("workspace_validation_error")
     quiz_reasons.extend(asset_policy_reasons)
-    if not chapter_items:
+    quiz_reasons.extend(runtime_quiz["global_errors"])
+    if not scoped_items:
         quiz_reasons.append("chapter_quiz_pool_empty")
-    if not valid and chapter_items:
-        quiz_reasons.append("no_gradable_chapter_items")
+    if not valid and scoped_items:
+        quiz_reasons.append("no_runtime_eligible_chapter_items")
     quiz_status = "blocked" if quiz_reasons else (
         "usable_with_gaps" if invalid else "ready")
     quiz = _result(
         quiz_status, quiz_reasons,
-        chapter=chapter, candidate_items=len(chapter_items), valid_items=valid,
-        excluded_items=sum(invalid.values()), exclusions=dict(sorted(invalid.items())),
+        chapter=chapter, candidate_items=scoped_items, valid_items=valid,
+        excluded_items=sum(invalid.values()), exclusions=invalid,
+        selection_gate="shared_runtime_eligibility",
+        bank_binding_id=(runtime_quiz.get("bank_binding") or {}).get("binding_id"),
     )
 
-    state = _load_json(os.path.join(workspace, "study_state.json"), {})
     language = state.get("language") if isinstance(state, dict) else None
     math = chapter_math_readiness(workspace, chapter)
     artifact_reasons = []
@@ -717,6 +790,11 @@ def capability_readiness(workspace, errors=(), warnings=(), stats=None, chapter=
         math_reasons=math["reason_codes"],
         math_counts=math["counts"],
         artifact_mode=_artifact_mode(state),
+        artifact_mode_preference=i18n.workspace_artifact_mode(state),
+        artifact_mode_effective=i18n.workspace_effective_artifact_mode(state),
+        artifact_mode_dormant=i18n.workspace_artifact_mode_dormant(state),
+        processing_mode=i18n.workspace_processing_mode(state),
+        answer_explanation_mode=i18n.workspace_answer_explanation_mode(state),
         receipt=receipt,
     )
     return {

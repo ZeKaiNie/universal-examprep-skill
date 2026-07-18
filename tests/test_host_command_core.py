@@ -65,7 +65,7 @@ def complete_progress_state():
         "time_budget": None,
         "language": None,
         "artifact_mode": "chat",
-        "preferences": {},
+        "preferences": {"interaction_style": "batch"},
         "mistake_archive": [],
         "confusion_log": [],
         "knowledge_window": [],

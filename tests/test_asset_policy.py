@@ -2,7 +2,9 @@ import hashlib
 import os
 import tempfile
 import unittest
+from unittest import mock
 
+import scripts.asset_policy as asset_policy_module
 from scripts.asset_policy import (
     audit_asset_policy,
     is_student_attempt_tainted,
@@ -84,6 +86,32 @@ class AssetPolicyTest(unittest.TestCase):
         self.assertFalse(is_student_attempt_tainted(
             "references/assets/official.png", tainted
         ))
+
+    def test_workspace_identity_capture_is_deduplicated_and_rechecked(self):
+        asset = {
+            "path": "references/assets/shared.png",
+            "role": "question_context",
+        }
+        quiz = {"id": "q1", "chapter": 1, "assets": [dict(asset)]}
+        teaching = {"id": "q1", "chapter": 1, "assets": [dict(asset)]}
+        unit = self.unit(
+            "unit_q", "question", external_id="q1", chapter_id="ch01",
+            path=asset["path"], role=asset["role"], assets=[dict(asset)],
+        )
+        identity = ("file", 1, 2)
+        with mock.patch.object(
+                asset_policy_module, "_asset_workspace_root", return_value="root"), \
+                mock.patch.object(
+                    asset_policy_module, "_stable_workspace_asset_identity",
+                    return_value=(identity, None),
+                ) as capture:
+            audit_asset_policy(
+                quiz_rows=[quiz], teaching_rows=[teaching], content_units=[unit],
+                workspace="workspace",
+            )
+        # One initial capture for the unique lexical path plus one end-of-snapshot
+        # drift recheck, independent of the number of repeated declarations.
+        self.assertEqual(2, capture.call_count)
 
     def test_workspace_audit_collapses_hardlink_aliases_before_tainting(self):
         with tempfile.TemporaryDirectory() as workspace:

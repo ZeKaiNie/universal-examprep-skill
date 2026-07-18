@@ -65,7 +65,9 @@ class IngestCourseTest(unittest.TestCase):
                     "--ingest-adapter", "docling", "--json",
                 ])
             self.assertEqual(2, code)
-            self.assertIn("host-injected adapter_runner", json.loads(output.getvalue())["error"])
+            error = json.loads(output.getvalue())["error"]
+            self.assertIn("remote/cloud host integration", error)
+            self.assertIn("never downloads, installs, imports, or invokes", error)
 
     def test_validator_protocol_rejects_crash_or_inconsistent_json(self):
         bad_results = [
@@ -111,6 +113,7 @@ class IngestCourseTest(unittest.TestCase):
                         "--mode", "from_scratch",
                         "--time-budget", "le1d",
                         "--language", "en",
+                        "--processing-mode", "full",
                         "--json",
                     ])
                 self.assertEqual(0, confirmation_code, confirmation_output.getvalue())
@@ -817,6 +820,25 @@ class IngestCourseTest(unittest.TestCase):
             (materials / "ch01_lecture.txt").write_text(
                 "Chapter 1\nA source-backed explanation.", encoding="utf-8"
             )
+            home = root / ".examprep-home"
+            identity = exam_start._capture_runtime_identity()
+            confirmation_output = io.StringIO()
+            with mock.patch.dict(os.environ, {"EXAMPREP_HOME": str(home)}), \
+                    mock.patch.object(
+                        exam_start, "_capture_runtime_identity",
+                        return_value=identity,
+                    ), contextlib.redirect_stdout(confirmation_output):
+                confirmation_code = exam_start.run([
+                    "confirm", "--course", "test-course",
+                    "--materials", str(materials),
+                    "--workspace", str(workspace),
+                    "--mode", "from_scratch", "--time-budget", "le1d",
+                    "--language", "en", "--processing-mode", "full",
+                    "--json",
+                ])
+            self.assertEqual(
+                0, confirmation_code, confirmation_output.getvalue()
+            )
             ready = self._start_gate(True)
             drifted = self._start_gate(False)
             captured_plans = []
@@ -833,7 +855,9 @@ class IngestCourseTest(unittest.TestCase):
                 )
 
             output = io.StringIO()
-            with mock.patch.object(
+            with mock.patch.dict(
+                    os.environ, {"EXAMPREP_HOME": str(home)}), \
+                    mock.patch.object(
                     ingest_course.exam_start,
                     "check_start_gate",
                     side_effect=(ready, ready, ready, drifted)), \
@@ -1249,6 +1273,25 @@ class IngestCourseTest(unittest.TestCase):
             (materials / "ch01_lecture.txt").write_text(
                 "Chapter 1\nA source-backed explanation.", encoding="utf-8"
             )
+            home = root / ".examprep-home"
+            identity = exam_start._capture_runtime_identity()
+            confirmation_output = io.StringIO()
+            with mock.patch.dict(os.environ, {"EXAMPREP_HOME": str(home)}), \
+                    mock.patch.object(
+                        exam_start, "_capture_runtime_identity",
+                        return_value=identity,
+                    ), contextlib.redirect_stdout(confirmation_output):
+                confirmation_code = exam_start.run([
+                    "confirm", "--course", "test-course",
+                    "--materials", str(materials),
+                    "--workspace", str(workspace),
+                    "--mode", "from_scratch", "--time-budget", "le1d",
+                    "--language", "en", "--processing-mode", "full",
+                    "--json",
+                ])
+            self.assertEqual(
+                0, confirmation_code, confirmation_output.getvalue()
+            )
             ready = self._start_gate(True)
             raw_input = {
                 "course_name": "Generation A",
@@ -1292,7 +1335,9 @@ class IngestCourseTest(unittest.TestCase):
                 return real_run(command)
 
             output = io.StringIO()
-            with mock.patch.object(
+            with mock.patch.dict(
+                    os.environ, {"EXAMPREP_HOME": str(home)}), \
+                    mock.patch.object(
                     ingest_course.exam_start,
                     "check_start_gate",
                     return_value=ready), \
@@ -1422,7 +1467,7 @@ class IngestCourseTest(unittest.TestCase):
                         "--materials", str(materials),
                         "--workspace", str(workspace),
                         "--mode", "from_scratch", "--time-budget", "le1d",
-                        "--language", "en", "--json",
+                        "--language", "en", "--processing-mode", "full", "--json",
                     ])
                 self.assertEqual(0, confirmation_code, confirmation_output.getvalue())
                 state_before = (workspace / "study_state.json").read_bytes()
@@ -1473,7 +1518,7 @@ class IngestCourseTest(unittest.TestCase):
                     "confirm", "--course", "test-course",
                     "--materials", str(materials), "--workspace", str(workspace),
                     "--mode", "from_scratch", "--time-budget", "le1d",
-                    "--language", "en", "--json",
+                    "--language", "en", "--processing-mode", "full", "--json",
                 ])
             self.assertEqual(0, confirmation_code, confirmation_output.getvalue())
 

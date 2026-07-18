@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 try:
+    from . import exam_start
     from .ingestion.claims import (
         CLAIM_RECEIPTS_DIR,
         CLAIM_RECORDS_PATH,
@@ -24,11 +25,7 @@ try:
         verify_claim_batch,
         verify_claim_records,
     )
-    from .ingestion.dedup import (
-        load_canonical_groups,
-        load_source_conflicts,
-        validate_workspace_fact_integrity,
-    )
+    from .ingestion.dedup import validate_workspace_fact_integrity
     from .ingestion.identifiers import file_sha256, is_link_or_reparse, safe_workspace_entry
     from .ingestion.models import ContentUnit, SchemaValidationError, SourceRecord
     from .ingestion.pipeline import verify_material_build_receipt
@@ -37,6 +34,7 @@ try:
         workspace_publication_lock,
     )
 except ImportError:
+    import exam_start
     from ingestion.claims import (
         CLAIM_RECEIPTS_DIR,
         CLAIM_RECORDS_PATH,
@@ -51,11 +49,7 @@ except ImportError:
         verify_claim_batch,
         verify_claim_records,
     )
-    from ingestion.dedup import (
-        load_canonical_groups,
-        load_source_conflicts,
-        validate_workspace_fact_integrity,
-    )
+    from ingestion.dedup import validate_workspace_fact_integrity
     from ingestion.identifiers import file_sha256, is_link_or_reparse, safe_workspace_entry
     from ingestion.models import ContentUnit, SchemaValidationError, SourceRecord
     from ingestion.pipeline import verify_material_build_receipt
@@ -116,20 +110,52 @@ def _pipeline_version(root):
             or type(document.get("schema_version")) is not int
             or document.get("schema_version") not in (1, 2)):
         raise ClaimValidationError("ingestion build manifest has an invalid schema_version")
+    version = document.get("pipeline_version")
+    if version not in ("ingestion-v1", "ingestion-v2"):
+        raise ClaimValidationError("ingestion build manifest pipeline_version is unsupported")
+    if version == "ingestion-v2" and document["schema_version"] != 2:
+        raise ClaimValidationError(
+            "current ingestion-v2 claim operations require build manifest schema_version 2"
+        )
     try:
         verify_material_build_receipt(
             root,
             build_manifest=document,
-            required=document["schema_version"] == 2,
+            required=(version == "ingestion-v2"),
         )
     except Exception as exc:
         raise ClaimValidationError(
             "ingestion material generation is invalid: %s" % exc
         ) from exc
-    version = document.get("pipeline_version")
-    if version not in ("ingestion-v1", "ingestion-v2"):
-        raise ClaimValidationError("ingestion build manifest pipeline_version is unsupported")
     return version
+
+
+def _require_ingestion_v2(root, operation):
+    """Reject every claims write route unless the current build is v2.
+
+    This check is intentionally separate from the full-processing preference
+    gate.  A legacy ingestion-v1 workspace may still use the separate,
+    read-only canonical Study Guide validation seam, but it must never import
+    or create claim records or publish a new claim-verification receipt.
+    """
+
+    version = _pipeline_version(root)
+    if version != "ingestion-v2":
+        raise ClaimValidationError(
+            "%s is available only for ingestion-v2; ingestion-v1 is read-only "
+            "and may validate only its existing canonical Study Guide"
+            % operation
+        )
+    return version
+
+
+def _validate_fixed_command_paths(args):
+    """Validate immutable claim control paths before workspace generation gates."""
+
+    _canonical_claim_path(args.claims)
+    if args.command == "verify":
+        chapter_id = _chapter(args.chapter)
+        _canonical_receipt_path(args.receipt, chapter_id)
 
 
 @contextmanager
@@ -213,6 +239,7 @@ def _emit(payload, as_json):
 def _run_import(args):
     root = _workspace(args.workspace)
     claims_relative = _canonical_claim_path(args.claims)
+    _require_ingestion_v2(root, "claim import")
     source = Path(os.path.abspath(args.input_claims))
     if source.is_symlink() or not source.is_file():
         raise ClaimValidationError("--input-claims must be a regular non-symlink file")
@@ -235,6 +262,7 @@ def _run_import(args):
 def _run_create(args):
     root = _workspace(args.workspace)
     claims_relative = _canonical_claim_path(args.claims)
+    _require_ingestion_v2(root, "claim creation")
     source = Path(os.path.abspath(args.input_proposals))
     if source.is_symlink() or not source.is_file():
         raise ClaimValidationError("--input-proposals must be a regular non-symlink file")
@@ -297,6 +325,7 @@ def _run_verify(args):
     chapter_id = _chapter(args.chapter)
     claims_relative = _canonical_claim_path(args.claims)
     receipt_relative = _canonical_receipt_path(args.receipt, chapter_id)
+    _require_ingestion_v2(root, "claim receipt publication")
     manifest_path = _entry(root, args.manifest, "guide manifest")
     # A verification receipt must not bless malformed JSON, even though it
     # deliberately does not interpret the manifest's semantic assertions.
@@ -307,37 +336,26 @@ def _run_verify(args):
     canonical_groups_path = _entry(root, CANONICAL_GROUPS_PATH, "canonical groups")
     source_conflicts_path = _entry(root, SOURCE_CONFLICTS_PATH, "source conflicts")
 
-    pipeline_version = _pipeline_version(root)
-    fact_integrity = (
-        validate_workspace_fact_integrity(root)
-        if pipeline_version == "ingestion-v2" else None
-    )
+    fact_integrity = validate_workspace_fact_integrity(root)
     rows = load_claim_records(
         root,
         claims_relative,
-        allow_empty=(pipeline_version == "ingestion-v2"),
+        allow_empty=True,
     )
     units = _load_units(root)
     sources = _load_sources(root)
-    # v1 strictly parses the two receipt-bound sidecars.  v2 first validates the
-    # complete manifest-bound/live-rederived fact snapshot above.
-    if fact_integrity is None:
-        load_canonical_groups(root, CANONICAL_GROUPS_PATH)
-        conflicts = load_source_conflicts(root, SOURCE_CONFLICTS_PATH)
-    else:
-        conflicts = fact_integrity["conflicts"]
-    if pipeline_version == "ingestion-v2":
-        unresolved = sorted(
-            conflict.conflict_id
-            for conflict in conflicts
-            if conflict.status == "unresolved"
+    conflicts = fact_integrity["conflicts"]
+    unresolved = sorted(
+        conflict.conflict_id
+        for conflict in conflicts
+        if conflict.status == "unresolved"
+    )
+    if unresolved:
+        raise ClaimValidationError(
+            "ingestion-v2 claim verification is blocked by unresolved source "
+            "conflicts: %r" % unresolved
         )
-        if unresolved:
-            raise ClaimValidationError(
-                "ingestion-v2 claim verification is blocked by unresolved source "
-                "conflicts: %r" % unresolved
-            )
-        validate_guide_claim_coverage(rows, manifest, chapter_id, units)
+    validate_guide_claim_coverage(rows, manifest, chapter_id, units)
     bound_hashes = {
         "source_manifest_sha256": file_sha256(source_manifest_path),
         "content_units_sha256": file_sha256(content_units_path),
@@ -345,11 +363,7 @@ def _run_verify(args):
         "source_conflicts_sha256": file_sha256(source_conflicts_path),
         "claim_records_sha256": file_sha256(claim_path),
     }
-    fact_snapshot = fact_integrity["snapshot"] if fact_integrity is not None else {
-        "schema_version": 1,
-        "pipeline_version": "ingestion-v1",
-        "inputs": dict(bound_hashes),
-    }
+    fact_snapshot = fact_integrity["snapshot"]
     receipt = verify_claim_records(
         rows,
         units,
@@ -363,8 +377,6 @@ def _run_verify(args):
     )
     receipt_path = _entry(root, receipt_relative, "receipt destination", must_exist=False)
     def recheck_before_receipt_publish():
-        if fact_integrity is None:
-            return
         current = validate_workspace_fact_integrity(root)["snapshot"]
         if current != fact_integrity["snapshot"]:
             raise ClaimValidationError(
@@ -424,7 +436,28 @@ def run(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     root = _workspace(args.workspace)
+    # Preserve the fixed control-file contract even when the workspace has no
+    # valid build manifest.  These checks are read-only and precede every gate.
+    _validate_fixed_command_paths(args)
+    try:
+        exam_start.require_full_processing(
+            str(root), purpose="Study Guide claim authoring/verification"
+        )
+    except exam_start.FullProcessingRequired as exc:
+        raise ClaimValidationError(str(exc)) from exc
+    # Prove v2 before publication-lock acquisition; the lock itself may create
+    # host lock state and therefore must not be the first v1 rejection point.
+    _require_ingestion_v2(root, "Study Guide claim authoring/verification")
     with _claim_workspace_lock(root):
+        try:
+            exam_start.require_full_processing(
+                str(root), purpose="Study Guide claim authoring/verification"
+            )
+        except exam_start.FullProcessingRequired as exc:
+            raise ClaimValidationError(str(exc)) from exc
+        # Recheck under the publication lock so generation drift between the
+        # preflight proof and lock acquisition cannot reach a claims write.
+        _require_ingestion_v2(root, "Study Guide claim authoring/verification")
         if args.command == "import":
             payload = _run_import(args)
         elif args.command == "create":

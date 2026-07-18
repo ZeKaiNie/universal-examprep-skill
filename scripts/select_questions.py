@@ -21,6 +21,11 @@ import json
 import os
 import sys
 
+try:
+    from .asset_policy import canonical_chapter_key
+except ImportError:  # standalone script entrypoint
+    from asset_policy import canonical_chapter_key
+
 for _s in ("stdout", "stderr"):
     try:
         getattr(sys, _s).reconfigure(encoding="utf-8")
@@ -49,6 +54,49 @@ def load_bank(ws):
     return [q for q in bank if isinstance(q, dict) and q.get("id") is not None]
 
 
+def load_runtime_bank(ws, chapter=None):
+    """Strict-load the live bank only at an explicit selection transition."""
+
+    try:
+        try:
+            from . import i18n, lightweight_session, validate_workspace
+            from .asset_policy import quiz_runtime_eligibility
+        except ImportError:  # standalone script entrypoint
+            import i18n
+            import lightweight_session
+            import validate_workspace
+            from asset_policy import quiz_runtime_eligibility
+
+        state_path = os.path.join(ws, "study_state.json")
+        ws_real = os.path.normcase(os.path.realpath(ws))
+        state_real = os.path.normcase(os.path.realpath(state_path))
+        if (os.path.islink(state_path) or not os.path.isfile(state_path)
+                or (state_real != ws_real
+                    and not state_real.startswith(ws_real + os.sep))):
+            raise ValueError("study_state.json is missing, linked, or outside workspace")
+        with open(state_path, "r", encoding="utf-8") as stream:
+            state = json.load(
+                stream,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError("non-finite JSON constant: %s" % value)
+                ),
+            )
+        if not isinstance(state, dict):
+            raise ValueError("study_state.json top level must be an object")
+        baseline = None
+        if i18n.workspace_processing_mode(state) == "lightweight":
+            baseline = lightweight_session.quiz_bank_baseline(ws)
+        policy = validate_workspace.workspace_asset_policy_snapshot(ws)
+        result = quiz_runtime_eligibility(
+            ws, policy, chapter=chapter, baseline=baseline
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        _die("题库 runtime 安全门禁无法建立: %s" % exc)
+    if result["global_errors"]:
+        _die("题库 runtime 安全门禁阻塞: %s" % ", ".join(result["global_errors"]))
+    return list(result["eligible_items"]), result
+
+
 def _chapter_of(q):
     c = q.get("chapter") if q.get("chapter") is not None else q.get("phase")
     return str(c) if c is not None else None
@@ -65,9 +113,13 @@ def match(q, args):
         if q.get("source_type") not in args.source_type:
             return False
     if args.chapter is not None:
-        keys = {str(q.get("chapter")) if q.get("chapter") is not None else None,
-                str(q.get("phase")) if q.get("phase") is not None else None} - {None}
-        if str(args.chapter) not in keys:              # chapter OR phase（题可同时带原章号与复习阶段）
+        keys = {
+            canonical_chapter_key(q.get(name), allow_phase=True)
+            for name in ("chapter", "phase", "chapter_id")
+            if q.get(name) is not None
+        } - {None}
+        target = canonical_chapter_key(args.chapter, allow_phase=True)
+        if target not in keys:                         # chapter OR phase（题可同时带原章号与复习阶段）
             return False
     if args.knowledge_point:
         kps = q.get("knowledge_points") or []
@@ -170,7 +222,7 @@ def run(argv=None):
         if v is not None and not 1 <= v <= 5:
             _die("--%s 必须在 1–5 内" % k.replace("_", "-"))
 
-    bank = load_bank(args.workspace)
+    bank, runtime = load_runtime_bank(args.workspace, chapter=args.chapter)
     if args.export_sqlite:
         export_sqlite(bank, args.export_sqlite)
         sys.stderr.write("[+] sqlite 缓存: %s（生成物，勿提交）\n" % args.export_sqlite)   # stdout 留给 --json
@@ -189,6 +241,9 @@ def run(argv=None):
     if args.json:
         print(json.dumps({"total_matched": total, "returned": len(hits),
                           "untagged_excluded": untagged,
+                          "runtime_scoped_items": runtime["scoped_items"],
+                          "runtime_exclusion_counts": runtime["exclusion_counts"],
+                          "bank_binding_id": runtime["bank_binding"]["binding_id"],
                           "items": [{"id": str(q["id"]), "type": q.get("type"),
                                      "chapter": q.get("chapter"), "phase": q.get("phase"),
                                      "source_type": q.get("source_type"),
@@ -199,6 +254,10 @@ def run(argv=None):
                                     for q in hits]}, ensure_ascii=False, indent=2))
         return 0
     print("匹配 %d 题（显示 %d）" % (total, len(hits)))
+    if runtime["exclusion_counts"]:
+        print("[!] runtime 安全门禁排除: %s" % ", ".join(
+            "%s=%d" % pair for pair in sorted(runtime["exclusion_counts"].items())
+        ))
     for q in hits:
         print("- [#%s] ch%s %s%s%s %s" % (
             q["id"], _chapter_of(q) or "?",

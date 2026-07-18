@@ -37,6 +37,23 @@ def _runner_pages(pages, discovered_page_count, warnings=None):
     }
 
 
+class _FixtureAdapter(A._AdapterBase):
+    """Exercise the generic local runner contract without naming a heavy parser.
+
+    Docling and MinerU are deliberately remote/cloud-host-only in the student
+    runtime.  The generic validation tests below still need a deterministic
+    in-process runner, so they use a test-only adapter ID that cannot be
+    selected by production resolution.
+    """
+
+    adapter_id = "fixture"
+
+    def _run(self, request):
+        if self.runner is None:
+            raise A.AdapterUnavailableError("fixture runner is missing")
+        return self.runner(request)
+
+
 class IngestionAdapterContractTest(unittest.TestCase):
     def test_core_text_request_and_receipt_are_content_addressed_and_deterministic(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -88,7 +105,7 @@ class IngestionAdapterContractTest(unittest.TestCase):
             self.assertEqual([page["page"] for page in result.pages], [1, 3])
             self.assertEqual(result.receipt.requested_pages, (1, 3))
 
-    def test_vendor_runner_is_normalized_without_importing_vendor_package(self):
+    def test_generic_runner_is_normalized_without_a_vendor_package(self):
         with tempfile.TemporaryDirectory() as temp:
             path = os.path.join(temp, "source.pdf")
             with open(path, "wb") as stream:
@@ -101,12 +118,11 @@ class IngestionAdapterContractTest(unittest.TestCase):
                 "discovered_page_count": 3,
                 "warnings": ["formula tree retained as text"],
             })
-            with mock.patch.object(A.importlib.util, "find_spec", return_value=None):
-                result = A.DoclingAdapter(runner=runner).extract(request)
+            result = _FixtureAdapter(runner=runner).extract(request)
 
             runner.assert_called_once_with(request)
             self.assertEqual(result.warnings, ("formula tree retained as text",))
-            self.assertEqual(result.receipt.adapter, "docling")
+            self.assertEqual(result.receipt.adapter, "fixture")
             self.assertIsNone(result.receipt.module)
             self.assertEqual(result.receipt.produced_pages, (2,))
             self.assertEqual(result.receipt.discovered_page_count, 3)
@@ -120,12 +136,12 @@ class IngestionAdapterContractTest(unittest.TestCase):
                 path, "source.pdf", "application/pdf")
             complete = _runner_pages(
                 [_page("source.pdf", number) for number in (1, 2, 3)], 3)
-            result = A.DoclingAdapter(runner=lambda unused: complete).extract(request)
+            result = _FixtureAdapter(runner=lambda unused: complete).extract(request)
             self.assertEqual((1, 2, 3), result.receipt.produced_pages)
             incomplete = _runner_pages(
                 [_page("source.pdf", number) for number in (1, 3)], 3)
             with self.assertRaisesRegex(A.AdapterContractError, "contiguous"):
-                A.DoclingAdapter(runner=lambda unused: incomplete).extract(request)
+                _FixtureAdapter(runner=lambda unused: incomplete).extract(request)
 
     def test_materialized_assets_are_regular_files_under_root_with_exact_hashes(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -147,18 +163,18 @@ class IngestionAdapterContractTest(unittest.TestCase):
             request = A.ExtractionRequest.from_path(
                 path, "source.pdf", "application/pdf", asset_root=asset_root)
             runner = lambda unused: _runner_pages([page], 1)
-            A.DoclingAdapter(runner=runner).extract(request)
+            _FixtureAdapter(runner=runner).extract(request)
             bad = _runner_pages([dict(page)], 1)
             bad["pages"][0] = dict(page)
             bad["pages"][0]["elements"] = [dict(page["elements"][0])]
             bad["pages"][0]["elements"][0]["asset_sha256"] = "0" * 64
             with self.assertRaisesRegex(A.AdapterContractError, "hash"):
-                A.DoclingAdapter(runner=lambda unused: bad).extract(request)
+                _FixtureAdapter(runner=lambda unused: bad).extract(request)
             with mock.patch.object(
                     A, "is_link_or_reparse",
                     side_effect=lambda value: os.path.basename(os.fspath(value)) == "figure.png"):
                 with self.assertRaises(A.AdapterPolicyError):
-                    A.DoclingAdapter(runner=runner).extract(request)
+                    _FixtureAdapter(runner=runner).extract(request)
 
             nested = os.path.join(asset_root, "nested")
             os.makedirs(nested)
@@ -177,25 +193,23 @@ class IngestionAdapterContractTest(unittest.TestCase):
                     A, "is_link_or_reparse",
                     side_effect=lambda value: os.path.basename(os.fspath(value)) == "nested"):
                 with self.assertRaisesRegex(A.AdapterPolicyError, "path contains"):
-                    A.DoclingAdapter(runner=nested_runner).extract(request)
+                    _FixtureAdapter(runner=nested_runner).extract(request)
 
-    def test_probe_uses_metadata_without_importing_vendor(self):
-        with mock.patch.object(A.importlib.util, "find_spec", return_value=object()), mock.patch.object(
-            A.importlib.metadata, "version", return_value="9.8.7"
-        ) as version:
-            receipt = A.MinerUAdapter().probe()
-        self.assertTrue(receipt.available)
-        self.assertEqual(receipt.module, "mineru")
-        self.assertEqual(receipt.distribution, "mineru")
-        self.assertEqual(receipt.version, "9.8.7")
+    def test_heavy_probe_never_inspects_local_vendor_metadata(self):
+        receipt = A.MinerUAdapter().probe()
+        self.assertFalse(receipt.available)
+        self.assertIsNone(receipt.module)
+        self.assertIsNone(receipt.distribution)
+        self.assertIsNone(receipt.version)
         self.assertFalse(receipt.runner_configured)
-        version.assert_called_once_with("mineru")
+        self.assertIn("remote/cloud-host-only", receipt.reason)
 
-    def test_missing_vendor_and_missing_runner_fail_explicitly(self):
-        with mock.patch.object(A.importlib.util, "find_spec", return_value=None):
-            receipt = A.DoclingAdapter().probe()
-            self.assertFalse(receipt.available)
-            self.assertIn("not installed", receipt.reason)
+    def test_heavy_parser_and_local_runner_fail_explicitly(self):
+        receipt = A.DoclingAdapter().probe()
+        self.assertFalse(receipt.available)
+        self.assertIn("remote/cloud-host-only", receipt.reason)
+        with self.assertRaisesRegex(A.AdapterContractError, "remote/cloud-host-only"):
+            A.DoclingAdapter(runner=lambda unused: {})
         with tempfile.TemporaryDirectory() as temp:
             path = os.path.join(temp, "source.pdf")
             with open(path, "wb") as stream:
@@ -236,7 +250,9 @@ class IngestionAdapterContractTest(unittest.TestCase):
             with open(path, "wb") as stream:
                 stream.write(b"second")
             with self.assertRaises(A.AdapterPolicyError):
-                A.DoclingAdapter(runner=lambda unused: [_page("source.pdf")]).extract(request)
+                _FixtureAdapter(
+                    runner=lambda unused: _runner_pages([_page("source.pdf")], 1)
+                ).extract(request)
 
             with open(path, "wb") as stream:
                 stream.write(b"stable")
@@ -244,7 +260,9 @@ class IngestionAdapterContractTest(unittest.TestCase):
                 path, "source.pdf", "application/pdf", pages=[2],
             )
             with self.assertRaises(A.AdapterContractError):
-                A.DoclingAdapter(runner=lambda unused: [_page("source.pdf", 1)]).extract(request)
+                _FixtureAdapter(
+                    runner=lambda unused: _runner_pages([_page("source.pdf", 1)], 2)
+                ).extract(request)
 
             bad = _page("source.pdf")
             bad["invented"] = "not part of the protocol"
@@ -267,7 +285,7 @@ class IngestionAdapterContractTest(unittest.TestCase):
 
             with self.assertRaisesRegex(
                     A.AdapterPolicyError, "source changed while adapter runner executed"):
-                A.DoclingAdapter(runner=mutating_runner).extract(request)
+                _FixtureAdapter(runner=mutating_runner).extract(request)
 
     def test_delayed_background_source_mutation_cannot_escape_final_fingerprint(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -311,7 +329,7 @@ class IngestionAdapterContractTest(unittest.TestCase):
                         A.AdapterPolicyError,
                         "source changed before adapter success receipt",
                     ):
-                        A.DoclingAdapter(runner=runner).extract(request)
+                        _FixtureAdapter(runner=runner).extract(request)
             finally:
                 mutate_after_post_run_check.set()
                 for worker in workers:
@@ -381,19 +399,19 @@ class IngestionAdapterContractTest(unittest.TestCase):
         with self.assertRaises(A.AdapterContractError):
             A.resolve_adapter("cloud-service")
 
-    @unittest.skipUnless(A.DoclingAdapter().probe().available, "Docling is not installed")
-    def test_optional_docling_installation_has_an_auditable_probe(self):
+    def test_docling_probe_is_remote_only_even_if_local_packages_exist(self):
         receipt = A.DoclingAdapter().probe()
-        self.assertTrue(receipt.available)
+        self.assertFalse(receipt.available)
         self.assertEqual(receipt.adapter, "docling")
-        self.assertIsNotNone(receipt.module)
+        self.assertIsNone(receipt.module)
+        self.assertIn("remote/cloud-host-only", receipt.reason)
 
-    @unittest.skipUnless(A.MinerUAdapter().probe().available, "MinerU is not installed")
-    def test_optional_mineru_installation_has_an_auditable_probe(self):
+    def test_mineru_probe_is_remote_only_even_if_local_packages_exist(self):
         receipt = A.MinerUAdapter().probe()
-        self.assertTrue(receipt.available)
+        self.assertFalse(receipt.available)
         self.assertEqual(receipt.adapter, "mineru")
-        self.assertIsNotNone(receipt.module)
+        self.assertIsNone(receipt.module)
+        self.assertIn("remote/cloud-host-only", receipt.reason)
 
 
 if __name__ == "__main__":

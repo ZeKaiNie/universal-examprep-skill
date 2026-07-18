@@ -215,6 +215,14 @@ def _file_generation(value):
     )
 
 
+def _stat_is_link_or_reparse(value):
+    """Recognize link/reparse metadata already captured by lstat/fstat."""
+
+    attributes = int(getattr(value, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    return stat.S_ISLNK(value.st_mode) or bool(attributes & reparse_flag)
+
+
 def stable_read_bytes(path):
     """Capture one regular-file generation and return its exact bytes and SHA-256.
 
@@ -307,6 +315,91 @@ def stable_file_sha256(path):
             or _file_generation(after_path) != generation):
         raise SchemaValidationError("digest source changed while it was read: %s" % source)
     return digests[0], generation[0]
+
+
+def lightweight_stable_file_sha256(path):
+    """Hash one lightweight file generation in a single streaming pass.
+
+    This is the deliberately cheaper digest primitive for on-demand teaching
+    assets.  It binds the pathname checks to one regular-file handle and
+    rejects path swaps or size/mtime drift observed before open, immediately
+    after open, or after the stream is consumed.  Unlike
+    :func:`stable_file_sha256`, it intentionally does not reread the handle and
+    must not be used to weaken authoritative full-ingestion snapshots.
+
+    Return ``(sha256, metadata)``.  ``metadata`` contains the exact
+    ``size_bytes`` and ``mtime_ns`` generation plus the hashable physical
+    ``identity`` tuple ``(st_dev, st_ino)`` for cache and hard-link alias keys.
+    """
+
+    source = Path(path)
+    try:
+        before = os.lstat(source)
+        if (not stat.S_ISREG(before.st_mode)
+                or _stat_is_link_or_reparse(before)
+                or is_link_or_reparse(source)):
+            raise SchemaValidationError(
+                "lightweight digest source must be a regular non-reparse file: %s"
+                % source
+            )
+        identity = _file_identity(before)
+        before_generation = _file_generation(before)
+
+        # O_NOFOLLOW closes the path-swap-to-symlink window where the host
+        # exposes it.  Windows reparse points are additionally rejected by the
+        # before/after path checks and the bound physical identity checks.
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(str(source), flags)
+        try:
+            with os.fdopen(descriptor, "rb") as stream:
+                descriptor = None
+                opened = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(opened.st_mode)
+                        or _stat_is_link_or_reparse(opened)
+                        or _file_identity(opened) != identity
+                        or _file_generation(opened) != before_generation):
+                    raise SchemaValidationError(
+                        "lightweight digest source changed between path check and open: %s"
+                        % source
+                    )
+                generation = _file_generation(opened)
+                digest = hashlib.sha256()
+                bytes_read = 0
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+                    bytes_read += len(block)
+                after_handle = os.fstat(stream.fileno())
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        after_path = os.lstat(source)
+    except SchemaValidationError:
+        raise
+    except OSError as exc:
+        raise SchemaValidationError(
+            "cannot capture stable lightweight file digest %s: %s" % (source, exc)
+        ) from exc
+
+    if (bytes_read != generation[0]
+            or not stat.S_ISREG(after_handle.st_mode)
+            or not stat.S_ISREG(after_path.st_mode)
+            or _stat_is_link_or_reparse(after_handle)
+            or _stat_is_link_or_reparse(after_path)
+            or is_link_or_reparse(source)
+            or _file_identity(after_handle) != identity
+            or _file_identity(after_path) != identity
+            or _file_generation(after_handle) != generation
+            or _file_generation(after_path) != generation):
+        raise SchemaValidationError(
+            "lightweight digest source changed while it was read: %s" % source
+        )
+    return digest.hexdigest(), {
+        "size_bytes": generation[0],
+        "mtime_ns": generation[1],
+        "identity": identity,
+    }
 
 
 def stable_read_json(path):
@@ -721,6 +814,8 @@ class _BatchValidationSnapshot:
     def __init__(self, store):
         self.store = store
         self._files = {}
+        self._crop_receipt_index_loaded = False
+        self._crop_receipt_index = None
 
         manifest_payload = self._read_json(
             store.manifest.path,
@@ -869,6 +964,34 @@ class _BatchValidationSnapshot:
         actual_sha, _unused = self._capture_digest(absolute, "quiz metadata asset")
         if expected_sha256 is not None and actual_sha != expected_sha256:
             raise SourceDriftError("quiz metadata asset hash drifted: %s" % path)
+
+    def crop_receipt_index(self):
+        """Load the receipt report once and bind it into final revalidation."""
+
+        if self._crop_receipt_index_loaded:
+            return self._crop_receipt_index
+        try:
+            try:
+                from asset_crops import crop_receipt_index
+            except ImportError:
+                from scripts.asset_crops import crop_receipt_index
+            path = safe_workspace_entry(
+                self.store.workspace, ".ingest/parse_report.json"
+            )
+            document = self._read_json(path, None, "crop receipt report")
+            if document is None:
+                raise PatchApplicationError(
+                    "legacy crop rebase requires .ingest/parse_report.json"
+                )
+            self._crop_receipt_index = crop_receipt_index(document)
+        except PatchApplicationError:
+            raise
+        except (ImportError, OSError, TypeError, ValueError) as exc:
+            raise PatchApplicationError(
+                "legacy crop rebase cannot load the live receipt index: %s" % exc
+            ) from exc
+        self._crop_receipt_index_loaded = True
+        return self._crop_receipt_index
 
     def revalidate(self):
         """Fail closed if any captured path changed before result/commit."""
@@ -1510,18 +1633,275 @@ class IngestionStore:
                 raise PatchApplicationError(
                     "speaker-note answer must be paired to a question or marked unrecoverable"
                 )
+        if "inline_worked_answer_candidate" in reasons:
+            if len(issue.evidence) != 1:
+                raise PatchApplicationError(
+                    "inline worked promotion requires one dedicated review evidence file"
+                )
+            evidence_ref = issue.evidence[0]
+            try:
+                inline_evidence = read_json(
+                    safe_workspace_entry(self.workspace, evidence_ref.path)
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                raise PatchApplicationError(
+                    "inline worked review evidence is unreadable: %s" % exc
+                ) from exc
+            if (
+                not isinstance(inline_evidence, dict)
+                or inline_evidence.get("schema_version") != 1
+                or inline_evidence.get("kind") != "inline_worked_answer_review"
+                or inline_evidence.get("review_verdict")
+                    != "complete_inline_worked_demonstration"
+            ):
+                raise PatchApplicationError(
+                    "generic inline candidate evidence cannot promote an answer; "
+                    "register exact visual/native evidence first"
+                )
+            if [operation.get("op") for operation in patch.operations] != [
+                    "replace_unit", "add_unit", "pair_qa"]:
+                raise PatchApplicationError(
+                    "inline worked promotion requires exactly replace_unit + "
+                    "add_unit + pair_qa"
+                )
+            replace_operation = patch.operations[0]
+            evidence_question = inline_evidence.get("question_unit")
+            evidence_question_sha256 = inline_evidence.get(
+                "question_unit_sha256"
+            )
+            if (
+                not isinstance(evidence_question, dict)
+                or evidence_question_sha256
+                    != hashlib.sha256(
+                        canonical_json(evidence_question).encode("utf-8")
+                    ).hexdigest()
+                or replace_operation.get("unit_id")
+                    != inline_evidence.get("question_unit_id")
+                or replace_operation.get("expected_unit_sha256")
+                    != evidence_question_sha256
+            ):
+                raise PatchApplicationError(
+                    "inline worked replace_unit is not bound to the reviewed question revision"
+                )
+            if len(targets) != 1 or targets[0] is None or targets[0].kind != "question":
+                raise PatchApplicationError(
+                    "inline worked-answer issue must target exactly one question"
+                )
+            question = targets[0]
+            if (
+                inline_evidence.get("question_unit_id") != question.unit_id
+                or inline_evidence.get("source_id") != question.source_id
+                or inline_evidence.get("source_sha256") != question.source_sha256
+                or inline_evidence.get("source_page") != question.page
+            ):
+                raise PatchApplicationError(
+                    "inline worked evidence identity disagrees with the patched question"
+                )
+            teaching_rows = read_json(
+                safe_workspace_entry(
+                    self.workspace, "references/teaching_examples.json"
+                ),
+                default=[],
+            )
+            teaching_matches = [
+                row for row in teaching_rows
+                if isinstance(row, dict)
+                and str(row.get("id")) == question.external_id
+            ] if isinstance(teaching_rows, list) else []
+            if len(teaching_matches) != 1:
+                raise PatchApplicationError(
+                    "inline worked teaching row is missing or ambiguous"
+                )
+            teaching_row = teaching_matches[0]
+            teaching_is_reviewed_original = (
+                inline_evidence.get("teaching_row") == teaching_row
+                and inline_evidence.get("teaching_row_sha256")
+                    == hashlib.sha256(
+                        canonical_json(teaching_row).encode("utf-8")
+                    ).hexdigest()
+            )
+            quiz_rows = read_json(
+                safe_workspace_entry(self.workspace, "references/quiz_bank.json"),
+                default=[],
+            )
+            if (
+                not isinstance(quiz_rows, list)
+                or any(
+                    isinstance(row, dict)
+                    and str(row.get("id")) == question.external_id
+                    for row in quiz_rows
+                )
+            ):
+                raise PatchApplicationError(
+                    "inline worked item must be absent from quiz_bank at apply time"
+                )
+            answer = units.get(question.paired_unit_id)
+            if (
+                answer is None
+                or answer.kind != "answer"
+                or answer.paired_unit_id != question.unit_id
+                or answer.external_id != question.external_id
+                or answer.source_id != question.source_id
+                or answer.source_sha256 != question.source_sha256
+                or answer.source_file != question.source_file
+                or answer.page != question.page
+            ):
+                raise PatchApplicationError(
+                    "inline worked answer must be a reciprocal same-revision/page pair"
+                )
+            question_metadata = question.metadata
+            answer_metadata = answer.metadata
+            title = question_metadata.get("teaching_title")
+            if (
+                question_metadata.get("teaching_role") != "worked_example"
+                or answer_metadata.get("teaching_role") != "worked_example"
+                or question_metadata.get("gradable") is not False
+                or answer_metadata.get("gradable") is not False
+                or question_metadata.get("source") != "material"
+                or answer_metadata.get("source") != "material"
+                or answer_metadata.get("answer_origin") != "inline_material"
+                or not isinstance(title, str)
+                or answer_metadata.get("teaching_title") != title
+            ):
+                raise PatchApplicationError(
+                    "inline worked pair lacks its non-gradable material teaching contract"
+                )
+            teaching_is_compiled = (
+                teaching_row.get("teaching_role") == "worked_example"
+                and teaching_row.get("gradable") is False
+                and teaching_row.get("source") == "material"
+                and teaching_row.get("source_file") == question.source_file
+                and teaching_row.get("source_pages") == [question.page]
+                and teaching_row.get("title") == title
+                and teaching_row.get("question") == question.text
+                and teaching_row.get("answer") == answer.text
+                and teaching_row.get("answer_origin") == "inline_material"
+                and teaching_row.get("inline_material_source_unit_id")
+                    == answer_metadata.get("inline_material_source_unit_id")
+                and teaching_row.get("answer_source_file") == answer.source_file
+                and teaching_row.get("answer_source_pages") == [answer.page]
+                and teaching_row.get("answer_source_language")
+                    == answer_metadata.get("source_language")
+            )
+            if not (teaching_is_reviewed_original or teaching_is_compiled):
+                raise PatchApplicationError(
+                    "inline worked teaching row drifted from both reviewed and "
+                    "compiled states"
+                )
+            source_unit = units.get(
+                answer_metadata.get("inline_material_source_unit_id")
+            )
+            if (
+                source_unit is None
+                or source_unit.kind != "text"
+                or source_unit.method != "native"
+                or source_unit.provenance != "material"
+                or source_unit.source_id != question.source_id
+                or source_unit.source_sha256 != question.source_sha256
+                or source_unit.source_file != question.source_file
+                or source_unit.page != question.page
+                or source_unit.text != question.text
+                or source_unit.text != answer.text
+                or source_unit.metadata.get("source_language") not in ("zh", "en")
+                or question_metadata.get("source_language")
+                    != source_unit.metadata.get("source_language")
+                or answer_metadata.get("source_language")
+                    != source_unit.metadata.get("source_language")
+            ):
+                raise PatchApplicationError(
+                    "inline worked answer must reproduce one exact same-page native "
+                    "material text unit with zh/en provenance"
+                )
+            if (
+                inline_evidence.get("material_unit_id") != source_unit.unit_id
+                or inline_evidence.get("material_unit") != source_unit.to_dict()
+                or inline_evidence.get("material_unit_sha256")
+                    != hashlib.sha256(
+                        canonical_json(source_unit.to_dict()).encode("utf-8")
+                    ).hexdigest()
+            ):
+                raise PatchApplicationError(
+                    "inline worked evidence names a different native material unit/revision"
+                )
+            normalized_title = " ".join(title.split()).casefold()
+            normalized_source = " ".join(source_unit.text.split()).casefold()
+            if not (
+                normalized_source.startswith(normalized_title)
+                and len(normalized_source) > len(normalized_title)
+            ):
+                raise PatchApplicationError(
+                    "inline worked native text must begin with its teaching title"
+                )
+            prompt_assets = [
+                asset for asset in question_metadata.get("assets") or ()
+                if isinstance(asset, dict)
+                and asset.get("role") == "question_context"
+                and asset.get("crop_receipt_schema_version") == 2
+                and asset.get("semantic_purity_schema_version") == 2
+            ]
+            if len(prompt_assets) != 1:
+                raise PatchApplicationError(
+                    "inline worked question needs one current semantic-v2 prompt crop"
+                )
+            try:
+                try:
+                    from asset_crops import verify_crop_asset_live_binding
+                except ImportError:
+                    from scripts.asset_crops import verify_crop_asset_live_binding
+                live_receipt = verify_crop_asset_live_binding(
+                    self.workspace,
+                    self.source_root,
+                    prompt_assets[0],
+                    expected_item_id=question.external_id,
+                    expected_chapter_id=question.chapter_id,
+                    require_current_semantic=True,
+                )
+            except (ImportError, OSError, TypeError, ValueError) as exc:
+                raise PatchApplicationError(
+                    "inline worked prompt crop failed current live verification: %s"
+                    % exc
+                ) from exc
+            if (
+                inline_evidence.get("crop_receipt_id")
+                != prompt_assets[0].get("crop_receipt_id")
+                or inline_evidence.get("crop_receipt") != live_receipt.to_dict()
+                or inline_evidence.get("crop_receipt_sha256")
+                    != hashlib.sha256(
+                        canonical_json(live_receipt.to_dict()).encode("utf-8")
+                    ).hexdigest()
+            ):
+                raise PatchApplicationError(
+                    "inline worked evidence names a different prompt crop receipt/revision"
+                )
+            if any(
+                isinstance(asset, dict)
+                and asset.get("role") in ("answer_context", "worked_solution")
+                for asset in answer_metadata.get("assets") or ()
+            ):
+                raise PatchApplicationError(
+                    "inline worked answer cannot carry an answer-side visual"
+                )
 
-    def _validate_unit_metadata_context(self, units, snapshot=None):
-        anchors = {
-            (unit.source_id, unit.page)
-            for unit in units.values() if unit.kind == "page_anchor"
-        }
-        current_source_hashes = (
-            snapshot.current_source_hashes
-            if snapshot is not None
-            else {record.sha256 for record in self.manifest.records()}
+    def _validate_unit_metadata_context(
+            self, units, snapshot=None, *, only_unit_ids=None, anchors=None,
+            current_source_hashes=None):
+        if anchors is None:
+            anchors = {
+                (unit.source_id, unit.page)
+                for unit in units.values() if unit.kind == "page_anchor"
+            }
+        if current_source_hashes is None:
+            current_source_hashes = (
+                snapshot.current_source_hashes
+                if snapshot is not None
+                else {record.sha256 for record in self.manifest.records()}
+            )
+        candidates = (
+            units.values()
+            if only_unit_ids is None
+            else (units[unit_id] for unit_id in sorted(set(only_unit_ids)))
         )
-        for unit in units.values():
+        for unit in candidates:
             metadata = unit.metadata
             if not metadata:
                 continue
@@ -1552,6 +1932,52 @@ class IngestionStore:
                         raise PatchApplicationError(
                             "answer metadata.answer_value disagrees with answer text"
                         )
+                if metadata.get("answer_origin") == "inline_material":
+                    source_unit = units.get(
+                        metadata.get("inline_material_source_unit_id")
+                    )
+                    question = units.get(unit.paired_unit_id)
+                    source_language = metadata.get("source_language")
+                    if (
+                        source_unit is None
+                        or source_unit.kind != "text"
+                        or source_unit.method != "native"
+                        or source_unit.provenance != "material"
+                        or source_unit.source_id != unit.source_id
+                        or source_unit.source_sha256 != unit.source_sha256
+                        or source_unit.source_file != unit.source_file
+                        or source_unit.page != unit.page
+                        or source_unit.text != unit.text
+                        or source_unit.metadata.get("source_language")
+                            != source_language
+                        or source_language not in ("zh", "en")
+                    ):
+                        raise PatchApplicationError(
+                            "inline material answer does not bind one exact same-page "
+                            "native zh/en material unit"
+                        )
+                    if (
+                        question is None
+                        or question.kind != "question"
+                        or question.paired_unit_id != unit.unit_id
+                        or question.external_id != unit.external_id
+                        or question.source_id != unit.source_id
+                        or question.source_sha256 != unit.source_sha256
+                        or question.source_file != unit.source_file
+                        or question.page != unit.page
+                        or question.text != source_unit.text
+                        or question.metadata.get("source_language")
+                            != source_language
+                        or question.metadata.get("teaching_role")
+                            != "worked_example"
+                        or question.metadata.get("teaching_title")
+                            != metadata.get("teaching_title")
+                        or question.metadata.get("gradable") is not False
+                    ):
+                        raise PatchApplicationError(
+                            "inline material answer lacks one reciprocal same-page "
+                            "worked-example question"
+                        )
             for asset in metadata.get("assets") or ():
                 path = asset["path"]
                 if not path.startswith("references/assets/"):
@@ -1574,8 +2000,292 @@ class IngestionStore:
                         "quiz metadata asset source hash is not in the current manifest"
                     )
 
+    @staticmethod
+    def _current_semantic_crops(unit):
+        """Return the unit's immutable current semantic-v2 crop mirrors."""
+
+        if unit is None:
+            return []
+        return [
+            asset for asset in unit.metadata.get("assets") or ()
+            if isinstance(asset, dict)
+            and asset.get("type") == "crop_image"
+            and asset.get("crop_receipt_schema_version") == 2
+            and asset.get("semantic_purity_schema_version") == 2
+        ]
+
+    @staticmethod
+    def _assert_legacy_asset_matches_crop(asset, receipt, label):
+        """Fail when an exact superseded path belongs to another declaration."""
+
+        if asset.get("role") != receipt.role:
+            # A reviewed material build may conservatively reclassify an old
+            # answer-looking page as a student attempt.  Preserve that taint;
+            # never perform the unsafe inverse transition automatically.
+            if receipt.role != "student_attempt":
+                raise PatchApplicationError(
+                    "%s role conflicts with its superseding crop receipt" % label
+                )
+        for field, expected in (
+                ("source_file", receipt.source_file),
+                ("source_sha256", receipt.source_sha256),
+                ("source_page", receipt.source_page)):
+            if field in asset and asset[field] != expected:
+                raise PatchApplicationError(
+                    "%s %s conflicts with its superseding crop receipt"
+                    % (label, field)
+                )
+
+    def _overlay_material_crop_assets(
+            self, base_unit, proposed, receipt_index, snapshot):
+        """Project receipt-proven material crops over an exact ledger result.
+
+        Historical v1 ``replace_unit`` rows predate compare-and-swap digests and
+        sometimes carry a whole-page asset snapshot.  A later material build may
+        replace that exact path with a semantic-v2 crop.  The ledger is replayed
+        exactly first so historical CAS digests retain their meaning; this derived
+        projection then keeps the reviewed crop without rewriting the ledger or
+        any unrelated asset.  Only the signed ``supersedes`` edge is accepted.
+        """
+
+        try:
+            try:
+                from asset_crops import (
+                    compact_asset_from_receipt,
+                    verify_crop_asset_live_binding,
+                )
+            except ImportError:
+                from scripts.asset_crops import (
+                    compact_asset_from_receipt,
+                    verify_crop_asset_live_binding,
+                )
+        except ImportError as exc:
+            raise PatchApplicationError(
+                "legacy crop rebase cannot load the crop contract"
+            ) from exc
+
+        payload = proposed.to_dict()
+        proposed_assets = payload["metadata"].get("assets")
+        if proposed_assets is None:
+            proposed_assets = []
+            payload["metadata"]["assets"] = proposed_assets
+        if not isinstance(proposed_assets, list):
+            raise PatchApplicationError(
+                "legacy replace metadata.assets must remain an array"
+            )
+
+        base_assets = self._current_semantic_crops(base_unit)
+        if base_assets and (
+            not isinstance(base_unit.external_id, str)
+            or not base_unit.external_id
+            or not isinstance(base_unit.chapter_id, str)
+            or not base_unit.chapter_id
+        ):
+            raise PatchApplicationError(
+                "material crop overlay requires exact item and chapter identities"
+            )
+        base_receipt_ids = [asset.get("crop_receipt_id") for asset in base_assets]
+        if len(base_receipt_ids) != len(set(base_receipt_ids)):
+            raise PatchApplicationError(
+                "base unit repeats a current semantic crop receipt"
+            )
+
+        changed = False
+        rebased_paths = set()
+        try:
+            for base_asset in base_assets:
+                receipt = verify_crop_asset_live_binding(
+                    self.workspace,
+                    self.source_root,
+                    base_asset,
+                    receipt_index=receipt_index,
+                    expected_item_id=base_unit.external_id,
+                    expected_chapter_id=base_unit.chapter_id,
+                    require_current_semantic=True,
+                )
+                snapshot.verify_asset(
+                    receipt.output_path, expected_sha256=receipt.output_sha256
+                )
+                source_record = snapshot.verify_source(
+                    receipt.source_id, receipt.source_sha256
+                )
+                if source_record.path != receipt.source_file:
+                    raise PatchApplicationError(
+                        "crop receipt source ID resolves to a different source path"
+                    )
+
+                existing = [
+                    index for index, asset in enumerate(proposed_assets)
+                    if isinstance(asset, dict)
+                    and asset.get("crop_receipt_id") == receipt.crop_receipt_id
+                ]
+                if existing:
+                    if len(existing) != 1:
+                        raise PatchApplicationError(
+                            "legacy replace repeats a current crop receipt"
+                        )
+                    verify_crop_asset_live_binding(
+                        self.workspace,
+                        self.source_root,
+                        proposed_assets[existing[0]],
+                        receipt_index=receipt_index,
+                        expected_item_id=base_unit.external_id,
+                        expected_chapter_id=base_unit.chapter_id,
+                        require_current_semantic=True,
+                    )
+                    if payload.get("asset_path") == receipt.output_path:
+                        self._assert_legacy_asset_matches_crop(
+                            {
+                                "role": payload.get("asset_role"),
+                                "source_file": proposed.source_file,
+                                "source_sha256": proposed.source_sha256,
+                                "source_page": proposed.page,
+                            },
+                            receipt,
+                            "material overlay redundant top-level crop",
+                        )
+                        base_payload = base_unit.to_dict()
+                        payload["asset_path"] = base_payload.get("asset_path")
+                        payload["asset_role"] = base_payload.get("asset_role")
+                        if "asset_sha256" in base_payload["metadata"]:
+                            payload["metadata"]["asset_sha256"] = (
+                                base_payload["metadata"]["asset_sha256"]
+                            )
+                        else:
+                            payload["metadata"].pop("asset_sha256", None)
+                        changed = True
+                    if receipt.supersedes:
+                        if len(receipt.supersedes) != 1:
+                            raise PatchApplicationError(
+                                "material crop overlay requires one exact superseded path"
+                            )
+                        old_path = receipt.supersedes[0]
+                        duplicate_old = [
+                            asset for asset in proposed_assets
+                            if isinstance(asset, dict)
+                            and asset.get("path") == old_path
+                        ]
+                        if duplicate_old:
+                            raise PatchApplicationError(
+                                "current crop and its superseded asset coexist"
+                            )
+                        if payload.get("asset_path") == old_path:
+                            self._assert_legacy_asset_matches_crop(
+                                {
+                                    "role": payload.get("asset_role"),
+                                    "source_file": proposed.source_file,
+                                    "source_sha256": proposed.source_sha256,
+                                    "source_page": proposed.page,
+                                },
+                                receipt,
+                                "material overlay top-level asset",
+                            )
+                            base_payload = base_unit.to_dict()
+                            payload["asset_path"] = base_payload.get("asset_path")
+                            payload["asset_role"] = base_payload.get("asset_role")
+                            if "asset_sha256" in base_payload["metadata"]:
+                                payload["metadata"]["asset_sha256"] = (
+                                    base_payload["metadata"]["asset_sha256"]
+                                )
+                            else:
+                                payload["metadata"].pop("asset_sha256", None)
+                            rebased_paths.add(old_path)
+                            changed = True
+                    continue
+
+                if len(receipt.supersedes) != 1:
+                    raise PatchApplicationError(
+                        "material crop overlay requires one exact superseded path"
+                    )
+                old_path = receipt.supersedes[0]
+                if old_path == receipt.output_path or old_path in rebased_paths:
+                    raise PatchApplicationError(
+                        "material crop overlay has an ambiguous superseded path"
+                    )
+                matches = [
+                    index for index, asset in enumerate(proposed_assets)
+                    if isinstance(asset, dict) and asset.get("path") == old_path
+                ]
+                if len(matches) != 1:
+                    raise PatchApplicationError(
+                        "ledger result must carry exactly one superseded asset mirror"
+                    )
+                index = matches[0]
+                legacy_asset = proposed_assets[index]
+                self._assert_legacy_asset_matches_crop(
+                    legacy_asset, receipt,
+                    "legacy replace metadata.assets[%d]" % index,
+                )
+                compact = compact_asset_from_receipt(receipt)
+                caption = base_asset.get("caption")
+                if not (isinstance(caption, str) and caption.strip()):
+                    caption = legacy_asset.get("caption")
+                if isinstance(caption, str) and caption.strip():
+                    compact["caption"] = caption
+                proposed_assets[index] = compact
+
+                if payload.get("asset_path") == old_path:
+                    self._assert_legacy_asset_matches_crop(
+                        {
+                            "role": payload.get("asset_role"),
+                            "source_file": proposed.source_file,
+                            "source_sha256": proposed.source_sha256,
+                            "source_page": proposed.page,
+                        },
+                        receipt,
+                        "legacy replace top-level asset",
+                    )
+                    base_payload = base_unit.to_dict()
+                    if base_payload.get("asset_path") == old_path:
+                        raise PatchApplicationError(
+                            "base material still exposes a superseded top-level asset"
+                        )
+                    payload["asset_path"] = base_payload.get("asset_path")
+                    payload["asset_role"] = base_payload.get("asset_role")
+                    if "asset_sha256" in base_payload["metadata"]:
+                        payload["metadata"]["asset_sha256"] = (
+                            base_payload["metadata"]["asset_sha256"]
+                        )
+                    else:
+                        payload["metadata"].pop("asset_sha256", None)
+                rebased_paths.add(old_path)
+                changed = True
+        except PatchApplicationError:
+            raise
+        except (OSError, TypeError, ValueError) as exc:
+            raise PatchApplicationError(
+                    "material crop overlay failed live receipt verification: %s" % exc
+            ) from exc
+
+        effective = ContentUnit.from_dict(payload) if changed else proposed
+        effective_assets = effective.metadata.get("assets") or ()
+        for base_asset in base_assets:
+            receipt_id = base_asset.get("crop_receipt_id")
+            if sum(
+                1 for asset in effective_assets
+                if isinstance(asset, dict)
+                and asset.get("crop_receipt_id") == receipt_id
+            ) != 1:
+                raise PatchApplicationError(
+                    "material crop overlay did not preserve every base crop exactly once"
+                )
+        if any(
+            effective.asset_path == path
+            or any(
+                isinstance(asset, dict) and asset.get("path") == path
+                for asset in effective_assets
+            )
+            for path in rebased_paths
+        ):
+            raise PatchApplicationError(
+                "material crop overlay left a superseded asset path behind"
+            )
+        return effective
+
     def _apply_operations_to_state(
-            self, patch, units, mappings, record, snapshot=None):
+            self, patch, units, mappings, record, snapshot=None,
+            validate_global=True, allow_legacy_replace_without_digest=False,
+            material_crop_receipt_index=None, material_crop_base_units=None):
         changed = 0
         final_status = "applied"
         chapter_assignments = {}
@@ -1605,12 +2315,74 @@ class IngestionStore:
                 current = units.get(operation["unit_id"])
                 if current is None:
                     raise PatchApplicationError("replace_unit target does not exist")
+                expected_unit_sha256 = operation.get("expected_unit_sha256")
+                if (expected_unit_sha256 is None
+                        and not allow_legacy_replace_without_digest):
+                    raise PatchApplicationError(
+                        "new replace_unit operations must bind expected_unit_sha256"
+                    )
+                if expected_unit_sha256 is not None:
+                    current_sha256 = hashlib.sha256(
+                        canonical_json(current.to_dict()).encode("utf-8")
+                    ).hexdigest()
+                    if current_sha256 != expected_unit_sha256:
+                        base_unit = (
+                            material_crop_base_units.get(current.unit_id)
+                            if material_crop_base_units is not None else None
+                        )
+                        if (
+                            snapshot is None
+                            or material_crop_receipt_index is None
+                            or not self._current_semantic_crops(base_unit)
+                        ):
+                            raise ConflictError(
+                                "replace_unit target changed after the patch was authored"
+                            )
+                        projected = self._overlay_material_crop_assets(
+                            base_unit,
+                            current,
+                            material_crop_receipt_index,
+                            snapshot,
+                        )
+                        projected_sha256 = hashlib.sha256(
+                            canonical_json(projected.to_dict()).encode("utf-8")
+                        ).hexdigest()
+                        if projected_sha256 != expected_unit_sha256:
+                            raise ConflictError(
+                                "replace_unit target changed after the patch was authored"
+                            )
+                        # The CAS still matches one exact canonical state.  This
+                        # projection merely places the receipt-bound material
+                        # overlay at the point where a post-build patch observed
+                        # it; arbitrary drift remains a conflict.
+                        current = projected
+                        units[current.unit_id] = current
                 if current.source_id != patch.source_id or current.source_sha256 != patch.source_sha256:
                     raise SourceDriftError("replace_unit target belongs to a different source revision")
                 if proposed.unit_id != current.unit_id:
                     raise PatchApplicationError(
                         "replace_unit cannot change the stable locator identity"
                     )
+                if (
+                    expected_unit_sha256 is not None
+                    and not allow_legacy_replace_without_digest
+                    and snapshot is not None
+                    and material_crop_receipt_index is not None
+                    and material_crop_base_units is not None
+                ):
+                    base_unit = material_crop_base_units.get(current.unit_id)
+                    if self._current_semantic_crops(base_unit):
+                        projected_proposed = self._overlay_material_crop_assets(
+                            base_unit,
+                            proposed,
+                            material_crop_receipt_index,
+                            snapshot,
+                        )
+                        if projected_proposed.to_dict() != proposed.to_dict():
+                            raise PatchApplicationError(
+                                "new replace_unit cannot drop or resurrect a "
+                                "receipt-bound base crop"
+                            )
                 if current.to_dict() != proposed.to_dict():
                     units[current.unit_id] = proposed
                     changed_this_operation = True
@@ -1766,8 +2538,9 @@ class IngestionStore:
                 inherited_changed = True
             if inherited_changed:
                 changed += 1
-        self._validate_unit_metadata_context(units, snapshot=snapshot)
-        self._validate_question_identities(units)
+        if validate_global:
+            self._validate_unit_metadata_context(units, snapshot=snapshot)
+            self._validate_question_identities(units)
         return changed, final_status
 
     @staticmethod
@@ -1827,11 +2600,22 @@ class IngestionStore:
         return has_cross_source_pair, True
 
     def _expected_compiled_state(self, reopen_stale=False, snapshot=None):
-        if snapshot is not None and reopen_stale:
+        external_snapshot = snapshot is not None
+        if external_snapshot and reopen_stale:
             raise PatchApplicationError(
                 "a read-only batch snapshot cannot reopen stale review issues"
             )
-        units = dict(snapshot.base_units if snapshot is not None else self.base_units())
+        local_snapshot = snapshot is None
+        if local_snapshot:
+            # Replaying a long ledger through live helpers would reread the
+            # manifest/queue and rehash the same source/evidence/assets once per
+            # patch.  Capture one immutable validation snapshot instead; its
+            # digest cache is revalidated before the reconstructed state escapes.
+            snapshot = _BatchValidationSnapshot(self)
+        base_units = dict(
+            snapshot.base_units if snapshot is not None else self.base_units()
+        )
+        units = dict(base_units)
         mappings = dict(
             snapshot.base_mappings if snapshot is not None else self.base_mappings()
         )
@@ -1848,7 +2632,30 @@ class IngestionStore:
                     or mapping.phase_id != unit.phase_id):
                 raise SourceDriftError("base mapping disagrees with its content unit")
 
+        # Establish one valid parser-only prefix.  Later ledger entries can then
+        # validate only units whose metadata they add/replace; page anchors are
+        # append-only under the stable-locator contract, so this preserves the
+        # same every-prefix invariant without rescanning every asset on every
+        # historical patch.
+        anchors = {
+            (unit.source_id, unit.page)
+            for unit in units.values() if unit.kind == "page_anchor"
+        }
+        current_source_hashes = snapshot.current_source_hashes
+        self._validate_unit_metadata_context(
+            units, snapshot=snapshot, anchors=anchors,
+            current_source_hashes=current_source_hashes,
+        )
+        self._validate_question_identities(units)
+
         ledger = snapshot.ledger if snapshot is not None else self._ledger()
+        has_material_crop_overlay = any(
+            self._current_semantic_crops(unit) for unit in base_units.values()
+        )
+        material_crop_receipt_index = (
+            snapshot.crop_receipt_index()
+            if has_material_crop_overlay else None
+        )
         for entry in ledger.values():
             patch = ReviewPatch.from_dict(entry["patch"])
             record = self._manifest_record(patch.source_id, snapshot=snapshot)
@@ -1887,8 +2694,29 @@ class IngestionStore:
                 snapshot=snapshot,
             )
             _changed, expected_status = self._apply_operations_to_state(
-                patch, units, mappings, record, snapshot=snapshot
+                patch, units, mappings, record, snapshot=snapshot,
+                validate_global=False,
+                # v1 ledgers predate replace-unit compare-and-swap bindings.
+                # Keep those immutable historical entries replayable, while all
+                # candidate validation/application paths retain the strict
+                # default above and therefore cannot author another such row.
+                allow_legacy_replace_without_digest=True,
+                material_crop_receipt_index=material_crop_receipt_index,
+                material_crop_base_units=base_units,
             )
+            metadata_unit_ids = set()
+            for operation in patch.operations:
+                if operation["op"] not in ("add_unit", "replace_unit"):
+                    continue
+                unit = ContentUnit.from_dict(operation["unit"])
+                metadata_unit_ids.add(unit.unit_id)
+                if unit.kind == "page_anchor":
+                    anchors.add((unit.source_id, unit.page))
+            self._validate_unit_metadata_context(
+                units, snapshot=snapshot, only_unit_ids=metadata_unit_ids,
+                anchors=anchors, current_source_hashes=current_source_hashes,
+            )
+            self._validate_question_identities(units)
             self._validate_issue_postcondition(
                 issue, patch, units, mappings, _changed, expected_status,
                 require_change=False,
@@ -1898,6 +2726,31 @@ class IngestionStore:
                     "ledger patch status disagrees with review issue: %s" % patch.issue_id
                 )
             replayed_issue_ids.add(patch.issue_id)
+        if material_crop_receipt_index is not None:
+            for unit_id in sorted(base_units):
+                base_unit = base_units[unit_id]
+                if not self._current_semantic_crops(base_unit):
+                    continue
+                effective = units.get(unit_id)
+                if effective is None:
+                    raise PatchApplicationError(
+                        "material crop base unit disappeared during ledger replay"
+                    )
+                units[unit_id] = self._overlay_material_crop_assets(
+                    base_unit,
+                    effective,
+                    material_crop_receipt_index,
+                    snapshot,
+                )
+        # One final complete check protects this optimization against future
+        # operation types that may acquire cross-unit metadata effects.
+        self._validate_unit_metadata_context(units, snapshot=snapshot)
+        self._validate_question_identities(units)
+        if local_snapshot:
+            # Revalidate before any intentional queue/status write below; a
+            # post-write revalidation would correctly see our own mutation as
+            # drift rather than an external race.
+            snapshot.revalidate()
         if reopen_stale:
             for issue_id in sorted(stale_issue_ids - replayed_issue_ids):
                 issue = self.review_queue.get(issue_id)
@@ -1905,8 +2758,6 @@ class IngestionStore:
                     self.review_queue.replace(issue.with_status("pending"))
             if stale_issue_ids - replayed_issue_ids:
                 self.refresh_source_statuses()
-        self._validate_unit_metadata_context(units, snapshot=snapshot)
-        self._validate_question_identities(units)
         return units, mappings
 
     def rebuild_compiled_from_ledger(self):
@@ -2005,20 +2856,40 @@ class IngestionStore:
         if patch.status != "validated":
             raise PatchApplicationError("only a validated patch may pass contextual validation")
         with self.validation_lock():
-            units, mappings = self._expected_compiled_state()
-            issue = self.review_queue.get(patch.issue_id)
-            record = self._validate_patch_context(
-                patch, issue, allow_terminal=False, units=units
-            )
-            units = dict(units)
-            mappings = dict(mappings)
-            changed, final_status = self._apply_operations_to_state(
-                patch, units, mappings, record
-            )
-            self._validate_issue_postcondition(
-                issue, patch, units, mappings, changed, final_status,
-                require_change=True,
-            )
+            snapshot = _BatchValidationSnapshot(self)
+            try:
+                units, mappings = self._expected_compiled_state(snapshot=snapshot)
+                issue = self._review_issue(patch.issue_id, snapshot=snapshot)
+                record = self._validate_patch_context(
+                    patch, issue, allow_terminal=False, units=units,
+                    snapshot=snapshot,
+                )
+                units = dict(units)
+                mappings = dict(mappings)
+                material_crop_receipt_index = (
+                    snapshot.crop_receipt_index()
+                    if any(
+                        self._current_semantic_crops(unit)
+                        for unit in snapshot.base_units.values()
+                    ) else None
+                )
+                changed, final_status = self._apply_operations_to_state(
+                    patch,
+                    units,
+                    mappings,
+                    record,
+                    snapshot=snapshot,
+                    material_crop_receipt_index=material_crop_receipt_index,
+                    material_crop_base_units=snapshot.base_units,
+                )
+                self._validate_issue_postcondition(
+                    issue, patch, units, mappings, changed, final_status,
+                    require_change=True,
+                )
+            except Exception:
+                snapshot.revalidate()
+                raise
+            snapshot.revalidate()
         return patch
 
     def _validated_batch_rows(self, patches):
@@ -2073,6 +2944,13 @@ class IngestionStore:
         with self.validation_lock():
             snapshot = _BatchValidationSnapshot(self)
             ledger, units, mappings = self._checked_batch_state(snapshot=snapshot)
+            material_crop_receipt_index = (
+                snapshot.crop_receipt_index()
+                if any(
+                    self._current_semantic_crops(unit)
+                    for unit in snapshot.base_units.values()
+                ) else None
+            )
             try:
                 for patch in rows:
                     fingerprint = self._patch_fingerprint(patch)
@@ -2096,6 +2974,8 @@ class IngestionStore:
                         candidate_mappings,
                         record,
                         snapshot=snapshot,
+                        material_crop_receipt_index=material_crop_receipt_index,
+                        material_crop_base_units=snapshot.base_units,
                     )
                     self._validate_issue_postcondition(
                         issue,
@@ -2153,33 +3033,55 @@ class IngestionStore:
                 )
             resuming = pending == intent
 
-            expected_units, expected_mappings = self._expected_compiled_state()
+            snapshot = _BatchValidationSnapshot(self)
+            expected_units, expected_mappings = self._expected_compiled_state(
+                snapshot=snapshot
+            )
             if (not resuming
-                    and {key: value.to_dict() for key, value in self.units().items()}
+                    and {key: value.to_dict() for key, value in snapshot.units.items()}
                     != {key: value.to_dict() for key, value in expected_units.items()}):
                 raise PatchApplicationError(
                     "compiled content_units were modified outside the ledger; run rebuild"
                 )
             if (not resuming
-                    and {key: value.to_dict() for key, value in self.mappings().items()}
+                    and {key: value.to_dict() for key, value in snapshot.mappings.items()}
                     != {key: value.to_dict() for key, value in expected_mappings.items()}):
                 raise PatchApplicationError(
                     "compiled chapter mappings were modified outside the ledger; run rebuild"
                 )
 
-            issue = self.review_queue.get(patch.issue_id)
+            issue = self._review_issue(patch.issue_id, snapshot=snapshot)
             record = self._validate_patch_context(
-                patch, issue, allow_terminal=resuming, units=expected_units
+                patch, issue, allow_terminal=resuming, units=expected_units,
+                snapshot=snapshot,
             )
 
             units = dict(expected_units)
             mappings = dict(expected_mappings)
-            changed, final_status = self._apply_operations_to_state(
-                patch, units, mappings, record
+            material_crop_receipt_index = (
+                snapshot.crop_receipt_index()
+                if any(
+                    self._current_semantic_crops(unit)
+                    for unit in snapshot.base_units.values()
+                ) else None
             )
-            self._validate_issue_postcondition(
-                issue, patch, units, mappings, changed, final_status
-            )
+            try:
+                changed, final_status = self._apply_operations_to_state(
+                    patch,
+                    units,
+                    mappings,
+                    record,
+                    snapshot=snapshot,
+                    material_crop_receipt_index=material_crop_receipt_index,
+                    material_crop_base_units=snapshot.base_units,
+                )
+                self._validate_issue_postcondition(
+                    issue, patch, units, mappings, changed, final_status
+                )
+            except Exception:
+                snapshot.revalidate()
+                raise
+            snapshot.revalidate()
             # Only create the write-ahead intent after every deterministic schema,
             # scope, source, operation, and semantic postcondition check passed.
             # Invalid patches therefore cannot strand the workspace in a pending
@@ -2220,6 +3122,13 @@ class IngestionStore:
         with self.mutation_lock():
             snapshot = _BatchValidationSnapshot(self)
             ledger, units, mappings = self._checked_batch_state(snapshot=snapshot)
+            material_crop_receipt_index = (
+                snapshot.crop_receipt_index()
+                if any(
+                    self._current_semantic_crops(unit)
+                    for unit in snapshot.base_units.values()
+                ) else None
+            )
             staged = []
             failure = None
             try:
@@ -2256,6 +3165,8 @@ class IngestionStore:
                         candidate_mappings,
                         record,
                         snapshot=snapshot,
+                        material_crop_receipt_index=material_crop_receipt_index,
+                        material_crop_base_units=snapshot.base_units,
                     )
                     self._validate_issue_postcondition(
                         issue,

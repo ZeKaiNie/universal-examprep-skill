@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -48,9 +49,31 @@ class _Store:
 class BoundedReviewList(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        self.material_temp = tempfile.TemporaryDirectory()
+        self.home_temp = tempfile.TemporaryDirectory()
         self.workspace = self.temp.name
+        self.environment = mock.patch.dict(
+            os.environ, {"EXAMPREP_HOME": self.home_temp.name}
+        )
+        self.environment.start()
+        output = io.StringIO()
+        identity = ingest_review.exam_start._capture_runtime_identity()
+        with mock.patch.object(
+                ingest_review.exam_start, "_capture_runtime_identity",
+                return_value=identity), contextlib.redirect_stdout(output):
+            code = ingest_review.exam_start.run([
+                "confirm", "--course", "review-fixture",
+                "--materials", self.material_temp.name,
+                "--workspace", self.workspace,
+                "--mode", "from_scratch", "--time-budget", "le1d",
+                "--language", "en", "--processing-mode", "full", "--json",
+            ])
+        self.assertEqual(0, code, output.getvalue())
 
     def tearDown(self):
+        self.environment.stop()
+        self.home_temp.cleanup()
+        self.material_temp.cleanup()
         self.temp.cleanup()
 
     def _run(self, issues, argv):
@@ -220,6 +243,194 @@ class BatchReviewApply(unittest.TestCase):
         args.patch_files = ["three.json"]
         with self.assertRaises(SystemExit):
             ingest_review._batch_patch_paths(args)
+
+
+class ReviewerDiscoveredIssue(unittest.TestCase):
+    def setUp(self):
+        self.workspace = os.getcwd()
+        self.source = SimpleNamespace(
+            source_id="src_" + "a" * 64,
+            sha256="b" * 64,
+            path="materials/week01.pdf",
+        )
+
+        class Manifest:
+            def __init__(inner, source):
+                inner.source = source
+
+            def get(inner, source_id):
+                return inner.source if source_id == inner.source.source_id else None
+
+            def verify_current(inner, source_id, sha256):
+                if (source_id, sha256) != (inner.source.source_id, inner.source.sha256):
+                    raise RuntimeError("source drift")
+
+        class Queue:
+            def __init__(inner):
+                inner.rows = []
+
+            def get(inner, issue_id):
+                return next((row for row in inner.rows if row.issue_id == issue_id), None)
+
+            def append(inner, issue):
+                inner.rows.append(issue)
+
+        self.store = SimpleNamespace(
+            manifest=Manifest(self.source),
+            review_queue=Queue(),
+            mutation_lock=lambda: contextlib.nullcontext(),
+            ingest_transaction=lambda unused: contextlib.nullcontext(),
+            _expected_compiled_state=lambda: ({}, ()),
+            refresh_source_statuses=mock.Mock(),
+        )
+
+    def test_report_is_evidence_bound_and_idempotent(self):
+        args = SimpleNamespace(
+            source_id=self.source.source_id,
+            reason=["missing_prompt_asset"],
+            page=[3, 3],
+            target_unit=None,
+            severity="blocking",
+            description="The printed prompt image is missing.",
+            suggested_action="Recover the original page image.",
+        )
+        receipt = {"receipts": [{
+            "source_file": self.source.path,
+            "source_sha256": self.source.sha256,
+            "produced_pages": [1, 2, 3],
+        }]}
+        with mock.patch.object(ingest_review, "atomic_write_json") as write_evidence, \
+                mock.patch.object(ingest_review, "read_json", return_value=receipt), \
+                mock.patch.object(ingest_review, "refresh_build_manifest") as refresh:
+            first = ingest_review._report_issue(self.workspace, self.store, args)
+            second = ingest_review._report_issue(self.workspace, self.store, args)
+
+        self.assertTrue(first["created"])
+        self.assertFalse(second["created"])
+        self.assertEqual(first["issue"]["issue_id"], second["issue"]["issue_id"])
+        self.assertEqual([3], first["issue"]["pages"])
+        self.assertEqual("blocking", first["issue"]["severity"])
+        self.assertEqual(1, len(self.store.review_queue.rows))
+        self.assertEqual(2, self.store.refresh_source_statuses.call_count)
+        self.assertEqual(2, refresh.call_count)
+        refresh.assert_called_with(
+            self.workspace,
+            rehash_artifacts=False,
+            rehash_artifact_names=("review_queue", "source_manifest"),
+        )
+        self.assertEqual(2, write_evidence.call_count)
+        evidence = first["issue"]["evidence"][0]
+        self.assertTrue(evidence["path"].startswith(".ingest/evidence/"))
+
+    def test_report_requires_a_location_or_target(self):
+        args = SimpleNamespace(
+            source_id=self.source.source_id,
+            reason=["missing_prompt_asset"],
+            page=None,
+            target_unit=None,
+            severity="warning",
+            description="Missing evidence.",
+            suggested_action="Inspect the source.",
+        )
+        with self.assertRaises(SystemExit) as raised:
+            ingest_review._report_issue(self.workspace, self.store, args)
+        self.assertEqual(2, raised.exception.code)
+
+    def test_report_rejects_a_page_absent_from_revision_receipt(self):
+        args = SimpleNamespace(
+            source_id=self.source.source_id,
+            reason=["missing_prompt_asset"],
+            page=[999999],
+            target_unit=None,
+            severity="warning",
+            description="Unbound location.",
+            suggested_action="Inspect the source.",
+        )
+        receipt = {"receipts": [{
+            "source_file": self.source.path,
+            "source_sha256": self.source.sha256,
+            "produced_pages": [1, 2, 3],
+        }]}
+        with mock.patch.object(ingest_review, "read_json", return_value=receipt):
+            with self.assertRaises(SystemExit) as raised:
+                ingest_review._report_issue(self.workspace, self.store, args)
+        self.assertEqual(2, raised.exception.code)
+
+
+class FullPromptConfirmation(unittest.TestCase):
+    def test_confirmation_is_revision_bound_and_persisted_through_patch(self):
+        source_id = "src_" + "d" * 64
+        source_sha256 = "e" * 64
+        asset_sha256 = "f" * 64
+        unit = ingest_review.ContentUnit.create(
+            source_id=source_id,
+            source_sha256=source_sha256,
+            source_file="materials/week01.pdf",
+            kind="question",
+            text="See the original printed prompt.",
+            page=3,
+            ordinal=1,
+            external_id="hw1_q1",
+            asset_path="references/assets/hw1-q1.png",
+            asset_role="question_context",
+            metadata={
+                "question_text_status": "page_reference",
+                "requires_assets": True,
+                "source": "material",
+                "source_type": "homework",
+                "quiz_type": "subjective",
+                "assets": [{
+                    "path": "references/assets/hw1-q1.png",
+                    "role": "question_context",
+                    "sha256": asset_sha256,
+                    "source_file": "materials/week01.pdf",
+                    "source_sha256": source_sha256,
+                }],
+            },
+        )
+        issue = SimpleNamespace(
+            issue_id="issue_" + "1" * 64,
+            source_id=source_id,
+            source_sha256=source_sha256,
+            status="claimed",
+            reason_codes=("full_prompt_asset_confirmed",),
+            target_unit_ids=(unit.unit_id,),
+            evidence=(ingest_review.EvidenceRef(
+                ".ingest/evidence/%s/finding.json" % source_id,
+                "2" * 64,
+            ),),
+        )
+        store = SimpleNamespace(
+            review_queue=SimpleNamespace(get=lambda unused: issue),
+            _expected_compiled_state=lambda: ({unit.unit_id: unit}, ()),
+            apply_patch=mock.Mock(return_value=SimpleNamespace(issue_status="applied")),
+        )
+        fake_asset = mock.Mock()
+        fake_asset.is_file.return_value = True
+        fake_asset.is_symlink.return_value = False
+        args = SimpleNamespace(issue_id=issue.issue_id, reviewer="visual-auditor")
+
+        with mock.patch.object(
+                ingest_review, "safe_workspace_entry", return_value=fake_asset), \
+                mock.patch.object(
+                    ingest_review, "file_sha256", return_value=asset_sha256), \
+                mock.patch.object(
+                    ingest_review, "compile_review_outputs",
+                    return_value={"readiness": "usable_with_gaps"}):
+            payload = ingest_review._confirm_full_prompt(os.getcwd(), store, args)
+
+        patch = store.apply_patch.call_args.args[0]
+        proposed = patch.operations[0]["unit"]
+        self.assertEqual(
+            hashlib.sha256(
+                ingest_review.canonical_json(unit.to_dict()).encode("utf-8")
+            ).hexdigest(),
+            patch.operations[0]["expected_unit_sha256"],
+        )
+        asset = proposed["metadata"]["assets"][0]
+        self.assertIs(asset["contains_full_prompt"], True)
+        self.assertEqual(asset_sha256, payload["confirmed"][0]["asset_sha256"])
+        self.assertEqual("applied", payload["issue_status"])
 
 
 if __name__ == "__main__":

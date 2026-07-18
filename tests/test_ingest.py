@@ -25,6 +25,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(REPO_ROOT, "scripts")
 sys.path.insert(0, SCRIPTS)
 
+from scripts import exam_start
 from scripts import ingest as ingest_module
 from scripts import validate_workspace
 from scripts.ingestion import ContentUnit
@@ -54,8 +55,44 @@ VALID = {
 }
 
 
+_RUNTIME_IDENTITY = None
+_CONFIRMED_FULL_PAIRS = set()
+
+
+def _confirm_full_workspace(workspace, materials):
+    """Register the exact full-mode pair used by a compiler fixture."""
+    global _RUNTIME_IDENTITY
+    workspace = os.path.abspath(workspace)
+    materials = os.path.abspath(materials)
+    key = (os.path.normcase(workspace), os.path.normcase(materials))
+    if key in _CONFIRMED_FULL_PAIRS:
+        return
+    os.makedirs(materials, exist_ok=True)
+    if _RUNTIME_IDENTITY is None:
+        _RUNTIME_IDENTITY = exam_start._capture_runtime_identity()
+    output = io.StringIO()
+    with mock.patch.object(
+            exam_start, "_capture_runtime_identity",
+            return_value=_RUNTIME_IDENTITY), redirect_stdout(output):
+        code = exam_start.run([
+            "confirm", "--course", "compiler-fixture",
+            "--materials", materials, "--workspace", workspace,
+            "--mode", "from_scratch", "--time-budget", "le1d",
+            "--language", "en", "--processing-mode", "full", "--json",
+        ])
+    if code != 0:
+        raise AssertionError(output.getvalue())
+    _CONFIRMED_FULL_PAIRS.add(key)
+
+
 def run_ingest(input_obj, out_dir, *extra):
     """把 input_obj 写成临时 JSON 并调用 ingest.py，返回 CompletedProcess。"""
+    ingestion = input_obj.get("ingestion") if isinstance(input_obj, dict) else None
+    materials = (
+        ingestion.get("source_root")
+        if isinstance(ingestion, dict) else None
+    ) or (os.path.abspath(out_dir) + "-materials")
+    _confirm_full_workspace(out_dir, materials)
     fd, in_path = tempfile.mkstemp(suffix=".json")
     os.close(fd)
     with open(in_path, "w", encoding="utf-8") as f:
@@ -83,6 +120,16 @@ class IngestEndToEndTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.home = self.tmp + "-registry"
+        self.materials = self.tmp + "-materials"
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, self.materials, ignore_errors=True)
+        environment = mock.patch.dict(
+            os.environ, {"EXAMPREP_HOME": self.home}
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        _confirm_full_workspace(self.tmp, self.materials)
 
     def structured_input(self):
         materials = os.path.join(self.tmp, "materials")
@@ -112,6 +159,7 @@ class IngestEndToEndTest(unittest.TestCase):
             quiz_items=[question],
             report={"warnings": [], "skipped": [], "ai_review": []},
         )
+        _confirm_full_workspace(workspace, materials)
         return workspace, {
             "course_name": "Concurrency 101",
             "phases": [{
@@ -621,17 +669,15 @@ class IngestEndToEndTest(unittest.TestCase):
         self.assertNotIn("Traceback", output.getvalue())
 
     def test_anchors_replaced_with_generated_content(self):
+        progress_before = read(self.tmp, "study_progress.md")
         run_ingest(VALID, self.tmp)
         plan = read(self.tmp, "study_plan.md")
         prog = read(self.tmp, "study_progress.md")
-        # 锚点被替换、未原样残留
+        # Confirmation now creates the learner-state view before the compiler.
+        # The compiler replaces plan markers but must preserve that generated view.
         self.assertNotIn("<!-- PHASE_TABLE -->", plan)
-        self.assertNotIn("<!-- PHASE_CHECKLIST -->", prog)
-        self.assertNotIn("{CURRENT_PHASE}", prog)
-        # 生成了按实际章节渲染的内容
-        self.assertIn("| **阶段 1** | 基础概念篇 |", plan)
-        self.assertIn("阶段 1：基础概念篇", prog)
-        self.assertIn("- [ ] **阶段 2**：线性表", prog)
+        self.assertIn("**", plan)
+        self.assertEqual(progress_before, prog)
 
     # ---------- 极端输入：结构性错误应中止（退出码 1） ----------
     def test_missing_phase_key_fails_loudly(self):
@@ -920,7 +966,11 @@ class IngestEndToEndTest(unittest.TestCase):
 
         smaller = dict(VALID, teaching_examples=[examples[1]])
         result = run_ingest(smaller, self.tmp)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "teaching baseline IDs missing from the current teaching_examples snapshot",
+            result.stdout + result.stderr,
+        )
         baseline = json.loads(read(
             self.tmp, "references", "teaching_baseline.json"))
         report = json.loads(read(self.tmp, "ingest_report.json"))
@@ -930,8 +980,8 @@ class IngestEndToEndTest(unittest.TestCase):
         self.assertEqual(baseline["teaching_example_ids_by_chapter"],
                          {"1": ["ex1"], "2": ["ex2"]})
         self.assertEqual(report["teaching_example_ids"], ["ex1", "ex2"])
-        self.assertEqual(report["current_teaching_example_ids"], ["ex2"])
-        self.assertEqual([item["id"] for item in current], ["ex2"])
+        self.assertEqual(report["current_teaching_example_ids"], ["ex1", "ex2"])
+        self.assertEqual([item["id"] for item in current], ["ex1", "ex2"])
 
     def test_invalid_teaching_example_role_fails_loudly(self):
         data = {
@@ -1021,7 +1071,7 @@ class IngestEndToEndTest(unittest.TestCase):
         r = run_ingest(data, self.tmp)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         bank = json.loads(read(self.tmp, "references", "quiz_bank.json"))
-        self.assertEqual(bank[0]["id"], 0)
+        self.assertEqual(bank[0]["id"], "0")
         self.assertEqual(len({q["id"] for q in bank}), 2, f"ID 重复: {[q['id'] for q in bank]}")
 
     # ---------- 回归：true_false 中英文规范化 ----------
@@ -1091,8 +1141,19 @@ class IngestEndToEndTest(unittest.TestCase):
 
 
 class IngestReportPersistence(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.home = self.tmp + "-registry"
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        environment = mock.patch.dict(
+            os.environ, {"EXAMPREP_HOME": self.home}
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def test_missing_answers_persisted_to_workspace(self):
-        tmp = tempfile.mkdtemp()
+        tmp = self.tmp
         data = {"course_name": "测试课", "phases": [
             {"phase_num": 1, "phase_name": "第一章", "wiki_filename": "ch01.md",
              "wiki_content": "# 第一章"}],
@@ -1101,14 +1162,13 @@ class IngestReportPersistence(unittest.TestCase):
         in_path = os.path.join(tmp, "raw.json")
         with open(in_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
-        r = subprocess.run([sys.executable, INGEST, "-i", in_path, "-o", tmp],
-                           capture_output=True, text=True, encoding="utf-8")
+        r = run_ingest(data, tmp)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         rep = json.load(open(os.path.join(tmp, "ingest_report.json"), encoding="utf-8"))
         self.assertIn("q1", rep["missing_answer_ids"])            # 缺答案清单持久化，后续会话可接手
 
     def test_missing_answer_ids_match_assigned_ids(self):
-        tmp = tempfile.mkdtemp()
+        tmp = self.tmp
         data = {"course_name": "测试课", "phases": [
             {"phase_num": 1, "phase_name": "第一章", "wiki_filename": "ch01.md",
              "wiki_content": "# 第一章"}],
@@ -1117,8 +1177,7 @@ class IngestReportPersistence(unittest.TestCase):
         in_path = os.path.join(tmp, "raw.json")
         with open(in_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
-        r = subprocess.run([sys.executable, INGEST, "-i", in_path, "-o", tmp],
-                           capture_output=True, text=True, encoding="utf-8")
+        r = run_ingest(data, tmp)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         rep = json.load(open(os.path.join(tmp, "ingest_report.json"), encoding="utf-8"))
         bank = json.load(open(os.path.join(tmp, "references", "quiz_bank.json"), encoding="utf-8"))

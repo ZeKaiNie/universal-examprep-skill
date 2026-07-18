@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import base64
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,12 @@ import study_guide_document as sgd  # noqa: E402
 import study_guide_render as sgr  # noqa: E402
 import study_guide_qa as sgqa  # noqa: E402
 from study_guide_render import GuideError  # noqa: E402
+
+
+ALT_VALID_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+    "0000000c49444154789c63f8ffff3f0005fe02fe0def46b80000000049454e44ae426082"
+)
 
 
 def fake_math(latex, display="inline"):
@@ -44,7 +51,12 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
         )
         with open(os.path.join(self.ws, "references", "assets", "prompt.png"), "wb") as stream:
             stream.write(pixel)
-        self._json("study_state.json", {"language": "bilingual"})
+        self._json("study_state.json", {
+            "language": "bilingual",
+            "artifact_mode": "visual",
+            "processing_mode": "full",
+            "answer_explanation_mode": "ordinary",
+        })
         self._json("references/teaching_examples.json", [
             {
                 "id": "ex-lecture-1", "chapter": 1, "source_type": "lecture",
@@ -66,6 +78,9 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
             )
         self.start_gate = {
             "ready_to_use": True,
+            "ready_to_ingest": True,
+            "processing_mode": "full",
+            "answer_explanation_mode": "ordinary",
             "workspace": self.ws,
             "materials": self.materials,
             "registered_course": "fixture",
@@ -80,10 +95,36 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
             }},
         }
         self.real_start_gate = sgr._start_gate_or_raise
+        self.real_require_full_processing = sgd.exam_start.require_full_processing
         gate_patch = mock.patch.object(
             sgr, "_start_gate_or_raise", return_value=self.start_gate)
         gate_patch.start()
         self.addCleanup(gate_patch.stop)
+        document_gate_patch = mock.patch.object(
+            sgd.exam_start, "require_full_processing",
+            return_value=self.start_gate,
+        )
+        document_gate_patch.start()
+        self.addCleanup(document_gate_patch.stop)
+        real_document_validator = sgd.validate_manifest
+
+        def validate_synthetic_document_fixture(*args, **kwargs):
+            report = real_document_validator(*args, **kwargs)
+            # This class predates the redistributable ingestion-v2 Gold Set and
+            # tests document layout rather than ingestion provenance.  Preserve
+            # all real content validation, while explicitly labelling only this
+            # synthetic fixture for the lower-level document renderer.
+            if report.get("ingestion_pipeline_version") is None:
+                report = dict(report)
+                report["ingestion_pipeline_version"] = "ingestion-v2"
+            return report
+
+        document_manifest_patch = mock.patch.object(
+            sgd, "validate_manifest",
+            side_effect=validate_synthetic_document_fixture,
+        )
+        document_manifest_patch.start()
+        self.addCleanup(document_manifest_patch.stop)
         qa_gate_patch = mock.patch.object(
             sgqa.exam_start, "check_registered_workspace_gate",
             return_value=self.start_gate,
@@ -123,6 +164,29 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
             self.ws, manifest or self.manifest(), fake_math,
             materials_root=self.materials)
 
+    def _run_synthetic_publication_fixture(self, argv):
+        """Exercise publication layout without mislabelling this v1-less fixture.
+
+        Crop/provenance publication gates have dedicated ingestion-v2 tests.  This
+        older synthetic fixture exists only to test HTML/PDF/receipt mechanics, so
+        provide the already-validated snapshot explicitly instead of teaching the
+        production loader to accept a self-declared protocol version.
+        """
+
+        path = os.path.join(self.ws, "notebook", "ch01.guide.json")
+        with open(path, "r", encoding="utf-8") as stream:
+            manifest = json.load(stream)
+        report = sgd.validate_manifest(self.ws, 1, manifest)
+        report["ingestion_pipeline_version"] = "ingestion-v2"
+        report["input_path"] = path
+        snapshot = sgr._capture_regular_file_snapshot(
+            self.ws, path, "synthetic typed manifest")
+        snapshot["fact_integrity"] = None
+        with mock.patch.object(
+                sgr, "_load_typed_manifest_snapshot",
+                return_value=(manifest, report, snapshot)):
+            return sgr.run(argv, fake_math)
+
     def manifest(self):
         formula = {
             "id": "f-speed", "latex": r"v=\frac{d}{t}",
@@ -133,8 +197,15 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
                 {"symbol": "t", "meaning": both("时间", "time")},
             ],
             "applicability": both("路程和时间使用一致单位。", "Distance and time use compatible units."),
+            "explanation_provenance": both(
+                "ai_supplement", "ai_supplement"),
+            "applicability_provenance": both(
+                "ai_supplement", "ai_supplement"),
             "source_refs": [self._source("formula")],
         }
+        for variable in formula["variables"]:
+            variable["meaning_provenance"] = both(
+                "ai_supplement", "ai_supplement")
         walk = {
             "item_id": "ex-lecture-1", "source_type": "lecture",
             "answer_provenance": {"zh": "ai_supplemented", "en": "material"},
@@ -143,12 +214,18 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
                 "kp-speed": both("把题目中的路程和时间代入平均速度关系。",
                                  "Map the prompt's distance and time into average speed."),
             },
+            "knowledge_point_uses_provenance": {
+                "kp-speed": both("ai_supplement", "ai_supplement"),
+            },
             "notebook_anchor": "ex-lecture-1-ex-lecture-1",
             "title": both("速度公式例题", "Speed-formula example"),
             "original_language": "en", "prompt_asset_mode": "full_prompt",
             "prompt_asset_paths": ["references/assets/prompt.png"], "answer_asset_paths": [],
             "translation": {"zh": "一辆车 2 小时行驶 100 千米，求速度。"},
+            "translation_provenance": {"zh": "ai_translation"},
             "what_asked": both("求平均速度。", "Find the average speed."),
+            "what_asked_provenance": both(
+                "ai_supplement", "ai_supplement"),
             "known_quantities": [
                 {"label": both("路程", "Distance"), "symbol": "d", "value": "100", "unit": "km"},
                 {"label": both("时间", "Time"), "symbol": "t", "value": "2", "unit": "h"},
@@ -164,17 +241,38 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
                     {"symbol": "t", "maps_to": both("2 小时", "2 hours")},
                 ],
                 "substitution": r"v=100/2=50\ \mathrm{km/h}",
+                "why_applicable_provenance": both(
+                    "ai_supplement", "ai_supplement"),
+                "substitution_provenance": "ai_supplement",
             }],
             "steps": [
                 both("先写出速度公式。", "Write the speed formula."),
                 both("代入 100 和 2，得到 50。", "Substitute 100 and 2 to get 50."),
             ],
+            "steps_provenance": [
+                both("ai_supplement", "ai_supplement"),
+                both("ai_supplement", "ai_supplement"),
+            ],
             "answer": both("平均速度是 50 千米/小时。", "The average speed is 50 km/h."),
-            "self_check": both("50×2=100，能还原路程。", "50×2=100, which recovers the distance."),
+            "answer_explanation": both(
+                "速度表示平均每一小时走过多少路程。题目给出总路程一百千米和总时间两小时，所以先把一百除以二，得到五十。单位也要一起相除：千米除以小时就是千米每小时。因此五十不是总路程，而是车辆在这两小时内平均每小时对应的路程；把五十千米每小时乘回两小时，会重新得到一百千米，这说明计算含义与题目数据一致。",
+                "Speed describes how much distance corresponds to one hour on average. The prompt supplies a total distance of 100 kilometres and a total time of 2 hours, so the applicable relationship is distance divided by time. Substituting the given values produces 100 divided by 2, which equals 50. The units divide in the same way: kilometres divided by hours becomes kilometres per hour. Therefore 50 is not the total distance; it means that each hour accounts for 50 kilometres on average over this trip. Multiplying 50 kilometres per hour by the stated 2 hours reconstructs the original 100 kilometres, so the numerical result, its unit, and its meaning all agree with the prompt.",
+            ),
+            "answer_explanation_provenance": {
+                "zh": "ai_supplement", "en": "ai_supplement",
+            },
             "source_trace": [self._source("question"), self._source("answer")],
         }
+        for quantity in walk["known_quantities"] + walk["unknown_quantities"]:
+            quantity["provenance"] = both("ai_supplement", "ai_supplement")
+        for mapping in walk["formula_uses"][0]["variable_mapping"]:
+            mapping["maps_to_provenance"] = both(
+                "ai_supplement", "ai_supplement")
         return {
-            "schema_version": 1, "chapter": 1, "language": "bilingual", "profile": "full",
+            "schema_version": 1,
+            "authoring_protocol_version": 2,
+            "answer_explanation_mode": "ordinary",
+            "chapter": 1, "language": "bilingual", "profile": "full",
             "knowledge_points": [{
                 "id": "kp-speed", "title": both("平均速度", "Average speed"),
                 "explanation": both("把总路程平均分配到每个单位时间。",
@@ -202,12 +300,111 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
         self.assertIn("代入数字 / 条件 / Substitute values / conditions", document)
         self.assertIn("⑦ 来源追踪 / ⑦ Source trace", document)
         self.assertIn("🟡 AI补充，可能与你老师讲的不完全一致", document)
-        self.assertIn("🟡 AI翻译，原资料为另一种语言", document)
-        self.assertNotIn("🟢 来自资料", document)
+        self.assertIn("🌐 AI翻译，原资料为另一种语言", document)
+        self.assertIn("🟢 来自资料", document)
         self.assertIn("🟢 From your materials", document)
+        self.assertEqual(1, document.count("AI补充，可能与你老师讲的不完全一致"))
+        self.assertEqual(1, document.count("AI translation — source material is in another language"))
+        self.assertIn('id="provenance-legend"', document)
+        self.assertIn("⑥ 为什么这个答案成立", document)
+        self.assertNotIn("答案自检", document)
+        self.assertNotIn("50×2=100", document)
+        article = document.index('<article class="example-card"')
+        header = document.index('<header class="example-header">', article)
+        prompt = document.index('<section class="prompt-zone">', article)
+        uses = document.index('<section class="kp-uses">', article)
+        walkthrough = document.index('<section class="walkthrough-zone">', article)
+        self.assertLess(header, prompt)
+        self.assertLess(prompt, uses)
+        self.assertLess(uses, walkthrough)
+        self.assertIn('<div class="prompt-intro"><h4>', document)
+        self.assertIn('</h4><figure class="source-asset">', document)
+        self.assertIn('<div class="final-answer"><h4>', document)
+        self.assertIn('<div class="answer-pair"><section class="answer-language lang-zh"',
+                      document)
+        self.assertIn('<div class="closing-pair"><div class="source-box">', document)
+        self.assertNotIn('class="self-check"', document)
         expected_uri = Path(os.path.join(
             self.materials, "lecture", "ch01.pdf")).resolve().as_uri() + "#page=4"
         self.assertIn('href="%s"' % expected_uri, document)
+
+    def test_student_view_uses_teaching_fields_and_hides_machine_ids_and_ocr_quotes(self):
+        manifest = self.manifest()
+        kp = manifest["knowledge_points"][0]
+        kp["explanation"]["en"] = "RAW CONCEPT OCR P[A] =\nm\nX\ni=1"
+        kp["teaching_explanation"] = both(
+            "把互斥分支的概率加权相加。",
+            "Add the mutually exclusive branches with their probability weights.")
+        kp["teaching_explanation_provenance"] = {
+            "zh": "ai_supplement", "en": "ai_supplement"}
+        walk = manifest["walkthroughs"][0]
+        walk["answer"]["en"] = "RAW ANSWER OCR = 4\n9 ."
+        walk["teaching_answer"] = both(
+            "答案是 $4/9$。", "The answer is $4/9$.")
+        walk["teaching_answer_provenance"] = {
+            "zh": "ai_supplemented", "en": "ai_supplemented"}
+        walk["source_trace"][0]["quote_span"] = "DUPLICATED FULL QUESTION OCR"
+        walk["source_trace"].append(dict(walk["source_trace"][0]))
+
+        document, _report = self._render(manifest)
+        self.assertNotIn("RAW CONCEPT OCR", document)
+        self.assertNotIn("RAW ANSWER OCR", document)
+        self.assertNotIn("DUPLICATED FULL QUESTION OCR", document)
+        self.assertNotIn(">unit unit-p4<", document)
+        self.assertNotIn("<code>f-speed</code>", document)
+        self.assertNotIn("<li><code>kp-speed</code>", document)
+        self.assertNotIn(">ex-lecture-1 ·", document)
+        self.assertNotIn('<span class="en-prefix">EN · </span><p>', document)
+        self.assertIn('<p><span class="en-prefix">EN · </span>', document)
+        self.assertIn("<math", document)
+        renderer = sgd.MarkdownRenderer(self.ws, fake_math, language="双语")
+        duplicate = dict(walk["source_trace"][0])
+        trace = sgd._source_trace(
+            renderer, [duplicate, dict(duplicate)], "bilingual", self.materials)
+        self.assertEqual(1, trace.count("<li "))
+
+    def test_formula_fragments_not_used_by_examples_stay_in_evidence_not_student_cards(self):
+        manifest = self.manifest()
+        walk = manifest["walkthroughs"][0]
+        walk["formula_uses"] = []
+        walk["solution_kind"] = "concept"
+        walk["no_formula_reason"] = both(
+            "这道题按定义作答，不需要套公式。",
+            "This item is answered from the definition without a formula.")
+        walk["no_formula_reason_provenance"] = both(
+            "ai_supplement", "ai_supplement")
+
+        document, _report = self._render(manifest)
+
+        self.assertEqual(1, document.count('data-formula-id="f-speed"'))
+        example = document[document.index('<article class="example-card"'):]
+        self.assertNotIn('data-formula-id="f-speed"', example)
+        self.assertNotIn('<section class="formula-use">', example)
+        self.assertIn("⑦ 来源追踪", document)
+
+    def test_typed_tex_symbols_render_as_inline_mathml_in_every_symbol_slot(self):
+        manifest = self.manifest()
+        formula = manifest["knowledge_points"][0]["formulas"][0]
+        formula["variables"][0]["symbol"] = r"\alpha"
+        walk = manifest["walkthroughs"][0]
+        walk["formula_uses"][0]["variable_mapping"][0]["symbol"] = r"\alpha"
+        walk["known_quantities"][0]["symbol"] = r"\beta"
+
+        calls = []
+
+        def recording_math(latex, display="inline"):
+            calls.append((latex, display))
+            return '<math><mrow><mi>converted</mi></mrow></math>'
+
+        document = sgd.render_manifest(
+            self.ws, manifest, recording_math, materials_root=self.materials
+        )[0]
+
+        self.assertEqual(2, calls.count((r"\alpha", "inline")))
+        self.assertEqual(1, calls.count((r"\beta", "inline")))
+        self.assertNotIn(r"<code>\alpha</code>", document)
+        self.assertNotIn(r"<code>\beta</code>", document)
+        self.assertGreaterEqual(document.count('class="math-inline" role="math"'), 3)
 
     def test_source_inventory_is_localized_in_hero_for_every_language(self):
         cases = {
@@ -233,9 +430,20 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
         }
         for language, (expected, excluded) in cases.items():
             with self.subTest(language=language):
-                self._json("study_state.json", {"language": language})
+                self._json("study_state.json", {
+                    "language": language,
+                    "artifact_mode": "visual",
+                    "processing_mode": "full",
+                    "answer_explanation_mode": "ordinary",
+                })
                 manifest = self.manifest()
                 manifest["language"] = language
+                if language != "bilingual":
+                    walk = manifest["walkthroughs"][0]
+                    walk["answer_explanation"] = {
+                        language: walk["answer_explanation"][language]}
+                    walk["answer_explanation_provenance"] = {
+                        language: walk["answer_explanation_provenance"][language]}
                 document, report = self._render(manifest)
                 match = re.search(
                     r'<p class="source-inventory">.*?</p>', document, re.S)
@@ -315,6 +523,8 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
         manifest["walkthroughs"][0]["no_formula_reason"] = both(
             "这题直接比较定义，不需要代数公式。",
             "This problem compares the definition directly; no algebraic formula is needed.")
+        manifest["walkthroughs"][0]["no_formula_reason_provenance"] = both(
+            "ai_supplement", "ai_supplement")
         document, _ = self._render(manifest)
         self.assertIn("这题直接比较定义", document)
         self.assertIn("compares the definition directly", document)
@@ -324,6 +534,8 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
         manifest["knowledge_points"].append({
             "id": "kp-units", "title": both("单位一致", "Compatible units"),
             "explanation": both("运算前统一单位。", "Make units compatible before calculating."),
+            "explanation_provenance": both(
+                "ai_supplement", "ai_supplement"),
             "formulas": [], "source_refs": [self._source("concept")],
             "example_ids": ["ex-lecture-1"],
         })
@@ -332,6 +544,8 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
         walk["knowledge_point_uses"]["kp-units"] = both(
             "确认千米和小时可直接组成千米/小时。",
             "Check that kilometres and hours form km/h directly.")
+        walk["knowledge_point_uses_provenance"]["kp-units"] = both(
+            "ai_supplement", "ai_supplement")
         document, _ = self._render(manifest)
         self.assertIn('href="#example-ex-lecture-1"', document)
         self.assertIn("确认千米和小时", document)
@@ -393,6 +607,58 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
         with self.assertRaisesRegex(GuideError, "material source file is missing"):
             self._render(manifest)
 
+    def test_direct_document_render_rejects_crop_replaced_after_receipt_validation(self):
+        manifest = self.manifest()
+        relative = "references/assets/prompt.png"
+        target = os.path.join(self.ws, *relative.split("/"))
+        with open(target, "rb") as stream:
+            approved = stream.read()
+        self.assertNotEqual(approved, ALT_VALID_PNG)
+
+        report = sgd.validate_manifest(
+            self.ws, 1, manifest, _enforce_v2_crop_receipts=True)
+        report = dict(report)
+        report["crop_receipt_verification"] = {
+            "required": True,
+            "status": "verified",
+            "verified_asset_count": 1,
+            "crop_receipt_ids": ["crop_" + "a" * 64],
+            "verified_asset_bindings": [{
+                "path": relative,
+                "crop_receipt_id": "crop_" + "a" * 64,
+                "sha256": hashlib.sha256(approved).hexdigest(),
+                "width": 1,
+                "height": 1,
+            }],
+        }
+        real_resolve = sgd._resolve_asset
+        replaced = {"done": False}
+        embedded = {"data_uri": None}
+
+        def replace_before_embed(*args, **kwargs):
+            if len(args) > 1 and args[1] == relative and not replaced["done"]:
+                replacement = target + ".replacement"
+                with open(replacement, "wb") as stream:
+                    stream.write(ALT_VALID_PNG)
+                os.replace(replacement, target)
+                replaced["done"] = True
+            resolved = real_resolve(*args, **kwargs)
+            if len(args) > 1 and args[1] == relative:
+                embedded["data_uri"] = resolved
+            return resolved
+
+        with mock.patch.object(sgd, "validate_manifest", return_value=report), \
+                mock.patch.object(sgd, "_resolve_asset", side_effect=replace_before_embed), \
+                self.assertRaisesRegex(
+                    sgr.ArtifactDriftError, "receipt-bound Study Guide crop.*path was replaced"
+                ):
+            self._render(manifest)
+        self.assertTrue(replaced["done"])
+        self.assertIn(
+            base64.b64encode(approved).decode("ascii"), embedded["data_uri"])
+        self.assertNotIn(
+            base64.b64encode(ALT_VALID_PNG).decode("ascii"), embedded["data_uri"])
+
     def test_material_source_parent_symlink_or_reparse_is_rejected_when_supported(self):
         outside = tempfile.mkdtemp(prefix="outside-materials-")
         self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
@@ -421,6 +687,79 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
             sgd.validate_guide_document(
                 document.replace("</main>", card + "</main>"),
                 report["walkthrough_item_ids"], self.ws, self.materials)
+
+    def test_formula_source_quote_is_rendered_as_mathml_not_visible_tex(self):
+        manifest = self.manifest()
+        manifest["knowledge_points"][0]["formulas"][0]["source_refs"][0][
+            "quote_span"] = r"v=\frac{d}{t}"
+        document, report = self._render(manifest)
+        self.assertNotIn(r"\frac", document)
+        self.assertGreaterEqual(document.count("<math"), 2)
+        self.assertTrue(sgd.validate_guide_document(
+            document, report["walkthrough_item_ids"], self.ws, self.materials)["ok"])
+
+    def test_print_css_paginates_long_blocks_without_blank_colored_shells(self):
+        document, _report = self._render()
+        self.assertIn(
+            ".formula-card,.formula-use,.final-answer,.answer-explanation,table,.prompt-zone,.walkthrough-zone"
+            "{break-inside:auto;box-decoration-break:clone;-webkit-box-decoration-break:clone}",
+            document,
+        )
+        self.assertNotIn(".mapped-examples-heading{break-before:page}", document)
+        self.assertNotIn(".knowledge-section{break-before:page}", document)
+        self.assertIn("tr{break-inside:avoid}", document)
+        self.assertIn(
+            ".localized-pair,.answer-language,.solution-steps>li"
+            "{break-inside:avoid;page-break-inside:avoid}",
+            document,
+        )
+        self.assertIn(".answer-language+.answer-language{break-before:avoid}", document)
+        self.assertNotIn(".answer-pair,.answer-language", document)
+        self.assertNotIn(".solution-steps>li,.closing-pair", document)
+        self.assertIn(
+            "figure,.example-header,.kp-uses,.prompt-intro,.formula-intro,.translation,.provenance-legend,.cross-reference li,.source-box li"
+            "{break-inside:avoid;page-break-inside:avoid}",
+            document,
+        )
+        self.assertIn(".example-header{break-after:avoid}", document)
+        self.assertIn(
+            ".source-box>strong{break-after:avoid;page-break-after:avoid}",
+            document,
+        )
+        self.assertNotIn(".example-header,.kp-uses{break-after:avoid}", document)
+        self.assertIn(".prompt-intro{display:inline-block;width:100%;vertical-align:top}", document)
+        self.assertIn(".source-asset img{max-height:160mm}", document)
+        self.assertIn(".example-card .source-asset img{max-height:155mm}", document)
+
+    def test_ai_substitution_provenance_is_rendered_below_not_inside_math(self):
+        value = r"\boxed{v=50}\quad\text{AI补充 / AI-supplemented}"
+        self.assertEqual(
+            (r"\boxed{v=50}", "ai_supplement"),
+            sgd._split_substitution_provenance(value),
+        )
+        manifest = self.manifest()
+        manifest["walkthroughs"][0]["formula_uses"][0]["substitution"] = value
+        document, _report = self._render(manifest)
+        self.assertIn('<div class="formula-display substitution-math">', document)
+        self.assertIn('class="provenance-marker"', document)
+        self.assertNotIn("AI补充 / AI-supplemented</mtext>", document)
+
+    def test_document_lint_uses_shared_raw_tex_vocabulary(self):
+        document, report = self._render()
+        for command, message in (
+                (r"\alpha", "visible raw TeX"),
+                (r"\pmod", "visible raw TeX"),
+                (r"$\alpha$", "visible raw TeX"),
+                (r"$x$", "unrendered dollar-delimited TeX")):
+            with self.subTest(command=command):
+                with self.assertRaisesRegex(GuideError, message):
+                    sgd.validate_guide_document(
+                        document.replace("</main>", command + "</main>"),
+                        report["walkthrough_item_ids"], self.ws, self.materials)
+        with_paths = document.replace(
+            "</main>", r"D:\min\notes C:\beta\file \\server\share\quad</main>")
+        self.assertTrue(sgd.validate_guide_document(
+            with_paths, report["walkthrough_item_ids"], self.ws, self.materials)["ok"])
 
     def test_document_lint_rejects_remote_script_and_traversal_links(self):
         document, report = self._render()
@@ -454,16 +793,16 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
         stale_pdf = os.path.join(self.ws, "study_guide", "ch01.pdf")
         with open(stale_pdf, "wb") as stream:
             stream.write(b"%PDF-1.4\nstale")
-        self.assertEqual(0, sgr.run([
+        self.assertEqual(0, self._run_synthetic_publication_fixture([
             "--workspace", self.ws, "--chapter", "1", "--profile", "full",
             "--pdf-backend", "html",
-        ], fake_math))
+        ]))
         html_path = os.path.join(self.ws, "study_guide", "ch01.html")
         receipt_path = os.path.join(self.ws, "study_guide", "ch01.receipt.json")
         self.assertTrue(os.path.isfile(html_path))
         with open(receipt_path, "r", encoding="utf-8") as stream:
             receipt = json.load(stream)
-        self.assertEqual(2, receipt["schema_version"])
+        self.assertEqual(3, receipt["schema_version"])
         self.assertEqual("study_guide", receipt["artifact_type"])
         self.assertEqual("full", receipt["profile"])
         self.assertEqual("bilingual", receipt["language"])
@@ -486,9 +825,16 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
         import exam_start
 
         with mock.patch.object(
-                exam_start, "check_registered_workspace_gate",
-                return_value={"ready_to_use": False, "reason": "workspace_not_registered"}):
-            with self.assertRaisesRegex(GuideError, "exam_start confirm"):
+                exam_start, "require_full_processing",
+                side_effect=self.real_require_full_processing), \
+                mock.patch.object(
+                    exam_start, "check_registered_workspace_gate",
+                    return_value={
+                        "ready_to_use": False,
+                        "reason": "workspace_not_registered",
+                    }):
+            with self.assertRaisesRegex(
+                    GuideError, "exact confirmed workspace/materials pair"):
                 self.real_start_gate(self.ws)
 
     def test_browser_pdf_receipt_is_hash_bound_and_waits_for_page_qa(self):
@@ -516,10 +862,10 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
 
         with mock.patch.object(sgr, "find_browser", return_value="C:/browser/msedge.exe"), \
                 mock.patch.object(sgr, "print_pdf", side_effect=fake_print):
-            self.assertEqual(0, sgr.run([
+            self.assertEqual(0, self._run_synthetic_publication_fixture([
                 "--workspace", self.ws, "--chapter", "1", "--profile", "full",
                 "--pdf-backend", "browser", "--pdf",
-            ], fake_math))
+            ]))
         with open(os.path.join(self.ws, "study_guide", "ch01.receipt.json"),
                   encoding="utf-8") as stream:
             receipt = json.load(stream)
@@ -542,10 +888,10 @@ class TypedStudyGuideDocumentTest(unittest.TestCase):
         os.makedirs(os.path.join(self.ws, "notebook"), exist_ok=True)
         self._json("notebook/ch01.guide.json", self.manifest())
         with mock.patch.object(sgr, "find_browser", return_value=browser):
-            self.assertEqual(0, sgr.run([
+            self.assertEqual(0, self._run_synthetic_publication_fixture([
                 "--workspace", self.ws, "--chapter", "1", "--profile", "full",
                 "--pdf-backend", "browser", "--pdf",
-            ], fake_math))
+            ]))
         code, report = sgqa.render(self.ws, 1)
         with open(os.path.join(self.ws, "study_guide", "ch01.receipt.json"),
                   encoding="utf-8") as stream:

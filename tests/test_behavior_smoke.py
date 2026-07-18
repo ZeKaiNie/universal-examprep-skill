@@ -53,8 +53,12 @@ class BehaviorSmokeTest(unittest.TestCase):
     def test_fixture_passes_validate_workspace(self):
         ok, errors, warnings, _ = H.validate_fixture_workspace(H.FIXTURE)
         self.assertTrue(ok, f"mini-course fixture 未通过校验: {[e['msg'] for e in errors]}")
-        # the documented fixture must be 0-error AND 0-warning (a warning = a lost recommended field)
-        self.assertEqual(warnings, [], f"fixture 不应有告警（会削弱 6 题型 smoke）: {[w['msg'] for w in warnings]}")
+        # The committed fixture is not a live, machine-bound lightweight session.  Its single
+        # deferred-session warning is expected; any content/schema warning still weakens the smoke.
+        self.assertEqual(len(warnings), 1, [w["msg"] for w in warnings])
+        self.assertIn(
+            "lightweight session has not been initialized", warnings[0]["msg"]
+        )
 
     # 2
     def test_fixture_quiz_bank_covers_all_six_types(self):
@@ -473,11 +477,11 @@ class BehaviorSmokeTest(unittest.TestCase):
                          "七步齐全但 ④ 出现在 ② 之前（公式先行）必须被抓")
         # 步骤名只被清单式提及（不在行首做标题）不算
         checklist = ("请按 ① 题面图、② 这题在问什么、③ 图里要读的量、④ 核心公式、"
-                     "⑤ 逐步演算、⑥ 答案自检、⑦ 知识点溯源 的顺序输出。")
+                     "⑤ 逐步演算、⑥ 为什么这个答案成立、⑦ 知识点溯源 的顺序输出。")
         self.assertFalse(H.teaching_template_ok(checklist), "行内清单提及七步不算真的走了模板")
         # 只有标题没有正文不算
         empty = ("① 题面图：\n② 这题在问什么：\n③ 图里要读的量：\n④ 核心公式：\n"
-                 "⑤ 逐步演算：\n⑥ 答案自检：\n⑦ 知识点溯源：\n")
+                 "⑤ 逐步演算：\n⑥ 为什么这个答案成立：\n⑦ 知识点溯源：\n")
         self.assertFalse(H.teaching_template_ok(empty), "空标题必须被抓")
         # ⑦ 溯源必须真的落到章节或 wiki 路径，不许空口宣称
         no_cite = good.replace(
@@ -548,22 +552,22 @@ class BehaviorSmokeTest(unittest.TestCase):
         self.assertFalse(H.teaching_template_ok(drop4), "④ 缺标题、子步骤以块名开头不得冒充 ④")
         # HKJ：纯编号标题骨架（步下无正文）必须被抓
         skeleton = ("[#x]\n1. 题面图\n2. 这题在问什么\n3. 图里要读的量\n4. 核心公式\n5. 逐步演算\n"
-                    "6. 答案自检\n7. 知识点溯源 references/wiki/ch01.md [p](../a.pdf#page=1)\n"
+                    "6. 为什么这个答案成立\n7. 知识点溯源 references/wiki/ch01.md [p](../a.pdf#page=1)\n"
                     "题目来源：a.pdf｜答案来源：b.pdf｜🟢 来自资料\n")
         self.assertFalse(H.teaching_template_ok(skeleton), "纯编号标题骨架（无正文）必须被抓")
         # HKO：两题响应里第二题省略 ②/④/⑦ 必须被抓；两题都齐全才通过
         q2_bad = good + ("\n\n【第二题】[#mc_q2] 另一题\n① 题面图：\n本题无图。\n③ 图里要读的量：\nx。\n"
-                         "⑤ 逐步演算：\n算。\n⑥ 答案自检：\n对。\n"
+                         "⑤ 逐步演算：\n算。\n⑥ 为什么这个答案成立：\n解释。\n"
                          "题目来源：h.pdf｜答案来源：s.pdf｜🟢 来自资料\n")
         self.assertFalse(H.teaching_template_ok(q2_bad), "多题时后续题缺步必须被抓（不能靠首题满足全局）")
         q2_ok = good + ("\n\n【第二题】[#mc_q2] 另一题\n① 题面图：\n本题无图。\n② 这题在问什么：\n问啥。\n"
-                        "③ 图里要读的量：\nx。\n④ 核心公式：\nf。\n⑤ 逐步演算：\n算。\n⑥ 答案自检：\n对。\n"
+                        "③ 图里要读的量：\nx。\n④ 核心公式：\nf。\n⑤ 逐步演算：\n算。\n⑥ 为什么这个答案成立：\n解释。\n"
                         "⑦ 知识点溯源：\nreferences/wiki/ch03.md 原文 [p](../c.pdf#page=2)\n"
                         "题目来源：h.pdf｜答案来源：s.pdf｜🟢 来自资料\n")
         self.assertTrue(H.teaching_template_ok(q2_ok), "两题都各自齐全应通过")
         # 逐题来源块：第二题缺来源块必须被抓
         q2_no_src = good + ("\n\n【第二题】[#mc_q2] 另一题\n① 题面图：\n本题无图。\n② 这题在问什么：\n问啥。\n"
-                            "③ 图里要读的量：\nx。\n④ 核心公式：\nf。\n⑤ 逐步演算：\n算。\n⑥ 答案自检：\n对。\n"
+                            "③ 图里要读的量：\nx。\n④ 核心公式：\nf。\n⑤ 逐步演算：\n算。\n⑥ 为什么这个答案成立：\n解释。\n"
                             "⑦ 知识点溯源：\nreferences/wiki/ch03.md 原文 [p](../c.pdf#page=2)\n")
         self.assertFalse(H.question_source_block_ok(q2_no_src), "多题时后续题缺来源块必须被抓")
 
@@ -652,7 +656,7 @@ class BehaviorSmokeTest(unittest.TestCase):
         good = _read("mock/sample_outputs/teaching_template_good.txt")
         # QR_v：未标号的第二题（有自己的 ① 但缺 ②/④）必须被抓
         q2_untagged = good + ("\n\n另一道题：\n① 题面图：\n本题无图。\n③ 图里要读的量：\nx。\n"
-                              "⑤ 逐步演算：\n算。\n⑥ 答案自检：\n对。\n⑦ 知识点溯源：\n"
+                              "⑤ 逐步演算：\n算。\n⑥ 为什么这个答案成立：\n解释。\n⑦ 知识点溯源：\n"
                               "references/wiki/ch03.md [p](../c.pdf#page=2)\n"
                               "题目来源：h.pdf｜答案来源：s.pdf｜🟢 来自资料\n")
         self.assertFalse(H.teaching_template_ok(q2_untagged), "未标号的缺步第二题必须被抓（不能只按 [#id] 切）")

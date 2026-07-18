@@ -54,6 +54,7 @@
       "preferred": {
         "kind": "native_skill",
         "name": "pdf",
+        "adapter_id": "codex.pdf",
         "install_required": false,
         "preflight_backend": "native",
         "input_contract": "Print or convert the validated self-contained study_guide/chNN.html without rewriting course content."
@@ -85,6 +86,7 @@
       "preferred": {
         "kind": "official_plugin",
         "name": "document-skills@anthropic-agent-skills",
+        "adapter_id": "claude_code.document-skills.pdf",
         "install_required_when_missing": true,
         "requires_user_confirmation": true,
         "preflight_backend": "native",

@@ -19,6 +19,51 @@ Coordinate last-minute exam prep. Teach from one compiled wiki chapter, quiz and
 
 Activate for an approaching exam, cram plan, drills, mistake review, concept Q&A, or pre-exam handout. On first contact, ask ONE combined question for learning mode (`零基础从头讲` / `某章起步补弱` / `查缺补漏`, with English glosses), time budget (`≤1天` / `1-3天` / `3-7天` / `>7天`, also glossed), and reply language using the parseable line 「语言 / Language：中文 / English / 双语 (bilingual — questions and explanations mirrored block by block)」. Persist all three together. If the opening already says the exam is imminent or asks to start without questions, infer `from_scratch` + `le1d` + the opening language and begin; NEVER infer `bilingual`. `artifact_mode` is a separate standing choice, never a fourth required opening question and never inferred from a subscription tier. Legacy `normal|sprint|panic|mock` values are migration-only. Do not activate outside exam prep.
 
+### Startup processing choice
+
+At the start, show the two material-processing choices once and recommend
+`lightweight`: `轻量按需（推荐） / lightweight on-demand (recommended)` versus
+`完整建库 / full knowledge-base build`. Persist the canonical choice as
+`study_state.json.processing_mode=lightweight|full`. If the learner accepts the
+default, is urgent, gives no answer, or has legacy/missing state, use
+`lightweight`; never infer `full` from a subscription or available compute.
+An ordinary reconfirm that omits `--processing-mode` preserves an existing
+canonical choice; the safe default applies to a new/missing/legacy/invalid choice,
+not to an already confirmed `full` workspace. Keep this choice independent from
+`artifact_mode=chat|visual`.
+
+`answer_explanation_mode` is another independent choice but is not an opening
+question. Missing/legacy/invalid means `ordinary`: full Guides still contain a
+detailed beginner-first explanation for every item, authored in the normal context,
+without a second Provider or isolation claim. `isolated` is full-ingestion-v2-only
+and uses two consent stages. After confirming the host can support fresh/stateless
+tool-disabled per-item calls, disclose Provider/API-billing and retention/privacy,
+then obtain a no-upload planning opt-in before persisting `isolated` and preparing
+its packet, annotations, requests, and plan. Before any call, inspect and disclose
+that plan's exact item/image scope and count, separately check current official
+pricing and give a bounded estimate, then obtain exact-plan upload consent. Never
+infer it from a GPT model, subscription, key, `full`, or `visual`; a host that lacks
+the capability stays `ordinary`.
+
+Teaching cadence is another optional, independent preference, not an opening
+question. `preferences.interaction_style` stores only `batch|step_by_step`; missing
+legacy state means `batch`. A stored `step_by_step` choice is effective only when
+`processing_mode=full` and `no_questions=false`; lightweight or no-questions keeps
+the preference but reports it dormant and uses effective `batch`. Effective step
+mode reads the next teaching item in manifest order from one workspace-locked
+snapshot and records a marker-bound notebook/manifest hash binding. Existing
+unbound teaching IDs remain legal batch history, but every bound ID stays subject
+to live validation after any cadence change. Guide publication preserves valid
+bound blocks and rejects stale bindings or unbound markers; every retained teaching
+baseline ID must still have a current teaching-manifest snapshot, never only a quiz
+copy.
+
+Teaching IDs use the existing typed Guide-safe Unicode contract (1–200 characters,
+without whitespace, controls/replacement character, or ``[]#|`/\``). A structurally
+sound append-only roster expansion or live-binding revision drift reopens an old
+completed phase as `usable_with_gaps`; structural damage remains blocked, and the
+Guide/completion receipt must be rebuilt after the pending item is recorded.
+
 ## Inputs
 
 - Confirmed, separate materials and workspace paths.
@@ -28,17 +73,36 @@ Activate for an approaching exam, cram plan, drills, mistake review, concept Q&A
 
 Normal construction is delegated to `exam-ingest`, which runs `python scripts/ingest_course.py --materials <dir> --workspace <ws> --json`. `ingest.py` is only the lower-level compiler for an existing payload; never ask the student to author JSON.
 
+`processing_mode=lightweight` uses the original materials directly and does not
+require `.ingest/`, compiled wiki/bank files, or a typed Study Guide. It keeps
+learning truth in `study_state.json` and page-batch truth in
+`.lightweight/session.json`. `processing_mode=full` delegates construction to
+`exam-ingest` as before.
+
 ## Workflow
 
 Run these gates before routing any learning action:
 
 1. **Confirm the exact workspace.** Run `python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" workspace-list --json`. An empty registry requires materials path, separate target path, the three learning choices, and an optional 30-second tour. A nonempty registry requires choosing the exact saved course/path and filling missing choices. Never silently use the repository or cwd. After confirmation, use the single write gate:
 
-   `python "${CLAUDE_SKILL_DIR}/scripts/exam_start.py" confirm --course <course> --materials <dir> --workspace <ws> --mode <mode> --time-budget <tier> --language <zh|en|bilingual> [--artifact-mode chat|visual] [--urgent] --json`
+   `python "${CLAUDE_SKILL_DIR}/scripts/exam_start.py" confirm --course <course> --materials <dir> --workspace <ws> --mode <mode> --time-budget <tier> --language <zh|en|bilingual> --processing-mode <lightweight|full> [--artifact-mode chat|visual] [--answer-explanation-mode ordinary|isolated] [--urgent] --json`
 
-   `--urgent` may infer only mode and budget; the caller supplies the opening language. Use `exam_start.py status ... --json` for read-only checks. Every opening panel shows the absolute workspace path.
+   Omit `--answer-explanation-mode` during ordinary confirmation; omission preserves an
+   existing canonical choice, while new/legacy/invalid state safely resolves to
+   `ordinary`. Supply `isolated` only after the separate extension gate above.
 
-2. **Build missing artifacts.** A confirmed workspace missing wiki, bank, or state/progress routes to `exam-ingest`; do not teach while its result says `readiness=blocked`.
+   `--urgent` may infer only mode and budget; the caller supplies the opening language. Use `exam_start.py status ... --json` for read-only checks. Lightweight requires `ready_to_start=true`; the separate `ready_to_ingest=true` gate is intentionally false until processing is explicit `full`. Every opening panel shows the absolute workspace path.
+
+2. **Route by the persisted processing choice.** In `lightweight`, do not call
+   `ingest_course.py`, parser/OCR adapters, retrieval builders, Study Guide authoring,
+   HTML/PDF rendering, or LangGraph. Initialize once with
+   `python "${CLAUDE_SKILL_DIR}/scripts/lightweight_session.py" init --materials <dir> --workspace <ws> --json`,
+   which safely creates the workspace-local `.lightweight/assets/` output directory;
+   never require the host to create that directory as an undocumented prerequisite.
+   Then plan only the current phase's PDF pages or one standalone raster, at most
+   eight pages per batch and with at most one `planned|visual_ready` batch. In `full`, a workspace missing wiki,
+   bank, or state/progress routes to `exam-ingest`; do not teach while its result
+   says `readiness=blocked`.
 
 3. **Restore state first.** Restore from `study_state.json` when it exists. If absent and Python works, immediately run `update_progress.py --workspace <ws> init`; hand-maintain Markdown only when Python truly cannot run. Continue the requested action after restoration.
 
@@ -48,13 +112,13 @@ Run these gates before routing any learning action:
 
 After the gates, choose one route:
 
-- **Teaching:** delegate one chapter to `exam-tutor`. Persist every walkthrough. Before structured phase completion, build and validate/import the current `profile=full` typed guide. In `chat`, that typed gate is enough; standing `visual` or a one-shot artifact request delegates rendering and all-page QA to `exam-study-guide` and requires `artifact_ready=ready`.
+- **Teaching:** delegate one chapter to `exam-tutor`. Persist every walkthrough. In explicit `full`, build and validate/import the current `profile=full` typed guide before phase completion; `chat` stops at that typed gate, while standing `visual` or a one-shot artifact request delegates rendering and all-page QA to `exam-study-guide` and requires `artifact_ready=ready`. Lightweight never enters either typed Guide or artifact rendering.
 - **Quiz:** delegate selected current-chapter bank items to `exam-quiz`; choice, subjective, diagram, fill-blank, true/false, and code are supported. No usable item means no verifiable checkpoint and a `covered_unverified` cap—NEVER invent a substitute. Compute diagram structures before rendering them.
 - **Concept Q&A:** answer from the current chapter and send why/what/how-derived confusion to `confusion-tracker`.
 - **Two wrong attempts:** offer hint / skip and archive / continue.
 - **Final review:** trigger when all study phases are cleared, judged from `study_state.json`'s `current_phase`/`phase_checklist` (or the legacy view) against `study_plan.md`, or when explicitly requested. A fresh student teaches first. Load mistakes and confusions, then use `exam-review`. Automatic review under `chat` stays conversational; explicit cheat-sheet creation may write Markdown, while PDF still needs `visual` or an explicit print/PDF request and delegates to `exam-cheatsheet`.
 
-After each learning/checkpoint event, update with `python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace <ws> set/add-mistake/add-confusion/set-mistake-status/set-confusion-status/record-phase-evidence/complete-phase/set-check` and refresh the panel. File-less clients use a copyable text breakpoint.
+After each learning/checkpoint event, update with `python "${CLAUDE_SKILL_DIR}/scripts/update_progress.py" --workspace <ws> set/add-mistake/add-confusion/set-mistake-status/set-confusion-status/record-phase-evidence/record-taught-example/complete-phase/set-check` and refresh the panel. Use `record-taught-example` only for effective full step mode as defined above; batch teaching evidence stays on `record-phase-evidence`. File-less clients use a copyable text breakpoint.
 
 ### Modes
 
@@ -73,12 +137,116 @@ Time modifies cadence, never source/asset/bank safety:
 
 Window state lives in `study_state.json.knowledge_window`; a point/index locator is required and cross-chapter names also need chapter. Deprecated modes migrate as follows: panic→zero-basic+one-day, sprint→fill-gaps+1–3 days, normal/mock→fill-gaps. `mock` is quiz cadence, not a mode.
 
+### Material processing
+
+`study_state.json.processing_mode` is `lightweight` or `full`:
+
+- `lightweight` is the default and recommended path. Run `lightweight_session.py
+  status`, then `plan --chapter <N> --source <relative-file> --pages <range>` only
+  when the learner reaches that topic; `<N>` must equal `current_phase`, sources are
+  limited to PDF or definitely single-frame PNG/JPEG/BMP, a batch is at most eight
+  primary pages, and only one batch may remain active. If the learner continues
+  after this phase was already marked complete, the same `plan` transition must
+  recoverably reopen the completion record; never leave an active batch hidden
+  behind a stale completed badge or hand-edit the progress view. Ask the host's native
+  visual/PDF capability to render and inspect only those pages. A single-page work
+  order has no contact sheet. For multiple pages, overview contact sheets group at
+  most four pages and must partition the primary batch exactly once, at roughly
+  768 px per row-major tile. Each sheet is consumed once by an `overview` call.
+  New visual receipts use schema 3: enumerate stable `teaching_item_ids` on every
+  primary page and define each item as `text|figure|mixed` with generic prompt/answer
+  components. Each component declares its role, sorted required context IDs, exact
+  allowed detected IDs, and a source-qualified crop. Context-only components are
+  allowed, but at least one prompt component must visibly contain the target. A
+  `detail` call may combine prompt components only for one target; a `solution` call
+  may combine answer components only for one target. Every component gets an
+  independent one-crop `crop_review` model call whose detected IDs exactly equal its
+  declared target/context scope and which proves no unrelated content or student
+  attempt. Geometry or a filename is not semantic evidence.
+  If an official answer is elsewhere, run `register-answer-dependency --batch-id
+  <id> --source <relative-file> --pages <range>` while the batch is planned. This is
+  additive. Use `set-answer-dependency ... --pages <exact-range> --reason <reason>`
+  to replace/narrow a binding or `remove-answer-dependency ... --reason <reason>` to
+  remove it; both are audited and exact retries are idempotent. Every
+  primary/dependency page declares content types
+  and `answer_provenance`. Dependency pages are answer locators/detail inputs and
+  never enter a solution call; only an `official_solution` parent may produce an
+  answer component, and every registered official-solution page must be covered by
+  one. Student-attempt/unknown pages remain inspectable but
+  cannot satisfy answer evidence. Model-call rows bind exact host/model, asset path/hash,
+  and source-qualified source ID/path/revision/page locations; bare page numbers are
+  insufficient and an asset cannot be reused across ordinary stage calls. A contact
+  sheet never replaces a page or prompt component. Every canonical page, dependency-page,
+  contact, prompt, and answer evidence file is PNG with matching magic bytes and
+  measured dimensions under `.lightweight/assets/`, never under or reused from a
+  full-build asset path. Page images are at least 480×480 and item crops at least
+  64×64. Every component crop is distinct; answer components remain hidden until
+  solution/review.
+  Import the receipt with `record-visual`, teach in full beginner-friendly detail,
+  persist the exact `notebook/chNN.md#entry-anchor`, then use
+  `mark-taught --taught-item-ids <exact-comma-separated-IDs>`. It revalidates
+  source/visual/notebook bindings, separates inspected pages from taught item scope,
+  and publishes the taught receipt plus
+  `phase_evidence[phase].lightweight_batches` under the workspace lock; a retry
+  idempotently repairs a taught-first interruption. Never shorten teaching output
+  to save input tokens. Lightweight completion requires all current-phase batches
+  taught and a one-to-one live event set, skips typed Guide/full-build evidence, and
+  may reach `covered_unverified`. At first init, preserve an immutable stat-only
+  baseline for any pre-existing standard bank without parsing or hashing it. Only an
+  explicit quiz/checkpoint opens the bank and binds the exact bank/item revision.
+  `verified` still requires two distinct revision-bound handled items from that
+  unchanged pre-existing baseline and one pass; an absent-at-init, replaced, or
+  drifted bank and legacy unbound checkpoint rows cannot qualify. Never invent a
+  scored quiz.
+  Schema-2 visual receipts remain immutable history. A legacy active schema-2
+  `visual_ready` attempt is quarantined from recording/teaching and may only be
+  auditably abandoned before a new schema-3 attempt. If an unfinished scope must be closed, run `abandon --batch-id <id> --reason
+  <concrete-reason>` on its `planned|visual_ready` batch. The hash-bound abandonment
+  receipt remains in the ledger and a replacement plan becomes a new attempt. A
+  `taught` batch is durable progress and cannot be abandoned. If it must be redone,
+  `replace-taught --batch-id <id> --reason <concrete-reason>` retains its receipts,
+  notebook binding, and progress event as immutable `superseded` history and opens a
+  planned successor for the exact same primary slice; it revalidates dependency
+  revisions while preserving their exact page sets. The predecessor/event stays
+  auditable but is excluded from the current completion denominator.
+  Routine `status` takes a generation-stable read-only snapshot without creating or
+  opening a lock for writing; workspace validation performs metadata plus
+  physical-identity checks only. Exact stream hashes are recomputed only by `plan`,
+  dependency registration/replacement/removal, `record-visual`, `mark-taught`, phase completion, or
+  explicit `status --verify-live`. Non-current taught history keeps immutable
+  receipt/progress-event consistency checks and is counted as
+  `unchecked_historical` until that phase becomes current again. Read
+  `status_schema_version=2` and `answer_taint_contract_version=2` before
+  interpreting the machine status fields. Read
+  `full_page_answer_taint_status` only as a conservative fact about the uncropped
+  locator/detail page. Read `answer_taint_status`, `item_crop_review_status`, and
+  `teaching_publication_status` as the separate item-crop teaching verdict; a parent
+  page containing a student attempt does not relabel clean reviewed crops plus an
+  official answer crop as blocked.
+- `full` is explicit opt-in. It opens `ingest_course.py` and the validated structured
+  build/review route. It still does not imply `artifact_mode=visual` and does not
+  authorize a PDF without that separate explicit choice.
+
+To switch modes, use `update_progress.py --workspace <ws> set --processing-mode
+lightweight|full`, then rerun `exam_start.py confirm` so the runtime/start receipt
+describes the selected route. Switching to lightweight does not delete a prior
+structured workspace; it only forbids eager rebuilds and uses existing current
+artifacts lazily when they remain valid. Reconfirming later without a processing
+flag preserves this canonical choice.
+
 ### Artifact output
 
 `study_state.json.artifact_mode` is `chat` or `visual`:
 
 - `chat` is the safe default for missing/legacy/unknown values: conversation plus notebook/state, with no automatic chapter HTML/PDF or cheat-sheet PDF.
 - `visual` persists only after an explicit choice via `update_progress.py ... set --artifact-mode visual`; it requests typed manifest → render → receipt → every-page QA. Delivery and completion require `artifact_ready=ready`. Failure stays blocked/degraded. It never permits silent installation.
+
+The stored preference remains independent from processing intensity. Under
+`processing_mode=lightweight`, even a stored `visual` is reported as
+`artifact_mode_preference=visual`, `artifact_mode_effective=chat`, and
+`artifact_mode_dormant=true`; it becomes active only after an explicit switch to
+`full`. A one-shot Guide request likewise requires that switch rather than bypassing
+the lightweight boundary.
 
 An explicit return uses `set --artifact-mode chat`. A one-shot request temporarily overrides `chat` without changing the stored preference. Never inspect or infer a subscription tier. A language change stales prior-language manifests/artifacts; re-author/import and, when visual output is requested, rerender and repeat all-page QA.
 
@@ -88,6 +256,17 @@ An explicit return uses `set --artifact-mode chat`. A one-shot request temporari
 - Dispatch student prose from `study_state.json.language` with SINGLE-LANGUAGE PURITY: `zh` is pure Simplified Chinese; `en` is pure English using canonical vocabulary (default if unset unless the opening was Chinese); `bilingual` mirrors each zh block under `> EN:`. Machine IDs, keys, hashes, enums, statuses, and reason codes remain stable. Original-language evidence may remain only when explicitly labelled; agent prose still follows the selected language.
 - Be concise and conclusion-first. End every reply with localized subject/current-stage/progress/mistake fields.
 - Use the full canonical provenance sentences: 🟢 来自资料 / 🟢 From your materials; 🟡 AI补充，可能与你老师讲的不完全一致 / 🟡 AI-supplemented — may differ from what your teacher taught; ⚠️ AI生成答案，非老师/教材提供 / ⚠️ AI-generated answer — not from your teacher or textbook. Unsupported answers always carry the full ⚠️ label. If materials give no basis, say 「资料里没有这道题的答案」 or “The materials do not contain an answer to this question.”
+
+### Heavy capability boundary
+
+Never download, install, import, or execute MinerU, Docling, or LangGraph in the
+student's local environment. The lightweight route never offers them. A full-mode
+learner must explicitly request a named heavy capability before it can be proposed,
+and execution must occur in a host-supplied remote/cloud service with separately
+confirmed upload/privacy terms. If the active host has no such remote integration,
+say it is unavailable and stay on native visual/core review; an installed local
+package is not permission to use it. Workspace files and `study_state.json`, not a
+remote workflow checkpoint, remain the state truth.
 
 ## Language packs
 

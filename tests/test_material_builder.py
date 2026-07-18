@@ -6,8 +6,10 @@ synthetic page text, and the PDF backend is a fake object injected into run(). T
 where the optional PDF dependencies are not installed.
 """
 import copy
+import contextlib
 import importlib.util
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -25,6 +27,120 @@ SCRIPTS = os.path.join(ROOT, "scripts")
 sys.path.insert(0, SCRIPTS)
 
 import build_raw_input_from_workspace as B  # noqa: E402
+import exam_start  # noqa: E402
+
+
+_RUNTIME_IDENTITY = None
+_CONFIRMED_FULL_PAIRS = set()
+_B_RUN = B.run
+_B_MAIN = B.main
+
+
+def _fixture_workspace(args, explicit=None):
+    """Infer a canonical test workspace without bypassing product validation."""
+    if explicit is not None:
+        return os.path.abspath(str(explicit))
+    asset_root = getattr(args, "asset_root", None)
+    if asset_root:
+        references = os.path.dirname(os.path.abspath(asset_root))
+        if (os.path.basename(asset_root) == "assets"
+                and os.path.basename(references) == "references"):
+            return os.path.dirname(references)
+    candidates = []
+    for value in (getattr(args, "out", None), getattr(args, "report", None)):
+        if value:
+            parent = os.path.dirname(os.path.abspath(value))
+            if os.path.basename(parent) == ".ingest":
+                candidates.append(os.path.dirname(parent))
+    if candidates and all(
+            os.path.normcase(os.path.normpath(value))
+            == os.path.normcase(os.path.normpath(candidates[0]))
+            for value in candidates):
+        return candidates[0]
+    return None
+
+
+def _fixture_home(workspace):
+    return os.path.join(
+        os.path.dirname(os.path.abspath(workspace)),
+        ".%s-examprep-home" % os.path.basename(os.path.abspath(workspace)),
+    )
+
+
+def _cached_runtime_identity():
+    global _RUNTIME_IDENTITY
+    if _RUNTIME_IDENTITY is None:
+        _RUNTIME_IDENTITY = exam_start._capture_runtime_identity()
+    return _RUNTIME_IDENTITY
+
+
+@contextlib.contextmanager
+def _confirmed_full_pair(materials, workspace):
+    """Create and expose the exact receipt/state/registry required by full mode."""
+    materials = os.path.abspath(materials)
+    workspace = os.path.abspath(workspace)
+    home = _fixture_home(workspace)
+    key = (os.path.normcase(workspace), os.path.normcase(materials))
+    runtime_identity = _cached_runtime_identity()
+    with mock.patch.dict(os.environ, {"EXAMPREP_HOME": home}), \
+            mock.patch.object(
+                exam_start, "_capture_runtime_identity",
+                return_value=runtime_identity):
+        receipt = os.path.join(workspace, exam_start.RUNTIME_RECEIPT_NAME)
+        registry = os.path.join(home, "workspaces.json")
+        if (key not in _CONFIRMED_FULL_PAIRS
+                or not os.path.isfile(receipt)
+                or not os.path.isfile(registry)):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = exam_start.run([
+                    "confirm", "--course", "material-builder-fixture",
+                    "--materials", materials, "--workspace", workspace,
+                    "--mode", "from_scratch", "--time-budget", "le1d",
+                    "--language", "en", "--processing-mode", "full", "--json",
+                ])
+            if code != 0:
+                raise AssertionError(output.getvalue())
+            _CONFIRMED_FULL_PAIRS.add(key)
+        yield home
+
+
+def _confirmed_builder_run(args, *positional, **kwargs):
+    """Give publication-mode builder fixtures an exact full-mode receipt."""
+    workspace = _fixture_workspace(
+        args, explicit=kwargs.get("publication_workspace")
+    )
+    if workspace is None:
+        return _B_RUN(args, *positional, **kwargs)
+    with _confirmed_full_pair(getattr(args, "materials"), workspace):
+        return _B_RUN(args, *positional, **kwargs)
+
+
+def _confirmed_builder_main(argv=None, backend=None):
+    """Confirm canonical B.main fixtures before its early workspace gate."""
+    args = B.build_arg_parser().parse_args(argv)
+    workspace = _fixture_workspace(args)
+    if workspace is None:
+        return _B_MAIN(argv, backend=backend)
+    expected_out = os.path.join(workspace, ".ingest", "source_raw_input.json")
+    expected_report = os.path.join(workspace, ".ingest", "parse_report.json")
+    if not (
+            os.path.normcase(os.path.normpath(os.path.abspath(args.out)))
+            == os.path.normcase(os.path.normpath(expected_out))
+            and os.path.normcase(os.path.normpath(os.path.abspath(args.report)))
+            == os.path.normcase(os.path.normpath(expected_report))):
+        return _B_MAIN(argv, backend=backend)
+    with _confirmed_full_pair(args.materials, workspace):
+        return _B_MAIN(argv, backend=backend)
+
+
+B.run = _confirmed_builder_run
+B.main = _confirmed_builder_main
+
+
+def tearDownModule():
+    B.run = _B_RUN
+    B.main = _B_MAIN
 
 
 PNG = bytes.fromhex(
@@ -58,6 +174,19 @@ class FakeBackend(object):
             return None
         return PNG
 
+    def page_layout(self, pdf_path, page_index):
+        return {
+            "page_bbox": [0.0, 0.0, 612.0, 792.0],
+            "images": [],
+            "text_boxes": [],
+            "text_blocks": [],
+        }
+
+    def render_page_clip_png(self, pdf_path, page_index, bbox):
+        # Delegate so specialised failure backends that override the historical
+        # full-page method exercise the same failure on the strict clip route.
+        return self.render_page_png(pdf_path, page_index)
+
 
 def _pages(file, *texts):
     return [{"file": file, "page": i + 1, "text": t} for i, t in enumerate(texts)]
@@ -77,7 +206,12 @@ def _args(materials, **over):
     report_supplied = "report" in over
     out = over.pop("out", os.path.join(materials, "raw_input.json"))
     rep = over.pop("report", os.path.join(materials, "parse_report.json"))
-    aroot = over.pop("asset_root", os.path.join(materials, "ws", "references", "assets"))
+    aroot = over.pop(
+        "asset_root",
+        os.path.join(
+            os.path.abspath(materials) + "-workspace", "references", "assets"
+        ),
+    )
     if aroot is not None:
         workspace = os.path.dirname(os.path.dirname(os.path.abspath(aroot)))
         ingest = os.path.join(workspace, ".ingest")
@@ -473,6 +607,18 @@ class CoreExtraction(unittest.TestCase):
         self.assertNotEqual(a, b)
         self.assertIn("lecture", a)
         self.assertIn("solutions", b)
+
+    def test_crop_spec_digest_changes_asset_name(self):
+        first = B._safe_asset_name(
+            "quiz.pdf", 12, "q1", "_qcrop1",
+            source_sha256="1" * 64, crop_spec_sha256="2" * 64,
+        )
+        second = B._safe_asset_name(
+            "quiz.pdf", 12, "q1", "_qcrop1",
+            source_sha256="1" * 64, crop_spec_sha256="3" * 64,
+        )
+        self.assertNotEqual(first, second)
+        self.assertIn("crop_%s" % ("2" * 12), first)
 
     # ---- round-4 hardening ----
     def test_inline_mention_is_not_a_marker(self):
@@ -891,6 +1037,9 @@ class CoreExtraction(unittest.TestCase):
                                             "Quiz 1.1 Solution  the shaded region is A and B."))[0]
         self.assertTrue(it["requires_assets"])
         self.assertIn("shaded region", it["answer"])             # not just a page-reference string
+        self.assertEqual(
+            "Quiz 1.1 Solution the shaded region is A and B.", it["answer"])
+        self.assertNotIn("须看原页", it["answer"])
 
     # ---- round-12 (P0B r12) hardening ----
     def test_answer_heading_recognized_as_solution(self):
@@ -1087,40 +1236,22 @@ class CliAndRun(unittest.TestCase):
                 row["metadata"].get("source_language") == "en" for row in prose
             ), source_file)
 
-    def test_programmatic_optional_adapter_runner_remains_injectable(self):
+    def test_programmatic_heavy_adapter_runner_is_rejected_locally(self):
         materials = _materials_with_pdf()
 
-        def runner(request):
-            self.assertEqual("ch01.pdf", request.source_file)
-            return {
-                "pages": [{
-                    "file": "ch01.pdf",
-                    "page": 1,
-                    "text": "Chapter 1\nGrounded adapter content.",
-                    "elements": [{
-                        "kind": "text",
-                        "text": "Chapter 1\nGrounded adapter content.",
-                        "ordinal": 0,
-                        "bbox": None,
-                        "method": "native",
-                        "confidence": 1.0,
-                    }],
-                    "embedded_assets": [],
-                    "review_signals": [],
-                }],
-                "discovered_page_count": 1,
-                "warnings": [],
-            }
+        runner = mock.Mock(side_effect=AssertionError(
+            "the local builder must never invoke a heavy parser runner"
+        ))
 
-        code, payload, unused_report = B.run(
+        code, payload, report = B.run(
             _args(materials, ingest_adapter="docling", render_pages="never"),
             backend=B.NoBackend(),
             adapter_runner=runner,
         )
-        self.assertEqual(0, code)
-        receipt = payload["ingestion"]["parser_receipts"][0]
-        self.assertEqual("docling", receipt["adapter"])
-        self.assertEqual(1, receipt["discovered_page_count"])
+        self.assertEqual(3, code)
+        runner.assert_not_called()
+        self.assertIn("remote/cloud-host-only", payload["error"])
+        self.assertEqual([], report["files_scanned"])
 
     def test_docx_review_signal_uses_explicit_break_segment_locator(self):
         materials = os.path.join(tempfile.mkdtemp(prefix="docx-location-"), "materials")
@@ -1173,8 +1304,9 @@ class CliAndRun(unittest.TestCase):
                       if row["source_file"] == "scan.png" and row["kind"] == "figure")
         self.assertEqual("source_page", raster["asset_role"])
         self.assertEqual([0.0, 0.0, 16.0, 12.0], raster["bbox"])
+        workspace = os.path.dirname(os.path.dirname(args.asset_root))
         self.assertTrue(os.path.isfile(os.path.join(
-            materials, "ws", *raster["asset_path"].split("/"))))
+            workspace, *raster["asset_path"].split("/"))))
         self.assertTrue(any(row.get("kind") == "standalone_raster_needs_ocr"
                             for row in report["ai_review"]))
 
@@ -1532,14 +1664,30 @@ class CliAndRun(unittest.TestCase):
     def test_render_required_without_asset_root_errors(self):
         d = _materials_with_pdf()
         be = FakeBackend({"ch01.pdf": ["Quiz 1.1  Venn diagram at right.", "Quiz 1.1 Solution  s."]})
-        code, payload, _ = B.run(_args(d, render_pages="required", asset_root=None), backend=be)
+        workspace = os.path.abspath(d) + "-workspace"
+        args = _args(
+            d, render_pages="required", asset_root=None,
+            out=os.path.join(workspace, ".ingest", "source_raw_input.json"),
+            report=os.path.join(workspace, ".ingest", "parse_report.json"),
+        )
+        code, payload, _ = B.run(
+            args, backend=be, publication_workspace=workspace
+        )
         self.assertEqual(code, 2)
         self.assertIn("asset-root", payload["error"])
 
     def test_render_auto_without_asset_root_warns_and_skips(self):
         d = _materials_with_pdf()
         be = FakeBackend({"ch01.pdf": ["Quiz 1.1  Venn diagram at right.", "Quiz 1.1 Solution  s."]})
-        code, ri, report = B.run(_args(d, asset_root=None), backend=be)   # render auto, no --asset-root
+        workspace = os.path.abspath(d) + "-workspace"
+        args = _args(
+            d, asset_root=None,
+            out=os.path.join(workspace, ".ingest", "source_raw_input.json"),
+            report=os.path.join(workspace, ".ingest", "parse_report.json"),
+        )
+        code, ri, report = B.run(
+            args, backend=be, publication_workspace=workspace
+        )  # render auto, no --asset-root
         self.assertEqual(code, 0)
         self.assertTrue(any("asset_root_not_set" in w for w in report["warnings"]))
         self.assertEqual(report["pages_rendered"], 0)                     # nothing written to a wrong place
@@ -1590,7 +1738,7 @@ class CliAndRun(unittest.TestCase):
 
         self.assertEqual(3, code)
         self.assertTrue(any(
-            "invalid or undecodable PNG" in row.get("why", "")
+            "invalid PNG" in row.get("why", "")
             for row in report["skipped"]
         ))
         self.assertFalse(os.path.exists(args.asset_root))
@@ -1609,7 +1757,7 @@ class CliAndRun(unittest.TestCase):
         self.assertTrue(qside)                                    # but the page WAS rendered
         self.assertTrue(os.path.isfile(os.path.join(args.asset_root, os.path.basename(qside[0]["path"]))))
 
-    def test_renders_all_continued_answer_pages(self):
+    def test_continued_answer_page_without_exact_crop_stays_in_review(self):
         d = _materials_with_pdf()
         be = FakeBackend({"ch01.pdf": ["Quiz 1.4  Shade the Venn diagram at right.",
                                        "Quiz 1.4 Solution  part1.",
@@ -1618,9 +1766,20 @@ class CliAndRun(unittest.TestCase):
         code, ri, report = B.run(args, backend=be)
         item = next(q for q in ri["quiz_bank"] if q["id"] == "lecture_quiz_1_4")
         sol = [a for a in item["assets"] if a["role"] == "answer_context"]
-        self.assertEqual(len(sol), 2)                        # BOTH solution pages get an asset...
-        for a in sol:                                        # ...and both are rendered to disk
-            self.assertTrue(os.path.isfile(os.path.join(args.asset_root, os.path.basename(a["path"]))))
+        # The first answer page has a unique solution marker and is isolated.
+        # A continuation marker alone does not prove that its whole page contains
+        # no unrelated material, so it remains explicit review work until an
+        # exact layout/vision crop is supplied; no unsafe whole-page fallback.
+        self.assertEqual(len(sol), 1)
+        self.assertTrue(os.path.isfile(os.path.join(
+            args.asset_root, os.path.basename(sol[0]["path"])
+        )))
+        self.assertTrue(any(
+            row.get("kind") == "item_asset_crop_not_materialized"
+            and row.get("pages") == [3]
+            and row.get("side") == "answer"
+            for row in report["ai_review"]
+        ))
 
     def test_answer_spanning_multiple_files_warns(self):
         d = os.path.join(tempfile.mkdtemp(prefix="mat-"), "materials")
@@ -1655,7 +1814,7 @@ class PublicationLocking(unittest.TestCase):
         with open(os.path.join(materials, "ch01.pdf"), "rb") as stream:
             source_sha256 = hashlib.sha256(stream.read()).hexdigest()
         name = B._safe_asset_name(
-            "ch01.pdf", 1, "lecture_quiz_1_1", "",
+            "ch01.pdf", 1, "lecture_quiz_1_1", "_isolated",
             source_sha256=source_sha256,
         )
         return materials, workspace, assets, out, report, backend, name
@@ -2838,14 +2997,18 @@ class PublicationLocking(unittest.TestCase):
             report = os.path.join(workspace, ".ingest", "parse_report.json")
             assets = os.path.join(workspace, "references", "assets")
 
-            with B.workspace_publication_lock(workspace):
-                code = B.main([
-                    "--materials", materials,
-                    "--out", out,
-                    "--report", report,
-                    "--asset-root", assets,
-                    "--render-pages", "never",
-                ], backend=B.NoBackend())
+            # Establish the full-mode receipt before deliberately holding the
+            # publication lock; confirmation itself is a state mutation and is
+            # correctly unable to run inside the conflict being tested.
+            with _confirmed_full_pair(materials, workspace):
+                with B.workspace_publication_lock(workspace):
+                    code = B.main([
+                        "--materials", materials,
+                        "--out", out,
+                        "--report", report,
+                        "--asset-root", assets,
+                        "--render-pages", "never",
+                    ], backend=B.NoBackend())
 
             self.assertEqual(7, code)
             self.assertFalse(os.path.exists(out))
@@ -2856,10 +3019,14 @@ class PublicationLocking(unittest.TestCase):
             self.assertFalse(os.path.exists(assets))
 
 
-def _ingest(raw_input_path, out_dir):
-    return subprocess.run([sys.executable, os.path.join(SCRIPTS, "ingest.py"),
-                           "-i", raw_input_path, "-o", out_dir],
-                          capture_output=True, text=True, encoding="utf-8")
+def _ingest(raw_input_path, out_dir, materials):
+    with _confirmed_full_pair(materials, out_dir):
+        return subprocess.run(
+            [sys.executable, os.path.join(SCRIPTS, "ingest.py"),
+             "-i", raw_input_path, "-o", out_dir],
+            capture_output=True, text=True, encoding="utf-8",
+            env=os.environ.copy(),
+        )
 
 
 def _validate(ws):
@@ -2879,22 +3046,21 @@ class IngestIntegration(unittest.TestCase):
         os.makedirs(os.path.dirname(args.out), exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(ri, f, ensure_ascii=False)
-        ws = os.path.join(d, "ws")
-        r = _ingest(args.out, ws)
+        ws = os.path.dirname(os.path.dirname(args.out))
+        r = _ingest(args.out, ws, d)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(os.path.isfile(os.path.join(ws, "references", "quiz_bank.json")))
 
     def test_asset_fields_survive_into_quiz_bank(self):
         d = _materials_with_pdf()
         be = FakeBackend({"ch01.pdf": ["Quiz 1.1  Shade the Venn diagram at right.", "Quiz 1.1 Solution  s."]})
-        args = _args(d)  # asset-root points into ws/references/assets so renders land in the workspace
-        args.asset_root = os.path.join(d, "ws", "references", "assets")
+        args = _args(d)
         code, ri, _ = B.run(args, backend=be)
         os.makedirs(os.path.dirname(args.out), exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(ri, f, ensure_ascii=False)
-        ws = os.path.join(d, "ws")
-        self.assertEqual(_ingest(args.out, ws).returncode, 0)
+        ws = os.path.dirname(os.path.dirname(args.out))
+        self.assertEqual(_ingest(args.out, ws, d).returncode, 0)
         with open(os.path.join(ws, "references", "quiz_bank.json"), encoding="utf-8") as f:
             qb = json.load(f)
         item = next(q for q in qb if q["id"] == "lecture_quiz_1_1")
@@ -2910,28 +3076,29 @@ class IngestIntegration(unittest.TestCase):
         be = FakeBackend({"ch01.pdf": ["Quiz 1.1  Venn diagram at right.", "Quiz 1.1 Solution  s."]},
                          can_render=False)
         args = _args(d, render_pages="auto")
-        args.asset_root = os.path.join(d, "ws", "references", "assets")
         code, ri, _ = B.run(args, backend=be)
         os.makedirs(os.path.dirname(args.out), exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(ri, f, ensure_ascii=False)
-        ws = os.path.join(d, "ws")
-        self.assertEqual(_ingest(args.out, ws).returncode, 0)
+        ws = os.path.dirname(os.path.dirname(args.out))
+        self.assertEqual(_ingest(args.out, ws, d).returncode, 0)
         V = _validate(ws)
         errors = V.validate(ws)[0]
         self.assertEqual(V._exit_code(errors), 1)  # missing required asset -> fail-closed
 
     def test_old_handauthored_raw_input_still_works(self):
         d = tempfile.mkdtemp(prefix="old-")
+        materials = os.path.join(d, "materials")
+        os.makedirs(materials)
         ri = {"course_name": "Old", "phases": [{"phase_num": 1, "phase_name": "P1",
               "wiki_filename": "ch1.md", "wiki_content": "# c"}],
               "quiz_bank": [{"id": "q1", "chapter": 1, "type": "choice", "question": "?",
                              "options": ["A", "B"], "answer": "A", "source": "material"}]}
-        p = os.path.join(d, "raw_input.json")
+        p = os.path.join(materials, "raw_input.json")
         with open(p, "w", encoding="utf-8") as f:
             json.dump(ri, f)
-        ws = os.path.join(d, "ws")
-        self.assertEqual(_ingest(p, ws).returncode, 0)
+        ws = os.path.join(d, "workspace")
+        self.assertEqual(_ingest(p, ws, materials).returncode, 0)
 
 
 class Hygiene(unittest.TestCase):

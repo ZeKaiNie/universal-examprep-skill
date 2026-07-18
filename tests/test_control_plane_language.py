@@ -63,8 +63,8 @@ ALLOWED_TOKENS = (
     "题面图", "答案图",   # 复合形 题面图 / question-side asset 已移出控制文本（改语言参数化）
     # seven-step template labels (exam-tutor canon; behavior_smoke parses transcripts for these)
     "① 题面图", "② 这题在问什么", "③ 图里要读的量", "④ 核心公式",
-    "⑤ 逐步演算", "⑥ 答案自检", "⑦ 知识点溯源",
-    "这题在问什么", "图里要读的量", "核心公式", "逐步演算", "答案自检", "知识点溯源",
+    "⑤ 逐步演算", "⑥ 为什么这个答案成立", "⑦ 知识点溯源",
+    "这题在问什么", "图里要读的量", "核心公式", "逐步演算", "为什么这个答案成立", "知识点溯源",
     "材料里要读的关键句/概念", "核心概念", "逐点展开",
     "七步精讲", "文科变体", "讲解模板",
     # closers (default-off blocks; names are canonical)
@@ -181,7 +181,7 @@ class ControlPlaneLanguageTest(unittest.TestCase):
 
     def test_tutor_chinese_template_preserved(self):
         t = read("skills", "exam-tutor", "SKILL.md")
-        for label in ("当前阶段", "这题在问什么", "核心公式", "逐步演算", "答案自检",
+        for label in ("当前阶段", "这题在问什么", "核心公式", "逐步演算", "为什么这个答案成立",
                       "知识点溯源", "易错点", "3分钟速记"):
             self.assertIn(label, t, f"exam-tutor 丢失中文教学模板标签: {label}")
 

@@ -285,13 +285,13 @@ Exit gate: test evidence covers real adapters and semantic invariants, not only 
 
 Default core: Python standard library plus whichever already-supported PDF backend passed preflight.
 
-Implemented routes are explicit and local:
+The current runtime routes are explicit; only the core routes are local:
 
 1. the default core parser, using the already-supported PDF backend that passed preflight plus stdlib DOCX/PPTX/XLSX/raster/text parsing;
 2. dedicated stdlib XLSX and standalone-raster routes, with worksheet/image page-equivalent anchors and typed review rather than fake OCR success;
-3. optional Docling or MinerU **host-runner identities** selected explicitly for eligible PDF/OOXML files. Package metadata probing alone is not extraction: the host must supply a callable local runner whose normalized output passes the same contract.
+3. optional Docling or MinerU remote/cloud integrations, only after the user explicitly names the parser and separately accepts the disclosed upload/retention/privacy boundary. The student runtime never probes, downloads, installs, imports, executes, or accepts a callable local runner; without a configured remote integration it stays on core plus typed visual review.
 
-No adapter installs packages/models, enables network access, or uploads material. A missing/invalid optional runner is an explicit operation failure, then the host returns to core/typed review; it is not silently installed or relabeled as success. LiteParse and cloud parser integrations remain prior-art/future candidates, not implemented routes. The project remains useful with the core BM25 path and no vector database.
+The bundled local adapters install no packages/models, enable no network access, and upload no material. A remote parser is a separately operated host boundary, not a bundled adapter or local fallback; if unavailable it is reported honestly and the host returns to core/typed review. LiteParse remains prior art rather than an implemented route. The project remains useful with the core BM25 path and no vector database.
 
 ## 7. Deletion safety
 

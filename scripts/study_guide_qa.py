@@ -50,7 +50,7 @@ except ImportError:  # pragma: no cover - standalone entrypoint path
 
 
 SCHEMA_VERSION = 1
-ARTIFACT_RECEIPT_SCHEMA_VERSION = 2
+ARTIFACT_RECEIPT_SCHEMA_VERSION = 3
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 TIMESTAMP_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$"
@@ -60,19 +60,26 @@ RECEIPT_FIELDS = frozenset((
     "content_manifest", "content_manifest_sha256", "expected_item_ids",
     "rendered_item_ids", "omitted_item_ids", "html_file", "html_sha256",
     "pdf_file", "pdf_sha256", "pdf_backend", "converter",
+    "native_adapter_id", "native_adapter_version",
     "conversion_input_html_sha256", "conversion_started_at",
-    "conversion_completed_at", "conversion_run_sha256", "preflight",
+    "conversion_completed_at", "conversion_start_gate_sha256",
+    "conversion_run_sha256", "preflight",
     "start_gate", "generated_at", "status", "visual_qa",
 ))
 START_GATE_FIELDS = frozenset((
     "ready_to_use", "workspace", "materials", "registered_course",
+    "answer_explanation_mode",
     "runtime_digest", "runtime_file_count", "skill_version", "git_commit",
     "git_branch", "git_dirty", "python_executable",
 ))
 MANUAL_REVIEW_CHECKS = (
     "all_prompt_images_diagrams_and_formulas_are_visible_and_readable",
+    "every_question_and_answer_crop_contains_only_its_target_item_and_no_neighboring_content",
     "no_content_is_clipped_overlapped_or_hidden_at_page_boundaries",
     "selected_language_and_required_translation_are_complete_and_natural",
+    "full_prompt_images_do_not_repeat_original_or_ocr_prompt_text_and_show_only_needed_translation",
+    "provenance_meanings_appear_once_then_only_collapsed_terminal_emoji_markers",
+    "every_item_has_a_detailed_beginner_first_answer_explanation_covering_formula_or_rule_substitution_and_final_meaning_with_no_generic_self_check",
     "no_orphan_heading_stranded_caption_or_excessive_blank_region_remains",
 )
 RAW_TEX_RE = re.compile(
@@ -82,6 +89,8 @@ RAW_TEX_RE = re.compile(
     r"\${1,2}[^$\r\n]+\${1,2})"
 )
 QA_PAGE_RE = re.compile(r"^ch(?P<chapter>\d+)_p(?P<page>\d{3})\.png$")
+NATIVE_ADAPTER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,127}$")
+NATIVE_ADAPTER_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$")
 
 
 class QAError(Exception):
@@ -148,6 +157,31 @@ def _strict_json_load(path):
     if not isinstance(value, dict):
         raise QAError("chapter receipt must be a JSON object")
     return value
+
+
+def _declared_native_adapter_ids():
+    path = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "docs", "pdf-capability-adapters.json"
+    ))
+    registry = _strict_json_load(path)
+    if registry.get("schema_version") != 1 or not isinstance(registry.get("runtimes"), list):
+        raise QAError("native PDF adapter registry schema is invalid")
+    allowed = set()
+    for row in registry["runtimes"]:
+        if not isinstance(row, dict):
+            raise QAError("native PDF adapter registry contains an invalid runtime")
+        preferred = row.get("preferred")
+        if not isinstance(preferred, dict) or preferred.get("preflight_backend") != "native":
+            continue
+        adapter_id = preferred.get("adapter_id")
+        if not isinstance(adapter_id, str) or not NATIVE_ADAPTER_ID_RE.fullmatch(adapter_id):
+            raise QAError("native PDF adapter registry contains an invalid adapter_id")
+        if adapter_id in allowed:
+            raise QAError("native PDF adapter registry contains a duplicate adapter_id")
+        allowed.add(adapter_id)
+    if not allowed:
+        raise QAError("native PDF adapter registry declares no native adapters")
+    return allowed
 
 
 def _parse_timestamp(value, label):
@@ -504,6 +538,8 @@ def _start_gate_snapshot(gate):
         "workspace": gate.get("workspace"),
         "materials": gate.get("materials"),
         "registered_course": gate.get("registered_course"),
+        "answer_explanation_mode": gate.get(
+            "answer_explanation_mode", "ordinary"),
         "runtime_digest": runtime.get("runtime_digest"),
         "runtime_file_count": runtime.get("runtime_file_count"),
         "skill_version": runtime.get("skill_version"),
@@ -522,6 +558,8 @@ def _validate_start_gate_snapshot(value, workspace):
     for field in ("workspace", "materials", "registered_course", "skill_version",
                   "python_executable"):
         _safe_single_line(value.get(field), "start_gate.%s" % field)
+    if value.get("answer_explanation_mode") not in ("ordinary", "isolated"):
+        raise QAError("receipt start_gate.answer_explanation_mode is invalid")
     if not exam_start.update_progress._same_canonical_path(value["workspace"], workspace):
         raise QAError("receipt start_gate belongs to another workspace")
     if not isinstance(value.get("runtime_digest"), str) or not HASH_RE.fullmatch(
@@ -551,21 +589,31 @@ def _conversion_input_hash(html_path):
     return _sha256_bytes(ready.encode("utf-8"))
 
 
-def _conversion_run_hash(chapter, profile, language, html_sha256, pdf_sha256,
-                         conversion_input_html_sha256, converter,
+def _conversion_run_hash(chapter, profile, language, content_manifest,
+                         content_manifest_sha256, html_file, html_sha256, pdf_file,
+                         pdf_sha256, pdf_backend, conversion_input_html_sha256,
+                         converter, native_adapter_id, native_adapter_version,
                          conversion_started_at, conversion_completed_at,
-                         start_gate):
+                         conversion_start_gate_sha256, start_gate):
     return _canonical_hash({
         "artifact_type": "study_guide",
         "chapter": chapter,
         "profile": profile,
         "language": language,
+        "content_manifest": content_manifest,
+        "content_manifest_sha256": content_manifest_sha256,
+        "html_file": html_file,
         "html_sha256": html_sha256,
+        "pdf_file": pdf_file,
         "pdf_sha256": pdf_sha256,
+        "pdf_backend": pdf_backend,
         "conversion_input_html_sha256": conversion_input_html_sha256,
         "converter": converter,
+        "native_adapter_id": native_adapter_id,
+        "native_adapter_version": native_adapter_version,
         "conversion_started_at": conversion_started_at,
         "conversion_completed_at": conversion_completed_at,
+        "conversion_start_gate_sha256": conversion_start_gate_sha256,
         "start_gate": start_gate,
     })
 
@@ -585,8 +633,9 @@ def _strict_state_language(workspace):
 def validate_receipt_chain(workspace, chapter, require_pdf=True):
     """Validate one immutable render/conversion identity chain against current state.
 
-    This never fills a missing field.  A native or externally dropped PDF has no same-run
-    browser conversion receipt and therefore cannot be visually accepted or published.
+    This never fills a missing field.  A browser PDF needs its same-run receipt; a native
+    PDF needs the atomic bind-native receipt.  An externally dropped, partial, stale, or
+    identity-mismatched PDF therefore cannot be visually accepted or published.
     """
     workspace = _guard_workspace(workspace)
     if isinstance(chapter, bool) or not isinstance(chapter, int) or chapter < 1:
@@ -649,6 +698,18 @@ def validate_receipt_chain(workspace, chapter, require_pdf=True):
     report_manifest_path = os.path.realpath(report.get("input_path") or "")
     if os.path.normcase(report_manifest_path) != os.path.normcase(manifest_path):
         raise QAError("manifest validator did not load the canonical chapter manifest")
+    if report.get("ingestion_pipeline_version") == "ingestion-v1":
+        raise QAError(
+            "ingestion-v1 Study Guide compatibility is read-only; historical "
+            "artifacts cannot receive a new visual-QA publication claim"
+        )
+    if report.get("authoring_protocol_version") != 2:
+        raise QAError(
+            "visual QA requires authoring_protocol_version=2 with target-item "
+            "crop receipts and detailed per-item answer explanations; the explicit "
+            "answer_explanation_mode separately determines whether isolated receipts "
+            "are required"
+        )
     for field, report_field in (
             ("profile", "profile"), ("language", "language"),
             ("expected_item_ids", "expected_item_ids"),
@@ -682,13 +743,22 @@ def validate_receipt_chain(workspace, chapter, require_pdf=True):
         raise QAError("current workspace start gate is not ready")
     if _start_gate_snapshot(current_gate) != recorded_gate:
         raise QAError("workspace/runtime start gate drifted from artifact receipt")
+    conversion_gate_hash = receipt.get("conversion_start_gate_sha256")
+    if (not isinstance(conversion_gate_hash, str)
+            or not HASH_RE.fullmatch(conversion_gate_hash)
+            or conversion_gate_hash != _canonical_hash(recorded_gate)):
+        raise QAError("conversion start-gate identity is invalid or drifted")
 
     pdf_fields = (
         "pdf_file", "pdf_sha256", "converter", "conversion_input_html_sha256",
         "conversion_started_at", "conversion_completed_at", "conversion_run_sha256",
     )
+    native_identity_fields = ("native_adapter_id", "native_adapter_version")
     has_pdf_binding = all(receipt.get(field) is not None for field in pdf_fields)
-    any_pdf_binding = any(receipt.get(field) is not None for field in pdf_fields)
+    any_pdf_binding = any(
+        receipt.get(field) is not None
+        for field in pdf_fields + native_identity_fields
+    )
     backend = receipt.get("pdf_backend")
     if backend not in ("html", "browser", "native"):
         raise QAError("receipt pdf_backend is invalid")
@@ -707,13 +777,13 @@ def validate_receipt_chain(workspace, chapter, require_pdf=True):
             raise QAError("unbound artifact receipt status is inconsistent")
         if require_pdf:
             raise QAError(
-                "artifact receipt has no same-run browser PDF binding; external/native PDF "
-                "binding is forbidden"
+                "artifact receipt has no complete browser/native PDF binding; run the "
+                "declared backend conversion and bind-native workflow first"
             )
         return receipt, context
 
-    if backend != "browser":
-        raise QAError("only the same-run browser route can bind a Study Guide PDF")
+    if backend == "html":
+        raise QAError("HTML-only backend cannot bind a Study Guide PDF")
     if receipt.get("status") not in ("qa_pending", "ready"):
         raise QAError("bound PDF artifact receipt status is invalid")
     expected_pdf_rel = "study_guide/%s.pdf" % stem
@@ -729,27 +799,47 @@ def validate_receipt_chain(workspace, chapter, require_pdf=True):
     if _sha256_file(pdf_path) != pdf_hash:
         raise QAError("chapter PDF hash drifted from artifact receipt")
     converter = _safe_single_line(receipt.get("converter"), "converter")
+    native_adapter_id = receipt.get("native_adapter_id")
+    native_adapter_version = receipt.get("native_adapter_version")
+    if backend == "browser":
+        if native_adapter_id is not None or native_adapter_version is not None:
+            raise QAError("browser receipt must not claim a native adapter identity")
+    else:
+        if (not isinstance(native_adapter_id, str)
+                or not NATIVE_ADAPTER_ID_RE.fullmatch(native_adapter_id)
+                or native_adapter_id not in _declared_native_adapter_ids()):
+            raise QAError("native receipt adapter id is invalid or undeclared")
+        if (not isinstance(native_adapter_version, str)
+                or not NATIVE_ADAPTER_VERSION_RE.fullmatch(native_adapter_version)):
+            raise QAError("native receipt adapter version is invalid")
+        if converter != "native:%s@%s" % (native_adapter_id, native_adapter_version):
+            raise QAError("native receipt converter does not match its adapter identity")
     input_hash = receipt.get("conversion_input_html_sha256")
     if not isinstance(input_hash, str) or not HASH_RE.fullmatch(input_hash):
         raise QAError("receipt conversion_input_html_sha256 is invalid")
-    if _conversion_input_hash(html_path) != input_hash:
-        raise QAError("browser conversion input drifted from the current HTML")
+    expected_input_hash = (
+        _conversion_input_hash(html_path) if backend == "browser" else html_hash
+    )
+    if expected_input_hash != input_hash:
+        raise QAError("%s conversion input drifted from the current HTML" % backend)
     started = _parse_timestamp(receipt.get("conversion_started_at"),
                                "conversion_started_at")
     completed = _parse_timestamp(receipt.get("conversion_completed_at"),
                                  "conversion_completed_at")
     if completed < started:
-        raise QAError("browser conversion completion precedes its start")
+        raise QAError("PDF conversion completion precedes its start")
     if generated_at < completed:
-        raise QAError("artifact receipt predates browser conversion completion")
+        raise QAError("artifact receipt predates PDF conversion completion")
     run_hash = receipt.get("conversion_run_sha256")
     expected_run_hash = _conversion_run_hash(
-        chapter, profile, language, html_hash, pdf_hash, input_hash, converter,
+        chapter, profile, language, expected_manifest_rel, manifest_hash,
+        expected_html_rel, html_hash, expected_pdf_rel, pdf_hash, backend,
+        input_hash, converter, native_adapter_id, native_adapter_version,
         receipt["conversion_started_at"], receipt["conversion_completed_at"],
-        recorded_gate,
+        conversion_gate_hash, recorded_gate,
     )
     if not isinstance(run_hash, str) or run_hash != expected_run_hash:
-        raise QAError("browser conversion run hash is invalid or drifted")
+        raise QAError("PDF conversion run hash is invalid or drifted")
     context["pdf_path"] = pdf_path
     return receipt, context
 
@@ -790,11 +880,16 @@ class PyMuPDFBackend(object):
             document = self.module.open(pdf_input)
         try:
             output = []
+            scale = 150.0 / 72.0
+            matrix = self.module.Matrix(scale, scale)
             for index in range(document.page_count):
                 page = document[index]
                 text = page.get_text("text") or ""
-                pixmap = page.get_pixmap(dpi=150, alpha=False)
-                png = pixmap.tobytes("png")
+                # Matrix scaling produces the requested pixel dimensions.  Some
+                # PyMuPDF versions still emit pHYs metadata, so strip that optional
+                # chunk to keep host viewers from shifting/cropping correct pixels.
+                pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+                png = _strip_png_physical_density(pixmap.tobytes("png"))
                 output.append({
                     "png": png,
                     "text": text,
@@ -829,7 +924,7 @@ class PDFiumBackend(object):
                     buffer = io.BytesIO()
                     image.save(buffer, format="PNG")
                     output.append({
-                        "png": buffer.getvalue(),
+                        "png": _strip_png_physical_density(buffer.getvalue()),
                         "text": text,
                         "width": int(image.width),
                         "height": int(image.height),
@@ -897,6 +992,33 @@ def _png_dimensions(payload):
         raise QAError("renderer did not produce a valid PNG: %s" % exc)
 
 
+def _strip_png_physical_density(payload):
+    """Remove optional PNG ``pHYs`` chunks without recompressing pixels."""
+    raw = bytes(payload)
+    if not raw.startswith(PNG_SIGNATURE):
+        raise QAError("renderer did not produce a valid PNG signature")
+    output = [PNG_SIGNATURE]
+    offset = len(PNG_SIGNATURE)
+    saw_iend = False
+    while offset < len(raw):
+        if offset + 12 > len(raw):
+            raise QAError("renderer produced a truncated PNG chunk")
+        length = int.from_bytes(raw[offset:offset + 4], "big")
+        end = offset + 12 + length
+        if end > len(raw):
+            raise QAError("renderer produced a truncated PNG chunk payload")
+        kind = raw[offset + 4:offset + 8]
+        if kind != b"pHYs":
+            output.append(raw[offset:end])
+        offset = end
+        if kind == b"IEND":
+            saw_iend = True
+            break
+    if not saw_iend or offset != len(raw):
+        raise QAError("renderer produced a malformed PNG chunk stream")
+    return b"".join(output)
+
+
 def _looks_like_orphan_heading(text):
     lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
     while lines and re.fullmatch(
@@ -906,8 +1028,19 @@ def _looks_like_orphan_heading(text):
     if not lines:
         return False
     tail = lines[-1]
+    if (re.search(r"\.(?:pdf|pptx|docx)\b", tail, re.I)
+            and re.search(
+                r"(?:\b(?:p\.?|page)\s*\d+|第\s*\d+\s*页)", tail, re.I)):
+        return False
+    if re.fullmatch(r"(?:EN|中文)\s*[·•]?", tail, re.I):
+        return True
+    if re.search(
+            r"(?:来源证据|来源追踪|Source evidence|Source trace|"
+            r"题面翻译|Prompt translation)\s*$",
+            tail, re.I):
+        return True
     return len(tail) <= 80 and bool(re.search(
-        r"(?:chapter|knowledge point|worked example|example|solution|quiz|"
+        r"(?:chapter|knowledge point|worked example|example|solution|answer|quiz|"
         r"第\s*\d+\s*章|知识点|例题|解答|答案|测验)\s*[:：]?$", tail, re.I
     ))
 
@@ -1339,6 +1472,12 @@ def run(argv=None, backend=None, now=None, _state_locked=False):
     if args.chapter < 1:
         raise QAError("--chapter must be a positive integer", 2)
     workspace = _guard_workspace(args.workspace)
+    try:
+        exam_start.require_full_processing(
+            workspace, purpose="Study Guide visual QA"
+        )
+    except exam_start.FullProcessingRequired as exc:
+        raise QAError(str(exc), 2) from exc
     if not _state_locked:
         with workspace_publication_lock(workspace):
             return run(argv, backend=backend, now=now, _state_locked=True)

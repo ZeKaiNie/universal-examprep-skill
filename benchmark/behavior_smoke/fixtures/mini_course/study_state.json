@@ -5,7 +5,12 @@
   "mode": null,
   "time_budget": null,
   "language": null,
-  "preferences": {},
+  "artifact_mode": "chat",
+  "processing_mode": "lightweight",
+  "answer_explanation_mode": "ordinary",
+  "preferences": {
+    "interaction_style": "batch"
+  },
   "mistake_archive": [],
   "confusion_log": [],
   "knowledge_window": [],

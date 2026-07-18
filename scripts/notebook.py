@@ -16,19 +16,24 @@ silently deleted. A write failure is FAIL-LOUD (non-zero exit) — never silentl
 
     python scripts/notebook.py --workspace <ws> add-entry --chapter 2 --type walkthrough \
         --id q13 --title "Venn 图判断" < body.md      # body via STDIN; rebuilds notebook/index.md
+    python scripts/notebook.py --workspace <ws> add-entry --chapter 2 --type walkthrough \
+        --id ex13 --teaching-example < body.md        # explicit step-by-step evidence marker
     python scripts/notebook.py --workspace <ws> add-entry --chapter 2 --type feedback \
         --id q13 --mistake < body.md                  # also mirrors into mistakes/ + its index
     python scripts/notebook.py --workspace <ws> rebuild              # regenerate both index.md
     python scripts/notebook.py --workspace <ws> list [--json]        # entries inventory
 
-Headings/labels come from i18n msgids (--lang zh|en; default: study_state.json language,
-falling back to zh). Entry anchors are GitHub-style slugs of "[#<id>] <title>", so index
+Headings/labels come from i18n msgids (--lang zh|en|bilingual; default:
+study_state.json language, falling back to zh). Bilingual metadata and derived-index
+headings mirror the Chinese and English labels in one durable file. Entry anchors are
+GitHub-style slugs of "[#<id>] <title>", so index
 links jump straight to the entry. Chapter files are parsed back by their "## [#<id>]"
 block markers, fence-aware: a "## " line inside a fenced code block is content, never a
 block boundary. Exit codes: 0 ok · 1 read/write failure · 2 bad input/usage.
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -41,7 +46,8 @@ for _s in ("stdin", "stdout", "stderr"):
         pass
 
 import i18n
-from ingestion import workspace_publication_lock
+from ingestion import is_link_or_reparse, workspace_publication_lock
+from stable_ids import STABLE_ITEM_ID_RE, stable_item_id_problem
 
 NOTEBOOK_DIR = "notebook"
 MISTAKES_DIR = "mistakes"
@@ -58,7 +64,9 @@ _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 # 章文件名：chNN.md（生成时 NN 补零到 2 位；回读容忍手写的 ch3.md）
 _CH_FILE_RE = re.compile(r"^ch(\d+)\.md$")
 # 条目 id：进标题的 [#id] 与锚点，禁空白与破坏解析/链接的字符
-_ID_RE = re.compile(r"^[^\s\[\]#|`]+$")
+_ID_RE = STABLE_ITEM_ID_RE
+_TEACHING_EXAMPLE_MARKER_RE = re.compile(
+    r"^<!-- exam-cram-teaching-example-id-sha256: ([0-9a-f]{64}) -->$")
 
 
 def _die(msg, code=2):
@@ -70,8 +78,8 @@ def _die(msg, code=2):
 
 def _read_regular(path):
     """Read a UTF-8 regular file; symlinks are refused (they can point outside the workspace)."""
-    if os.path.islink(path):
-        _die("%s 是符号链接——可能指向工作区外，拒绝读取（请替换为真实文件）" % path, 1)
+    if is_link_or_reparse(path):
+        _die("%s 是 link/reparse point——可能指向工作区外，拒绝读取（请替换为真实文件）" % path, 1)
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
@@ -85,14 +93,22 @@ def _guard_dir(ws, name, create=False):
     """notebook/ 与 mistakes/ 必须是工作区内的真实目录：符号链接目录或经链接逃出工作区都拒绝
     （load_state 同款口径）——否则每次落盘都在往用户不知道的地方写。"""
     d = os.path.join(ws, name)
-    if os.path.islink(d):
-        _die("%s 是符号链接目录——可能指向工作区外，拒绝读写（请替换为真实目录）" % d, 1)
-    if create and not os.path.isdir(d):
+    if os.path.lexists(d) and is_link_or_reparse(d):
+        _die("%s 是 link/reparse point——可能指向工作区外，拒绝读写（请替换为真实目录）" % d, 1)
+    if os.path.lexists(d) and not os.path.isdir(d):
+        _die("%s 已存在但不是目录——拒绝读写，请先修复工作区结构" % d, 1)
+    if create and not os.path.lexists(d):
         try:
             os.makedirs(d)
         except OSError as e:
             _die("无法创建目录 %s（%s）" % (d, e), 1)
-    if os.path.isdir(d) and not os.path.realpath(d).startswith(os.path.realpath(ws) + os.sep):
+    real_ws = os.path.normcase(os.path.realpath(ws))
+    real_dir = os.path.normcase(os.path.realpath(d))
+    try:
+        contained = os.path.commonpath((real_ws, real_dir)) == real_ws
+    except ValueError:
+        contained = False
+    if os.path.isdir(d) and not contained:
         _die("%s 经符号链接逃出工作区——拒绝读写" % d, 1)
     return d
 
@@ -103,13 +119,13 @@ def _save_files(plan, note):
     (worst case an index is stale; `rebuild` repairs it). Same conventions as
     update_progress.save: O_EXCL tmp creation, symlink-tmp refusal, fail-loud."""
     for path, _content in plan:
-        if os.path.islink(path):
-            _die("%s 是符号链接——可能指向工作区外，拒绝写入（请替换为真实文件）" % path, 1)
+        if is_link_or_reparse(path):
+            _die("%s 是 link/reparse point——可能指向工作区外，拒绝写入（请替换为真实文件）" % path, 1)
         if os.path.lexists(path) and not os.path.isfile(path):
             _die("%s 已存在但不是常规文件（目录/特殊文件）——拒绝写入，请先手动清理" % path, 1)
         tmp = path + ".tmp"
-        if os.path.islink(tmp):
-            _die("检测到符号链接临时文件 %s——可能指向工作区外，拒绝写入（请手动清理后重试）" % tmp, 1)
+        if is_link_or_reparse(tmp):
+            _die("检测到 link/reparse 临时文件 %s——可能指向工作区外，拒绝写入（请手动清理后重试）" % tmp, 1)
     tmps = []
     try:
         for path, content in plan:
@@ -137,8 +153,8 @@ def _save_files(plan, note):
 def _load_state(ws):
     """study_state.json（可缺省）——只为读语言偏好与错题状态；load_state 同款 fail-loud。"""
     path = os.path.join(ws, STATE_NAME)
-    if os.path.islink(path):
-        _die("study_state.json 是符号链接——事实源可能指向工作区外，拒绝读取（请替换为真实文件）", 1)
+    if is_link_or_reparse(path):
+        _die("study_state.json 是 link/reparse point——事实源可能指向工作区外，拒绝读取（请替换为真实文件）", 1)
     if not os.path.isfile(path):
         return None
     try:
@@ -153,12 +169,37 @@ def _load_state(ws):
 
 
 def _resolve_lang(arg_lang, state):
-    """--lang 显式覆盖 > study_state.json 的 language（经 i18n 归一） > zh；
-    bilingual 的落盘标题走 zh（双语=zh 包+镜像组合，文件只落一份标题）。"""
+    """--lang explicit override > canonical state language > zh fallback."""
     if arg_lang:
         return arg_lang
     lang = i18n.workspace_language(state)
-    return lang if lang in ("zh", "en") else "zh"
+    return lang if lang in ("zh", "en", "bilingual") else "zh"
+
+
+def _mirror_inline(zh_text, en_text):
+    """Join one zh/en UI label without producing two Markdown block markers."""
+    if not isinstance(zh_text, str) or not isinstance(en_text, str):
+        return zh_text if isinstance(zh_text, str) else en_text
+    zh_match = re.match(r"^(#{1,6}\s+)(.*)$", zh_text)
+    en_match = re.match(r"^(#{1,6}\s+)(.*)$", en_text)
+    if zh_match and en_match and zh_match.group(1) == en_match.group(1):
+        return "%s%s / %s" % (
+            zh_match.group(1), zh_match.group(2), en_match.group(2))
+    return "%s / %s" % (zh_text, en_text)
+
+
+def _msg(msgid, lang, **fmt):
+    if lang != "bilingual":
+        return i18n.msg(msgid, lang, **fmt)
+    return _mirror_inline(
+        i18n.msg(msgid, "zh", **fmt), i18n.msg(msgid, "en", **fmt))
+
+
+def _display(kind, code, lang):
+    if lang != "bilingual":
+        return i18n.display(kind, code, lang)
+    return _mirror_inline(
+        i18n.display(kind, code, "zh"), i18n.display(kind, code, "en"))
 
 
 # ---------------- chapter-file parsing / rendering (fence-aware block model) ----------------
@@ -197,6 +238,10 @@ def parse_chapter(text):
                 blocks.append(cur)
                 continue
         (cur["lines"] if cur else pre).append(line)
+    if fence is not None:
+        raise ValueError(
+            "notebook chapter contains an unterminated fenced code block"
+        )
     return pre, blocks
 
 
@@ -224,9 +269,39 @@ def github_slug(text):
     return "".join(out)
 
 
-def make_entry_lines(eid, title, type_label, ts, body):
+def teaching_example_marker(eid):
+    digest = hashlib.sha256(eid.encode("utf-8")).hexdigest()
+    return "<!-- exam-cram-teaching-example-id-sha256: %s -->" % digest
+
+
+def block_has_teaching_example_marker(block, eid):
+    expected = hashlib.sha256(eid.encode("utf-8")).hexdigest()
+    lines = block.get("lines") or []
+    markers = []
+    for line in lines:
+        match = _TEACHING_EXAMPLE_MARKER_RE.match(line)
+        if match:
+            markers.append(match.group(1))
+    return (len(lines) > 4
+            and lines[4] == teaching_example_marker(eid)
+            and markers == [expected])
+
+
+def block_sha256(block):
+    """Hash one parsed entry in the canonical block form used by Guide bindings."""
+
+    lines = block.get("lines") if isinstance(block, dict) else None
+    if not isinstance(lines, list) or any(not isinstance(line, str) for line in lines):
+        raise ValueError("notebook block lines must be a string array")
+    rendered = "\n".join(lines).rstrip() + "\n"
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
+def make_entry_lines(eid, title, type_label, ts, body, teaching_example=False):
     """One entry block: heading + one-line meta (type · timestamp) + body + trailing ---."""
     lines = ["## [#%s] %s" % (eid, title), "", "> %s · %s" % (type_label, ts), ""]
+    if teaching_example:
+        lines += [teaching_example_marker(eid), ""]
     lines += body.splitlines()
     lines += ["", "---"]
     return lines
@@ -248,7 +323,7 @@ def _block_meta(lines):
 
 
 def _label_to_type():
-    """Reverse map: zh/en display labels (and the canonical codes themselves) → type code."""
+    """Reverse map: zh/en/bilingual labels (and canonical codes) → type code."""
     rev = {t: t for t in TYPES}
     for lang in ("zh", "en"):
         cat = i18n.catalog(lang)
@@ -256,6 +331,8 @@ def _label_to_type():
             lab = cat.get("notebook_type." + t)
             if lab:
                 rev[lab] = t
+    for t in TYPES:
+        rev[_display("notebook_type", t, "bilingual")] = t
     return rev
 
 
@@ -334,11 +411,11 @@ def render_index(title_msgid, chapters, lang, status_map=None):
     """Deterministic TOC: title heading, one '## 章' section per non-empty chapter, one link
     per entry. mistakes/index.md additionally joins each entry to its study_state mistake
     row by id and appends the status (rendered in the pack language)."""
-    lines = [i18n.msg(title_msgid, lang), ""]
+    lines = [_msg(title_msgid, lang), ""]
     for num, fname, blocks, pre in chapters:
         if not blocks:
             continue
-        lines.append("## " + i18n.msg("notebook.chapter_heading", lang, num=num))
+        lines.append("## " + _msg("notebook.chapter_heading", lang, num=num))
         lines.append("")
         for b, anchor in zip(blocks, anchors_for(pre, blocks)):
             # 链接文字里的 [] 会破坏 md 链接结构——换全角括号（标题原文在章文件里，无损）
@@ -346,8 +423,8 @@ def render_index(title_msgid, chapters, lang, status_map=None):
             line = "- [%s](%s#%s)" % (text, fname, anchor)
             if status_map and b["id"] in status_map:
                 code = i18n.canon_row_status(status_map[b["id"]])
-                line += " " + i18n.msg("mistakes.status_suffix", lang,
-                                       status=i18n.display("row", code, lang))
+                line += " " + _msg("mistakes.status_suffix", lang,
+                                    status=_display("row", code, lang))
             lines.append(line)
         lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"
@@ -366,6 +443,8 @@ def _read_body():
     # 未闭合围栏会把后续条目整个吞进围栏——两种都在写入前拒绝，保住章文件永远可解析
     fence = None
     for line in body.splitlines():
+        if _TEACHING_EXAMPLE_MARKER_RE.match(line):
+            _die("正文包含保留的 teaching-example evidence 标记；请删掉，改用 --teaching-example")
         fence, marker = _fence_step(fence, line)
         if marker:
             continue
@@ -404,15 +483,25 @@ def cmd_add_entry(ws, args):
     if args.chapter < 1:
         _die("--chapter 必须 ≥ 1，当前 %d" % args.chapter)
     eid = (args.id or "").strip()
-    if not _ID_RE.match(eid):
-        _die("--id 非法：%r——id 进标题锚点 [#id]，不能为空、含空白或 []#|` 字符" % (args.id or ""))
+    id_problem = stable_item_id_problem(eid)
+    if id_problem:
+        _die("--id 非法：%r——%s" % (args.id or "", id_problem))
     title = re.sub(r"\s*[\r\n]+\s*", " ", args.title or "").strip() or eid
+    if not entry_anchor(eid, title):
+        _die(
+            "--id/--title 生成的 Markdown anchor 为空；当 ID 只含标点或符号时，"
+            "请提供至少含一个字母、数字、中文字符、下划线或连字符的 --title"
+        )
+    teaching_example = bool(getattr(args, "teaching_example", False))
+    if teaching_example and args.type != "walkthrough":
+        _die("--teaching-example requires --type walkthrough")
     body = _read_body()
     state = _load_state(ws)
     lang = _resolve_lang(args.lang, state)
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    label = i18n.display("notebook_type", args.type, lang)
-    new_lines = make_entry_lines(eid, title, label, ts, body)
+    label = _display("notebook_type", args.type, lang)
+    new_lines = make_entry_lines(
+        eid, title, label, ts, body, teaching_example=teaching_example)
     ch_name = "ch%02d.md" % args.chapter
 
     plan, overrides = [], {ch_name: None}
@@ -505,11 +594,16 @@ def run(argv=None):
     p_add.add_argument("--mistake", action="store_true",
                        help="also mirror the entry into mistakes/ch<NN>.md and rebuild "
                             "mistakes/index.md")
-    p_add.add_argument("--lang", choices=["zh", "en"], default=None,
+    p_add.add_argument(
+        "--teaching-example", action="store_true",
+        help="mark this walkthrough as an explicitly taught manifest example; required by "
+             "update_progress record-taught-example",
+    )
+    p_add.add_argument("--lang", choices=["zh", "en", "bilingual"], default=None,
                        help="heading language (default: study_state.json language, "
                             "falling back to zh)")
     p_reb = sub.add_parser("rebuild")
-    p_reb.add_argument("--lang", choices=["zh", "en"], default=None,
+    p_reb.add_argument("--lang", choices=["zh", "en", "bilingual"], default=None,
                        help="heading language (default: study_state.json language, "
                             "falling back to zh)")
     p_list = sub.add_parser("list")

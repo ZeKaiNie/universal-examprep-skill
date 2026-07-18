@@ -96,6 +96,17 @@ class IngestionCoreTest(unittest.TestCase):
         self.store.review_queue.append(issue)
         return issue
 
+    @staticmethod
+    def replace_operation(current, replacement):
+        return {
+            "op": "replace_unit",
+            "unit_id": current.unit_id,
+            "expected_unit_sha256": hashlib.sha256(
+                storage_module.canonical_json(current.to_dict()).encode("utf-8")
+            ).hexdigest(),
+            "unit": replacement.to_dict(),
+        }
+
     def test_stable_ids_and_strict_model_round_trips(self):
         self.assertEqual(
             make_source_id("materials\\week01.pdf"),
@@ -163,6 +174,102 @@ class IngestionCoreTest(unittest.TestCase):
         )
         self.assertEqual(patch_a.patch_id, patch_b.patch_id)
         self.assertEqual(patch_a, ReviewPatch.from_dict(patch_a.to_dict()))
+
+    def test_content_unit_asset_prompt_controls_are_typed_and_revision_bound(self):
+        asset_sha = hashlib.sha256(b"complete prompt crop").hexdigest()
+        unit = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "question",
+            "See the complete prompt image.",
+            1,
+            ordinal=19,
+            external_id="prompt-q1",
+            metadata={
+                "quiz_type": "subjective",
+                "assets": [{
+                    "path": "references/assets/prompt-q1.png",
+                    "role": "question_context",
+                    "type": "crop_image",
+                    "contains_full_prompt": True,
+                    "sha256": asset_sha,
+                    "source_sha256": self.source.sha256,
+                    "source_file": self.source.path,
+                }],
+            },
+        )
+        restored = ContentUnit.from_dict(unit.to_dict())
+        self.assertEqual("crop_image", restored.metadata["assets"][0]["type"])
+        self.assertIs(True, restored.metadata["assets"][0]["contains_full_prompt"])
+        self.assertEqual(asset_sha, restored.metadata["assets"][0]["sha256"])
+
+        invalid_cases = (
+            ("contains_full_prompt", "true", "must be a boolean"),
+            ("type", "screenshot", "must be one of"),
+            ("role", "figure", "requires role=question_context"),
+        )
+        for field, value, message in invalid_cases:
+            with self.subTest(field=field):
+                malformed = unit.to_dict()
+                malformed["metadata"]["assets"][0][field] = value
+                with self.assertRaisesRegex(SchemaValidationError, message):
+                    ContentUnit.from_dict(malformed)
+
+        unbound = unit.to_dict()
+        unbound["metadata"]["assets"][0].pop("sha256")
+        with self.assertRaisesRegex(SchemaValidationError, "exact asset sha256 revision"):
+            ContentUnit.from_dict(unbound)
+
+        noncanonical = unit.to_dict()
+        noncanonical["metadata"]["assets"][0]["path"] = (
+            "references\\assets\\prompt-q1.png"
+        )
+        with self.assertRaisesRegex(SchemaValidationError, "canonical POSIX separators"):
+            ContentUnit.from_dict(noncanonical)
+
+    def test_content_unit_preserves_receipted_crop_location_contract(self):
+        asset_sha = hashlib.sha256(b"target-only crop").hexdigest()
+        spec_sha = "b" * 64
+        asset = {
+            "path": "references/assets/q1_crop_%s.png" % spec_sha[:12],
+            "role": "question_context",
+            "type": "crop_image",
+            "sha256": asset_sha,
+            "source_file": self.source.path,
+            "source_sha256": self.source.sha256,
+            "source_page": 3,
+            "source_bbox_pdf_points": [40.0, 120.0, 560.0, 410.0],
+            "crop_receipt_id": "crop_" + "a" * 64,
+            "crop_spec_sha256": spec_sha,
+            "content_scope": "full_prompt",
+            "isolation": "target_item_only",
+            "contains_full_prompt": True,
+        }
+        unit = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "question",
+            "See the target-only crop.",
+            3,
+            ordinal=27,
+            external_id="crop-q1",
+            metadata={"quiz_type": "subjective", "assets": [asset]},
+        )
+        restored = ContentUnit.from_dict(unit.to_dict())
+        self.assertEqual(asset, restored.metadata["assets"][0])
+
+        for field, value, message in (
+            ("source_page", 0, "integer >= 1"),
+            ("isolation", "whole_page", "must be one of"),
+            ("content_scope", "full_answer", "side=prompt"),
+        ):
+            with self.subTest(field=field):
+                malformed = unit.to_dict()
+                malformed["metadata"]["assets"][0][field] = value
+                with self.assertRaisesRegex(SchemaValidationError, message):
+                    ContentUnit.from_dict(malformed)
 
     def test_zxx_is_valid_only_for_formula_symbol_units(self):
         formula = ContentUnit.create(
@@ -431,7 +538,7 @@ class IngestionCoreTest(unittest.TestCase):
             self.source.source_id,
             self.source.sha256,
             [
-                {"op": "replace_unit", "unit_id": question.unit_id, "unit": replaced_question.to_dict()},
+                self.replace_operation(question, replaced_question),
                 {"op": "add_unit", "unit": added.to_dict()},
                 {"op": "assign_chapter", "unit_id": question.unit_id, "chapter": "Chapter 1",
                  "phase": "Phase 1", "chapter_id": "ch01", "phase_id": "phase01"},
@@ -464,6 +571,156 @@ class IngestionCoreTest(unittest.TestCase):
         self.assertTrue(replay.replayed)
         self.assertEqual(1, len(read_jsonl(self.store.ledger_path)))
 
+    def test_replace_unit_expected_digest_rejects_a_stale_authored_patch(self):
+        original = self.unit("text", "Original value", 1, 21)
+        self.store.append_unit(original)
+        first_issue = self.issue("garbled_text", [original.unit_id])
+        stale_issue = self.issue("no_text", [original.unit_id])
+        expected_original = hashlib.sha256(
+            storage_module.canonical_json(original.to_dict()).encode("utf-8")
+        ).hexdigest()
+
+        current = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "text",
+            "First reviewer value",
+            1,
+            ordinal=original.ordinal,
+            bbox=original.bbox,
+        )
+        first_patch = ReviewPatch.create(
+            first_issue.issue_id,
+            self.source.source_id,
+            self.source.sha256,
+            [{"op": "replace_unit", "unit_id": original.unit_id,
+              "expected_unit_sha256": expected_original, "unit": current.to_dict()}],
+            [self.evidence],
+            status="validated",
+        )
+        self.store.apply_patch(first_patch)
+
+        stale_value = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "text",
+            "Stale reviewer value",
+            1,
+            ordinal=original.ordinal,
+            bbox=original.bbox,
+        )
+        stale_patch = ReviewPatch.create(
+            stale_issue.issue_id,
+            self.source.source_id,
+            self.source.sha256,
+            [{"op": "replace_unit", "unit_id": original.unit_id,
+              "expected_unit_sha256": expected_original,
+              "unit": stale_value.to_dict()}],
+            [self.evidence],
+            status="validated",
+        )
+        with self.assertRaisesRegex(ConflictError, "changed after the patch was authored"):
+            self.store.apply_patch(stale_patch)
+        self.assertEqual("First reviewer value", self.store.units()[original.unit_id].text)
+        self.assertEqual("pending", self.store.review_queue.get(stale_issue.issue_id).status)
+
+    def test_new_replace_unit_patch_requires_expected_digest_on_every_entry_path(self):
+        original = self.unit("text", "Original value", 1, 22)
+        self.store.append_unit(original)
+        issue = self.issue("garbled_text", [original.unit_id])
+        replacement = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "text",
+            "Recovered value",
+            1,
+            ordinal=original.ordinal,
+            bbox=original.bbox,
+        )
+        patch = ReviewPatch.create(
+            issue.issue_id,
+            self.source.source_id,
+            self.source.sha256,
+            [{
+                "op": "replace_unit",
+                "unit_id": original.unit_id,
+                "unit": replacement.to_dict(),
+            }],
+            [self.evidence],
+            status="validated",
+        )
+
+        for operation in (
+                lambda: self.store.validate_patch(patch),
+                lambda: self.store.validate_patches([patch]),
+                lambda: self.store.apply_patch(patch),
+                lambda: self.store.apply_patches([patch])):
+            with self.subTest(operation=operation):
+                with self.assertRaisesRegex(
+                        PatchApplicationError,
+                        "must bind expected_unit_sha256"):
+                    operation()
+                self.assertEqual(
+                    "Original value", self.store.units()[original.unit_id].text
+                )
+                self.assertEqual(
+                    "pending", self.store.review_queue.get(issue.issue_id).status
+                )
+                self.assertFalse(self.store.ledger_path.exists())
+                self.assertFalse(self.store.pending_patch_path.exists())
+
+    def test_legacy_ledger_replace_without_expected_digest_remains_replayable(self):
+        original = self.unit("text", "Legacy original", 1, 23)
+        self.store.append_unit(original)
+        issue = self.issue("garbled_text", [original.unit_id], status="applied")
+        replacement = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "text",
+            "Legacy recovered",
+            1,
+            ordinal=original.ordinal,
+            bbox=original.bbox,
+        )
+        legacy_patch = ReviewPatch.create(
+            issue.issue_id,
+            self.source.source_id,
+            self.source.sha256,
+            [{
+                "op": "replace_unit",
+                "unit_id": original.unit_id,
+                "unit": replacement.to_dict(),
+            }],
+            [self.evidence],
+            status="validated",
+        )
+        atomic_write_jsonl(self.store.ledger_path, [{
+            "patch_id": legacy_patch.patch_id,
+            "fingerprint": self.store._patch_fingerprint(legacy_patch),
+            "issue_id": legacy_patch.issue_id,
+            "source_id": legacy_patch.source_id,
+            "source_sha256": legacy_patch.source_sha256,
+            "source_revisions": self.store._declared_patch_source_revisions(
+                legacy_patch
+            ),
+            "patch": legacy_patch.to_dict(),
+        }])
+
+        expected_units, _mappings = self.store._expected_compiled_state()
+        self.assertEqual("Legacy recovered", expected_units[original.unit_id].text)
+        self.store.rebuild_compiled_from_ledger()
+        self.assertEqual(
+            "Legacy recovered", self.store.units()[original.unit_id].text
+        )
+        replay = self.store.apply_patch(legacy_patch)
+        self.assertFalse(replay.applied)
+        self.assertTrue(replay.replayed)
+        self.assertEqual(1, len(read_jsonl(self.store.ledger_path)))
+
     def test_batch_apply_reconstructs_ledger_once_and_replays_idempotently(self):
         originals = [
             self.unit("text", "Old text one", 1, 31),
@@ -490,11 +747,7 @@ class IngestionCoreTest(unittest.TestCase):
                 issue.issue_id,
                 self.source.source_id,
                 self.source.sha256,
-                [{
-                    "op": "replace_unit",
-                    "unit_id": unit.unit_id,
-                    "unit": replacement.to_dict(),
-                }],
+                [self.replace_operation(unit, replacement)],
                 [self.evidence],
                 status="validated",
             ))
@@ -562,11 +815,7 @@ class IngestionCoreTest(unittest.TestCase):
             first_issue.issue_id,
             self.source.source_id,
             self.source.sha256,
-            [{
-                "op": "replace_unit",
-                "unit_id": first.unit_id,
-                "unit": recovered.to_dict(),
-            }],
+            [self.replace_operation(first, recovered)],
             [self.evidence],
             status="validated",
         )
@@ -574,11 +823,7 @@ class IngestionCoreTest(unittest.TestCase):
             second_issue.issue_id,
             self.source.source_id,
             self.source.sha256,
-            [{
-                "op": "replace_unit",
-                "unit_id": second.unit_id,
-                "unit": second.to_dict(),
-            }],
+            [self.replace_operation(second, second)],
             [self.evidence],
             status="validated",
         )
@@ -660,11 +905,7 @@ class IngestionCoreTest(unittest.TestCase):
                 issue.issue_id,
                 self.source.source_id,
                 self.source.sha256,
-                [{
-                    "op": "replace_unit",
-                    "unit_id": unit.unit_id,
-                    "unit": replacement.to_dict(),
-                }],
+                [self.replace_operation(unit, replacement)],
                 [self.evidence],
                 status="validated",
             ))
@@ -727,11 +968,7 @@ class IngestionCoreTest(unittest.TestCase):
             issue.issue_id,
             self.source.source_id,
             self.source.sha256,
-            [{
-                "op": "replace_unit",
-                "unit_id": original.unit_id,
-                "unit": replacement.to_dict(),
-            }],
+            [self.replace_operation(original, replacement)],
             [self.evidence],
             status="validated",
         )
@@ -813,6 +1050,67 @@ class IngestionCoreTest(unittest.TestCase):
         self.assertEqual(before_queue, self.store.review_queue.path.read_bytes())
         self.assertFalse(self.store.ledger_path.exists())
 
+    def test_ledger_replay_rejects_an_invalid_prefix_even_if_a_later_patch_repairs_it(self):
+        original = self.unit(
+            "question", "Original prompt", 1, 63,
+            external_id="shared-prefix-id",
+        )
+        duplicate = self.unit(
+            "question", "Recovered duplicate prompt", 1, 64,
+            external_id="shared-prefix-id",
+        )
+        repaired = ContentUnit.create(
+            self.source.source_id,
+            self.source.sha256,
+            self.source.path,
+            "question",
+            duplicate.text,
+            1,
+            ordinal=duplicate.ordinal,
+            external_id="repaired-prefix-id",
+            bbox=duplicate.bbox,
+        )
+        self.assertEqual(duplicate.unit_id, repaired.unit_id)
+        self.store.append_unit(original)
+        add_issue = self.issue("visual_question", status="applied")
+        repair_issue = self.issue(
+            "garbled_text", [duplicate.unit_id], status="applied"
+        )
+        patches = [
+            ReviewPatch.create(
+                add_issue.issue_id,
+                self.source.source_id,
+                self.source.sha256,
+                [{"op": "add_unit", "unit": duplicate.to_dict()}],
+                [self.evidence],
+                status="validated",
+            ),
+            ReviewPatch.create(
+                repair_issue.issue_id,
+                self.source.source_id,
+                self.source.sha256,
+                [{"op": "replace_unit", "unit_id": duplicate.unit_id,
+                  "unit": repaired.to_dict()}],
+                [self.evidence],
+                status="validated",
+            ),
+        ]
+        rows = []
+        for patch in patches:
+            rows.append({
+                "patch_id": patch.patch_id,
+                "fingerprint": self.store._patch_fingerprint(patch),
+                "issue_id": patch.issue_id,
+                "source_id": patch.source_id,
+                "source_sha256": patch.source_sha256,
+                "source_revisions": self.store._declared_patch_source_revisions(patch),
+                "patch": patch.to_dict(),
+            })
+        atomic_write_jsonl(self.store.ledger_path, rows)
+
+        with self.assertRaisesRegex(ConflictError, "external_id is not unique"):
+            self.store._expected_compiled_state()
+
     def test_validation_never_recovers_pending_ingestion(self):
         original = self.unit("text", "Unreadable value", 1, 71)
         self.store.append_unit(original)
@@ -831,11 +1129,7 @@ class IngestionCoreTest(unittest.TestCase):
             issue.issue_id,
             self.source.source_id,
             self.source.sha256,
-            [{
-                "op": "replace_unit",
-                "unit_id": original.unit_id,
-                "unit": recovered.to_dict(),
-            }],
+            [self.replace_operation(original, recovered)],
             [self.evidence],
             status="validated",
         )

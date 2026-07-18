@@ -21,16 +21,27 @@ Why this module exists (language layering; see shipped docs/language-policy.md):
     fail-loud philosophy as the old _normalize_* trio this module replaces.
 
 Public surface:
-    MODES, TIERS, LANGS, ARTIFACT_MODES, WINDOW_STATUSES, ROW_STATUSES
+    MODES, TIERS, LANGS, ARTIFACT_MODES, PROCESSING_MODES,
+    ANSWER_EXPLANATION_MODES, INTERACTION_STYLES, WINDOW_STATUSES,
+    ROW_STATUSES
     canon_mode(v)      -> (code_or_original, implied_tier_or_None, warning_or_None)
     canon_tier(v)      -> (code_or_original, warning_or_None)
     canon_language(v)  -> (code_or_original, warning_or_None)
     canon_artifact_mode(v) -> (code_or_original, warning_or_None)
+    canon_processing_mode(v) -> (code_or_original, warning_or_None)
+    canon_answer_explanation_mode(v) -> ("ordinary" | "isolated", warning_or_None)
     canon_window_status(v) -> code_or_original   (strict check is the caller's job)
     canon_row_status(v)    -> code_or_original   (unknown free strings pass through)
     display(kind, code, lang="zh") -> student-visible string (passthrough when unknown)
     workspace_language(state_or_None) -> "zh" | "en" | "bilingual"
     workspace_artifact_mode(state_or_None) -> "chat" | "visual"
+    workspace_effective_artifact_mode(state_or_None) -> "chat" | "visual"
+    workspace_artifact_mode_dormant(state_or_None) -> bool
+    workspace_processing_mode(state_or_None) -> "lightweight" | "full"
+    workspace_answer_explanation_mode(state_or_None) -> "ordinary" | "isolated"
+    workspace_interaction_style_preference(state_or_None) -> "batch" | "step_by_step"
+    workspace_effective_interaction_style(state_or_None) -> "batch" | "step_by_step"
+    workspace_interaction_style_dormant(state_or_None) -> bool
     catalog(lang) -> dict (embedded catalog merged with locales/<lang>/messages.json)
     msg(msgid, lang, **fmt) -> formatted message string (P2 fills the inventory)
 """
@@ -42,6 +53,9 @@ MODES = ("from_scratch", "shore_up", "fill_gaps")
 TIERS = ("le1d", "d1_3", "d3_7", "gt7d")
 LANGS = ("zh", "en", "bilingual")
 ARTIFACT_MODES = ("chat", "visual")
+PROCESSING_MODES = ("lightweight", "full")
+ANSWER_EXPLANATION_MODES = ("ordinary", "isolated")
+INTERACTION_STYLES = ("batch", "step_by_step")
 WINDOW_STATUSES = ("in_window", "out_window", "verified")
 # Row statuses: the KNOWN lifecycle set. `set-*-status` stays free-string tolerant —
 # unknown statuses pass through untouched; only known vocabulary is normalized.
@@ -114,6 +128,22 @@ _EN = {
     "mistakes.index_title": "# ❌ Mistake-notebook index",
     "mistakes.status_suffix": "| Status: %(status)s",
 }
+_ZH.update({
+    "processing.lightweight": "轻量按需（推荐）",
+    "processing.full": "完整建库",
+})
+_EN.update({
+    "processing.lightweight": "lightweight on-demand (recommended)",
+    "processing.full": "full knowledge-base build",
+})
+_ZH.update({
+    "answer_explanation.ordinary": "普通逐题详解",
+    "answer_explanation.isolated": "隔离逐题详解（延展功能）",
+})
+_EN.update({
+    "answer_explanation.ordinary": "ordinary per-item explanation",
+    "answer_explanation.isolated": "isolated per-item explanation (extended)",
+})
 _EMBEDDED = {"zh": _ZH, "en": _EN}
 
 # ---------------------------------------------------------------- input → code maps
@@ -178,6 +208,19 @@ _ARTIFACT_IN.update({
     "token不敏感": "visual", "token 不敏感": "visual",
     "study guide": "visual", "printable": "visual", "token-insensitive": "visual",
     "print pdf": "visual", "visual": "visual",
+})
+
+_PROCESSING_IN = {c: c for c in PROCESSING_MODES}
+_PROCESSING_IN.update({_ZH["processing." + c]: c for c in PROCESSING_MODES})
+_PROCESSING_IN.update({_EN["processing." + c].lower(): c for c in PROCESSING_MODES})
+_PROCESSING_IN.update({
+    "light": "lightweight", "lite": "lightweight", "on-demand": "lightweight",
+    "on demand": "lightweight", "lazy": "lightweight", "default": "lightweight",
+    "轻量": "lightweight", "轻量模式": "lightweight", "按需": "lightweight",
+    "按需处理": "lightweight", "默认": "lightweight",
+    "complete": "full", "heavy": "full", "knowledge base": "full",
+    "full ingestion": "full", "完整": "full", "完整模式": "full",
+    "全量": "full", "完整建库": "full", "全量建库": "full",
 })
 
 _WINDOW_IN = {c: c for c in WINDOW_STATUSES}
@@ -247,6 +290,48 @@ def canon_artifact_mode(v):
                % (v, "/".join(ARTIFACT_MODES)))
 
 
+def canon_processing_mode(v):
+    """Normalize an explicit material-processing choice.
+
+    Processing intensity is independent from ``artifact_mode``: chat output must
+    not silently start a full ingestion, and full ingestion must not silently
+    request a printable artifact.  Unknown values stay visible for audit while the
+    effective runtime fails safe to ``lightweight``.
+    """
+    v = (v or "").strip()
+    if v in _PROCESSING_IN:
+        return _PROCESSING_IN[v], None
+    key = v.lower()
+    if key in _PROCESSING_IN:
+        return _PROCESSING_IN[key], None
+    return v, (
+        "non-standard processing mode %r; canonical values are %s; "
+        "the effective runtime falls back to lightweight"
+        % (v, "/".join(PROCESSING_MODES))
+    )
+
+
+def canon_answer_explanation_mode(v):
+    """Normalize the optional per-item explanation execution choice.
+
+    Unlike descriptive preferences, this value controls whether course material
+    may leave the ordinary authoring context for separately isolated model calls.
+    Missing, malformed, legacy, and unknown values therefore fail safe to
+    ``ordinary`` instead of preserving an unsafe opt-in-shaped value.
+    """
+
+    if not isinstance(v, str):
+        return "ordinary", (
+            "missing or non-string answer explanation mode; using ordinary"
+            if v is not None else None
+        )
+    if v in ANSWER_EXPLANATION_MODES:
+        return v, None
+    return "ordinary", (
+        "unknown or non-canonical answer explanation mode %r; using ordinary" % v
+    )
+
+
 def canon_window_status(v):
     """已知窗口状态词（代号/中/英显示）→ 代号；未知原样返回（是否拒绝由调用方决定）。"""
     v = (v or "").strip()
@@ -310,13 +395,115 @@ def workspace_language(state):
 
 
 def workspace_artifact_mode(state):
-    """Return the effective output-resource mode, failing safe for old or unknown state.
+    """Return the persisted output-resource preference, failing safe when unknown.
 
     Missing fields keep v3-compatible chat teaching.  A PDF/visual workflow is therefore
-    enabled only by a recognized, explicitly persisted ``visual`` choice.
+    requested only by a recognized, explicitly persisted ``visual`` choice.  Call
+    :func:`workspace_effective_artifact_mode` at an execution gate because a visual
+    preference is deliberately dormant while processing is lightweight.
     """
     v = (state or {}).get("artifact_mode") if isinstance(state, dict) else state
     if not isinstance(v, str):
         return "chat"
     code, _w = canon_artifact_mode(v)
     return code if code in ARTIFACT_MODES else "chat"
+
+
+def workspace_effective_artifact_mode(state):
+    """Return the artifact mode an execution gate may honor now.
+
+    ``artifact_mode`` is a durable preference, independent from processing intensity.
+    Lightweight sessions retain an explicit ``visual`` preference for a later switch to
+    full mode, but cannot author/render a Study Guide, so their effective artifact mode is
+    always ``chat``.
+    """
+
+    if workspace_processing_mode(state) != "full":
+        return "chat"
+    return workspace_artifact_mode(state)
+
+
+def workspace_artifact_mode_dormant(state):
+    """Whether an explicit visual preference is retained but currently inactive."""
+
+    return (
+        workspace_artifact_mode(state) == "visual"
+        and workspace_effective_artifact_mode(state) == "chat"
+    )
+
+
+def workspace_processing_mode(state):
+    """Return the effective processing mode, defaulting safely to lightweight.
+
+    New, legacy, missing, and malformed state must never trigger an eager full
+    material build.  Only an explicitly persisted canonical ``full`` opts in.
+    """
+    v = (state or {}).get("processing_mode") if isinstance(state, dict) else state
+    if not isinstance(v, str):
+        return "lightweight"
+    code, _w = canon_processing_mode(v)
+    return code if code in PROCESSING_MODES else "lightweight"
+
+
+def workspace_answer_explanation_mode(state):
+    """Return the effective per-item explanation mode, defaulting to ordinary.
+
+    ``isolated`` is an explicit extended-function opt-in.  A legacy workspace,
+    an invalid hand edit, or a missing field must never activate it.
+    """
+
+    v = ((state or {}).get("answer_explanation_mode")
+         if isinstance(state, dict) else state)
+    # This reader consumes persisted security-sensitive state, not human input.
+    # Only the exact canonical opt-in may activate external isolated calls.
+    return "isolated" if v == "isolated" else "ordinary"
+
+
+def workspace_no_questions(state):
+    """Return the effective persisted no-questions choice without guessing."""
+
+    if not isinstance(state, dict):
+        return False
+    preferences = state.get("preferences")
+    if not isinstance(preferences, dict):
+        return False
+    for key in ("no_questions", "no-questions", "不要出题", "不要问我"):
+        if key not in preferences:
+            continue
+        value = preferences.get(key)
+        if value is True:
+            return True
+        if isinstance(value, str) and value.strip().lower() in (
+                "1", "true", "yes", "on", "是", "不出题", "不要问"):
+            return True
+    return False
+
+
+def workspace_interaction_style_preference(state):
+    """Return the canonical stored cadence; malformed legacy values fail to batch."""
+
+    preferences = state.get("preferences") if isinstance(state, dict) else None
+    if not isinstance(preferences, dict):
+        return "batch"
+    value = preferences.get("interaction_style", "batch")
+    return value if value in INTERACTION_STYLES else "batch"
+
+
+def workspace_effective_interaction_style(state):
+    """Resolve cadence at runtime; lightweight/no-questions makes step mode dormant."""
+
+    preference = workspace_interaction_style_preference(state)
+    if (
+        preference == "step_by_step"
+        and workspace_processing_mode(state) == "full"
+        and not workspace_no_questions(state)
+    ):
+        return "step_by_step"
+    return "batch"
+
+
+def workspace_interaction_style_dormant(state):
+    return (
+        workspace_interaction_style_preference(state) == "step_by_step"
+        and workspace_effective_interaction_style(state) == "batch"
+    )

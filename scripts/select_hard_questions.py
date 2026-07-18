@@ -31,7 +31,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import score_difficulty as sd            # noqa: E402  同目录，复用打分与题库加载
-from select_questions import SOURCE_TYPES  # noqa: E402  单一 source_type 词表，与 A2 一致
+from asset_policy import canonical_chapter_key  # noqa: E402
+from select_questions import (  # noqa: E402  单一 source_type/安全题池，与 A2 一致
+    SOURCE_TYPES,
+    load_runtime_bank,
+)
 from update_progress import _normalize_mode, parse_md as _parse_md, MD_NAME  # noqa: E402  旧模式迁移 + md 回落解析
 
 for _s in ("stdout", "stderr"):
@@ -141,7 +145,10 @@ def _chapter_key(q):
 
 def _chapter_keys(q):
     """匹配用的章号集合：chapter 与 phase 都算（与 A2 select_questions 的 chapter-OR-phase 一致）。"""
-    return {str(q.get(k)) for k in ("chapter", "phase") if q.get(k) is not None}
+    return {
+        canonical_chapter_key(q.get(k), allow_phase=True)
+        for k in ("chapter", "phase", "chapter_id") if q.get(k) is not None
+    } - {None}
 
 
 def _numeric_chapters(q):
@@ -259,13 +266,7 @@ def main(argv=None):
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
-    bank = sd.load_bank(args.workspace)
-    items = [
-        q for q in bank
-        if (isinstance(q, dict)
-            and q.get("id") is not None
-            and q.get("gradable") is not False)
-    ]
+    items, runtime = load_runtime_bank(args.workspace, chapter=args.chapter)
     state = load_state(args.workspace)
     raw_mode = args.mode or (state or {}).get("mode")
     mode = _normalize_mode(raw_mode)[0] if raw_mode else "fill_gaps"   # 旧四模式/中文词→代号，词表同源 i18n
@@ -274,6 +275,11 @@ def main(argv=None):
     idx = build_mastery(state)
     late = sd._late_chapter_cutoff(items)
     notes = []
+    if runtime["exclusion_counts"]:
+        notes.append("runtime 安全门禁排除：%s" % ", ".join(
+            "%s=%d" % pair
+            for pair in sorted(runtime["exclusion_counts"].items())
+        ))
 
     # 范围过滤（A2 契约）：显式 --source-type 优先；否则按存档 scope 推导——非混合但推不出即 fail-loud。
     # 显式 --source-type all/mixed/* = 一次性覆盖存档范围为混合池（A2 越界覆盖路径；声明由技能层负责）。
@@ -303,7 +309,9 @@ def main(argv=None):
     scored = []
     untagged_excluded = 0                                # A2 契约：未标签项被范围排除必须"排除并如实上报"
     for i, q in enumerate(items):
-        if args.chapter is not None and str(args.chapter) not in _chapter_keys(q):
+        if (args.chapter is not None
+                and canonical_chapter_key(args.chapter, allow_phase=True)
+                not in _chapter_keys(q)):
             continue
         if from_chapter is not None:
             nums = _numeric_chapters(q)                   # chapter 与 phase 都算（双标不误剔）
@@ -337,6 +345,9 @@ def main(argv=None):
                           "state_loaded": state is not None,
                           "source_types": sorted(source_types) if source_types else None,
                           "untagged_excluded": untagged_excluded,
+                          "runtime_scoped_items": runtime["scoped_items"],
+                          "runtime_exclusion_counts": runtime["exclusion_counts"],
+                          "bank_binding_id": runtime["bank_binding"]["binding_id"],
                           "from_chapter": from_chapter, "notes": notes, "items": payload},
                          ensure_ascii=False, indent=2))
     else:

@@ -13,21 +13,30 @@ workspace validator.
 """
 
 import hashlib
+import json
 import math
 import os
 import re
 import stat
 import unicodedata
+from collections import Counter
 from pathlib import Path
 
 try:
+    from stable_ids import stable_item_id_problem
+except ImportError:  # package import from the repository root
+    from scripts.stable_ids import stable_item_id_problem
+
+try:
     from ingestion.identifiers import (
+        canonical_json,
         is_link_or_reparse,
         normalize_workspace_path,
         safe_workspace_entry,
     )
 except ImportError:  # package import from the repository root
     from scripts.ingestion.identifiers import (
+        canonical_json,
         is_link_or_reparse,
         normalize_workspace_path,
         safe_workspace_entry,
@@ -43,6 +52,22 @@ KNOWN_ASSET_ROLES = PROMPT_ASSET_ROLES | ANSWER_ASSET_ROLES | frozenset((
 SOURCE_ITEM_ASSET_ROLES = PROMPT_ASSET_ROLES | ANSWER_ASSET_ROLES | frozenset((
     STUDENT_ATTEMPT,
 ))
+QUIZ_RUNTIME_TYPES = frozenset((
+    "choice", "subjective", "diagram", "fill_blank", "true_false", "code",
+))
+QUIZ_RUNTIME_TRUE_FALSE = frozenset((
+    "true", "false", "t", "f", "yes", "no", "1", "0",
+    "真", "假", "对", "错", "正确", "错误",
+))
+QUIZ_RUNTIME_IMAGE_MIMES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+}
+QUIZ_RUNTIME_MAX_IMAGE_BYTES = 64 * 1024 * 1024
+QUIZ_RUNTIME_MAX_BANK_BYTES = 128 * 1024 * 1024
+QUIZ_RUNTIME_MAX_SESSION_BYTES = 8 * 1024 * 1024
 
 
 def physical_asset_key(path):
@@ -676,13 +701,19 @@ def audit_asset_policy(
 
     identity_by_key = {}
     if workspace_root is not None:
+        identity_captures = {}
         for rows in (quiz_rows, teaching_rows, content_units):
             for row in rows:
                 for path, _role, key in declarations.get(id(row), ()):
-                    identity, problem = _stable_workspace_asset_identity(
-                        workspace_root, path, key
-                    )
-                    if problem:
+                    captured = identity_captures.get(key)
+                    if captured is None:
+                        identity, problem = _stable_workspace_asset_identity(
+                            workspace_root, path, key
+                        )
+                        captured = (path, identity, problem)
+                        identity_captures[key] = captured
+                    _captured_path, identity, problem = captured
+                    if problem and key not in identity_by_key:
                         invalid.append(problem)
                     previous = identity_by_key.setdefault(key, identity)
                     if previous != identity:
@@ -722,6 +753,22 @@ def audit_asset_policy(
                         "asset revision drift for %r: expected %s, found %s"
                         % (path, expected, actual)
                     )
+        # Recheck each unique path once after all declarations/digests.  This
+        # preserves drift detection without reopening the same asset for every
+        # quiz/teaching/content-unit alias (which made large workspaces
+        # effectively quadratic on Windows).
+        for key, (path, first_identity, first_problem) in identity_captures.items():
+            if first_problem:
+                continue
+            final_identity, final_problem = _stable_workspace_asset_identity(
+                workspace_root, path, key
+            )
+            if final_problem:
+                invalid.append(final_problem)
+            elif final_identity != first_identity:
+                invalid.append(
+                    "asset path identity changed during policy snapshot: %r" % path
+                )
 
     def physical_identity(key):
         return identity_by_key.get(key, ("path", key))
@@ -779,6 +826,626 @@ def audit_asset_policy(
         "invalid_declarations": invalid,
         "item_groups": groups,
     }
+
+
+def _stable_runtime_blob(root, relative_path, label, max_bytes):
+    """Read one independent regular file and bind bytes to one live generation."""
+
+    try:
+        canonical = normalize_workspace_path(relative_path)
+    except ValueError as exc:
+        raise ValueError("%s path is unsafe: %s" % (label, exc)) from exc
+    if canonical != relative_path:
+        raise ValueError("%s path is not canonical POSIX form" % label)
+    try:
+        candidate = safe_workspace_entry(root, canonical)
+        before = os.lstat(str(candidate))
+    except (OSError, ValueError) as exc:
+        raise ValueError("%s is missing or unsafe: %s" % (label, exc)) from exc
+    if (is_link_or_reparse(candidate) or not stat.S_ISREG(before.st_mode)
+            or int(getattr(before, "st_nlink", 1)) != 1):
+        raise ValueError(
+            "%s must be an independent regular file, not a link/reparse/hardlink"
+            % label
+        )
+    if before.st_size <= 0 or before.st_size > max_bytes:
+        raise ValueError(
+            "%s must be non-empty and no larger than %d bytes"
+            % (label, max_bytes)
+        )
+
+    def identity(value):
+        return (
+            int(getattr(value, "st_dev", 0)),
+            int(getattr(value, "st_ino", 0)),
+        )
+
+    def generation(value):
+        return (
+            int(value.st_size),
+            int(getattr(value, "st_mtime_ns", int(value.st_mtime * 1000000000))),
+            int(getattr(value, "st_nlink", 1)),
+        )
+
+    initial_identity = identity(before)
+    initial_generation = generation(before)
+    if initial_identity[1] == 0:
+        raise ValueError("%s filesystem exposes no stable physical identity" % label)
+    payload = bytearray()
+    try:
+        with open(candidate, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            while True:
+                block = stream.read(1024 * 1024)
+                if not block:
+                    break
+                payload.extend(block)
+                if len(payload) > max_bytes:
+                    raise ValueError("%s exceeds the byte-size safety bound" % label)
+            after_handle = os.fstat(stream.fileno())
+        after = os.lstat(str(candidate))
+    except OSError as exc:
+        raise ValueError("%s cannot be read: %s" % (label, exc)) from exc
+    if (not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(after_handle.st_mode)
+            or not stat.S_ISREG(after.st_mode)
+            or is_link_or_reparse(candidate)
+            or identity(opened) != initial_identity
+            or identity(after_handle) != initial_identity
+            or identity(after) != initial_identity
+            or generation(opened) != initial_generation
+            or generation(after_handle) != initial_generation
+            or generation(after) != initial_generation):
+        raise ValueError("%s changed while its bytes were captured" % label)
+    token = _asset_identity_token((
+        "file", initial_identity[0], initial_identity[1],
+    ))
+    return {
+        "path": canonical,
+        "payload": bytes(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size_bytes": initial_generation[0],
+        "mtime_ns": initial_generation[1],
+        "physical_identity": token,
+    }
+
+
+def quiz_bank_stat_baseline(workspace):
+    """Capture only safe filesystem metadata for a pre-existing quiz bank.
+
+    Startup deliberately does not open or parse the bank.  The first explicit
+    quiz/checkpoint transition performs the strict content read and binds its
+    exact revision separately.
+    """
+
+    root = _asset_workspace_root(workspace)
+    relative = "references/quiz_bank.json"
+    try:
+        candidate = safe_workspace_entry(root, relative)
+    except (OSError, ValueError) as exc:
+        raise ValueError("quiz bank baseline path is unsafe: %s" % exc) from exc
+    if not os.path.lexists(str(candidate)):
+        unsigned = {
+            "schema_version": 1,
+            "receipt_type": "lightweight_quiz_bank_baseline",
+            "path": relative,
+            "exists": False,
+            "size_bytes": None,
+            "mtime_ns": None,
+            "physical_identity": None,
+        }
+    else:
+        try:
+            current = os.lstat(str(candidate))
+        except OSError as exc:
+            raise ValueError("quiz bank baseline cannot be inspected: %s" % exc) from exc
+        if (is_link_or_reparse(candidate) or not stat.S_ISREG(current.st_mode)
+                or int(getattr(current, "st_nlink", 1)) != 1):
+            raise ValueError(
+                "pre-existing quiz bank must be an independent regular file"
+            )
+        inode = int(getattr(current, "st_ino", 0))
+        if inode == 0:
+            raise ValueError("quiz bank filesystem exposes no stable physical identity")
+        unsigned = {
+            "schema_version": 1,
+            "receipt_type": "lightweight_quiz_bank_baseline",
+            "path": relative,
+            "exists": True,
+            "size_bytes": int(current.st_size),
+            "mtime_ns": int(getattr(
+                current, "st_mtime_ns", int(current.st_mtime * 1000000000)
+            )),
+            "physical_identity": _asset_identity_token((
+                "file", int(getattr(current, "st_dev", 0)), inode,
+            )),
+        }
+    result = dict(unsigned)
+    result["baseline_id"] = "quiz-base-" + hashlib.sha256(
+        canonical_json(unsigned).encode("utf-8")
+    ).hexdigest()[:24]
+    return result
+
+
+def validate_quiz_bank_stat_baseline(value):
+    expected = {
+        "schema_version", "receipt_type", "path", "exists", "size_bytes",
+        "mtime_ns", "physical_identity", "baseline_id",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("quiz bank baseline fields are invalid")
+    if (value.get("schema_version") != 1
+            or value.get("receipt_type") != "lightweight_quiz_bank_baseline"
+            or value.get("path") != "references/quiz_bank.json"
+            or not isinstance(value.get("exists"), bool)):
+        raise ValueError("quiz bank baseline identity is invalid")
+    if value["exists"]:
+        if (type(value.get("size_bytes")) is not int or value["size_bytes"] < 0
+                or type(value.get("mtime_ns")) is not int or value["mtime_ns"] < 0
+                or not re.fullmatch(
+                    r"file:\d+:\d+", str(value.get("physical_identity") or "")
+                )):
+            raise ValueError("quiz bank present-baseline metadata is invalid")
+    elif any(value.get(key) is not None for key in (
+            "size_bytes", "mtime_ns", "physical_identity")):
+        raise ValueError("quiz bank absent-baseline metadata must be null")
+    unsigned = dict(value)
+    baseline_id = unsigned.pop("baseline_id")
+    expected_id = "quiz-base-" + hashlib.sha256(
+        canonical_json(unsigned).encode("utf-8")
+    ).hexdigest()[:24]
+    if baseline_id != expected_id:
+        raise ValueError("quiz bank baseline digest is invalid")
+    return value
+
+
+def load_lightweight_quiz_bank_baseline(workspace):
+    """Read only the small session ledger and return its immutable init baseline."""
+
+    session_file = _stable_runtime_blob(
+        _asset_workspace_root(workspace),
+        ".lightweight/session.json",
+        "lightweight session",
+        QUIZ_RUNTIME_MAX_SESSION_BYTES,
+    )
+    try:
+        session = json.loads(
+            session_file["payload"].decode("utf-8"),
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError("non-finite JSON constant: %s" % value)
+            ),
+        )
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("lightweight session is not strict UTF-8 JSON") from exc
+    if not isinstance(session, dict):
+        raise ValueError("lightweight session top level must be an object")
+    baseline = session.get("quiz_bank_baseline")
+    validate_quiz_bank_stat_baseline(baseline)
+    return baseline
+
+
+def _current_quiz_bank_stat(workspace):
+    current = quiz_bank_stat_baseline(workspace)
+    current.pop("baseline_id")
+    return current
+
+
+def _quiz_runtime_has_value(value):
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, dict, set, frozenset)):
+        return bool(value)
+    return True
+
+
+def _quiz_runtime_scope_reason(item, chapter_key):
+    raw_values = [
+        item.get(name) for name in ("chapter", "phase", "chapter_id")
+        if item.get(name) is not None
+    ]
+    if not raw_values:
+        return "scope_missing"
+    keys = []
+    for value in raw_values:
+        key = canonical_chapter_key(value, allow_phase=True)
+        if key is None:
+            return "scope_invalid"
+        keys.append(key)
+    if chapter_key is not None and chapter_key not in set(keys):
+        return "out_of_scope"
+    return None
+
+
+def _quiz_runtime_choice_error(item):
+    options = item.get("options")
+    if (not isinstance(options, list) or len(options) < 2
+            or any(not isinstance(value, str) or not value.strip()
+                   for value in options)):
+        return "choice_options_invalid"
+    answer = item.get("answer")
+    if not isinstance(answer, str) or not answer.strip():
+        return "choice_answer_missing"
+
+    def forms(value):
+        raw = value.strip()
+        match = re.match(r"^\s*([A-Za-z0-9]+)\s*[.．)：:、]\s*(.*?)\s*$", raw)
+        if match:
+            return raw.casefold(), match.group(1).casefold(), match.group(2).casefold()
+        return raw.casefold(), raw.casefold(), raw.casefold()
+
+    answer_forms = set(forms(answer))
+    matches = [
+        index for index, option in enumerate(options)
+        if answer_forms & set(forms(option))
+    ]
+    return None if len(matches) == 1 else "choice_answer_not_unique_option"
+
+
+def _quiz_runtime_oracle_error(item):
+    qtype = item.get("type")
+    if qtype == "choice":
+        return _quiz_runtime_choice_error(item)
+    if qtype == "subjective":
+        keywords = item.get("keywords")
+        if keywords is None:
+            keywords = item.get("answer_keywords")
+        if (not isinstance(keywords, list) or not keywords
+                or any(not isinstance(value, str) or not value.strip()
+                       for value in keywords)):
+            return "subjective_keywords_missing"
+        return None
+    if qtype == "code":
+        if not isinstance(item.get("language"), str) or not item["language"].strip():
+            return "code_language_missing"
+        if not (_quiz_runtime_has_value(item.get("expected_behavior"))
+                or _quiz_runtime_has_value(item.get("tests"))):
+            return "code_oracle_missing"
+        return None
+    if qtype == "true_false":
+        answer = item.get("answer")
+        if isinstance(answer, bool):
+            return None
+        if (isinstance(answer, str)
+                and answer.strip().casefold() in QUIZ_RUNTIME_TRUE_FALSE):
+            return None
+        return "true_false_oracle_invalid"
+    if not _quiz_runtime_has_value(item.get("answer")):
+        return "answer_missing"
+    return None
+
+
+def _quiz_runtime_ai_provenance_error(item):
+    flag = item.get("ai_generated")
+    if flag is not None and not isinstance(flag, bool):
+        return "ai_generated_flag_invalid"
+    source = item.get("source")
+    answer_provenance = item.get("answer_provenance")
+    if answer_provenance is not None and not isinstance(answer_provenance, str):
+        return "answer_provenance_invalid"
+    marked_ai = (
+        flag is True
+        or source == "ai_generated"
+        or answer_provenance in ("ai_generated", "ai_supplemented")
+    )
+    if marked_ai and source not in ("ai_generated", "mixed"):
+        return "ai_answer_provenance_invalid"
+    if flag is False and source == "ai_generated":
+        return "ai_answer_provenance_conflict"
+    return None
+
+
+def _quiz_runtime_prompt_assets_error(
+        workspace, item, policy, cache, visual_required):
+    assets = item.get("assets")
+    if assets is not None and not isinstance(assets, list):
+        return "assets_invalid"
+    prompt_assets = [
+        asset for asset in (assets or ())
+        if isinstance(asset, dict) and asset.get("role") in PROMPT_ASSET_ROLES
+    ]
+    if not visual_required:
+        return None
+    if not prompt_assets:
+        return "prompt_asset_missing"
+    root = _asset_workspace_root(workspace)
+    tainted_keys = policy.get("tainted_keys")
+    tainted_identities = policy.get("tainted_identity_keys")
+    for asset in prompt_assets:
+        path = asset.get("path")
+        if not isinstance(path, str):
+            return "prompt_asset_path_invalid"
+        try:
+            canonical = normalize_workspace_path(path)
+        except ValueError:
+            return "prompt_asset_path_invalid"
+        if canonical != path:
+            return "prompt_asset_path_noncanonical"
+        key = physical_asset_key(path)
+        if key in tainted_keys:
+            return "student_attempt_asset_conflict"
+        expected = asset.get("sha256")
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            return "prompt_asset_revision_missing"
+        extension = os.path.splitext(canonical)[1].lower()
+        inferred_mime = QUIZ_RUNTIME_IMAGE_MIMES.get(extension)
+        if inferred_mime is None:
+            return "prompt_asset_format_unsupported"
+        declared_mime = asset.get("media_type") or asset.get("mime_type")
+        if declared_mime is not None:
+            if not isinstance(declared_mime, str):
+                return "prompt_asset_mime_invalid"
+            normalized_mime = declared_mime.lower().split(";", 1)[0].strip()
+            if normalized_mime == "image/jpg":
+                normalized_mime = "image/jpeg"
+            if normalized_mime != inferred_mime:
+                return "prompt_asset_mime_mismatch"
+        source_file = asset.get("source_file")
+        source_sha = asset.get("source_sha256")
+        if (source_file is None) != (source_sha is None):
+            return "prompt_asset_source_revision_incomplete"
+        if source_file is not None:
+            try:
+                normalized_source = normalize_workspace_path(source_file)
+            except ValueError:
+                return "prompt_asset_source_path_invalid"
+            if (normalized_source != source_file
+                    or not isinstance(source_sha, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", source_sha)):
+                return "prompt_asset_source_revision_invalid"
+        cached = cache.get(canonical)
+        if cached is None:
+            try:
+                cached = _stable_runtime_blob(
+                    root, canonical, "quiz prompt asset", QUIZ_RUNTIME_MAX_IMAGE_BYTES
+                )
+            except ValueError:
+                return "prompt_asset_unreadable_or_aliased"
+            cache[canonical] = cached
+        if cached["sha256"] != expected:
+            return "prompt_asset_revision_drift"
+        if cached["physical_identity"] in tainted_identities:
+            return "student_attempt_asset_conflict"
+        try:
+            try:
+                from image_validation import validate_image_blob
+            except ImportError:  # pragma: no cover - package import
+                from scripts.image_validation import validate_image_blob
+            width, height = validate_image_blob(inferred_mime, cached["payload"])
+        except (ImportError, ValueError):
+            return "prompt_asset_not_decodable"
+        if width < 1 or height < 1:
+            return "prompt_asset_dimensions_invalid"
+    return None
+
+
+def quiz_runtime_eligibility(workspace, policy, chapter=None, baseline=None):
+    """Return the only quiz rows safe to select, grade, or count as evidence.
+
+    ``policy`` must be the complete live three-layer workspace policy snapshot;
+    callers obtain it only at an explicit quiz/checkpoint/completion transition.
+    Routine lightweight mount/readiness must not call this function.
+    """
+
+    global_errors = []
+    if not isinstance(policy, dict) or not isinstance(policy.get("quiz_rows"), list):
+        global_errors.append("quiz_runtime_policy_invalid")
+        rows = []
+    else:
+        rows = policy["quiz_rows"]
+    for key, code in (
+            ("unsafe_paths", "quiz_runtime_policy_unsafe"),
+            ("conflicts", "quiz_runtime_policy_conflict")):
+        values = policy.get(key) if isinstance(policy, dict) else None
+        if not isinstance(values, list):
+            global_errors.append("quiz_runtime_policy_invalid")
+        elif values:
+            global_errors.append(code)
+    if (not isinstance(policy, dict)
+            or not isinstance(policy.get("tainted_keys"), (set, frozenset))
+            or not isinstance(policy.get("tainted_identity_keys"), (set, frozenset))):
+        global_errors.append("quiz_runtime_policy_invalid")
+
+    chapter_key = None
+    if chapter is not None:
+        chapter_key = canonical_chapter_key(chapter, allow_phase=True)
+        if chapter_key is None:
+            global_errors.append("quiz_runtime_target_scope_invalid")
+
+    current_bank = None
+    if baseline is not None:
+        try:
+            validate_quiz_bank_stat_baseline(baseline)
+            current_bank = _current_quiz_bank_stat(workspace)
+        except (OSError, ValueError):
+            global_errors.append("quiz_bank_baseline_unreadable")
+        else:
+            if not baseline["exists"]:
+                global_errors.append("quiz_bank_not_preexisting")
+            else:
+                expected = {
+                    key: baseline[key] for key in (
+                        "schema_version", "receipt_type", "path", "exists",
+                        "size_bytes", "mtime_ns", "physical_identity",
+                    )
+                }
+                if current_bank != expected:
+                    global_errors.append("quiz_bank_changed_since_lightweight_init")
+
+    identity_counts = Counter()
+    canonical_ids = []
+    for row in rows:
+        ident = row.get("id") if isinstance(row, dict) else None
+        if (isinstance(ident, (str, int)) and not isinstance(ident, bool)
+                and stable_item_id_problem(str(ident)) is None):
+            canonical = str(ident)
+            canonical_ids.append(canonical)
+            identity_counts[canonical] += 1
+        else:
+            canonical_ids.append(None)
+
+    eligible = []
+    eligible_by_id = {}
+    excluded_by_id = {}
+    exclusions = Counter()
+    scoped_items = 0
+    asset_cache = {}
+    for index, item in enumerate(rows):
+        ident = canonical_ids[index]
+        reason = None
+        if not isinstance(item, dict):
+            reason = "item_not_object"
+        elif ident is None:
+            reason = "id_invalid"
+        elif identity_counts[ident] != 1:
+            reason = "duplicate_id"
+        else:
+            scope_reason = _quiz_runtime_scope_reason(item, chapter_key)
+            if scope_reason == "out_of_scope":
+                reason = scope_reason
+            else:
+                scoped_items += 1
+                reason = scope_reason
+        if reason is None:
+            gradable = item.get("gradable")
+            if gradable is not None and not isinstance(gradable, bool):
+                reason = "gradable_invalid"
+            elif gradable is False:
+                reason = "non_gradable"
+        if reason is None:
+            if item.get("type") not in QUIZ_RUNTIME_TYPES:
+                reason = "type_invalid"
+            elif not isinstance(item.get("question"), str) or not item["question"].strip():
+                reason = "question_missing"
+        if reason is None:
+            reason = _quiz_runtime_oracle_error(item)
+        if reason is None:
+            reason = _quiz_runtime_ai_provenance_error(item)
+        if reason is None:
+            requires = item.get("requires_assets")
+            maybe = item.get("maybe_requires_assets")
+            if ((requires is not None and not isinstance(requires, bool))
+                    or (maybe is not None and not isinstance(maybe, bool))):
+                reason = "asset_flag_invalid"
+            else:
+                visual = (
+                    requires is True or maybe is True
+                    or item.get("question_text_status") in ("stub", "page_reference")
+                )
+                reason = _quiz_runtime_prompt_assets_error(
+                    workspace, item, policy, asset_cache, visual
+                )
+        if reason is None and not global_errors:
+            eligible.append(item)
+            eligible_by_id[ident] = item
+        else:
+            if reason is None:
+                reason = "global_policy_blocked"
+            if reason != "out_of_scope":
+                exclusions[reason] += 1
+            if ident is not None:
+                excluded_by_id.setdefault(ident, set()).add(reason)
+
+    bank_binding = None
+    if not global_errors:
+        try:
+            bank_file = _stable_runtime_blob(
+                _asset_workspace_root(workspace),
+                "references/quiz_bank.json",
+                "quiz bank",
+                QUIZ_RUNTIME_MAX_BANK_BYTES,
+            )
+        except (OSError, ValueError):
+            global_errors.append("quiz_bank_revision_unreadable")
+            eligible = []
+            eligible_by_id = {}
+        else:
+            try:
+                parsed_bank = json.loads(
+                    bank_file["payload"].decode("utf-8"),
+                    parse_constant=lambda value: (_ for _ in ()).throw(
+                        ValueError("non-finite JSON constant: %s" % value)
+                    ),
+                )
+            except (UnicodeDecodeError, ValueError):
+                global_errors.append("quiz_bank_revision_unreadable")
+                eligible = []
+                eligible_by_id = {}
+                parsed_bank = None
+            if parsed_bank != rows:
+                global_errors.append("quiz_bank_changed_during_runtime_snapshot")
+                eligible = []
+                eligible_by_id = {}
+            item_hashes = {
+                ident: hashlib.sha256(
+                    canonical_json(item).encode("utf-8")
+                ).hexdigest()
+                for ident, item in sorted(eligible_by_id.items())
+            }
+            unsigned = {
+                "schema_version": 1,
+                "receipt_type": "quiz_runtime_bank_binding",
+                "path": bank_file["path"],
+                "bank_sha256": bank_file["sha256"],
+                "size_bytes": bank_file["size_bytes"],
+                "mtime_ns": bank_file["mtime_ns"],
+                "physical_identity": bank_file["physical_identity"],
+                "baseline_id": baseline.get("baseline_id") if baseline else None,
+                "chapter": chapter_key,
+                "eligible_item_sha256": item_hashes,
+            }
+            bank_binding = dict(unsigned)
+            bank_binding["binding_id"] = "quiz-bind-" + hashlib.sha256(
+                canonical_json(unsigned).encode("utf-8")
+            ).hexdigest()[:24]
+
+    if global_errors:
+        bank_binding = None
+
+    return {
+        "eligible_items": eligible,
+        "eligible_by_id": eligible_by_id,
+        "excluded_by_id": {
+            ident: tuple(sorted(reasons))
+            for ident, reasons in sorted(excluded_by_id.items())
+        },
+        "exclusion_counts": dict(sorted(exclusions.items())),
+        "scoped_items": scoped_items,
+        "global_errors": tuple(sorted(set(global_errors))),
+        "bank_binding": bank_binding,
+    }
+
+
+def quiz_runtime_ref_error(result, item_id, binding=None):
+    """Validate one canonical checkpoint ID and its optional immutable binding."""
+
+    if not isinstance(result, dict):
+        return "quiz runtime eligibility result is invalid"
+    errors = result.get("global_errors") or ()
+    if errors:
+        return "quiz runtime gate is blocked: %s" % ",".join(errors)
+    ident = str(item_id)
+    item = (result.get("eligible_by_id") or {}).get(ident)
+    if item is None:
+        reasons = (result.get("excluded_by_id") or {}).get(ident)
+        if reasons:
+            return "checkpoint item is runtime-ineligible: %s" % ",".join(reasons)
+        return "checkpoint ID is absent from the runtime-eligible bank: %s" % ident
+    if binding is None:
+        return None
+    required = {"bank_binding_id", "bank_sha256", "item_sha256"}
+    if not isinstance(binding, dict) or set(binding) != required:
+        return "lightweight checkpoint revision binding is missing or malformed"
+    bank = result.get("bank_binding")
+    if not isinstance(bank, dict):
+        return "quiz runtime bank binding is unavailable"
+    expected_item_hash = (bank.get("eligible_item_sha256") or {}).get(ident)
+    if (binding.get("bank_binding_id") != bank.get("binding_id")
+            or binding.get("bank_sha256") != bank.get("bank_sha256")
+            or binding.get("item_sha256") != expected_item_hash):
+        return "lightweight checkpoint bank/item revision has drifted"
+    return None
 
 
 def _promotion_identity_resolver(root, identities=None):
@@ -965,13 +1632,19 @@ __all__ = [
     "legacy_attempt_promotion_receipt",
     "legacy_attempt_promotion_receipts",
     "physical_asset_key",
+    "load_lightweight_quiz_bank_baseline",
+    "quiz_bank_stat_baseline",
+    "quiz_runtime_eligibility",
+    "quiz_runtime_ref_error",
     "student_attempt_tainted_keys",
+    "validate_quiz_bank_stat_baseline",
     "workspace_asset_is_student_attempt",
     "workspace_asset_identity_key",
     "ANSWER_ASSET_ROLES",
     "KNOWN_ASSET_ROLES",
     "PROMPT_ASSET_ROLES",
     "SOURCE_ITEM_ASSET_ROLES",
+    "QUIZ_RUNTIME_TYPES",
     "audit_asset_policy",
     "canonical_chapter_key",
 ]

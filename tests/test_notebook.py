@@ -394,7 +394,7 @@ class ContainmentGuards(unittest.TestCase):
             self._symlink(outside, os.path.join(ws, "notebook", "ch02.md"))
             r = add(ws, 2, "q13", "正文")
             self.assertEqual(r.returncode, 1, r.stderr)
-            self.assertIn("符号链接", r.stderr)
+            self.assertRegex(r.stderr, r"符号链接|link/reparse point")
             self.assertEqual(read(outside), "外部文件原文", "工作区外文件被改写")
 
     def test_symlinked_tmp_refused_exit1(self):

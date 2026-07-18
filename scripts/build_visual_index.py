@@ -44,6 +44,7 @@ import sys
 import tempfile
 
 try:
+    from . import exam_start
     from .ingestion import workspace_publication_lock
     from .ingestion.identifiers import is_link_or_reparse
     from .image_validation import (
@@ -59,6 +60,7 @@ try:
         workspace_asset_is_student_attempt,
     )
 except ImportError:
+    import exam_start
     from ingestion import workspace_publication_lock
     from ingestion.identifiers import is_link_or_reparse
     from image_validation import (
@@ -2649,6 +2651,13 @@ def run(argv=None, backend=None, _state_locked=False):
     ws = os.path.abspath(args.workspace)
     if not os.path.isdir(ws) or is_link_or_reparse(ws):
         _die("--workspace 必须是现有的非符号链接目录: %s" % ws)
+    try:
+        exam_start.require_full_processing(
+            ws, materials=args.materials,
+            purpose="full visual-index scanning/publication",
+        )
+    except exam_start.FullProcessingRequired as exc:
+        _die(str(exc))
     if not _state_locked:
         with workspace_publication_lock(ws):
             return run(argv, backend=backend, _state_locked=True)

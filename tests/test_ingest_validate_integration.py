@@ -16,6 +16,7 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INGEST = os.path.join(ROOT, "scripts", "ingest.py")
+EXAM_START = os.path.join(ROOT, "scripts", "exam_start.py")
 VALIDATE = os.path.join(ROOT, "scripts", "validate_workspace.py")
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
@@ -49,29 +50,47 @@ RAW = {
 }
 
 
-def _run(script, *args):
+def _run(script, *args, env=None):
     return subprocess.run([sys.executable, script] + list(args),
-                          capture_output=True, text=True, encoding="utf-8")
+                          capture_output=True, text=True, encoding="utf-8",
+                          env=env)
 
 
-def _ingest(raw, out_dir):
+def _ingest(raw, out_dir, materials, home):
+    env = dict(os.environ)
+    env["EXAMPREP_HOME"] = home
+    os.makedirs(materials, exist_ok=True)
+    confirmed = _run(
+        EXAM_START, "confirm", "--course", "validate-integration-fixture",
+        "--materials", materials, "--workspace", out_dir,
+        "--mode", "from_scratch", "--time-budget", "le1d",
+        "--language", "zh", "--processing-mode", "full", "--json",
+        env=env,
+    )
+    if confirmed.returncode != 0:
+        return confirmed
     fd, path = tempfile.mkstemp(suffix=".json")
     os.close(fd)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(raw, f, ensure_ascii=False)
     try:
-        return _run(INGEST, "-i", path, "-o", out_dir)
+        return _run(INGEST, "-i", path, "-o", out_dir, env=env)
     finally:
         os.remove(path)
 
 
 class IngestThenValidateCLI(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.tmp = os.path.join(self.root, "workspace")
+        self.materials = os.path.join(self.root, "materials")
+        self.home = os.path.join(self.root, ".examprep-home")
+        self.env = dict(os.environ)
+        self.env["EXAMPREP_HOME"] = self.home
 
     def _build_workspace(self):
-        r = _ingest(RAW, self.tmp)
+        r = _ingest(RAW, self.tmp, self.materials, self.home)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         # ingest does NOT create assets/ — the agent writes the image file (documented contract);
         # simulate that so the visual item v1 is complete before validation
@@ -83,7 +102,7 @@ class IngestThenValidateCLI(unittest.TestCase):
 
     def test_real_ingest_product_passes_real_validator_cli(self):
         ws = self._build_workspace()
-        r = _run(VALIDATE, ws)
+        r = _run(VALIDATE, ws, env=self.env)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)   # THE integration guarantee
 
     def test_tampered_source_enum_fails_validator(self):
@@ -92,20 +111,20 @@ class IngestThenValidateCLI(unittest.TestCase):
         bank = json.load(open(bank_path, encoding="utf-8"))
         bank[0]["source"] = "invented_src"                        # illegal provenance enum
         json.dump(bank, open(bank_path, "w", encoding="utf-8"), ensure_ascii=False)
-        r = _run(VALIDATE, ws)
+        r = _run(VALIDATE, ws, env=self.env)
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)    # error, not a warning
 
     def test_missing_visual_asset_fails_closed(self):
         ws = self._build_workspace()
         os.remove(os.path.join(ws, "references", "assets", "v1_p3.png"))
-        r = _run(VALIDATE, ws)
+        r = _run(VALIDATE, ws, env=self.env)
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)    # requires_assets without file = error
 
     def test_corrupted_bank_json_exits_2(self):
         ws = self._build_workspace()
         with open(os.path.join(ws, "references", "quiz_bank.json"), "w", encoding="utf-8") as f:
             f.write("{ not json")
-        r = _run(VALIDATE, ws)
+        r = _run(VALIDATE, ws, env=self.env)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)    # fatal, structured
 
 

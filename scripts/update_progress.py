@@ -10,10 +10,12 @@ view from it. A write failure is FAIL-LOUD (non-zero exit + message) — never s
 
     python scripts/update_progress.py --workspace <ws> init                # migrate md → json (once)
     python scripts/update_progress.py --workspace <ws> set --phase 3
+    python scripts/update_progress.py --workspace <ws> set --interaction-style step_by_step
     python scripts/update_progress.py --workspace <ws> set --scope homework-only --mode 查缺补漏
     python scripts/update_progress.py --workspace <ws> add-mistake --id hw_hw1_3 --chapter 2 --note "Venn 阴影判断错"
     python scripts/update_progress.py --workspace <ws> add-confusion --chapter 1 --note "循环队列取模"
     python scripts/update_progress.py --workspace <ws> record-phase-evidence --kind wiki --ref references/wiki/ch1.md
+    python scripts/update_progress.py --workspace <ws> record-taught-example --id ex1 --notebook-ref notebook/ch01.md#ex1
     python scripts/update_progress.py --workspace <ws> complete-phase --status covered_unverified
     python scripts/update_progress.py --workspace <ws> render               # json → md（修复被手改的 md）
     python scripts/update_progress.py --workspace <ws> show                 # 打印当前状态 JSON
@@ -44,13 +46,23 @@ for _s in ("stdout", "stderr"):
         pass
 
 import i18n
+import list_teaching_examples as _teaching_examples
 import notebook as _notebook
+from stable_ids import stable_item_id_problem
 from ingestion import workspace_publication_lock
 from ingestion.storage import _exclusive_file_lock
 try:
-    from asset_policy import physical_asset_key
+    from asset_policy import (
+        physical_asset_key,
+        quiz_runtime_eligibility,
+        quiz_runtime_ref_error,
+    )
 except ImportError:  # package import from repository root
-    from scripts.asset_policy import physical_asset_key
+    from scripts.asset_policy import (
+        physical_asset_key,
+        quiz_runtime_eligibility,
+        quiz_runtime_ref_error,
+    )
 
 STATE_NAME = "study_state.json"
 MD_NAME = "study_progress.md"
@@ -59,8 +71,12 @@ SCHEMA_VERSION = 1
 # v4.1 Step 4: phase completion is evidence-backed in manifest-aware workspaces.  The new
 # field is additive within schema v1 so legacy state remains readable without an eager migration.
 PHASE_EVIDENCE_STATUSES = ("covered_unverified", "verified")
-PHASE_EVIDENCE_FIELDS = ("wiki", "visual", "teaching_examples", "notebook", "checkpoint")
+PHASE_EVIDENCE_FIELDS = (
+    "wiki", "visual", "teaching_examples", "notebook", "checkpoint",
+    "lightweight_batches",
+)
 PHASE_EVIDENCE_CORE = ("wiki", "visual", "teaching_examples", "notebook")
+LIGHTWEIGHT_EVIDENCE_FIELDS = ("lightweight_batches",)
 CHECKPOINT_OUTCOMES = ("passed", "wrong", "skipped")
 PHASE_MANIFESTS = ("references/image_question_index.json",
                    "references/figure_page_index.json",
@@ -73,11 +89,19 @@ LEARNING_MODES = i18n.MODES
 TIME_TIERS = i18n.TIERS
 LANGUAGES = i18n.LANGS
 ARTIFACT_MODES = i18n.ARTIFACT_MODES
+PROCESSING_MODES = i18n.PROCESSING_MODES
+ANSWER_EXPLANATION_MODES = i18n.ANSWER_EXPLANATION_MODES
+INTERACTION_STYLES = i18n.INTERACTION_STYLES
+TEACHING_EXAMPLE_BINDING_FIELDS = frozenset((
+    "id", "notebook_ref", "notebook_block_sha256", "manifest_item_sha256",
+))
 
 _normalize_mode = i18n.canon_mode
 _normalize_tier = i18n.canon_tier
 _normalize_language = i18n.canon_language
 _normalize_artifact_mode = i18n.canon_artifact_mode
+_normalize_processing_mode = i18n.canon_processing_mode
+_normalize_answer_explanation_mode = i18n.canon_answer_explanation_mode
 
 
 def _disp(kind, code):
@@ -90,9 +114,20 @@ def _die(msg, code=2):
     raise SystemExit(code)
 
 
+def _validated_interaction_style(value):
+    """Return one canonical tutoring cadence or fail before state is written."""
+    if not isinstance(value, str) or value not in INTERACTION_STYLES:
+        _die("interaction_style must be exactly one of: %s; got %r"
+             % ("|".join(INTERACTION_STYLES), value))
+    return value
+
+
 def default_state():
     return {"version": SCHEMA_VERSION, "current_phase": 1, "scope": None, "mode": None,
-            "time_budget": None, "language": None, "artifact_mode": "chat", "preferences": {},
+            "time_budget": None, "language": None, "artifact_mode": "chat",
+            "processing_mode": "lightweight",
+            "answer_explanation_mode": "ordinary",
+            "preferences": {"interaction_style": "batch"},
             "mistake_archive": [], "confusion_log": [], "knowledge_window": [],
             "phase_checklist": [], "phase_evidence": {}, "last_updated": None}
 
@@ -140,6 +175,15 @@ def parse_md(text):
     prefs["language"] = lm.group(1).strip() if lm else None
     am = re.search(r"(?:输出资源模式|Artifact mode)\**\s*[：:]\s*(.+)", t, re.I)
     prefs["artifact_mode"] = am.group(1).strip() if am else None
+    pmode = re.search(r"(?:材料处理模式|Processing mode)\**\s*[:：]\s*(.+)", t, re.I)
+    prefs["processing_mode"] = pmode.group(1).strip() if pmode else None
+    emode = re.search(
+        r"(?:逐题答案解释模式|Answer explanation mode)\**\s*[:：]\s*(.+)",
+        t, re.I,
+    )
+    prefs["answer_explanation_mode"] = (
+        emode.group(1).strip() if emode else None
+    )
     mistakes, confusions, checklist, window = [], [], [], []
     cur, in_checklist, in_window, tbl_cols, window_cols = None, False, False, None, None
     for ln in t.splitlines():
@@ -365,18 +409,187 @@ def _phase_evidence_shape_errors(state):
                 errors.append("phase_evidence[%s].%s 必须是数组" % (key, field))
                 continue
             if field == "checkpoint":
+                checkpoint_ids = set()
                 for item in refs:
                     if not isinstance(item, dict):
                         errors.append("phase_evidence[%s].checkpoint 必须是 {id,outcome} 对象数组；"
                                       "只有 ID 不能证明答对" % key)
                         continue
+                    allowed = {"id", "outcome"}
+                    bound = allowed | {
+                        "bank_binding_id", "bank_sha256", "item_sha256",
+                    }
+                    if set(item) not in (allowed, bound):
+                        errors.append(
+                            "phase_evidence[%s].checkpoint[] 必须是 legacy {id,outcome} "
+                            "或 revision-bound {id,outcome,bank_binding_id,bank_sha256,item_sha256}"
+                            % key
+                        )
                     if not isinstance(item.get("id"), str) or not item["id"].strip():
                         errors.append("phase_evidence[%s].checkpoint[].id 必须是非空字符串" % key)
+                    elif item["id"] in checkpoint_ids:
+                        errors.append(
+                            "phase_evidence[%s].checkpoint[] 含重复 id %s" % (key, item["id"])
+                        )
+                    else:
+                        checkpoint_ids.add(item["id"])
                     if item.get("outcome") not in CHECKPOINT_OUTCOMES:
                         errors.append("phase_evidence[%s].checkpoint[].outcome 必须是 %s"
                                       % (key, "/".join(CHECKPOINT_OUTCOMES)))
-            elif any(not isinstance(x, str) or not x.strip() for x in refs):
-                errors.append("phase_evidence[%s].%s 必须是非空字符串数组" % (key, field))
+                    if set(item) == bound:
+                        if not re.fullmatch(
+                                r"quiz-bind-[0-9a-f]{24}",
+                                str(item.get("bank_binding_id") or "")):
+                            errors.append(
+                                "phase_evidence[%s].checkpoint[].bank_binding_id 非法" % key
+                            )
+                        for digest_field in ("bank_sha256", "item_sha256"):
+                            if not re.fullmatch(
+                                    r"[0-9a-f]{64}",
+                                    str(item.get(digest_field) or "")):
+                                errors.append(
+                                    "phase_evidence[%s].checkpoint[].%s 必须是 lowercase SHA-256"
+                                    % (key, digest_field)
+                                )
+            elif field == "lightweight_batches":
+                seen = set()
+                common = {
+                    "batch_id", "visual_receipt_id", "teaching_receipt_id",
+                    "notebook_entry", "notebook_entry_sha256", "source_sha256",
+                }
+                legacy = common | {"pages"}
+                item_scoped = common | {"inspected_pages", "taught_item_ids"}
+                for item in refs:
+                    fields = set(item) if isinstance(item, dict) else set()
+                    if (not isinstance(item, dict)
+                            or fields not in (legacy, item_scoped)):
+                        errors.append(
+                            "phase_evidence[%s].lightweight_batches 必须是严格受控的批次事件数组"
+                            % key
+                        )
+                        continue
+                    batch_id = item.get("batch_id")
+                    if not isinstance(batch_id, str) or not batch_id.strip():
+                        errors.append(
+                            "phase_evidence[%s].lightweight_batches[].batch_id 必须是非空字符串"
+                            % key
+                        )
+                    elif batch_id in seen:
+                        errors.append(
+                            "phase_evidence[%s].lightweight_batches 含重复 batch_id %s"
+                            % (key, batch_id)
+                        )
+                    else:
+                        seen.add(batch_id)
+                    for identity in ("visual_receipt_id", "teaching_receipt_id",
+                                     "notebook_entry"):
+                        if not isinstance(item.get(identity), str) or not item[identity].strip():
+                            errors.append(
+                                "phase_evidence[%s].lightweight_batches[].%s 必须是非空字符串"
+                                % (key, identity)
+                            )
+                    for digest in ("notebook_entry_sha256", "source_sha256"):
+                        if not isinstance(item.get(digest), str) or not re.fullmatch(
+                                r"[0-9a-f]{64}", item[digest]):
+                            errors.append(
+                                "phase_evidence[%s].lightweight_batches[].%s 必须是 sha256"
+                                % (key, digest)
+                            )
+                    page_field = (
+                        "inspected_pages" if fields == item_scoped else "pages"
+                    )
+                    pages = item.get(page_field)
+                    if (not isinstance(pages, list) or not pages
+                            or pages != sorted(set(pages))
+                            or any(type(page) is not int or page < 1 for page in pages)):
+                        errors.append(
+                            "phase_evidence[%s].lightweight_batches[].%s 必须是非空升序正整数数组"
+                            % (key, page_field)
+                        )
+                    if fields == item_scoped:
+                        taught_item_ids = item.get("taught_item_ids")
+                        if (not isinstance(taught_item_ids, list)
+                                or not taught_item_ids
+                                or taught_item_ids != sorted(set(taught_item_ids))
+                                or any(
+                                    not isinstance(item_id, str)
+                                    or not re.fullmatch(
+                                        r"[a-z0-9][a-z0-9._-]{0,127}", item_id
+                                    )
+                                    for item_id in taught_item_ids
+                                )):
+                            errors.append(
+                                "phase_evidence[%s].lightweight_batches[].taught_item_ids "
+                                "必须是非空、唯一、排序后的稳定 ID 数组" % key
+                            )
+            else:
+                if any(
+                    not isinstance(x, str)
+                    or not x.strip()
+                    or x != x.strip()
+                    for x in refs
+                ):
+                    errors.append(
+                        "phase_evidence[%s].%s 必须是规范非空字符串数组"
+                        % (key, field)
+                    )
+                elif len(refs) != len(set(refs)):
+                    errors.append(
+                        "phase_evidence[%s].%s 含重复值" % (key, field)
+                    )
+        bindings = record.get("teaching_example_bindings")
+        if bindings is not None:
+            if not isinstance(bindings, list):
+                errors.append(
+                    "phase_evidence[%s].teaching_example_bindings 必须是数组" % key)
+            else:
+                seen_binding_ids = set()
+                seen_binding_refs = set()
+                for binding in bindings:
+                    if (
+                        not isinstance(binding, dict)
+                        or set(binding) != TEACHING_EXAMPLE_BINDING_FIELDS
+                    ):
+                        errors.append(
+                            "phase_evidence[%s].teaching_example_bindings[] 必须精确包含 "
+                            "id/notebook_ref/notebook_block_sha256/manifest_item_sha256" % key)
+                        continue
+                    binding_id = binding.get("id")
+                    if stable_item_id_problem(binding_id):
+                        errors.append(
+                            "phase_evidence[%s].teaching_example_bindings[].id "
+                            "必须是规范非空单行字符串" % key)
+                    elif binding_id in seen_binding_ids:
+                        errors.append(
+                            "phase_evidence[%s].teaching_example_bindings 含重复 id %s"
+                            % (key, binding_id))
+                    else:
+                        seen_binding_ids.add(binding_id)
+                    notebook_ref = binding.get("notebook_ref")
+                    if (
+                        not isinstance(notebook_ref, str)
+                        or not notebook_ref.strip()
+                        or notebook_ref != notebook_ref.strip()
+                        or any(c in notebook_ref for c in ("\x00", "\r", "\n"))
+                    ):
+                        errors.append(
+                            "phase_evidence[%s].teaching_example_bindings[].notebook_ref "
+                            "必须是规范非空单行字符串" % key)
+                    elif notebook_ref in seen_binding_refs:
+                        errors.append(
+                            "phase_evidence[%s].teaching_example_bindings 含重复 "
+                            "notebook_ref %s" % (key, notebook_ref))
+                    else:
+                        seen_binding_refs.add(notebook_ref)
+                    for digest_field in (
+                        "notebook_block_sha256", "manifest_item_sha256",
+                    ):
+                        if not re.fullmatch(
+                            r"[0-9a-f]{64}", str(binding.get(digest_field) or "")
+                        ):
+                            errors.append(
+                                "phase_evidence[%s].teaching_example_bindings[].%s "
+                                "必须是 lowercase SHA-256" % (key, digest_field))
         status = record.get("status")
         if status is not None and status not in PHASE_EVIDENCE_STATUSES:
             errors.append("phase_evidence[%s].status 必须是 %s，当前 %r"
@@ -384,6 +597,12 @@ def _phase_evidence_shape_errors(state):
         for field in ("updated_at", "completed_at"):
             if record.get(field) is not None and not isinstance(record[field], str):
                 errors.append("phase_evidence[%s].%s 必须是字符串或省略" % (key, field))
+        completion_mode = record.get("completion_mode")
+        if completion_mode is not None and completion_mode not in ("lightweight", "full"):
+            errors.append(
+                "phase_evidence[%s].completion_mode 必须是 lightweight/full 或省略"
+                % key
+            )
     return errors
 
 
@@ -427,10 +646,14 @@ def _markdown_anchors(path):
             n = counts.get(slug, 0)
             counts[slug] = n + 1
             anchors.add(slug if n == 0 else "%s-%d" % (slug, n))
+    if fence is not None:
+        raise ValueError("notebook contains an unterminated fenced code block")
     return anchors
 
 
 def _json_ids(path, teaching_only=False):
+    if _is_link_or_reparse(path) or not os.path.isfile(path):
+        return None, "%s 必须是安全的普通文件" % os.path.basename(path)
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -740,14 +963,21 @@ def _teaching_baseline_for_phase(ws, chapter_keys, teaching, quiz):
         return set(), ["%s 顶层必须是对象，无法核对教学例题保留基线" % source_name]
     if source_name.endswith("teaching_baseline.json") and report.get("schema_version") != 1:
         return set(), ["references/teaching_baseline.json schema_version 必须为 1"]
+    if (
+        source_name.endswith("teaching_baseline.json")
+        and report.get("policy") != "append_only"
+    ):
+        return set(), [
+            "references/teaching_baseline.json policy 必须精确为 append_only"
+        ]
     raw_ids = report.get("teaching_example_ids")
     if raw_ids is None and source_name.endswith("teaching_baseline.json"):
         return set(), ["references/teaching_baseline.json 缺少 teaching_example_ids"]
     if raw_ids is None:                         # pre-baseline legacy report
         return set(), []
     if not (isinstance(raw_ids, list)
-            and all(isinstance(x, str) and x.strip() for x in raw_ids)
-            and len({x.strip() for x in raw_ids}) == len(raw_ids)):
+            and all(stable_item_id_problem(x) is None for x in raw_ids)
+            and len(set(raw_ids)) == len(raw_ids)):
         return set(), ["%s.teaching_example_ids 必须是无重复的非空字符串数组" % source_name]
     baseline = {x.strip() for x in raw_ids}
     expected = set()
@@ -761,7 +991,7 @@ def _teaching_baseline_for_phase(ws, chapter_keys, teaching, quiz):
             for raw_scope, raw_values in raw_map.items():
                 scope = _scope_number(raw_scope)
                 if scope is None or not (isinstance(raw_values, list)
-                                         and all(isinstance(x, str) and x.strip()
+                                         and all(stable_item_id_problem(x) is None
                                                  for x in raw_values)):
                     problems.append("teaching_example_ids_by_chapter[%r] 必须是可解析章节对应的字符串数组"
                                     % raw_scope)
@@ -858,7 +1088,7 @@ def _phase_scope_context(ws, record, phase):
     return problems, wiki_names, chapter_keys
 
 
-def _phase_manifest_content(ws, record, phase):
+def _phase_manifest_content(ws, state, record, phase):
     """Return (problems, teaching_required, chapter_keys) for the v4.1 manifest trio."""
     problems, wiki_names, chapter_keys = _phase_scope_context(ws, record, phase)
     if not phase_manifest_present(ws):
@@ -870,6 +1100,22 @@ def _phase_manifest_content(ws, record, phase):
     quiz, qerr = _read_json_value(os.path.join(refs, "quiz_bank.json"))
     problems.extend(x for x in (ferr, ierr, terr, qerr) if x)
     if any((ferr, ierr, terr, qerr)):
+        return problems, True, chapter_keys
+    if not isinstance(figure, dict):
+        problems.append("figure_page_index.json 顶层必须是对象")
+    if not isinstance(image, dict):
+        problems.append("image_question_index.json 顶层必须是对象")
+    if not isinstance(teaching, list):
+        problems.append("teaching_examples.json 顶层必须是数组")
+    if not isinstance(quiz, list):
+        problems.append("quiz_bank.json 顶层必须是数组")
+    if problems:
+        return problems, True, chapter_keys
+    teaching_structure_problems = (
+        _teaching_examples.pending_manifest_structure_problems(teaching)
+    )
+    if teaching_structure_problems:
+        problems.extend(teaching_structure_problems)
         return problems, True, chapter_keys
 
     # Zero suspects is meaningful only when the recall net actually ran with all needed backends and
@@ -989,11 +1235,25 @@ def _phase_manifest_content(ws, record, phase):
     if unscoped_teaching:
         problems.append("teaching_examples 含无可解析 chapter/phase 的条目，不能从阶段全集静默排除: %s"
                         % ", ".join(unscoped_teaching[:8]))
+    teaching_manifest_expected = set(expected)
     baseline_expected, baseline_problems = _teaching_baseline_for_phase(
         ws, chapter_keys, teaching, quiz)
+    baseline_only = baseline_expected - teaching_manifest_expected
+    if baseline_only:
+        problems.append(
+            "教学例题保留基线中的题目缺少当前 teaching_examples.json 快照: %s；"
+            "quiz-only 条目不能替代教学 roster，请恢复教学快照或重新导入"
+            % ", ".join(sorted(baseline_only))
+        )
     expected.update(baseline_expected)
     problems.extend(baseline_problems)
-    recorded = set(record.get("teaching_examples") or [])
+    # Bound step-by-step evidence keeps its stronger live notebook/manifest
+    # contract even after the learner changes cadence.  Unbound IDs remain
+    # legitimate batch evidence; both channels share one validator.
+    binding_status = _step_teaching_binding_status(
+        ws, state, phase, teaching)
+    problems.extend(binding_status["problems"])
+    recorded = set(binding_status["completed_ids"])
     missing_examples = expected - recorded
     if missing_examples:
         problems.append("教学例题 evidence 未覆盖本阶段 manifest 全集: %s"
@@ -1089,6 +1349,58 @@ def _completion_asset_policy(ws):
     return snapshot, None
 
 
+def _checkpoint_runtime(
+        ws, phase, asset_policy=_COMPLETION_ASSET_POLICY_UNSET,
+        asset_policy_error=None, processing_mode=None):
+    """Strict-load the bank once for an explicit checkpoint/completion transition."""
+
+    if asset_policy is _COMPLETION_ASSET_POLICY_UNSET:
+        asset_policy, asset_policy_error = _completion_asset_policy(ws)
+    if asset_policy_error:
+        return None, asset_policy_error
+    if processing_mode not in ("lightweight", "full"):
+        state, state_error = _read_json_value(os.path.join(ws, STATE_NAME))
+        if state_error or not isinstance(state, dict):
+            return None, "无法确定 checkpoint 的 processing_mode"
+        processing_mode = i18n.workspace_processing_mode(state)
+    baseline = None
+    if processing_mode == "lightweight":
+        try:
+            try:
+                from . import lightweight_session as lightweight
+            except ImportError:  # standalone scripts directory import
+                import lightweight_session as lightweight
+            baseline = lightweight.quiz_bank_baseline(ws)
+        except (OSError, TypeError, ValueError) as exc:
+            return None, "lightweight quiz bank baseline 无法验证：%s" % exc
+    try:
+        result = quiz_runtime_eligibility(
+            ws, asset_policy, chapter=phase, baseline=baseline
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        return None, "quiz runtime eligibility 无法建立：%s" % exc
+    if result.get("global_errors"):
+        return None, "quiz runtime gate 阻塞：%s" % ",".join(
+            result["global_errors"]
+        )
+    return result, None
+
+
+def _checkpoint_binding_from_runtime(runtime, ident):
+    bank = runtime.get("bank_binding") if isinstance(runtime, dict) else None
+    item_hash = (
+        (bank.get("eligible_item_sha256") or {}).get(ident)
+        if isinstance(bank, dict) else None
+    )
+    if (not isinstance(bank, dict) or not isinstance(item_hash, str)):
+        return None
+    return {
+        "bank_binding_id": bank.get("binding_id"),
+        "bank_sha256": bank.get("bank_sha256"),
+        "item_sha256": item_hash,
+    }
+
+
 def _item_completion_asset_error(item, tainted_keys):
     if not isinstance(item, dict):
         return None
@@ -1110,9 +1422,58 @@ def _item_completion_asset_error(item, tainted_keys):
     return None
 
 
+def _lightweight_batch_ref_error(ws, phase, ref):
+    """Validate one lightweight event against the live serialized batch ledger.
+
+    The heavyweight completion validator must not infer a batch from filenames or
+    duplicate the lightweight state-machine schema.  Importing here keeps the
+    dependency lazy and lets the state machine remain the sole receipt authority.
+    """
+    if not isinstance(phase, int) or phase < 1:
+        return "lightweight batch evidence requires its canonical positive phase"
+    try:
+        import lightweight_session as lightweight
+    except (ImportError, OSError) as exc:
+        return "无法加载 lightweight batch validator：%s" % exc
+    try:
+        return lightweight.progress_event_error(ws, phase, ref)
+    except (OSError, TypeError, ValueError) as exc:
+        return "lightweight batch evidence 无法验证：%s" % exc
+
+
 def phase_evidence_ref_error(ws, field, ref, asset_policy=_COMPLETION_ASSET_POLICY_UNSET,
-                             asset_policy_error=None):
+                             asset_policy_error=None, phase=None,
+                             quiz_runtime=None, require_quiz_binding=False,
+                             processing_mode=None):
     """Validate one evidence reference; return a human-readable error or None."""
+    if field == "lightweight_batches":
+        return _lightweight_batch_ref_error(ws, phase, ref)
+    if field == "checkpoint":
+        if not isinstance(ref, dict):
+            return "checkpoint 证据必须是对象"
+        if type(phase) is not int or phase < 1:
+            return "checkpoint 证据必须绑定规范正整数 phase"
+        ident_value = ref.get("id")
+        if (not isinstance(ident_value, str) or not ident_value.strip()
+                or ident_value != ident_value.strip()
+                or any(c in ident_value for c in ("\x00", "\r", "\n"))):
+            return "checkpoint 证据 ID 必须是规范非空单行字符串"
+        if quiz_runtime is None:
+            quiz_runtime, runtime_error = _checkpoint_runtime(
+                ws, phase, asset_policy, asset_policy_error,
+                processing_mode=processing_mode,
+            )
+            if runtime_error:
+                return runtime_error
+        binding_fields = {"bank_binding_id", "bank_sha256", "item_sha256"}
+        present = binding_fields & set(ref)
+        binding = {key: ref.get(key) for key in present} if present else None
+        if require_quiz_binding and binding is None:
+            return (
+                "lightweight verified checkpoint 缺 bank_binding_id/bank_sha256/"
+                "item_sha256；legacy {id,outcome} 只能保留为未验证历史"
+            )
+        return quiz_runtime_ref_error(quiz_runtime, ident_value, binding=binding)
     if asset_policy is _COMPLETION_ASSET_POLICY_UNSET:
         asset_policy, asset_policy_error = _completion_asset_policy(ws)
     if asset_policy_error:
@@ -1139,32 +1500,30 @@ def phase_evidence_ref_error(ws, field, ref, asset_policy=_COMPLETION_ASSET_POLI
             try:
                 if fragment not in _markdown_anchors(full):
                     return "notebook 证据锚点不存在: %s#%s" % (rel, fragment)
-            except (OSError, UnicodeDecodeError) as e:
-                return "notebook 证据无法读取: %s" % e
+            except (OSError, UnicodeDecodeError, ValueError) as e:
+                return "notebook 证据无法安全读取/解析: %s" % e
         return None
 
-    checkpoint = field == "checkpoint"
-    ident_value = ref.get("id") if checkpoint and isinstance(ref, dict) else ref
+    ident_value = ref
     if (not isinstance(ident_value, str) or not ident_value.strip()
             or any(c in ident_value for c in ("\x00", "\r", "\n"))):
         return "%s 证据 ID 必须是非空单行字符串" % field
     ident = ident_value.strip()
     if field == "teaching_examples":
+        id_problem = stable_item_id_problem(ident)
+        if id_problem:
+            return "教学例题证据 ID 不符合稳定 notebook/Guide 契约: %s" % id_problem
         teaching_path = os.path.join(ws, "references", "teaching_examples.json")
-        if os.path.isfile(teaching_path):
-            ids, error = _json_ids(teaching_path)
-            # A baseline item may intentionally remain only in the canonical bank.  The teaching
-            # manifest is a reachability snapshot, not a second answer source, so accept the union.
-            legacy_ids, legacy_error = _json_ids(
-                os.path.join(ws, "references", "quiz_bank.json"), teaching_only=True)
-            if not legacy_error:
-                ids = (ids or set()) | legacy_ids
-        else:
-            ids, error = _json_ids(os.path.join(ws, "references", "quiz_bank.json"), teaching_only=True)
+        if not os.path.isfile(teaching_path):
+            return (
+                "教学例题证据要求 references/teaching_examples.json；"
+                "quiz-only 条目不能替代教学 roster"
+            )
+        ids, error = _json_ids(teaching_path)
         if error:
             return error
         if ident not in ids:
-            return "教学例题 ID 不在 teaching_examples/legacy example bank 中: %s" % ident
+            return "教学例题 ID 不在 teaching_examples manifest 中: %s" % ident
         candidates = [
             row for row in asset_policy["teaching_rows"] + asset_policy["quiz_rows"]
             if isinstance(row, dict) and str(row.get("id")) == ident
@@ -1174,36 +1533,22 @@ def phase_evidence_ref_error(ws, field, ref, asset_policy=_COMPLETION_ASSET_POLI
             if problem:
                 return problem
         return None
-    if field == "checkpoint":
-        ids, error = _json_ids(os.path.join(ws, "references", "quiz_bank.json"))
-        if error:
-            return error
-        if ident not in ids:
-            return "checkpoint ID 不在 references/quiz_bank.json 中: %s" % ident
-        for item in asset_policy["quiz_rows"]:
-            if isinstance(item, dict) and str(item.get("id")) == ident:
-                problem = _item_completion_asset_error(item, tainted_keys)
-                if problem:
-                    return problem
-        return None
     return "未知 phase evidence 字段: %s" % field
 
 
 def _no_questions_preference(state):
-    prefs = state.get("preferences") or {}
-    for key in ("no_questions", "no-questions", "不要出题", "不要问我"):
-        if key not in prefs:
-            continue
-        value = str(prefs.get(key) or "").strip().lower()
-        if value in ("1", "true", "yes", "on", "是", "不出题", "不要问"):
-            return True
-    return False
+    return i18n.workspace_no_questions(state)
 
 
-def _phase_completion_problems(record, status, teaching_required=True):
+def _phase_completion_problems(record, status, teaching_required=True,
+                               processing_mode="full",
+                               require_checkpoint_bindings=False):
     problems = []
-    required_core = tuple(x for x in PHASE_EVIDENCE_CORE
-                          if x != "teaching_examples" or teaching_required)
+    if processing_mode == "lightweight":
+        required_core = LIGHTWEIGHT_EVIDENCE_FIELDS
+    else:
+        required_core = tuple(x for x in PHASE_EVIDENCE_CORE
+                              if x != "teaching_examples" or teaching_required)
     missing = [field for field in required_core if not (record.get(field) or [])]
     if missing:
         problems.append("缺必需证据: %s" % ", ".join(missing))
@@ -1215,40 +1560,277 @@ def _phase_completion_problems(record, status, teaching_required=True):
             problems.append("verified 至少需要 2 个不同题目的已处理 checkpoint")
         if not any(isinstance(x, dict) and x.get("outcome") == "passed" for x in checkpoints):
             problems.append("verified 至少需要 1 个 outcome=passed 的 checkpoint")
+        if require_checkpoint_bindings and any(
+                not isinstance(row, dict)
+                or not {"bank_binding_id", "bank_sha256", "item_sha256"} <= set(row)
+                for row in checkpoints):
+            problems.append(
+                "lightweight verified 的每个 checkpoint 都必须绑定 bank/item revision；"
+                "legacy {id,outcome} 不能用于 verified"
+            )
     return problems
 
 
-def phase_evidence_errors(ws, state, enforce_manifest_gate=True):
-    """Shared validator surface used by validate_workspace.py and the mutation commands."""
+def _lightweight_phase_problems(ws, phase, record, exact=False):
+    """Use identity-only routine checks; exact bytes only at completion."""
+    try:
+        import lightweight_session as lightweight
+    except (ImportError, OSError) as exc:
+        return ["无法加载 lightweight phase validator：%s" % exc]
+    try:
+        validator = (
+            lightweight.phase_completion_problems
+            if exact else lightweight.phase_identity_problems
+        )
+        return validator(ws, phase, record.get("lightweight_batches") or [])
+    except (OSError, TypeError, ValueError) as exc:
+        return ["lightweight phase evidence 无法验证：%s" % exc]
+
+
+def phase_evidence_errors(
+        ws, state, enforce_manifest_gate=True, recoverable_stale=None):
+    """Return phase errors, optionally separating recoverable roster staleness.
+
+    ``recoverable_stale`` may be a caller-owned list.  When supplied, live
+    notebook/manifest revision drift or an append-only current-roster expansion
+    is appended there instead of being returned as a structural error.  Completion
+    and Guide gates do not pass this list and therefore remain strict; the
+    workspace mount validator uses it to keep the manifest-order re-teach and
+    re-record recovery path open.
+    """
     errors = _phase_evidence_shape_errors(state)
     if errors:
         return errors
-    manifest_state, manifest_reason = phase_manifest_status(ws)
-    if manifest_state == "broken":
+    processing_mode = i18n.workspace_processing_mode(state)
+    if processing_mode == "full":
+        manifest_state, manifest_reason = phase_manifest_status(ws)
+    else:
+        manifest_state, manifest_reason = "dormant", "lightweight mode"
+    if processing_mode == "full" and manifest_state == "broken":
         errors.append("v4.1 manifest 处于 partial/broken 状态，阶段门禁拒绝 fail-open：" + manifest_reason)
     evidence = state.get("phase_evidence") or {}
-    asset_policy, asset_policy_error = _completion_asset_policy(ws)
+    if processing_mode == "full":
+        asset_policy, asset_policy_error = _completion_asset_policy(ws)
+    else:
+        asset_policy, asset_policy_error = _COMPLETION_ASSET_POLICY_UNSET, None
     for phase, record in evidence.items():
+        recoverable_notebook_refs = set()
         status = record.get("status")
         if status:
-            for problem in _phase_record_problems(ws, state, int(phase), status):
-                errors.append("phase_evidence[%s] 状态 %s：%s" % (phase, status, problem))
+            record_mode = _phase_record_processing_mode(state, record)
+            if processing_mode == "lightweight" and record_mode == "full":
+                # Full-build completion history is dormant after an explicit
+                # lightweight switch. Its bounded state shape remains visible,
+                # but routine mount must not wake wiki/manifest/.ingest readers.
+                continue
+            if (record_mode == "lightweight"
+                    and int(phase) != state.get("current_phase")):
+                # Historical lightweight phases keep immutable receipt bindings but
+                # deliberately avoid re-hashing old course files on every mount.  They
+                # are revalidated live when the learner resumes that phase.
+                try:
+                    import lightweight_session as lightweight
+                    identity_problems = lightweight.phase_identity_problems(
+                        ws, int(phase), record.get("lightweight_batches") or []
+                    )
+                except (ImportError, OSError, TypeError, ValueError) as exc:
+                    identity_problems = [
+                        "cannot validate historical lightweight identity: %s" % exc
+                    ]
+                for problem in identity_problems:
+                    errors.append(
+                        "phase_evidence[%s] historical lightweight identity: %s"
+                        % (phase, problem)
+                    )
+                continue
+            # Routine validation checks immutable batch/event identity here.
+            # ``lightweight_session.workspace_health`` performs the bounded
+            # metadata/physical-identity check for current evidence without
+            # streaming course bytes. Exact source/assets/notebook hashes are
+            # reserved for explicit publication/completion transitions and
+            # ``status --verify-live``. The quiz bank likewise remains dormant
+            # until an explicit checkpoint/completion action.
+            recoverable_step_problems = set()
+            recoverable_binding_ids = set()
+            recoverable_notebook_refs = set()
+            reopenable_pending_ids = set()
+            binding_status = None
+            if record_mode == "full":
+                teaching, teaching_error = _read_json_value(
+                    os.path.join(ws, "references", "teaching_examples.json"))
+                if not teaching_error:
+                    binding_status = _step_teaching_binding_status(
+                        ws, state, int(phase), teaching)
+                    direct_recoverable_problems = {
+                        "教学事件 %s：%s" % (ident, problem)
+                        for ident, problem
+                        in binding_status["binding_problems"].items()
+                    }
+                    fatal_step_problems = [
+                        problem for problem in binding_status["problems"]
+                        if problem not in direct_recoverable_problems
+                    ]
+                    baseline_problems = _step_roster_baseline_problems(
+                        ws, int(phase), teaching)
+                    # A completed receipt may be reopened only when the current
+                    # roster and every retained baseline relationship are
+                    # structurally sound.  Pending includes both a newly appended
+                    # manifest item and a previously bound item whose exact
+                    # manifest/notebook revision drifted.  Structural corruption
+                    # never enters this mount-only repair seam.
+                    if not fatal_step_problems and not baseline_problems:
+                        reopenable_pending_ids = {
+                            item["id"] for item in binding_status["pending_items"]
+                        }
+                    if reopenable_pending_ids:
+                        recoverable_step_problems = direct_recoverable_problems
+                        recoverable_binding_ids = set(
+                            binding_status["binding_problems"]
+                        )
+                        recoverable_notebook_refs = {
+                            binding.get("notebook_ref")
+                            for binding in (
+                                record.get("teaching_example_bindings") or []
+                            )
+                            if isinstance(binding, dict)
+                            and binding.get("id") in recoverable_binding_ids
+                            and isinstance(binding.get("notebook_ref"), str)
+                        }
+            phase_record_problems = _phase_record_problems(
+                    ws, state, int(phase), status,
+                    exact_lightweight=False,
+                    exact_quiz=False)
+            repairable_phase_problems = set(recoverable_step_problems)
+            if reopenable_pending_ids:
+                for notebook_ref in recoverable_notebook_refs:
+                    notebook_problem = phase_evidence_ref_error(
+                        ws, "notebook", notebook_ref,
+                        asset_policy, asset_policy_error,
+                        phase=int(phase), processing_mode="full",
+                    )
+                    if notebook_problem:
+                        repairable_phase_problems.add(
+                            "notebook 引用无效：%s" % notebook_problem
+                        )
+                missing_prefix = (
+                    "教学例题 evidence 未覆盖本阶段 manifest 全集: "
+                )
+                expected_missing_problem = missing_prefix + ", ".join(
+                    sorted(reopenable_pending_ids)
+                )
+                if expected_missing_problem in phase_record_problems:
+                    repairable_phase_problems.add(expected_missing_problem)
+                _scope_problems, _wiki_names, chapter_keys = (
+                    _phase_scope_context(ws, record, int(phase)))
+                repairable_phase_problems.update(
+                    _structured_study_guide_problems(
+                        ws, state, chapter_keys))
+            for problem in phase_record_problems:
+                formatted = (
+                    "phase_evidence[%s] 状态 %s：%s"
+                    % (phase, status, problem)
+                )
+                if recoverable_stale is not None and problem in repairable_phase_problems:
+                    recoverable_stale.append(formatted)
+                else:
+                    errors.append(formatted)
         else:
+            # A cadence/no-questions change may make step-by-step dormant, but it
+            # must never weaken evidence that was already bound to a live notebook
+            # block and manifest revision.  Unbound batch IDs remain legal.
+            has_teaching_bindings = bool(
+                record.get("teaching_example_bindings")
+            )
+            if (
+                processing_mode == "full"
+                and (
+                    i18n.workspace_effective_interaction_style(state)
+                        == "step_by_step"
+                    or has_teaching_bindings
+                )
+            ):
+                recoverable_notebook_refs = set()
+                teaching, teaching_error = _read_json_value(
+                    os.path.join(ws, "references", "teaching_examples.json"))
+                if teaching_error:
+                    errors.append(
+                        "phase_evidence[%s] step_by_step roster 无法读取：%s"
+                        % (phase, teaching_error))
+                else:
+                    for problem in _step_roster_baseline_problems(
+                            ws, int(phase), teaching):
+                        errors.append(
+                            "phase_evidence[%s] step_by_step roster：%s"
+                            % (phase, problem))
+                    step_status = _step_teaching_binding_status(
+                        ws, state, int(phase), teaching)
+                    recoverable_step_problems = {
+                        "教学事件 %s：%s" % (ident, problem)
+                        for ident, problem
+                        in step_status["binding_problems"].items()
+                    }
+                    recoverable_binding_ids = set(
+                        step_status["binding_problems"]
+                    )
+                    recoverable_notebook_refs = {
+                        binding.get("notebook_ref")
+                        for binding in (record.get("teaching_example_bindings") or [])
+                        if isinstance(binding, dict)
+                        and binding.get("id") in recoverable_binding_ids
+                        and isinstance(binding.get("notebook_ref"), str)
+                    }
+                    for problem in step_status["problems"]:
+                        formatted = (
+                            "phase_evidence[%s] step_by_step evidence：%s"
+                            % (phase, problem)
+                        )
+                        if (
+                            recoverable_stale is not None
+                            and problem in recoverable_step_problems
+                        ):
+                            recoverable_stale.append(formatted)
+                        else:
+                            errors.append(formatted)
             for field in PHASE_EVIDENCE_FIELDS:
+                if (processing_mode == "lightweight"
+                        and field != "lightweight_batches"):
+                    # Full-build evidence may remain as dormant history after an explicit
+                    # switch to lightweight. Checkpoint rows are also shape-checked only
+                    # on routine mount: strict bank loading is reserved for explicit
+                    # record/complete transitions.
+                    continue
                 for ref in record.get(field) or []:
                     problem = phase_evidence_ref_error(
-                        ws, field, ref, asset_policy, asset_policy_error)
+                        ws, field, ref, asset_policy, asset_policy_error,
+                        phase=int(phase))
                     if problem:
-                        errors.append("phase_evidence[%s].%s 引用无效：%s" % (phase, field, problem))
-    if enforce_manifest_gate and manifest_state == "ready":
+                        formatted = (
+                            "phase_evidence[%s].%s 引用无效：%s"
+                            % (phase, field, problem)
+                        )
+                        if (
+                            recoverable_stale is not None
+                            and field == "notebook"
+                            and ref in recoverable_notebook_refs
+                        ):
+                            recoverable_stale.append(formatted)
+                        else:
+                            errors.append(formatted)
+    completion_gate_active = (
+        processing_mode == "lightweight"
+        or (processing_mode == "full" and manifest_state == "ready")
+    )
+    if enforce_manifest_gate and completion_gate_active:
         for row in state.get("phase_checklist") or []:
             phase = phase_number_from_check(row.get("text") or "")
             if phase is None or not row.get("done"):
                 continue
             record = evidence.get(str(phase))
             if not isinstance(record, dict) or record.get("status") not in PHASE_EVIDENCE_STATUSES:
-                errors.append("phase_evidence[%d] 缺完成状态：新版 manifest 工作区不能只靠 done=true 完成阶段"
-                              % phase)
+                errors.append(
+                    "phase_evidence[%d] 缺完成状态：%s 工作区不能只靠 done=true 完成阶段"
+                    % (phase, processing_mode)
+                )
     return errors
 
 
@@ -1291,9 +1873,20 @@ def render_md(state):
         lines.append("* **语言偏好**：%s" % _md_cell(_disp("lang", state["language"]), default=""))
     # Always render the resource-output mode so init --force can round-trip the explicit choice.
     # Old/missing/unknown state is effective chat-only; unknown raw values remain visible for audit.
+    processing = state.get("processing_mode")
+    lines.append("* **材料处理模式**：%s" % _md_cell(
+        _disp("processing", processing) if processing
+        else _disp("processing", "lightweight"), default=""))
     artifact = state.get("artifact_mode")
     lines.append("* **输出资源模式**：%s" % _md_cell(
         _disp("artifact", artifact) if artifact else _disp("artifact", "chat"), default=""))
+    explanation_mode = i18n.workspace_answer_explanation_mode(state)
+    lines.append("* **逐题答案解释模式**：%s" % _md_cell(
+        _disp("answer_explanation", explanation_mode), default=""))
+    if i18n.workspace_artifact_mode_dormant(state):
+        lines.append(
+            "* **输出资源有效模式**：对话（visual 偏好已保留，但在轻量处理模式中暂停）"
+        )
     lines.append("")
     if state.get("phase_checklist"):
         # 打卡区随 state 一起渲染回来——迁移绝不丢每阶段完成状态；勾选走 set-check 官方路径
@@ -1311,8 +1904,10 @@ def render_md(state):
             record = state["phase_evidence"][phase]
             counts = ", ".join("%s=%d" % (field, len(record.get(field) or []))
                                for field in PHASE_EVIDENCE_FIELDS)
-            evidence_lines.append("- 阶段 %s：%s（%s）" %
-                                  (phase, status_words.get(record.get("status"), record.get("status")), counts))
+            completion_mode = record.get("completion_mode") or "-"
+            evidence_lines.append("- 阶段 %s：%s（completion_mode=%s；%s）" %
+                                  (phase, status_words.get(record.get("status"), record.get("status")),
+                                   completion_mode, counts))
         lines += ["## 🧾 阶段证据状态", "\n".join(evidence_lines), ""]
     lines += [
         "## ❌ 错题档案记录",
@@ -1364,7 +1959,7 @@ def load_state(ws):
     return st
 
 
-def save(ws, state, note):
+def save(ws, state, note, quiet=False):
     """Atomic UTF-8 write of BOTH the state json and the rendered md. Any failure is fail-loud."""
     state["last_updated"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     # two-phase: stage BOTH tmp files first, then replace md, then state (the source of truth) LAST —
@@ -1403,7 +1998,8 @@ def save(ws, state, note):
                 pass
         _die("写入进度失败：%s——事实源 study_state.json 未被超前破坏；若 md 已先行更新，跑 render 即可"
              "恢复一致。请告知用户（绝不静默继续）" % e, 1)
-    print("[+] %s（state + md 已同步更新）" % note)
+    if not quiet:
+        print("[+] %s（state + md 已同步更新）" % note)
 
 
 # ---------------- commands ----------------
@@ -1471,11 +2067,28 @@ def cmd_init(ws, args):
         prefs["artifact_mode"], _aw = _normalize_artifact_mode(prefs["artifact_mode"])
         if _aw:
             sys.stderr.write("update_progress[warn]: " + _aw + "\n")
-    for k in ("scope", "mode", "time_budget", "language", "artifact_mode"):
+    if prefs.get("processing_mode"):
+        prefs["processing_mode"], _pw = _normalize_processing_mode(
+            prefs["processing_mode"]
+        )
+        if _pw:
+            sys.stderr.write("update_progress[warn]: " + _pw + "\n")
+    if prefs.get("answer_explanation_mode"):
+        prefs["answer_explanation_mode"], _ew = (
+            _normalize_answer_explanation_mode(
+                prefs["answer_explanation_mode"]
+            )
+        )
+        if _ew:
+            sys.stderr.write("update_progress[warn]: " + _ew + "\n")
+    for k in ("scope", "mode", "time_budget", "language", "artifact_mode",
+              "processing_mode", "answer_explanation_mode"):
         if prefs.get(k):
             st[k] = prefs[k]
     if prefs.get("preferences"):                    # ⚙️ 偏好区（讲解风格等）同理——恢复路径不丢偏好
         st["preferences"].update(prefs["preferences"])
+    _validated_interaction_style(st["preferences"].get("interaction_style", "batch"))
+    st["preferences"].setdefault("interaction_style", "batch")
     save(ws, st, "init：从 %s 迁移（阶段 %d，错题 %d，疑难 %d，打卡 %d）"
          % (MD_NAME if os.path.isfile(md_path) else "空白", phase, len(mistakes), len(confusions),
             len(checklist)))
@@ -1497,7 +2110,10 @@ def _migrate_enums(ws, st):
             st["time_budget"], changed = mig_tier, True
     for field, canon in (("time_budget", lambda v: i18n.canon_tier(v)[0]),
                          ("language", lambda v: i18n.canon_language(v)[0]),
-                         ("artifact_mode", lambda v: i18n.canon_artifact_mode(v)[0])):
+                         ("artifact_mode", lambda v: i18n.canon_artifact_mode(v)[0]),
+                         ("processing_mode", lambda v: i18n.canon_processing_mode(v)[0]),
+                         ("answer_explanation_mode",
+                          lambda v: i18n.canon_answer_explanation_mode(v)[0])):
         v = st.get(field)
         if isinstance(v, str) and v:
             c = canon(v)
@@ -1538,7 +2154,7 @@ def _migrate_enums(ws, st):
     return changed
 
 
-def _require_state(ws, repairing_phase=False):
+def _require_state(ws, repairing_phase=False, repairing_interaction_style=False):
     st = load_state(ws)
     if st is None:
         _die("尚无 study_state.json——先跑 `update_progress.py --workspace <ws> init` 迁移")
@@ -1585,12 +2201,51 @@ def _require_state(ws, repairing_phase=False):
     elif not isinstance(st["preferences"], dict):
         _die("study_state.json 损坏：preferences 必须是对象，当前 %s"
              % type(st["preferences"]).__name__, 1)
+    # Missing means batch for legacy state. Invalid aliases never silently
+    # change cadence semantics.
+    raw_interaction_style = st["preferences"].get("interaction_style", "batch")
+    if raw_interaction_style not in INTERACTION_STYLES and repairing_interaction_style:
+        st["preferences"]["interaction_style"] = "batch"
+    else:
+        st["preferences"]["interaction_style"] = _validated_interaction_style(
+            raw_interaction_style)
     if st.get("artifact_mode") is None:
         # Additive state field: v3 and early-v4 workspaces keep their chat-only behavior.
         st["artifact_mode"] = "chat"
     elif not isinstance(st["artifact_mode"], str):
         _die("study_state.json 损坏：artifact_mode 必须是字符串，当前 %s"
              % type(st["artifact_mode"]).__name__, 1)
+    raw_processing_mode = st.get("processing_mode")
+    if raw_processing_mode is None:
+        # Legacy workspaces fail safe: a missing field never starts a full build.
+        st["processing_mode"] = "lightweight"
+    elif not isinstance(raw_processing_mode, str):
+        st["processing_mode"] = "lightweight"
+        sys.stderr.write(
+            "update_progress[migrate]: invalid non-string processing_mode was "
+            "reset to lightweight\n"
+        )
+    else:
+        canonical_processing, _warning = i18n.canon_processing_mode(
+            raw_processing_mode
+        )
+        if canonical_processing not in i18n.PROCESSING_MODES:
+            st["processing_mode"] = "lightweight"
+            sys.stderr.write(
+                "update_progress[migrate]: unknown processing_mode was reset "
+                "to lightweight\n"
+            )
+        else:
+            st["processing_mode"] = canonical_processing
+    raw_explanation_mode = st.get("answer_explanation_mode")
+    canonical_explanation, explanation_warning = (
+        i18n.canon_answer_explanation_mode(raw_explanation_mode)
+    )
+    st["answer_explanation_mode"] = canonical_explanation
+    if explanation_warning:
+        sys.stderr.write(
+            "update_progress[migrate]: %s\n" % explanation_warning
+        )
     return st
 
 
@@ -1660,7 +2315,11 @@ def _plan_phase_wikis(ws):
 
 def cmd_set(ws, args):
     # 提供 --phase 时豁免陈旧断点检查（这是修复路径；新值下面自行对照计划校验）
-    st = _require_state(ws, repairing_phase=args.phase is not None)
+    st = _require_state(
+        ws,
+        repairing_phase=args.phase is not None,
+        repairing_interaction_style=args.interaction_style is not None,
+    )
     changed = []
     if args.phase is not None:
         if args.phase < 1:
@@ -1671,6 +2330,17 @@ def cmd_set(ws, args):
             # 会让下一次会话恢复进不存在的阶段/wiki
             _die("--phase %d 不在 study_plan.md 的阶段列表 %s 中——先改计划再设阶段"
                  % (args.phase, sorted(plan)))
+        if (i18n.workspace_processing_mode(st) == "lightweight"
+                and args.phase != st.get("current_phase")):
+            try:
+                import lightweight_session as lightweight
+                switch_problem = lightweight.phase_switch_problem(ws, args.phase)
+            except (ImportError, OSError, TypeError, ValueError) as exc:
+                switch_problem = (
+                    "cannot inspect lightweight session before phase switch: %s" % exc
+                )
+            if switch_problem:
+                _die(switch_problem)
         st["current_phase"] = args.phase
         changed.append("phase=%d" % args.phase)
     # A6：mode 走 canonical 归一化（旧四模式迁移 + 未知值保留并警告，绝不静默改写）
@@ -1723,14 +2393,55 @@ def cmd_set(ws, args):
             changed.append("artifact_mode=%s" % _disp("artifact", artifact_mode))
             if awarn:
                 sys.stderr.write("update_progress[warn]: " + awarn + "\n")
+    if args.processing_mode is not None:
+        if not args.processing_mode:
+            st["processing_mode"] = "lightweight"
+            changed.append("processing_mode=lightweight (safe default)")
+        else:
+            processing_mode, pwarn = _normalize_processing_mode(args.processing_mode)
+            if (processing_mode == "full"
+                    and i18n.workspace_processing_mode(st) == "lightweight"):
+                try:
+                    import lightweight_session as lightweight
+                    switch_problem = lightweight.full_switch_problem(ws)
+                except (ImportError, OSError, TypeError, ValueError) as exc:
+                    switch_problem = (
+                        "cannot inspect lightweight session before mode switch: %s" % exc
+                    )
+                if switch_problem:
+                    _die(switch_problem)
+            st["processing_mode"] = processing_mode
+            changed.append("processing_mode=%s" % _disp("processing", processing_mode))
+            if pwarn:
+                sys.stderr.write("update_progress[warn]: " + pwarn + "\n")
+    if args.answer_explanation_mode is not None:
+        answer_explanation_mode, ewarn = _normalize_answer_explanation_mode(
+            args.answer_explanation_mode
+        )
+        st["answer_explanation_mode"] = answer_explanation_mode
+        changed.append(
+            "answer_explanation_mode=%s"
+            % _disp("answer_explanation", answer_explanation_mode)
+        )
+        if ewarn:
+            sys.stderr.write("update_progress[warn]: " + ewarn + "\n")
+    if args.interaction_style is not None:
+        st.setdefault("preferences", {})["interaction_style"] = (
+            _validated_interaction_style(args.interaction_style))
+        changed.append("interaction_style=%s" % args.interaction_style)
     for kv in (args.pref or []):
         if "=" not in kv:
             _die("--pref 需要 key=value 形式，当前 %r" % kv)
         k, v = kv.split("=", 1)
-        st.setdefault("preferences", {})[k.strip()] = v.strip()
-        changed.append("pref %s" % k.strip())
+        key, value = k.strip(), v.strip()
+        if not key:
+            _die("--pref key must not be empty")
+        if key == "interaction_style":
+            value = _validated_interaction_style(value)
+        st.setdefault("preferences", {})[key] = value
+        changed.append("pref %s" % key)
     if not changed:
-        _die("set 没有任何改动参数（--phase/--scope/--mode/--time-budget/--language/--artifact-mode/--pref）")
+        _die("set 没有任何改动参数（--phase/--scope/--mode/--time-budget/--language/--artifact-mode/--processing-mode/--answer-explanation-mode/--interaction-style/--pref）")
     save(ws, st, "set：" + "、".join(changed))
     return 0
 
@@ -1856,44 +2567,532 @@ def _phase_check_row(state, phase):
     return hits[0]
 
 
-def _phase_record_problems(ws, state, phase, status):
+def _phase_record_processing_mode(state, record):
+    """Resolve the mode that produced one completion receipt, with legacy inference."""
+    processing_mode = record.get("completion_mode") if record.get("status") else None
+    if processing_mode in ("lightweight", "full"):
+        return processing_mode
+    if record.get("lightweight_batches") and not any(
+            record.get(field) for field in PHASE_EVIDENCE_CORE):
+        return "lightweight"
+    if any(record.get(field) for field in PHASE_EVIDENCE_CORE):
+        return "full"
+    return i18n.workspace_processing_mode(state)
+
+
+def _phase_record_problems(
+        ws, state, phase, status, processing_mode_override=None,
+        exact_lightweight=False, exact_quiz=False):
     record = (state.get("phase_evidence") or {}).get(str(phase))
     if not isinstance(record, dict):
         return ["缺 phase_evidence[%d]；先逐项运行 record-phase-evidence" % phase]
     problems = []
-    asset_policy, asset_policy_error = _completion_asset_policy(ws)
-    manifest_state, manifest_reason = phase_manifest_status(ws)
-    if manifest_state == "broken":
-        problems.append("v4.1 manifest 处于 partial/broken 状态：%s" % manifest_reason)
-    for field in PHASE_EVIDENCE_FIELDS:
-        for ref in record.get(field) or []:
-            problem = phase_evidence_ref_error(
-                ws, field, ref, asset_policy, asset_policy_error)
-            if problem:
-                problems.append("%s 引用无效：%s" % (field, problem))
-    content_problems, teaching_required, chapter_keys = _phase_manifest_content(ws, record, phase)
-    problems.extend(content_problems)
-    problems.extend(_structured_study_guide_problems(ws, state, chapter_keys))
-    problems.extend(_phase_completion_problems(record, status, teaching_required=teaching_required))
+    processing_mode = processing_mode_override
+    if processing_mode not in ("lightweight", "full"):
+        processing_mode = _phase_record_processing_mode(state, record)
+    if processing_mode == "lightweight":
+        # Only selected batches are hashed/validated.  Dormant full-build evidence is
+        # intentionally excluded, and typed Study Guide/.ingest gates are never loaded.
+        if exact_quiz and status == "verified" and record.get("checkpoint"):
+            quiz_runtime, runtime_error = _checkpoint_runtime(
+                ws, phase, processing_mode="lightweight"
+            )
+            if runtime_error:
+                problems.append("checkpoint runtime：%s" % runtime_error)
+                quiz_runtime = None
+            for ref in record.get("checkpoint") or []:
+                if quiz_runtime is None:
+                    break
+                problem = phase_evidence_ref_error(
+                    ws, "checkpoint", ref, phase=phase,
+                    quiz_runtime=quiz_runtime,
+                    require_quiz_binding=(status == "verified"),
+                    processing_mode="lightweight",
+                )
+                if problem:
+                    problems.append("checkpoint 引用无效：%s" % problem)
+        problems.extend(_lightweight_phase_problems(
+            ws, phase, record, exact=exact_lightweight
+        ))
+        problems.extend(_phase_completion_problems(
+            record, status, processing_mode="lightweight",
+            require_checkpoint_bindings=(status == "verified"),
+        ))
+    else:
+        asset_policy, asset_policy_error = _completion_asset_policy(ws)
+        quiz_runtime = None
+        quiz_runtime_error = None
+        if record.get("checkpoint"):
+            quiz_runtime, quiz_runtime_error = _checkpoint_runtime(
+                ws, phase, asset_policy, asset_policy_error,
+                processing_mode="full",
+            )
+            if quiz_runtime_error:
+                problems.append("checkpoint runtime：%s" % quiz_runtime_error)
+        manifest_state, manifest_reason = phase_manifest_status(ws)
+        if manifest_state == "broken":
+            problems.append("v4.1 manifest 处于 partial/broken 状态：%s" % manifest_reason)
+        for field in PHASE_EVIDENCE_FIELDS:
+            if field == "lightweight_batches":
+                # Historical lightweight events remain auditable but cannot satisfy a
+                # full-build completion denominator.
+                continue
+            for ref in record.get(field) or []:
+                if field == "checkpoint" and quiz_runtime is None:
+                    break
+                problem = phase_evidence_ref_error(
+                    ws, field, ref, asset_policy, asset_policy_error, phase=phase,
+                    quiz_runtime=quiz_runtime if field == "checkpoint" else None,
+                    processing_mode="full",
+                )
+                if problem:
+                    problems.append("%s 引用无效：%s" % (field, problem))
+        content_problems, teaching_required, chapter_keys = _phase_manifest_content(
+            ws, state, record, phase
+        )
+        problems.extend(content_problems)
+        problems.extend(_structured_study_guide_problems(ws, state, chapter_keys))
+        problems.extend(_phase_completion_problems(
+            record, status, teaching_required=teaching_required,
+            processing_mode="full",
+        ))
     if status == "verified" and _no_questions_preference(state):
         problems.append("preferences.no_questions=true 时不能标为 verified；阶段上限是 covered_unverified")
     return problems
 
 
 def _complete_phase_in_state(ws, state, phase, status, row=None):
-    problems = _phase_record_problems(ws, state, phase, status)
+    completion_mode = i18n.workspace_processing_mode(state)
+    problems = _phase_record_problems(
+        ws, state, phase, status, processing_mode_override=completion_mode,
+        exact_lightweight=True, exact_quiz=True,
+    )
     if problems:
         _die("阶段 %d 无法完成为 %s：%s" % (phase, status, "；".join(problems)))
     record = state["phase_evidence"][str(phase)]
     record["status"] = status
+    record["completion_mode"] = completion_mode
     record["completed_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     (row or _phase_check_row(state, phase))["done"] = True
 
 
+def _teaching_manifest_item_sha256(item):
+    try:
+        payload = json.dumps(
+            item, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        return None, "teaching manifest item 不是严格 JSON：%s" % exc
+    return hashlib.sha256(payload).hexdigest(), None
+
+
+def _teaching_example_notebook_snapshot(ws, phase, example_id, notebook_ref):
+    """Return ``(snapshot, problem, recoverable)`` for one notebook binding.
+
+    Missing/replaced entry content is recoverable by writing a fresh marked
+    walkthrough and atomically recording its new anchor.  Unsafe filesystem
+    topology, an invalid UTF-8/Markdown notebook, or an impossible parsed block
+    is structural: the official notebook writer cannot safely repair those by
+    appending an entry, so mount validation must remain blocked.
+    """
+
+    expected_rel = "notebook/ch%02d.md" % phase
+    if (
+        not isinstance(notebook_ref, str)
+        or notebook_ref != notebook_ref.strip()
+        or notebook_ref.count("#") != 1
+        or any(char in notebook_ref for char in ("\x00", "\r", "\n"))
+    ):
+        return None, "notebook binding 必须是规范的单一 path#anchor", False
+    rel, raw_fragment = notebook_ref.split("#", 1)
+    fragment = unquote(raw_fragment)
+    if (
+        rel != expected_rel
+        or not fragment
+        or any(char in fragment for char in ("\x00", "\r", "\n"))
+    ):
+        return None, (
+            "record-taught-example 的 notebook 必须是当前章 %s#<anchor>"
+            % expected_rel), False
+    notebook_dir = os.path.join(ws, "notebook")
+    full = os.path.join(ws, *rel.split("/"))
+    if os.path.lexists(notebook_dir) and _is_link_or_reparse(notebook_dir):
+        return None, "workspace notebook 目录不得是 link/reparse point", False
+    if os.path.lexists(notebook_dir) and not os.path.isdir(notebook_dir):
+        return None, "workspace notebook 目标存在但不是目录", False
+    if os.path.lexists(full) and _is_link_or_reparse(full):
+        return None, "教学 notebook 文件不得是 link/reparse point", False
+    workspace_real = os.path.normcase(os.path.realpath(ws))
+    full_real = os.path.normcase(os.path.realpath(full))
+    try:
+        contained = os.path.commonpath((workspace_real, full_real)) == workspace_real
+    except ValueError:
+        contained = False
+    if not contained:
+        return None, "教学 notebook 路径解析后逃出工作区", False
+    if not os.path.lexists(full):
+        return None, "教学 notebook 文件不存在，必须重新精讲并记录", True
+    if not os.path.isfile(full):
+        return None, "教学 notebook 目标不是普通文件", False
+    try:
+        with open(full, "r", encoding="utf-8") as stream:
+            pre, blocks = _notebook.parse_chapter(stream.read())
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        return None, "record-taught-example notebook 结构不可安全读取：%s" % exc, False
+    matches = [block for block, anchor in zip(blocks, _notebook.anchors_for(pre, blocks))
+               if anchor == fragment]
+    if len(matches) != 1:
+        return None, (
+            "notebook anchor 必须唯一定位一个条目，当前命中 %d 个" % len(matches)
+        ), True
+    block = matches[0]
+    if block.get("id") != example_id:
+        return None, (
+            "notebook anchor 对应 ID %r，不是教学例题 %r"
+            % (block.get("id"), example_id)), True
+    label, _timestamp = _notebook._block_meta(block.get("lines") or [])
+    if _notebook._label_to_type().get(label) != "walkthrough":
+        return None, "notebook anchor 必须对应 notebook.py walkthrough 条目", True
+    if not _notebook.block_has_teaching_example_marker(block, example_id):
+        return None, (
+            "notebook walkthrough 缺少本题 teaching-example marker；请先用 "
+            "notebook.py add-entry --type walkthrough --teaching-example 重写该条目"), True
+    try:
+        block_sha256 = _notebook.block_sha256(block)
+    except ValueError as exc:
+        return None, "notebook walkthrough 结构无效：%s" % exc, False
+    return {
+        "id": example_id,
+        "notebook_ref": "%s#%s" % (rel, fragment),
+        "notebook_block_sha256": block_sha256,
+    }, None, False
+
+
+def _teaching_example_binding_structure_problem(binding, phase):
+    if not isinstance(binding, dict) or set(binding) != TEACHING_EXAMPLE_BINDING_FIELDS:
+        return (
+            "teaching_example_bindings 条目必须精确包含 "
+            "id/notebook_ref/notebook_block_sha256/manifest_item_sha256"
+        )
+    ident = binding.get("id")
+    if stable_item_id_problem(ident):
+        return "binding ID 必须是规范非空单行字符串"
+    notebook_ref = binding.get("notebook_ref")
+    expected_prefix = "notebook/ch%02d.md#" % phase
+    raw_fragment = (
+        notebook_ref[len(expected_prefix):]
+        if isinstance(notebook_ref, str)
+        and notebook_ref.startswith(expected_prefix)
+        else ""
+    )
+    decoded_fragment = unquote(raw_fragment)
+    if (
+        not isinstance(notebook_ref, str)
+        or notebook_ref != notebook_ref.strip()
+        or not notebook_ref.startswith(expected_prefix)
+        or notebook_ref.count("#") != 1
+        or not decoded_fragment
+        or any(char in notebook_ref for char in ("\x00", "\r", "\n"))
+        or any(char in decoded_fragment for char in ("\x00", "\r", "\n"))
+    ):
+        return "binding notebook_ref 必须规范定位当前章 notebook 的唯一 anchor"
+    for field in ("notebook_block_sha256", "manifest_item_sha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(binding.get(field) or "")):
+            return "binding %s 必须是 lowercase SHA-256" % field
+    return None
+
+
+def _teaching_example_binding_problem(ws, phase, binding, item, notebook_refs):
+    """Return ``(problem, recoverable_stale)`` for one structurally valid binding."""
+
+    if binding.get("id") != item.get("id"):
+        return "binding ID 与 manifest item 不一致", False
+    manifest_sha256, error = _teaching_manifest_item_sha256(item)
+    if error:
+        return error, False
+    if binding.get("manifest_item_sha256") != manifest_sha256:
+        return "manifest item revision 已变化，必须重新精讲并记录", True
+    if binding.get("notebook_ref") not in notebook_refs:
+        return "binding notebook_ref 未同时出现在 phase notebook evidence", False
+    snapshot, error, recoverable = _teaching_example_notebook_snapshot(
+        ws, phase, binding["id"], binding["notebook_ref"])
+    if error:
+        return error, recoverable
+    if snapshot["notebook_block_sha256"] != binding.get("notebook_block_sha256"):
+        return "已记录的教学 walkthrough 块已被改写，必须重新精讲并记录", True
+    return None, False
+
+
+def _step_teaching_binding_status(ws, state, phase, items):
+    """Validate exact step-by-step bindings and return one manifest-order snapshot."""
+
+    record = (state.get("phase_evidence") or {}).get(str(phase), {})
+    manifest_problems = (
+        _teaching_examples.pending_manifest_structure_problems(items)
+    )
+    if manifest_problems:
+        return {
+            "problems": manifest_problems,
+            "binding_problems": {},
+            "completed_ids": [],
+            "completed_id_set": set(),
+            "valid_bound_id_set": set(),
+            "pending_items": [],
+            "next": None,
+            "items": [],
+        }
+    chapter = str(phase)
+    hits = [item for item in items if chapter in _teaching_examples._chapter_keys(item)]
+    item_by_id = {item["id"]: item for item in hits}
+    problems = []
+    binding_problems = {}
+    recorded = record.get("teaching_examples") or []
+    if len(recorded) != len(set(recorded)):
+        problems.append("teaching_examples evidence 含重复 ID")
+    bindings = record.get("teaching_example_bindings") or []
+    binding_by_id = {}
+    binding_ids_by_ref = {}
+    for binding in bindings:
+        structure_problem = _teaching_example_binding_structure_problem(
+            binding, phase)
+        if structure_problem:
+            problems.append("teaching_example_bindings 结构损坏：%s" % structure_problem)
+            continue
+        ident = binding["id"]
+        if ident in binding_by_id:
+            problems.append("teaching_example_bindings 含重复 ID %s" % ident)
+        else:
+            binding_by_id[ident] = binding
+            notebook_ref = binding["notebook_ref"]
+            previous = binding_ids_by_ref.get(notebook_ref)
+            if previous is not None:
+                problems.append(
+                    "teaching_example_bindings 的 %s 与 %s 复用同一 notebook_ref"
+                    % (previous, ident))
+            else:
+                binding_ids_by_ref[notebook_ref] = ident
+    missing_ids = set(binding_by_id) - set(recorded)
+    if missing_ids:
+        problems.append(
+            "teaching_example_bindings 缺对应 teaching_examples ID：%s"
+            % ", ".join(sorted(missing_ids)))
+    notebook_refs = set(record.get("notebook") or [])
+    unexpected_recorded = set(recorded) - set(item_by_id)
+    if unexpected_recorded:
+        problems.append(
+            "teaching_examples evidence 不在当前章 manifest：%s"
+            % ", ".join(sorted(unexpected_recorded)))
+    # Unbound strings are legitimate evidence recorded while the effective cadence
+    # was batch. Bound IDs are step events and must pass the stronger live check.
+    valid = (set(recorded) & set(item_by_id)) - set(binding_by_id)
+    valid_bound = set()
+    for ident, binding in binding_by_id.items():
+        item = item_by_id.get(ident)
+        if item is None:
+            problems.append("教学事件 ID 不在当前章 manifest：%s" % ident)
+            continue
+        problem, recoverable_stale = _teaching_example_binding_problem(
+            ws, phase, binding, item, notebook_refs)
+        if problem:
+            if recoverable_stale:
+                binding_problems[ident] = problem
+                problems.append("教学事件 %s：%s" % (ident, problem))
+            else:
+                problems.append("教学事件 %s 结构损坏：%s" % (ident, problem))
+        else:
+            valid.add(ident)
+            valid_bound.add(ident)
+    completed_ids = [item["id"] for item in hits if item["id"] in valid]
+    pending_items = [item for item in hits if item["id"] not in valid]
+    return {
+        "problems": problems,
+        "binding_problems": binding_problems,
+        "completed_ids": completed_ids,
+        "completed_id_set": valid,
+        "valid_bound_id_set": valid_bound,
+        "pending_items": pending_items,
+        "next": pending_items[0] if pending_items else None,
+        "items": hits,
+    }
+
+
+def _step_roster_baseline_problems(ws, phase, items):
+    """Require every retained baseline ID to have a current teaching snapshot."""
+
+    manifest_problems = (
+        _teaching_examples.pending_manifest_structure_problems(items)
+    )
+    if manifest_problems:
+        return manifest_problems
+
+    path = os.path.join(ws, "references", "teaching_baseline.json")
+    if not os.path.lexists(path):
+        return []
+    payload, error = _read_json_value(path)
+    if error:
+        return ["step_by_step 无法读取 teaching baseline：%s" % error]
+    mapping = payload.get("teaching_example_ids_by_chapter") \
+        if isinstance(payload, dict) else None
+    if not isinstance(mapping, dict):
+        return ["step_by_step 要求 teaching_baseline 有逐章 ID 映射；请重建完整教学 roster"]
+    expected = mapping.get(str(phase), [])
+    if (
+        not isinstance(expected, list)
+        or any(stable_item_id_problem(value) is not None for value in expected)
+        or len(expected) != len(set(expected))
+    ):
+        return ["teaching_baseline 当前章 ID 映射无效；请重建完整教学 roster"]
+    manifest_ids = {
+        item["id"] for item in items
+        if str(phase) in _teaching_examples._chapter_keys(item)
+    }
+    missing = sorted(set(expected) - manifest_ids)
+    if missing:
+        return [
+            "step_by_step teaching roster 缺保留基线题目 %s；quiz-only 条目不能替代 "
+            "teaching_examples.json，请先用 full builder/review 恢复 roster"
+            % ", ".join(missing)
+        ]
+    return []
+
+
+def _taught_example_notebook_binding(ws, phase, example_id, notebook_ref, item):
+    snapshot, error, _recoverable = _teaching_example_notebook_snapshot(
+        ws, phase, example_id, notebook_ref)
+    if error:
+        _die("拒绝记录 taught example notebook evidence：%s" % error)
+    manifest_sha256, error = _teaching_manifest_item_sha256(item)
+    if error:
+        _die("拒绝记录 taught example manifest evidence：%s" % error)
+    snapshot["manifest_item_sha256"] = manifest_sha256
+    return snapshot
+
+
+def cmd_record_taught_example(ws, args):
+    """Atomically bind one explicit tutoring walkthrough to both evidence lists."""
+    st = _require_state(ws)
+    if i18n.workspace_processing_mode(st) != "full":
+        _die("record-taught-example 只用于 processing_mode=full")
+    if i18n.workspace_effective_interaction_style(st) != "step_by_step":
+        _die(
+            "record-taught-example 只用于有效 interaction_style=step_by_step；"
+            "lightweight 或 no_questions 会使已存偏好休眠")
+    phase = st["current_phase"]
+    example_id = (args.id or "").strip()
+    example_id_problem = stable_item_id_problem(example_id)
+    if example_id_problem:
+        _die("--id 不符合稳定 notebook/Guide ID 规范：%s" % example_id_problem)
+
+    items, missing = _teaching_examples.load_manifest(ws)
+    if missing:
+        _die("record-taught-example 需要 references/teaching_examples.json")
+    _teaching_examples._validate_pending_scopes(items)
+    chapter = str(phase)
+    matches = [item for item in items
+               if item.get("id") == example_id
+               and chapter in _teaching_examples._chapter_keys(item)]
+    if len(matches) != 1:
+        _die("教学例题 %r 必须在 current_phase=%d 的 manifest 中唯一存在，当前命中 %d 个"
+             % (example_id, phase, len(matches)))
+
+    baseline_problems = _step_roster_baseline_problems(ws, phase, items)
+    if baseline_problems:
+        _die(baseline_problems[0])
+    status = _step_teaching_binding_status(ws, st, phase, items)
+    binding_problem_messages = {
+        "教学事件 %s：%s" % (ident, problem)
+        for ident, problem in status["binding_problems"].items()
+    }
+    # A manifest/notebook revision can stale several bound items at once.  The
+    # official repair path must be able to advance through those pending IDs in
+    # manifest order; unrelated structural, duplicate, or unexpected-evidence
+    # problems still block every write.
+    blocking_problems = [
+        problem for problem in status["problems"]
+        if problem not in binding_problem_messages
+    ]
+    if blocking_problems:
+        _die("现有 step_by_step 教学证据无效：%s" % "；".join(blocking_problems))
+    already_complete = example_id in status["completed_id_set"]
+    if already_complete and status["binding_problems"]:
+        next_item = status["next"]
+        _die(
+            "必须先按 manifest 顺序修复下一条 stale/pending 教学证据 %r，"
+            "不能先重讲已完成题 %r"
+            % (next_item.get("id") if next_item else None, example_id)
+        )
+    if not already_complete:
+        next_item = status["next"]
+        if next_item is None or next_item.get("id") != example_id:
+            _die(
+                "新教学证据必须按 manifest 顺序记录下一题 %r，不能跳到 %r"
+                % (next_item.get("id") if next_item else None, example_id))
+    notebook_binding = _taught_example_notebook_binding(
+        ws, phase, example_id, (args.notebook_ref or "").strip(), matches[0])
+    notebook_ref = notebook_binding["notebook_ref"]
+    problem = phase_evidence_ref_error(
+        ws, "teaching_examples", example_id, phase=phase,
+        processing_mode="full")
+    if problem:
+        _die("拒绝记录 teaching-example evidence：%s" % problem)
+
+    record = st.setdefault("phase_evidence", {}).setdefault(str(phase), {})
+    notebooks = record.get("notebook")
+    if notebooks is None:
+        notebooks = record["notebook"] = []
+    examples = record.get("teaching_examples")
+    if examples is None:
+        examples = record["teaching_examples"] = []
+    if notebook_ref not in notebooks:
+        notebooks.append(notebook_ref)
+    if example_id not in examples:
+        examples.append(example_id)
+    bindings = record.get("teaching_example_bindings")
+    if bindings is None:
+        bindings = record["teaching_example_bindings"] = []
+    existing_binding = next(
+        (binding for binding in bindings
+         if isinstance(binding, dict) and binding.get("id") == example_id),
+        None,
+    )
+    if existing_binding is None:
+        bindings.append(notebook_binding)
+    else:
+        old_notebook_ref = existing_binding.get("notebook_ref")
+        if old_notebook_ref != notebook_ref and old_notebook_ref in notebooks:
+            still_referenced = any(
+                binding is not existing_binding
+                and isinstance(binding, dict)
+                and binding.get("notebook_ref") == old_notebook_ref
+                for binding in bindings
+            )
+            if not still_referenced:
+                notebooks.remove(old_notebook_ref)
+        existing_binding.clear()
+        existing_binding.update(notebook_binding)
+    record["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    # A same-ID re-teach may rewrite the marked walkthrough in place. Force all
+    # full/lightweight completion receipts to be re-evaluated even when the two
+    # evidence values were already present.
+    record.pop("status", None)
+    record.pop("completed_at", None)
+    record.pop("completion_mode", None)
+    for row in st.get("phase_checklist") or []:
+        if phase_number_from_check(row.get("text") or "") == phase:
+            row["done"] = False
+    save(ws, st, "taught example：阶段 %d #%s + notebook anchor + teaching evidence"
+         % (phase, example_id))
+    return 0
+
+
 def cmd_record_phase_evidence(ws, args):
     st = _require_state(ws)
-    manifest_state, manifest_reason = phase_manifest_status(ws)
-    if manifest_state == "broken":
+    if i18n.workspace_processing_mode(st) == "full":
+        manifest_state, manifest_reason = phase_manifest_status(ws)
+    else:
+        manifest_state, manifest_reason = "dormant", "lightweight mode"
+    if i18n.workspace_processing_mode(st) == "full" and manifest_state == "broken":
         _die("v4.1 manifest 处于 partial/broken 状态，拒绝记录阶段证据：" + manifest_reason)
     phase = args.phase if args.phase is not None else st["current_phase"]
     if phase < 1:
@@ -1902,15 +3101,44 @@ def cmd_record_phase_evidence(ws, args):
     if plan and phase not in plan:
         _die("--phase %d 不在 study_plan.md 的阶段列表 %s 中" % (phase, sorted(plan)))
     field = "teaching_examples" if args.kind == "teaching-example" else args.kind
+    if (
+        field == "teaching_examples"
+        and i18n.workspace_effective_interaction_style(st) == "step_by_step"
+    ):
+        _die("step_by_step 教学例题必须使用 record-taught-example --id <id> "
+             "--notebook-ref notebook/chNN.md#anchor 原子绑定，不能分开写 evidence")
+    checkpoint_runtime = None
     if field == "checkpoint":
         if not args.outcome:
             _die("checkpoint evidence 必须带 --outcome passed|wrong|skipped；只有题目 ID 不能证明答对")
         value = {"id": args.ref.strip(), "outcome": args.outcome}
+        processing_mode = i18n.workspace_processing_mode(st)
+        checkpoint_runtime, runtime_error = _checkpoint_runtime(
+            ws, phase, processing_mode=processing_mode
+        )
+        if runtime_error:
+            _die("拒绝记录 checkpoint evidence：%s" % runtime_error)
+        item_problem = quiz_runtime_ref_error(
+            checkpoint_runtime, value["id"]
+        )
+        if item_problem:
+            _die("拒绝记录 checkpoint evidence：%s" % item_problem)
+        if processing_mode == "lightweight":
+            binding = _checkpoint_binding_from_runtime(
+                checkpoint_runtime, value["id"]
+            )
+            if binding is None:
+                _die("拒绝记录 checkpoint evidence：无法建立 bank/item revision binding")
+            value.update(binding)
     else:
         if args.outcome:
             _die("--outcome 只用于 --kind checkpoint")
         value = args.ref.strip()
-    problem = phase_evidence_ref_error(ws, field, value)
+    problem = phase_evidence_ref_error(
+        ws, field, value, phase=phase,
+        quiz_runtime=checkpoint_runtime,
+        processing_mode=i18n.workspace_processing_mode(st),
+    )
     if problem:
         _die("拒绝记录 %s evidence：%s" % (field, problem))
 
@@ -1922,8 +3150,12 @@ def cmd_record_phase_evidence(ws, args):
         if existing is None:
             rows.append(value)
             changed = True
-        elif existing.get("outcome") != value["outcome"]:
-            existing["outcome"] = value["outcome"]
+        elif existing != value:
+            # Re-recording upgrades legacy rows and refreshes every immutable
+            # bank/item binding as one object; never retain a stale hash beside
+            # a new outcome.
+            existing.clear()
+            existing.update(value)
             changed = True
     elif value not in rows:
         rows.append(value)
@@ -1933,6 +3165,7 @@ def cmd_record_phase_evidence(ws, args):
         # Evidence changed after completion: force an explicit re-evaluation instead of preserving a stale badge.
         record.pop("status", None)
         record.pop("completed_at", None)
+        record.pop("completion_mode", None)
         for row in st.get("phase_checklist") or []:
             if phase_number_from_check(row.get("text") or "") == phase:
                 row["done"] = False
@@ -1986,7 +3219,11 @@ def cmd_set_check(ws, args):
         _die("set-check 需要 --index 或 --match 定位打卡项")
     row = hits[0]
     phase = phase_number_from_check(row.get("text") or "")
-    manifest_state, manifest_reason = phase_manifest_status(ws)
+    processing_mode = i18n.workspace_processing_mode(st)
+    if processing_mode == "full":
+        manifest_state, manifest_reason = phase_manifest_status(ws)
+    else:
+        manifest_state, manifest_reason = "dormant", "lightweight mode"
     if args.undone:
         row["done"] = False
         if phase is not None:
@@ -1994,16 +3231,31 @@ def cmd_set_check(ws, args):
             if isinstance(record, dict):
                 record.pop("status", None)
                 record.pop("completed_at", None)
-    elif phase is not None and manifest_state == "broken":
+                record.pop("completion_mode", None)
+    elif phase is not None and processing_mode == "full" and manifest_state == "broken":
         _die("v4.1 manifest 处于 partial/broken 状态，set-check 拒绝 fail-open：" + manifest_reason)
-    elif phase is not None and manifest_state == "ready":
+    elif phase is not None and (
+            processing_mode == "lightweight" or manifest_state == "ready"):
         if phase != st["current_phase"]:
             _die("新版 manifest 工作区只能完成 current_phase=%d；当前选中阶段 %d"
                  % (st["current_phase"], phase))
         record = (st.get("phase_evidence") or {}).get(str(phase)) or {}
         checkpoints = record.get("checkpoint") or []
-        can_verify = (len(checkpoints) >= 2
+        distinct_checkpoint_ids = {
+            row.get("id") for row in checkpoints
+            if isinstance(row, dict) and isinstance(row.get("id"), str)
+        }
+        bindings_ready = (
+            processing_mode != "lightweight"
+            or all(
+                isinstance(row, dict)
+                and {"bank_binding_id", "bank_sha256", "item_sha256"} <= set(row)
+                for row in checkpoints
+            )
+        )
+        can_verify = (len(distinct_checkpoint_ids) >= 2
                       and any(isinstance(x, dict) and x.get("outcome") == "passed" for x in checkpoints)
+                      and bindings_ready
                       and not _no_questions_preference(st))
         _complete_phase_in_state(ws, st, phase,
                                  "verified" if can_verify else "covered_unverified", row=row)
@@ -2368,6 +3620,22 @@ def run(argv=None):
     p_set.add_argument("--language", default=None)
     p_set.add_argument("--artifact-mode", dest="artifact_mode", default=None,
                        help="output resources: chat/visual (explicit choice; never inferred from subscription)")
+    p_set.add_argument(
+        "--processing-mode", dest="processing_mode", default=None,
+        choices=PROCESSING_MODES,
+        help="material processing: lightweight (default/recommended) or full",
+    )
+    p_set.add_argument(
+        "--answer-explanation-mode", dest="answer_explanation_mode",
+        default=None, choices=ANSWER_EXPLANATION_MODES,
+        help=("per-item explanation: ordinary (safe default) or isolated "
+              "(explicit extended-function opt-in)"),
+    )
+    p_set.add_argument(
+        "--interaction-style", dest="interaction_style",
+        choices=INTERACTION_STYLES, default=None,
+        help="optional full-mode teaching cadence: batch or step_by_step",
+    )
     p_set.add_argument("--pref", action="append", default=None, help="key=value; repeatable")
     # A6：window 子命令——知识点窗口进出（3-7 天/>7 天档的窗口系统落点）
     p_wa = sub.add_parser("window-add")
@@ -2408,6 +3676,15 @@ def run(argv=None):
                             help="workspace-relative path, teaching example ID, or quiz ID")
     p_evidence.add_argument("--outcome", choices=CHECKPOINT_OUTCOMES, default=None,
                             help="required for checkpoint: passed/wrong/skipped")
+    p_taught = sub.add_parser(
+        "record-taught-example",
+        help="step_by_step full mode: atomically bind one marked walkthrough and example ID",
+    )
+    p_taught.add_argument("--id", required=True, help="current-phase teaching example ID")
+    p_taught.add_argument(
+        "--notebook-ref", required=True,
+        help="exact notebook/chNN.md#anchor produced by a marked walkthrough write",
+    )
     p_complete = sub.add_parser(
         "complete-phase",
         help="evidence-gated completion: covered_unverified or verified")
@@ -2491,6 +3768,8 @@ def run(argv=None):
             return cmd_set_check(ws, args)
         if args.cmd == "record-phase-evidence":
             return cmd_record_phase_evidence(ws, args)
+        if args.cmd == "record-taught-example":
+            return cmd_record_taught_example(ws, args)
         if args.cmd == "complete-phase":
             return cmd_complete_phase(ws, args)
         return cmd_render(ws, args)

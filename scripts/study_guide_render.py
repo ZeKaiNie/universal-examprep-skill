@@ -31,19 +31,23 @@ from urllib.parse import unquote, urlsplit
 import xml.etree.ElementTree as ET
 
 import i18n
+import exam_start
 from ingestion import workspace_publication_lock
 from check_deps import (LATEX2MATHML_PIN, LATEX2MATHML_VERSION, build_report,
                         installed_distribution_version)
-from validate_workspace import LATEX_COMMAND_RE, workspace_asset_policy_snapshot
+from math_text_policy import search_visible_latex_command
+from validate_workspace import workspace_asset_policy_snapshot
 from asset_policy import physical_asset_key, workspace_asset_is_student_attempt
 from ingestion.identifiers import normalize_workspace_path
 try:
     from .image_validation import (
-        ImageValidationError, validate_image_blob as _shared_validate_image_blob,
+        ImageValidationError, png_dimensions,
+        validate_image_blob as _shared_validate_image_blob,
     )
 except ImportError:
     from image_validation import (
-        ImageValidationError, validate_image_blob as _shared_validate_image_blob,
+        ImageValidationError, png_dimensions,
+        validate_image_blob as _shared_validate_image_blob,
     )
 
 
@@ -57,7 +61,13 @@ for _stream in ("stdout", "stderr"):
 QUESTION_ROLES = {"question_context", "figure", "diagram", "table"}
 ANSWER_ROLES = {"answer_context", "worked_solution"}
 ALL_ROLES = QUESTION_ROLES | ANSWER_ROLES | {"student_attempt"}
-ARTIFACT_RECEIPT_SCHEMA_VERSION = 2
+ARTIFACT_RECEIPT_SCHEMA_VERSION = 3
+HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+UTC_TIMESTAMP_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$"
+)
+NATIVE_ADAPTER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,127}$")
+NATIVE_ADAPTER_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$")
 SOURCE_LABELS_ZH = {
     "teacher": "🟢 来自资料",
     "material": "🟢 来自资料",
@@ -191,6 +201,13 @@ _INLINE_DOLLAR_RE = re.compile(r"(?<![\\$])\$(?!\$)([^\n$]+?)(?<!\\)\$(?!\$)")
 _LEGACY_PAREN_RE = re.compile(r"(?<!\\)\((?=[^()\n]*\\[A-Za-z]+)[^()\n]+\)")
 _LEGACY_BRACKET_RE = re.compile(r"(?<!\\)\[(?=[^\[\]\n]*\\[A-Za-z]+)[^\[\]\n]+\]")
 _SOURCE_COMMENT_RE = re.compile(r"^\s*<!--\s*(.*?)\s*-->\s*$")
+_PMOD_COMPAT_RE = re.compile(
+    r"\\pmod(?![A-Za-z])(?:"
+    r"\s*\{([A-Za-z0-9](?:[A-Za-z0-9_+\-*/^ ]*[A-Za-z0-9])?)\}"
+    r"|\s+([A-Za-z0-9]+)"
+    r"|([0-9]+))"
+)
+_FRAC_COMMAND_RE = re.compile(r"\\frac(?![A-Za-z])")
 
 
 class GuideError(Exception):
@@ -365,7 +382,8 @@ def _coerce_tainted_asset_keys(ws, supplied, label):
 
 
 def _resolve_asset(ws, rel, label, allow_wiki_parent_asset=False,
-                   student_attempt_tainted_keys=_ASSET_POLICY_UNSET, taint_message=None):
+                   student_attempt_tainted_keys=_ASSET_POLICY_UNSET, taint_message=None,
+                   verified_asset_snapshot=None):
     """Resolve a workspace asset.
 
     Normal sources must use workspace-relative paths and may never contain ``..``.  The only
@@ -432,11 +450,43 @@ def _resolve_asset(ws, rel, label, allow_wiki_parent_asset=False,
     mime = mimetypes.guess_type(cur)[0]
     if not mime or not mime.startswith("image/"):
         raise GuideError("%s 不是可识别的图片文件：%s" % (label, rel))
-    try:
-        with open(cur, "rb") as f:
-            blob = f.read()
-    except OSError as exc:
-        raise GuideError("%s 图片不可读（%s）：%s" % (label, exc, rel))
+    if verified_asset_snapshot is None:
+        try:
+            with open(cur, "rb") as f:
+                blob = f.read()
+        except OSError as exc:
+            raise GuideError("%s 图片不可读（%s）：%s" % (label, exc, rel))
+    else:
+        if not isinstance(verified_asset_snapshot, dict):
+            raise GuideError("%s 的已验证图片快照无效：%s" % (label, rel))
+        snapshot_path = verified_asset_snapshot.get("path")
+        snapshot_blob = verified_asset_snapshot.get("bytes")
+        snapshot_sha256 = verified_asset_snapshot.get("sha256")
+        if (not isinstance(snapshot_path, str)
+                or os.path.normcase(os.path.abspath(snapshot_path))
+                != os.path.normcase(os.path.abspath(cur))):
+            raise ArtifactDriftError(
+                "%s receipt-bound crop snapshot names a different path: %s"
+                % (label, rel)
+            )
+        if not isinstance(snapshot_blob, bytes):
+            raise ArtifactDriftError(
+                "%s receipt-bound crop snapshot has no immutable bytes: %s"
+                % (label, rel)
+            )
+        if (not isinstance(snapshot_sha256, str)
+                or not HASH_RE.fullmatch(snapshot_sha256)
+                or _sha256_bytes(snapshot_blob) != snapshot_sha256):
+            raise ArtifactDriftError(
+                "%s receipt-bound crop snapshot digest is invalid: %s"
+                % (label, rel)
+            )
+        # Embed the exact immutable generation captured after the crop receipt was
+        # validated.  Never reopen the path here: a non-cooperating writer could
+        # otherwise replace it between validation and base64 encoding.  The direct
+        # document renderer and publication boundary both revalidate this snapshot's
+        # live path identity before returning/publishing.
+        blob = snapshot_blob
     _validate_image_blob(mime, blob, "%s（%s）" % (label, rel))
     return "data:%s;base64,%s" % (mime, base64.b64encode(blob).decode("ascii"))
 
@@ -599,7 +649,7 @@ def _local_name(tag):
     return tag.rsplit("}", 1)[-1].lower()
 
 
-def _sanitize_mathml(value, display):
+def _sanitize_mathml(value, display, source_latex=None):
     if not isinstance(value, str):
         raise GuideError("latex2mathml.convert 必须返回字符串", 1)
     try:
@@ -620,23 +670,103 @@ def _sanitize_mathml(value, display):
                 raise GuideError("MathML 输出包含不安全属性 %s" % key, 1)
     visible_math = "".join(root.itertext())
     if re.search(r"\\[A-Za-z]+", visible_math):
-        raise GuideError("MathML 输出仍含人类可见的 raw LaTeX 命令", 1)
+        snippet = (source_latex or "").replace("\r", " ").replace("\n", " ")[:160]
+        raise GuideError(
+            "MathML 输出仍含人类可见的 raw LaTeX 命令（公式：%s）" % repr(snippet), 1)
     root.set("display", "block" if display else "inline")
     return ET.tostring(root, encoding="unicode", short_empty_elements=True)
 
 
 def _legacy_formula(segment):
-    for rx in (_LEGACY_PAREN_RE, _LEGACY_BRACKET_RE, LATEX_COMMAND_RE):
+    for rx in (_LEGACY_PAREN_RE, _LEGACY_BRACKET_RE):
         m = rx.search(segment)
         if m:
             line = segment.count("\n", 0, m.start()) + 1
             snippet = m.group(0).replace("\n", " ")[:100]
             return line, snippet
+    m = search_visible_latex_command(segment)
+    if m:
+        line = segment.count("\n", 0, m.start()) + 1
+        return line, m.group(0)[:100]
     unresolved = re.search(r"\\(?:\(|\)|\[|\])|(?<!\\)\$\$", segment)
     if unresolved:
         line = segment.count("\n", 0, unresolved.start()) + 1
         return line, unresolved.group(0)
     return None
+
+
+def _tex_argument(latex, start):
+    """Return one ordinary TeX argument token and its end offset."""
+
+    position = start
+    while position < len(latex) and latex[position].isspace():
+        position += 1
+    if position >= len(latex):
+        raise GuideError(r"\frac is missing an argument", 1)
+    if latex[position] == "{":
+        depth = 0
+        escaped = False
+        for end in range(position, len(latex)):
+            char = latex[end]
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return latex[position:end + 1], end + 1, True
+                if depth < 0:
+                    break
+        raise GuideError(r"\frac has an unbalanced braced argument", 1)
+    if latex[position] == "\\":
+        match = re.match(r"\\(?:[A-Za-z]+|.)", latex[position:])
+        if match is None:
+            raise GuideError(r"\frac has an invalid control-sequence argument", 1)
+        end = position + len(match.group(0))
+        return latex[position:end], end, False
+    if latex[position] == "}":
+        raise GuideError(r"\frac has an unmatched closing brace argument", 1)
+    return latex[position], position + 1, False
+
+
+def _brace_unbraced_frac_arguments(latex):
+    r"""Make legal atomic ``\frac12`` shorthand explicit for latex2mathml 3.60."""
+
+    output = []
+    cursor = 0
+    for match in _FRAC_COMMAND_RE.finditer(latex):
+        if match.start() < cursor:
+            continue
+        output.append(latex[cursor:match.end()])
+        numerator, after_numerator, numerator_braced = _tex_argument(latex, match.end())
+        denominator, after_denominator, denominator_braced = _tex_argument(
+            latex, after_numerator)
+        output.append(numerator if numerator_braced else "{%s}" % numerator)
+        output.append(denominator if denominator_braced else "{%s}" % denominator)
+        cursor = after_denominator
+    output.append(latex[cursor:])
+    return "".join(output)
+
+
+def _latex_for_mathml(latex):
+    """Apply narrow render-only rewrites for audited converter gaps.
+
+    ``latex2mathml==3.60.0`` emits ``\\pmod`` as visible raw text.  Preserve the
+    authored/source TeX and rewrite only simple, unambiguous operands in the value
+    handed to the renderer.  Unsupported commands and complex/nested operands stay
+    untouched so the existing raw-TeX gate still fails closed.
+    """
+
+    def replace(match):
+        operand = next(group for group in match.groups() if group is not None).strip()
+        return r"\;(\operatorname{mod}\;%s)" % operand
+
+    return _brace_unbraced_frac_arguments(_PMOD_COMPAT_RE.sub(replace, latex))
 
 
 def _convert_math_segment(segment, converter, tokens):
@@ -646,12 +776,14 @@ def _convert_math_segment(segment, converter, tokens):
             if not latex:
                 raise GuideError("空 LaTeX 分隔符不是有效公式")
             try:
-                rendered = converter.get()(latex, display="block" if display else "inline")
+                render_latex = _latex_for_mathml(latex)
+                rendered = converter.get()(
+                    render_latex, display="block" if display else "inline")
             except MissingMathDependency:
                 raise
             except Exception as exc:
                 raise GuideError("LaTeX 转 MathML 失败：%s" % exc, 1)
-            safe = _sanitize_mathml(rendered, display)
+            safe = _sanitize_mathml(rendered, display, source_latex=latex)
             token = "STUDYGUIDEMATHTOKEN%06dZZ" % len(tokens)
             tokens[token] = (
                 '<span class="math-display" role="math">%s</span>' % safe
@@ -795,6 +927,16 @@ class MarkdownRenderer:
         for token, rendered in protected.items():
             value = value.replace(token, rendered)
         return value
+
+    def render_inline_math(self, latex):
+        """Render one typed, delimiter-free TeX value as inline MathML."""
+
+        if not isinstance(latex, str) or not latex.strip() or latex != latex.strip():
+            raise GuideError("inline TeX must be a non-empty trimmed string", 1)
+        if "\n" in latex or "\r" in latex or "$" in latex:
+            raise GuideError("inline TeX must be one line without Markdown $ delimiters", 1)
+        prepared, math_tokens = prepare_math("$%s$" % latex, self.math_converter)
+        return self.inline(prepared, math_tokens)
 
     def render(self, markdown):
         prepared, math_tokens = prepare_math(markdown or "", self.math_converter)
@@ -1312,7 +1454,13 @@ class _SelfContainedHTMLCheck(HTMLParser):
             return False
         if parsed.scheme.lower() != "file" or parsed.netloc not in ("", "localhost"):
             return False
-        if parsed.query or not re.fullmatch(r"page=[1-9]\d*", parsed.fragment or ""):
+        if parsed.query:
+            return False
+        # PDF page fragments are the only portable deep-link contract used by
+        # the Guide.  OOXML locations (slide, worksheet, logical DOCX segment)
+        # are still linked to their exact source file, but must not be
+        # misrepresented as PDF ``#page=`` anchors.
+        if parsed.fragment and not re.fullmatch(r"page=[1-9]\d*", parsed.fragment):
             return False
         decoded = unquote(parsed.path)
         if os.name == "nt" and re.match(r"^/[A-Za-z]:/", decoded):
@@ -1325,7 +1473,11 @@ class _SelfContainedHTMLCheck(HTMLParser):
             contained = False
         if not contained or os.path.islink(target) or not os.path.isfile(target):
             return False
-        canonical = Path(target_real).resolve().as_uri() + "#" + parsed.fragment
+        if parsed.fragment and Path(target_real).suffix.lower() != ".pdf":
+            return False
+        canonical = Path(target_real).resolve().as_uri()
+        if parsed.fragment:
+            canonical += "#" + parsed.fragment
         return value == canonical
 
     def handle_starttag(self, tag, attrs):
@@ -1540,6 +1692,122 @@ def _verify_file_snapshot(ws, snapshot, label):
     return current
 
 
+def _capture_verified_crop_asset_snapshots(ws, validation_report):
+    """Freeze exactly the crop generations approved by the live receipt gate.
+
+    ``validate_manifest`` intentionally returns only serializable receipt bindings.
+    This publication-side step converts those bindings into immutable byte/identity
+    snapshots.  The same bytes are fed to the HTML data URI, while the live path is
+    rechecked before the direct renderer returns and at every atomic publication
+    boundary.  A path replacement therefore cannot swap in unreceipted pixels.
+    """
+
+    if not isinstance(validation_report, dict):
+        raise GuideError("typed Study Guide validation report is invalid", 2)
+    verification = validation_report.get("crop_receipt_verification")
+    if verification is None:
+        # Compatibility-only synthetic/v1-less layout fixtures have no live crop
+        # gate.  A real structured ingestion-v2 validation always supplies it.
+        return {}
+    if (not isinstance(verification, dict)
+            or verification.get("required") is not True
+            or verification.get("status") != "verified"):
+        raise GuideError(
+            "typed Study Guide crop receipt verification is not current and verified",
+            2,
+        )
+    bindings = verification.get("verified_asset_bindings")
+    if not isinstance(bindings, list):
+        raise GuideError(
+            "typed Study Guide crop verification lacks exact asset bindings", 2
+        )
+    declared_count = verification.get("verified_asset_count")
+    if (isinstance(declared_count, bool) or not isinstance(declared_count, int)
+            or declared_count < len(bindings)):
+        raise GuideError(
+            "typed Study Guide crop verification asset count is inconsistent", 2
+        )
+
+    snapshots = {}
+    for index, binding in enumerate(bindings):
+        label = "verified Study Guide crop %d" % index
+        if not isinstance(binding, dict):
+            raise GuideError("%s binding is invalid" % label, 2)
+        relative = binding.get("path")
+        receipt_id = binding.get("crop_receipt_id")
+        expected_sha256 = binding.get("sha256")
+        expected_width = binding.get("width")
+        expected_height = binding.get("height")
+        if (not isinstance(relative, str) or not relative
+                or not isinstance(receipt_id, str) or not receipt_id
+                or not isinstance(expected_sha256, str)
+                or not HASH_RE.fullmatch(expected_sha256)
+                or isinstance(expected_width, bool)
+                or not isinstance(expected_width, int) or expected_width < 1
+                or isinstance(expected_height, bool)
+                or not isinstance(expected_height, int) or expected_height < 1):
+            raise GuideError("%s binding is incomplete" % label, 2)
+        try:
+            parts = _safe_relative_parts(relative, "%s path" % label)
+        except GuideError as exc:
+            raise GuideError("%s binding path is unsafe (%s)" % (label, exc), 2) from exc
+        path = os.path.join(ws, *parts)
+        snapshot = _capture_regular_file_snapshot(ws, path, label)
+        if snapshot["sha256"] != expected_sha256:
+            raise ArtifactDriftError(
+                "%s SHA-256 no longer matches crop receipt %s"
+                % (label, receipt_id)
+            )
+        try:
+            width, height = png_dimensions(snapshot["bytes"])
+        except ImageValidationError as exc:
+            raise ArtifactDriftError(
+                "%s is no longer a valid receipt-bound PNG (%s)" % (label, exc)
+            ) from exc
+        if (width, height) != (expected_width, expected_height):
+            raise ArtifactDriftError(
+                "%s dimensions no longer match crop receipt %s"
+                % (label, receipt_id)
+            )
+        if relative in snapshots:
+            raise GuideError(
+                "typed Study Guide crop verification repeats asset path %s" % relative,
+                2,
+            )
+        snapshot["relative_path"] = relative
+        snapshot["crop_receipt_id"] = receipt_id
+        snapshot["width"] = width
+        snapshot["height"] = height
+        snapshots[relative] = snapshot
+    return snapshots
+
+
+def _verify_crop_asset_snapshots(ws, snapshots):
+    """Fail closed if any receipt-bound crop path changed after freezing."""
+
+    if snapshots is None:
+        return
+    if isinstance(snapshots, dict):
+        rows = [snapshots[key] for key in sorted(snapshots)]
+    elif isinstance(snapshots, (list, tuple)):
+        rows = list(snapshots)
+    else:
+        raise ArtifactDriftError("receipt-bound crop snapshot collection is invalid")
+    seen = set()
+    for index, snapshot in enumerate(rows):
+        if not isinstance(snapshot, dict):
+            raise ArtifactDriftError("receipt-bound crop snapshot is invalid")
+        relative = snapshot.get("relative_path")
+        if not isinstance(relative, str) or not relative or relative in seen:
+            raise ArtifactDriftError(
+                "receipt-bound crop snapshot path is invalid or repeated"
+            )
+        seen.add(relative)
+        _verify_file_snapshot(
+            ws, snapshot, "receipt-bound Study Guide crop %s" % relative
+        )
+
+
 def _reject_duplicate_json_object(pairs):
     value = {}
     for key, child in pairs:
@@ -1568,11 +1836,32 @@ def _load_typed_manifest_snapshot(ws, chapter):
     except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
         raise GuideError("study-guide content manifest is not strict UTF-8 JSON: %s" % exc)
     try:
-        report = content.validate_manifest(ws, chapter, manifest)
+        report = content.validate_manifest(
+            ws, chapter, manifest, _enforce_v2_crop_receipts=True)
     except (ValueError, OSError) as exc:
         raise GuideError("study-guide content manifest is invalid: %s" % exc)
+    pipeline_version = report.get("ingestion_pipeline_version")
+    if pipeline_version != "ingestion-v2":
+        raise GuideError(
+            "%s Study Guide compatibility is read-only; a self-declared authoring "
+            "protocol cannot replace a verified ingestion-v2 workspace with live "
+            "target-item crop receipts"
+            % (pipeline_version or "non-structured"),
+            2,
+        )
+    if manifest.get("authoring_protocol_version") != 2:
+        raise GuideError(
+            "a new visual Study Guide requires authoring_protocol_version=2 with "
+            "target-item crop receipts and detailed per-item answer explanations; "
+            "the explicit answer_explanation_mode separately determines whether "
+            "isolated receipts are required",
+            2,
+        )
     snapshot["fact_integrity"] = (
         (report.get("claim_verification") or {}).get("fact_integrity")
+    )
+    snapshot["verified_crop_asset_snapshots"] = (
+        _capture_verified_crop_asset_snapshots(ws, report)
     )
     report["input_path"] = path
     return manifest, report, snapshot
@@ -1588,6 +1877,66 @@ def _canonical_hash(value):
 def _utc_now():
     return datetime.datetime.now(datetime.timezone.utc).replace(
         microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _parse_utc_timestamp(value, label):
+    if not isinstance(value, str) or not UTC_TIMESTAMP_RE.fullmatch(value):
+        raise GuideError("%s must be an ISO-8601 UTC timestamp ending in Z" % label, 2)
+    try:
+        return datetime.datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise GuideError("%s is not a valid UTC timestamp" % label, 2) from exc
+
+
+def _native_adapter_registry():
+    """Load the repository-owned allow-list without probing or installing anything."""
+    registry_path = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "docs", "pdf-capability-adapters.json"
+    ))
+    try:
+        with open(registry_path, "r", encoding="utf-8") as stream:
+            registry = json.load(
+                stream,
+                object_pairs_hook=_reject_duplicate_json_object,
+                parse_constant=_reject_constant,
+            )
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise GuideError("native PDF adapter registry is unavailable or invalid: %s" % exc, 1)
+    if not isinstance(registry, dict) or registry.get("schema_version") != 1:
+        raise GuideError("native PDF adapter registry schema is unsupported", 1)
+    allowed = {}
+    runtimes = registry.get("runtimes")
+    if not isinstance(runtimes, list):
+        raise GuideError("native PDF adapter registry has no runtime list", 1)
+    for row in runtimes:
+        if not isinstance(row, dict):
+            raise GuideError("native PDF adapter registry contains an invalid runtime", 1)
+        preferred = row.get("preferred")
+        if not isinstance(preferred, dict) or preferred.get("preflight_backend") != "native":
+            continue
+        adapter_id = preferred.get("adapter_id")
+        if not isinstance(adapter_id, str) or not NATIVE_ADAPTER_ID_RE.fullmatch(adapter_id):
+            raise GuideError(
+                "native PDF adapter registry entry %r lacks a valid adapter_id" % row.get("id"),
+                1,
+            )
+        if adapter_id in allowed:
+            raise GuideError("native PDF adapter registry duplicates %s" % adapter_id, 1)
+        allowed[adapter_id] = row.get("id")
+    if not allowed:
+        raise GuideError("native PDF adapter registry declares no native adapters", 1)
+    return allowed
+
+
+def _validate_native_adapter_identity(adapter_id, adapter_version):
+    if not isinstance(adapter_id, str) or not NATIVE_ADAPTER_ID_RE.fullmatch(adapter_id):
+        raise GuideError("native adapter id has an invalid canonical form", 2)
+    if adapter_id not in _native_adapter_registry():
+        raise GuideError("native adapter id is not declared by pdf-capability-adapters.json", 2)
+    if (not isinstance(adapter_version, str)
+            or not NATIVE_ADAPTER_VERSION_RE.fullmatch(adapter_version)):
+        raise GuideError("native adapter version has an invalid canonical form", 2)
+    return adapter_id, adapter_version
 
 
 def _preflight_or_raise(ws, chapter, backend, math_converter):
@@ -1606,20 +1955,15 @@ def _preflight_or_raise(ws, chapter, backend, math_converter):
 
 
 def _start_gate_or_raise(ws):
-    import exam_start
-
-    gate = exam_start.check_registered_workspace_gate(ws)
-    if not gate.get("ready_to_use"):
-        blockers = []
-        for attempt in gate.get("attempts") or []:
-            blockers.extend(attempt.get("blockers") or [])
-        detail = ", ".join(sorted(set(blockers))) or gate.get("reason") or "unknown"
-        raise GuideError(
-            "Study Guide rendering requires the confirmed workspace/materials pair, all "
-            "learning choices, and a matching runtime receipt; rerun exam_start confirm "
-            "(%s)" % detail,
-            2,
+    try:
+        gate = exam_start.require_full_processing(
+            ws, purpose="Study Guide/source-packet rendering"
         )
+    except exam_start.FullProcessingRequired as exc:
+        raise GuideError(
+            str(exc),
+            2,
+        ) from exc
     return gate
 
 
@@ -1630,6 +1974,8 @@ def _start_gate_snapshot(gate):
         "workspace": gate.get("workspace"),
         "materials": gate.get("materials"),
         "registered_course": gate.get("registered_course"),
+        "answer_explanation_mode": gate.get(
+            "answer_explanation_mode", "ordinary"),
         "runtime_digest": runtime.get("runtime_digest"),
         "runtime_file_count": runtime.get("runtime_file_count"),
         "skill_version": runtime.get("skill_version"),
@@ -1700,6 +2046,9 @@ def _verify_bound_fact_snapshot_files(ws, expected_facts):
 def _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot,
                                deep_fact_check=True):
     _verify_file_snapshot(ws, manifest_snapshot, "study-guide content manifest")
+    _verify_crop_asset_snapshots(
+        ws, manifest_snapshot.get("verified_crop_asset_snapshots", {})
+    )
     expected_facts = manifest_snapshot.get("fact_integrity")
     if expected_facts is not None:
         _verify_bound_fact_snapshot_files(ws, expected_facts)
@@ -1719,21 +2068,31 @@ def _verify_publication_inputs(ws, manifest_snapshot, start_gate_snapshot,
     _verify_start_gate_snapshot(ws, start_gate_snapshot)
 
 
-def _conversion_run_hash(chapter, profile, language, html_sha256, pdf_sha256,
-                         conversion_input_html_sha256, converter,
+def _conversion_run_hash(chapter, profile, language, content_manifest,
+                         content_manifest_sha256, html_file, html_sha256, pdf_file,
+                         pdf_sha256, pdf_backend, conversion_input_html_sha256,
+                         converter, native_adapter_id, native_adapter_version,
                          conversion_started_at, conversion_completed_at,
-                         start_gate):
+                         conversion_start_gate_sha256, start_gate):
     return _canonical_hash({
         "artifact_type": "study_guide",
         "chapter": chapter,
         "profile": profile,
         "language": language,
+        "content_manifest": content_manifest,
+        "content_manifest_sha256": content_manifest_sha256,
+        "html_file": html_file,
         "html_sha256": html_sha256,
+        "pdf_file": pdf_file,
         "pdf_sha256": pdf_sha256,
+        "pdf_backend": pdf_backend,
         "conversion_input_html_sha256": conversion_input_html_sha256,
         "converter": converter,
+        "native_adapter_id": native_adapter_id,
+        "native_adapter_version": native_adapter_version,
         "conversion_started_at": conversion_started_at,
         "conversion_completed_at": conversion_completed_at,
+        "conversion_start_gate_sha256": conversion_start_gate_sha256,
         "start_gate": start_gate,
     })
 
@@ -1747,6 +2106,10 @@ def _write_guide_receipt(ws, receipt_path, chapter, manifest_snapshot,
     manifest_path = manifest_snapshot["path"]
     html_path = html_snapshot["path"]
     html_sha256 = html_snapshot["sha256"]
+    content_manifest = os.path.relpath(
+        manifest_path, os.path.dirname(os.path.dirname(html_path))
+    ).replace("\\", "/")
+    html_file = "study_guide/%s" % os.path.basename(html_path)
     has_pdf = conversion is not None
     if has_pdf and (backend != "browser" or not os.path.isfile(pdf_path)):
         raise GuideError("browser PDF receipt requires a PDF produced by this render run", 1)
@@ -1757,10 +2120,17 @@ def _write_guide_receipt(ws, receipt_path, chapter, manifest_snapshot,
         if has_pdf else None
     )
     pdf_sha256 = pdf_snapshot["sha256"] if pdf_snapshot else None
+    pdf_file = "study_guide/%s" % os.path.basename(pdf_path) if has_pdf else None
     converter = conversion.get("converter") if has_pdf else None
+    native_adapter_id = None
+    native_adapter_version = None
     conversion_started_at = conversion.get("started_at") if has_pdf else None
     conversion_completed_at = conversion.get("completed_at") if has_pdf else None
     conversion_input_html_sha256 = conversion.get("input_html_sha256") if has_pdf else None
+    # Publish the expected gate identity with the unbound HTML receipt so a native
+    # adapter can record it before conversion.  It becomes part of the conversion
+    # run hash only after a PDF is bound.
+    conversion_start_gate_sha256 = _canonical_hash(start_gate_snapshot)
     if has_pdf:
         required_strings = {
             "converter": converter,
@@ -1781,8 +2151,12 @@ def _write_guide_receipt(ws, receipt_path, chapter, manifest_snapshot,
     conversion_run_sha256 = (
         _conversion_run_hash(
             chapter, manifest_report["profile"], manifest_report["language"],
-            html_sha256, pdf_sha256, conversion_input_html_sha256, converter,
-            conversion_started_at, conversion_completed_at, start_gate_snapshot,
+            content_manifest, manifest_snapshot["sha256"], html_file,
+            html_sha256, pdf_file, pdf_sha256, backend,
+            conversion_input_html_sha256, converter, native_adapter_id,
+            native_adapter_version, conversion_started_at,
+            conversion_completed_at, conversion_start_gate_sha256,
+            start_gate_snapshot,
         ) if has_pdf else None
     )
     receipt = {
@@ -1791,20 +2165,23 @@ def _write_guide_receipt(ws, receipt_path, chapter, manifest_snapshot,
         "chapter": chapter,
         "profile": manifest_report["profile"],
         "language": manifest_report["language"],
-        "content_manifest": os.path.relpath(manifest_path, os.path.dirname(os.path.dirname(html_path))).replace("\\", "/"),
+        "content_manifest": content_manifest,
         "content_manifest_sha256": manifest_snapshot["sha256"],
         "expected_item_ids": manifest_report["expected_item_ids"],
         "rendered_item_ids": manifest_report["walkthrough_item_ids"],
         "omitted_item_ids": manifest_report["omitted_item_ids"],
-        "html_file": "study_guide/%s" % os.path.basename(html_path),
+        "html_file": html_file,
         "html_sha256": html_sha256,
-        "pdf_file": "study_guide/%s" % os.path.basename(pdf_path) if has_pdf else None,
+        "pdf_file": pdf_file,
         "pdf_sha256": pdf_sha256,
         "pdf_backend": backend,
         "converter": converter,
+        "native_adapter_id": native_adapter_id,
+        "native_adapter_version": native_adapter_version,
         "conversion_input_html_sha256": conversion_input_html_sha256,
         "conversion_started_at": conversion_started_at,
         "conversion_completed_at": conversion_completed_at,
+        "conversion_start_gate_sha256": conversion_start_gate_sha256,
         "conversion_run_sha256": conversion_run_sha256,
         "preflight": preflight,
         "start_gate": start_gate_snapshot,
@@ -1824,6 +2201,169 @@ def _write_guide_receipt(ws, receipt_path, chapter, manifest_snapshot,
     _atomic_json(
         receipt_path, receipt, before_publish=recheck_before_receipt_publish)
     return receipt
+
+
+def bind_native_pdf(workspace, chapter, pdf_path, adapter_id, adapter_version,
+                    conversion_input_html_sha256, conversion_started_at,
+                    conversion_completed_at, conversion_start_gate_sha256,
+                    now=None, _state_locked=False):
+    """Atomically bind one host-created native PDF to the current HTML receipt.
+
+    The host creates the canonical PDF before calling this function.  Until this
+    transition succeeds, the existing ``awaiting_native_pdf`` receipt remains
+    non-deliverable and visual QA rejects the unbound file.  The function performs
+    no adapter invocation, network access, installation, or PDF rendering.
+    """
+    if isinstance(chapter, bool) or not isinstance(chapter, int) or chapter < 1:
+        raise GuideError("chapter must be a positive integer", 2)
+    ws = _guard_workspace(workspace)
+    _start_gate_or_raise(ws)
+    if not _state_locked:
+        with workspace_publication_lock(ws):
+            return bind_native_pdf(
+                ws, chapter, pdf_path, adapter_id, adapter_version,
+                conversion_input_html_sha256, conversion_started_at,
+                conversion_completed_at, conversion_start_gate_sha256,
+                now=now, _state_locked=True,
+            )
+
+    adapter_id, adapter_version = _validate_native_adapter_identity(
+        adapter_id, adapter_version
+    )
+    if (not isinstance(conversion_input_html_sha256, str)
+            or not HASH_RE.fullmatch(conversion_input_html_sha256)):
+        raise GuideError("native conversion input SHA-256 is invalid", 2)
+    if (not isinstance(conversion_start_gate_sha256, str)
+            or not HASH_RE.fullmatch(conversion_start_gate_sha256)):
+        raise GuideError("native conversion start-gate SHA-256 is invalid", 2)
+    started = _parse_utc_timestamp(conversion_started_at, "conversion_started_at")
+    completed = _parse_utc_timestamp(conversion_completed_at, "conversion_completed_at")
+    bound_at = now or _utc_now()
+    bound = _parse_utc_timestamp(bound_at, "binding timestamp")
+    if completed < started:
+        raise GuideError("native conversion completion precedes its start", 2)
+    if bound < completed:
+        raise GuideError("native binding timestamp precedes conversion completion", 2)
+
+    # Import lazily to keep ordinary HTML rendering independent from QA backends.
+    try:
+        import study_guide_qa as qa
+    except ImportError:  # pragma: no cover - package import path
+        from . import study_guide_qa as qa
+    try:
+        receipt, context = qa.validate_receipt_chain(ws, chapter, require_pdf=False)
+    except qa.QAError as exc:
+        raise GuideError("native PDF cannot bind to the current receipt: %s" % exc, 1)
+    if receipt.get("pdf_backend") != "native":
+        raise GuideError("native binding requires an HTML receipt rendered for backend=native", 2)
+    if receipt.get("status") != "awaiting_native_pdf":
+        raise GuideError("native PDF receipt is not awaiting a first binding", 1)
+    unbound_fields = (
+        "pdf_file", "pdf_sha256", "converter", "native_adapter_id",
+        "native_adapter_version", "conversion_input_html_sha256",
+        "conversion_started_at", "conversion_completed_at",
+        "conversion_run_sha256",
+    )
+    if any(receipt.get(field) is not None for field in unbound_fields):
+        raise GuideError("native PDF receipt already contains a partial binding", 1)
+
+    receipt_generated = _parse_utc_timestamp(
+        receipt.get("generated_at"), "unbound receipt generated_at"
+    )
+    if started < receipt_generated:
+        raise GuideError("native conversion started before the bound HTML receipt existed", 2)
+
+    manifest_snapshot = _load_typed_manifest_snapshot(ws, chapter)[2]
+    if manifest_snapshot["sha256"] != receipt.get("content_manifest_sha256"):
+        raise ArtifactDriftError("typed manifest differs from the unbound receipt")
+    html_snapshot = _capture_regular_file_snapshot(
+        ws, context["html_path"], "native conversion Study Guide HTML"
+    )
+    if html_snapshot["sha256"] != receipt.get("html_sha256"):
+        raise ArtifactDriftError("Study Guide HTML differs from the unbound receipt")
+    # Native adapters must consume the exact validated, self-contained HTML bytes.
+    # A hash supplied only after conversion cannot silently bind a different temp input.
+    if conversion_input_html_sha256 != html_snapshot["sha256"]:
+        raise GuideError("native adapter did not declare the current exact HTML as input", 1)
+    expected_gate_hash = _canonical_hash(receipt.get("start_gate"))
+    if receipt.get("conversion_start_gate_sha256") != expected_gate_hash:
+        raise ArtifactDriftError("unbound receipt start-gate hash is invalid")
+    if conversion_start_gate_sha256 != expected_gate_hash:
+        raise GuideError("native adapter start-gate identity does not match the HTML receipt", 1)
+
+    canonical_pdf = os.path.join(context["guide_dir"], context["stem"] + ".pdf")
+    if not isinstance(pdf_path, str) or not pdf_path.strip() or "\x00" in pdf_path:
+        raise GuideError("native PDF path must be explicit", 2)
+    supplied_pdf = os.path.realpath(os.path.abspath(pdf_path))
+    if os.path.normcase(supplied_pdf) != os.path.normcase(os.path.realpath(canonical_pdf)):
+        raise GuideError("native adapter output must use the canonical study_guide/chNN.pdf path", 2)
+    pdf_snapshot = _capture_regular_file_snapshot(
+        ws, canonical_pdf, "native Study Guide PDF"
+    )
+    if (not pdf_snapshot["bytes"].startswith(b"%PDF-")
+            or len(pdf_snapshot["bytes"]) < 100):
+        raise GuideError("native adapter output is not a valid non-empty PDF", 1)
+    receipt_snapshot = _capture_regular_file_snapshot(
+        ws, context["receipt_path"], "unbound Study Guide receipt"
+    )
+    try:
+        captured_receipt = json.loads(
+            receipt_snapshot["bytes"].decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_object,
+            parse_constant=_reject_constant,
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ArtifactDriftError("unbound receipt cannot be recaptured (%s)" % exc)
+    if captured_receipt != receipt:
+        raise ArtifactDriftError("unbound receipt changed while native binding was prepared")
+
+    pdf_file = "study_guide/%s.pdf" % context["stem"]
+    converter = "native:%s@%s" % (adapter_id, adapter_version)
+    updated = dict(receipt)
+    updated.update({
+        "pdf_file": pdf_file,
+        "pdf_sha256": pdf_snapshot["sha256"],
+        "converter": converter,
+        "native_adapter_id": adapter_id,
+        "native_adapter_version": adapter_version,
+        "conversion_input_html_sha256": conversion_input_html_sha256,
+        "conversion_started_at": conversion_started_at,
+        "conversion_completed_at": conversion_completed_at,
+        "conversion_start_gate_sha256": conversion_start_gate_sha256,
+        "generated_at": bound_at,
+        "status": "qa_pending",
+        "visual_qa": {"schema_version": 1, "status": "pending"},
+    })
+    updated["conversion_run_sha256"] = _conversion_run_hash(
+        chapter, updated["profile"], updated["language"],
+        updated["content_manifest"], updated["content_manifest_sha256"],
+        updated["html_file"], updated["html_sha256"], pdf_file,
+        updated["pdf_sha256"], "native", conversion_input_html_sha256,
+        converter, adapter_id, adapter_version, conversion_started_at,
+        conversion_completed_at, conversion_start_gate_sha256,
+        updated["start_gate"],
+    )
+
+    def recheck_before_native_binding():
+        _verify_file_snapshot(ws, receipt_snapshot, "unbound Study Guide receipt")
+        _verify_publication_inputs(ws, manifest_snapshot, updated["start_gate"])
+        _verify_file_snapshot(ws, html_snapshot, "native conversion Study Guide HTML")
+        _verify_file_snapshot(ws, pdf_snapshot, "native Study Guide PDF")
+        _validate_native_adapter_identity(adapter_id, adapter_version)
+        try:
+            current_receipt, unused_context = qa.validate_receipt_chain(
+                ws, chapter, require_pdf=False
+            )
+        except qa.QAError as exc:
+            raise ArtifactDriftError("unbound receipt no longer validates (%s)" % exc)
+        if current_receipt != receipt:
+            raise ArtifactDriftError("unbound receipt changed before native binding publication")
+
+    _atomic_json(
+        context["receipt_path"], updated,
+        before_publish=recheck_before_native_binding,
+    )
+    return updated
 
 
 def find_browser():
@@ -1949,19 +2489,88 @@ def run(argv=None, math_converter=None, _state_locked=False):
                         help="optional assertion; must match the typed chapter manifest")
     parser.add_argument("--pdf-backend", choices=("html", "browser", "native"), default="html")
     parser.add_argument("--pdf", action="store_true", help="also print chNN.pdf via local Edge/Chrome")
+    parser.add_argument(
+        "--bind-native", action="store_true",
+        help="atomically bind an already-created canonical native PDF to its HTML receipt",
+    )
+    parser.add_argument("--native-pdf-path")
+    parser.add_argument("--native-adapter-id")
+    parser.add_argument("--native-adapter-version")
+    parser.add_argument("--conversion-input-html-sha256")
+    parser.add_argument("--conversion-started-at")
+    parser.add_argument("--conversion-completed-at")
+    parser.add_argument("--conversion-start-gate-sha256")
+    parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     if args.chapter < 1:
         raise GuideError("--chapter 必须是正整数")
     ws = _guard_workspace(args.workspace)
+    # Both artifact types are intentionally outside lightweight mode.  Enforce this
+    # before taking a publication lock, preparing output directories, or deleting
+    # stale files so a lightweight session remains chat/notebook-only.
+    _start_gate_or_raise(ws)
     if not _state_locked:
         with workspace_publication_lock(ws):
             return run(argv, math_converter=math_converter, _state_locked=True)
+    native_values = {
+        "--native-pdf-path": args.native_pdf_path,
+        "--native-adapter-id": args.native_adapter_id,
+        "--native-adapter-version": args.native_adapter_version,
+        "--conversion-input-html-sha256": args.conversion_input_html_sha256,
+        "--conversion-started-at": args.conversion_started_at,
+        "--conversion-completed-at": args.conversion_completed_at,
+        "--conversion-start-gate-sha256": args.conversion_start_gate_sha256,
+    }
+    if args.bind_native:
+        if args.artifact_type != "study_guide" or args.pdf_backend != "native":
+            raise GuideError(
+                "--bind-native requires --artifact-type study_guide --pdf-backend native",
+                2,
+            )
+        if args.pdf:
+            raise GuideError("--bind-native cannot be combined with browser --pdf", 2)
+        if args.profile is not None:
+            raise GuideError("--bind-native reads the profile from the existing receipt", 2)
+        missing = [name for name, value in native_values.items() if value is None]
+        if missing:
+            raise GuideError("--bind-native is missing %s" % ", ".join(missing), 2)
+        receipt = bind_native_pdf(
+            ws, args.chapter, args.native_pdf_path, args.native_adapter_id,
+            args.native_adapter_version, args.conversion_input_html_sha256,
+            args.conversion_started_at, args.conversion_completed_at,
+            args.conversion_start_gate_sha256, _state_locked=True,
+        )
+        payload = {
+            "status": receipt["status"],
+            "chapter": receipt["chapter"],
+            "pdf_file": receipt["pdf_file"],
+            "pdf_sha256": receipt["pdf_sha256"],
+            "native_adapter_id": receipt["native_adapter_id"],
+            "native_adapter_version": receipt["native_adapter_version"],
+            "conversion_run_sha256": receipt["conversion_run_sha256"],
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        else:
+            print("[+] native PDF bound; visual QA is still required: %s" %
+                  receipt["pdf_file"])
+        return 0
+    if any(value is not None for value in native_values.values()):
+        raise GuideError("native binding arguments require --bind-native", 2)
     if args.pdf and args.pdf_backend != "browser":
         raise GuideError("--pdf requires --pdf-backend browser; native adapters run outside this script")
     if args.artifact_type == "source_packet" and args.profile is not None:
         raise GuideError("--profile applies only to artifact-type study_guide")
     if args.artifact_type == "study_guide" and args.profile is None:
         raise GuideError("artifact-type study_guide requires explicit --profile full|abridged", 2)
+    typed_guide = args.artifact_type == "study_guide"
+    manifest = manifest_report = manifest_snapshot = None
+    if typed_guide:
+        # Validate the generation/protocol gate before invalidating any readable
+        # historical artifact.  Legacy v1 files remain inspectable but can never
+        # be republished as a new visual Guide.
+        manifest, manifest_report, manifest_snapshot = (
+            _load_typed_manifest_snapshot(ws, args.chapter))
     output_dir = _prepare_output_dir(ws)
     suffix = "" if args.artifact_type == "study_guide" else ".source-packet"
     html_path = os.path.join(output_dir, "ch%02d%s.html" % (args.chapter, suffix))
@@ -1977,7 +2586,6 @@ def run(argv=None, math_converter=None, _state_locked=False):
         if not args.pdf:
             _remove_stale(pdf_path, os.path.basename(pdf_path))
 
-    typed_guide = args.artifact_type == "study_guide"
     try:
         if args.artifact_type == "source_packet":
             sources = load_chapter_sources(ws, args.chapter)
@@ -1992,8 +2600,6 @@ def run(argv=None, math_converter=None, _state_locked=False):
             from study_guide_document import render_manifest
             start_gate = _start_gate_or_raise(ws)
             start_gate_snapshot = _start_gate_snapshot(start_gate)
-            manifest, manifest_report, manifest_snapshot = (
-                _load_typed_manifest_snapshot(ws, args.chapter))
             if manifest_report["profile"] != args.profile:
                 raise GuideError("typed manifest profile=%s, not requested %s" %
                                  (manifest_report["profile"], args.profile))

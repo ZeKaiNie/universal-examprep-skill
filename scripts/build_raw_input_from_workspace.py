@@ -17,8 +17,8 @@ stdlib-only core + tests. PDF *text extraction* and *page rendering* are OPTIONA
   - render: PyMuPDF (`fitz`, native PNG, no extra deps) OR pypdfium2 + Pillow (its to_pil adapter)
 Install only if you need them, e.g.:  pip install pypdf pymupdf   (or: pip install pypdf pypdfium2 Pillow)
 Rendering also needs --asset-root <workspace>/references/assets (where the page PNGs are written).
-Docling/MinerU are explicit host-runner adapters only: this script never installs packages,
-downloads models, enables network access, or uploads course material.
+Docling/MinerU are explicit-request, remote/cloud host capabilities only. This local
+script never probes, installs, imports, or runs them and accepts no local heavy-parser runner.
 
 Usage:
   python scripts/build_raw_input_from_workspace.py \\
@@ -44,6 +44,16 @@ import sys
 import tempfile
 
 try:
+    import strict_json
+except ImportError:  # imported as scripts.build_raw_input_from_workspace
+    from scripts import strict_json
+
+try:
+    import exam_start
+except ImportError:  # imported as scripts.build_raw_input_from_workspace
+    from scripts import exam_start
+
+try:
     from ingestion import (
         ConflictError,
         IngestionStore,
@@ -51,6 +61,7 @@ try:
         SOURCE_UNIT_LANGUAGE_CODES,
         is_language_neutral_formula,
         is_link_or_reparse,
+        make_source_id,
         normalize_workspace_path,
         read_json,
         source_language_evidence,
@@ -77,6 +88,18 @@ try:
     )
     from validate_workspace import workspace_asset_policy_snapshot
     from image_validation import ImageValidationError, png_dimensions
+    from asset_crops import (
+        CropAnnotation,
+        CropContractError,
+        CropReceipt,
+        annotation_bbox_pdf_points,
+        canonical_sha256 as crop_canonical_sha256,
+        compact_asset_from_receipt,
+        crop_receipt_index as validate_crop_receipt_index,
+        make_crop_spec_sha256,
+        render_crop_png,
+        validate_crop_asset_binding,
+    )
 except ImportError:  # imported as scripts.build_raw_input_from_workspace in unit tests
     from scripts.ingestion import (
         ConflictError,
@@ -85,6 +108,7 @@ except ImportError:  # imported as scripts.build_raw_input_from_workspace in uni
         SOURCE_UNIT_LANGUAGE_CODES,
         is_language_neutral_formula,
         is_link_or_reparse,
+        make_source_id,
         normalize_workspace_path,
         read_json,
         source_language_evidence,
@@ -111,6 +135,18 @@ except ImportError:  # imported as scripts.build_raw_input_from_workspace in uni
     )
     from scripts.validate_workspace import workspace_asset_policy_snapshot
     from scripts.image_validation import ImageValidationError, png_dimensions
+    from scripts.asset_crops import (
+        CropAnnotation,
+        CropContractError,
+        CropReceipt,
+        annotation_bbox_pdf_points,
+        canonical_sha256 as crop_canonical_sha256,
+        compact_asset_from_receipt,
+        crop_receipt_index as validate_crop_receipt_index,
+        make_crop_spec_sha256,
+        render_crop_png,
+        validate_crop_asset_binding,
+    )
 
 try:
     from material_generation import (
@@ -535,7 +571,7 @@ def _solution_statement(page_text, kind, chapter, num, variant=_ANY_VARIANT):
     return " ".join(parts).strip()
 
 
-def extract_lecture_items(pages):
+def extract_lecture_items(pages, backend=None):
     """Pair lecture problems and solutions, preserving source-file identity."""
     marked = _markers_with_pages(pages)
     sol_by_key = {}
@@ -602,6 +638,9 @@ def extract_lecture_items(pages):
                           r"|第\s*\d+\s*[页张]", " ", _mo_body)
         marker_only = ((not needs) and len(prob_idxs) == 1
                        and not re.search(r"[A-Za-z一-鿿=+√∫∑^?×÷<>≤≥]", _mo_body))
+        question_crop_plan = _lecture_item_crop_plan(
+            pages, prob_idxs, key, backend, "problem"
+        ) if backend is not None and (needs or marker_only) else None
         # 完整原始题面（锚页 + 续页切片）——needs/marker_only 的 question 会被替换成指引句，
         # 跨页图线索（见下页图 在续页上）要靠它检查
         _cont_parts = [_problem_statement(
@@ -634,12 +673,14 @@ def extract_lecture_items(pages):
             "source": "material",
             "source_file": pf,
             "source_pages": [p for (f, p) in q_pages],
-            "_question_pages": q_pages,                     # stripped from the emitted bank
+            "_question_pages": ([] if question_crop_plan else q_pages),
             "_prompt_text": orig_question,                  # 原始题面含续页（needs 项 question 被替换成指引句）
             "_render": bool(needs or marker_only),          # render the page for figure- AND image-prompt items
             "requires_assets": bool(needs),
             "question_text_status": qts,
         }
+        if question_crop_plan:
+            item["_question_crops"] = question_crop_plan
         if variant is not None:
             item["variant"] = variant
         if kind == "example":
@@ -654,6 +695,12 @@ def extract_lecture_items(pages):
                 else "worked_example"
             )
             item["_teaching_title"] = "%s %s" % (label, number_label)
+            if item["_teaching_role"] == "worked_example":
+                # An inline worked Example remains teaching-only even when its
+                # exact source text can serve as solution evidence.  It must
+                # never enter the selectable/gradable question bank merely
+                # because that material evidence is now preserved.
+                item["gradable"] = False
         if not needs and _qt == "choice" and _opts:
             item["options"] = _opts
         # ``keywords`` is optional for subjective items.  Do not emit an empty
@@ -664,20 +711,35 @@ def extract_lecture_items(pages):
             first_file = ans[0][0]
             item["answer_source_file"] = first_file
             item["answer_source_pages"] = [p for (f, p) in ans if f == first_file]
-            item["_answer_pages"] = ans
+            answer_crop_plan = _lecture_item_crop_plan(
+                pages, ans_idx, key, backend, "solution"
+            ) if backend is not None and (needs or marker_only) else None
+            if answer_crop_plan:
+                item["_answer_crops"] = answer_crop_plan
+            else:
+                item["_answer_pages"] = ans
             ref = "见原始讲义 %s 第 %s 页的解答。" % (
                 first_file, "、".join(str(p) for (f, p) in ans if f == first_file))
             sol = " ".join(t for t in (_solution_statement(
                                            pages[j].get("text", ""), kind, key[1], key[2], variant)
                                        for j in ans_idx) if t).strip()
             if sol:
-                item["answer"] = sol + ("（解答可能依赖图，须看原页/asset）" if needs else "")
+                # Keep extracted material evidence byte-faithful to the source language.
+                # Asset requirements belong in typed metadata and answer-side page/asset
+                # records; appending an agent-authored Chinese hint here would later be
+                # claimable as if it were part of an English official solution.
+                item["answer"] = sol
                 _apply_typed_answer(item)
             else:
-                item["answer"] = ref + ("（依赖图，须看原页/asset）" if needs else "")
+                item["answer"] = ref
                 _apply_typed_answer(item)
         else:
-            item["answer_status"] = "unknown"   # honest: no solution page detected
+            # A bare Example heading plus non-empty body does not prove that the
+            # page contains a complete worked answer.  Keep the source-derived
+            # teaching item, but require an explicit typed review that binds a
+            # same-page native text unit and a current semantic-v2 prompt crop
+            # before an ``inline_material`` answer unit can be added.
+            item["answer_status"] = "unknown"
         items.append(item)
     return items
 
@@ -1179,6 +1241,159 @@ def _layout_has_scan_evidence(layout):
     )
 
 
+def _layout_marker_rows(layout):
+    """Return item-heading rows with their conservative vertical bounds."""
+
+    rows = []
+    for block in (layout or {}).get("text_blocks") or ():
+        if not isinstance(block, dict):
+            continue
+        bbox = block.get("bbox")
+        text = block.get("text")
+        if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4
+                and isinstance(text, str) and text.strip()):
+            continue
+        for marker in _hw_markers(text):
+            if marker.get("num") is None or marker.get("continued"):
+                continue
+            heading = text[marker["start"]:marker["start"] + 180]
+            role = marker.get("role")
+            if re.search(r"\b(?:solutions?|answers?)\b|解答|答案", heading, re.I):
+                role = "solution"
+            rows.append({
+                "num": marker["num"],
+                "role": role,
+                "bbox": [float(value) for value in bbox],
+            })
+    return sorted(rows, key=lambda row: (row["bbox"][1], row["bbox"][0]))
+
+
+def _target_item_page_crop(layout, item_number, *, continuation=False,
+                           margin=8.0):
+    """Infer a target-only vertical crop from answer-heading layout.
+
+    A page in an already parsed answer span belongs to the target item.  Its
+    first page must expose the target heading; a continuation page may start at
+    the page top.  The first different item heading ends the crop.  This is the
+    deterministic counterpart to a model/human CropAnnotation and never
+    silently selects a different item.
+    """
+
+    page_box = (layout or {}).get("page_bbox")
+    if not (isinstance(page_box, (list, tuple)) and len(page_box) == 4):
+        return None
+    markers = _layout_marker_rows(layout)
+    target = [row for row in markers if _hw_num(row["num"]) == _hw_num(item_number)]
+    if target:
+        start = min(row["bbox"][1] for row in target)
+    elif continuation:
+        start = float(page_box[1])
+    else:
+        return None
+    later_other = [
+        row["bbox"][1] for row in markers
+        if _hw_num(row["num"]) != _hw_num(item_number)
+        and row["bbox"][1] > start + 1.0
+    ]
+    end = min(later_other) if later_other else float(page_box[3])
+    top = max(float(page_box[1]), start - margin)
+    bottom = min(float(page_box[3]), end - margin)
+    if bottom <= top + 12.0:
+        return None
+    return [float(page_box[0]), top, float(page_box[2]), bottom]
+
+
+def _homework_answer_crop_plan(pages, answer, item_number, backend):
+    """Return one strict crop per parsed answer page, or ``None`` for review."""
+
+    if not answer or not answer[2]:
+        return None
+    layout_reader = getattr(backend, "page_layout", None)
+    clip_renderer = getattr(backend, "render_page_clip_png", None)
+    if not callable(layout_reader) or not callable(clip_renderer):
+        return None
+    source_file = answer[0]
+    page_rows = {
+        row.get("page"): row for row in pages if row.get("file") == source_file
+    }
+    crops = []
+    try:
+        for position, page_number in enumerate(answer[2]):
+            page_row = page_rows.get(page_number)
+            pdf_path = page_row.get("_pdf") if isinstance(page_row, dict) else None
+            if not pdf_path:
+                return None
+            layout = layout_reader(pdf_path, page_number - 1)
+            bbox = _target_item_page_crop(
+                layout, item_number, continuation=position > 0,
+            )
+            if bbox is None:
+                return None
+            crops.append((source_file, page_number, bbox))
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    return crops
+
+
+def _layout_lecture_marker_rows(layout):
+    rows = []
+    for block in (layout or {}).get("text_blocks") or ():
+        if not isinstance(block, dict):
+            continue
+        bbox = block.get("bbox")
+        text = block.get("text")
+        if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4
+                and isinstance(text, str) and text.strip()):
+            continue
+        for marker in _iter_markers(text):
+            rows.append({
+                "key": _key(marker),
+                "role": marker.get("role"),
+                "bbox": [float(value) for value in bbox],
+            })
+    return sorted(rows, key=lambda row: (row["bbox"][1], row["bbox"][0]))
+
+
+def _lecture_item_crop_plan(pages, page_indexes, item_key, backend, role):
+    if not page_indexes:
+        return None
+    layout_reader = getattr(backend, "page_layout", None)
+    clip_renderer = getattr(backend, "render_page_clip_png", None)
+    if not callable(layout_reader) or not callable(clip_renderer):
+        return None
+    crops = []
+    try:
+        for position, page_index in enumerate(page_indexes):
+            page_row = pages[page_index]
+            pdf_path = page_row.get("_pdf")
+            if not pdf_path:
+                return None
+            layout = layout_reader(pdf_path, page_row["page"] - 1)
+            page_box = layout.get("page_bbox") if isinstance(layout, dict) else None
+            if not (isinstance(page_box, (list, tuple)) and len(page_box) == 4):
+                return None
+            markers = _layout_lecture_marker_rows(layout)
+            target = [row for row in markers
+                      if row["key"] == item_key and row["role"] == role]
+            if target:
+                start = min(row["bbox"][1] for row in target)
+            elif position > 0:
+                start = float(page_box[1])
+            else:
+                return None
+            later = [row["bbox"][1] for row in markers
+                     if row["key"] != item_key and row["bbox"][1] > start + 1.0]
+            end = min(later) if later else float(page_box[3])
+            bbox = [float(page_box[0]), max(float(page_box[1]), start - 8.0),
+                    float(page_box[2]), min(float(page_box[3]), end - 8.0)]
+            if bbox[3] <= bbox[1] + 12.0:
+                return None
+            crops.append((page_row["file"], page_row["page"], bbox))
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    return crops
+
+
 def _homework_roster_route(pages, source_file, backend):
     """Resolve a roster to text prompts, safe image crops, or typed review."""
     roster = _homework_roster(pages, source_file)
@@ -1388,10 +1603,14 @@ def _chapter_from_homework_number(number):
 
 
 def _hw_num(s):
-    """Problem number as int, or a normalized string for textbook decimals / lettered subparts
-    （1.1 ≠ 1；1(a) 与 1a 同号，规范成 '1a'）."""
+    """Normalize integer or string problem numbers through one contract.
+
+    Layout markers may already carry an integer, while text-facing callers use
+    strings.  In both cases 1.1 ≠ 1 and 1(a) is equivalent to 1a.
+    """
     if s is None:
         return None
+    s = str(s)
     s = re.sub(r"[()\s]", "", s).lower()
     return int(s) if s.isdigit() else s
 
@@ -2056,6 +2275,34 @@ def extract_homework_items(pages, root_name="", exclude=frozenset(), backend=Non
             else:
                 item["answer_status"] = "unknown"
                 report["warnings"].append("hw_unanswered: %s（没找到配对答案，考前需人工核对）" % item["id"])
+            answer_crop_plan = _homework_answer_crop_plan(
+                pages, ans, mk["num"], backend
+            ) if ans else None
+
+            def _attach_answer_visual_plan():
+                if not ans:
+                    return
+                if answer_crop_plan:
+                    item["_render"] = True
+                    item.setdefault("_answer_crops", []).extend(answer_crop_plan)
+                else:
+                    message = (
+                        "answer_item_crop_review_required: %s（自动版面定位未能证明答案页中的"
+                        "目标题专属区域；拒绝把可能含其他题目的整页声明为答案图）" % item["id"]
+                    )
+                    report["warnings"].append(message)
+                    report["ai_review"].append({
+                        "kind": "item_asset_crop_not_materialized",
+                        "file": ans[0],
+                        "pages": list(ans[2] or []),
+                        "external_ids": [item["id"]],
+                        "side": "answer",
+                        "action": (
+                            message
+                            + "; provide a source/preview-bound --crop-annotations "
+                              "JSONL bbox. Whole-page fallback is forbidden."
+                        ),
+                    })
             if visual_plan is not None:
                 # The roster route has already proved a one-to-one prompt crop for this
                 # problem.  Bind only that crop as question-side evidence.  Handwriting
@@ -2071,7 +2318,7 @@ def extract_homework_items(pages, root_name="", exclude=frozenset(), backend=Non
                     # Student-work crops and official solution visuals are distinct evidence.
                     # Keep both in the render plan; role assignment later prevents the former
                     # from satisfying official-answer or Study Guide coverage.
-                    item["_answer_pages"] = [(ans[0], p) for p in (ans[2] or [])]
+                    _attach_answer_visual_plan()
                 items.append(item)
                 report["homework_problems"] += 1
                 continue
@@ -2102,12 +2349,11 @@ def extract_homework_items(pages, root_name="", exclude=frozenset(), backend=Non
                     item["question_text_status"] = "page_reference"
                 if ans and requires_assets_heuristic(ans[1], renderable=is_pdf.get(ans[0], False)):
                     item["_render"] = True
-                    item["_answer_pages"] = [(ans[0], p) for p in (ans[2] or [])]
+                    _attach_answer_visual_plan()
             elif ans and requires_assets_heuristic(ans[1], renderable=is_pdf.get(ans[0], False)):
                 # 题面纯文本、官方解答依赖图（see the graph below）——渲染答案侧原页作 answer_context，
                 # 复盘讲解不至于指着看不见的图；不设 requires_assets（题面本身完整可问）
-                item["_render"] = True
-                item["_answer_pages"] = [(ans[0], p) for p in (ans[2] or [])]
+                _attach_answer_visual_plan()
             items.append(item)
             report["homework_problems"] += 1
         if dup_counts:
@@ -2176,14 +2422,355 @@ def group_sections(pages, notes=None):
     return [by_ch[c] for c in sorted(order)]
 
 
-def _safe_asset_name(file, page, item_id, suffix="", source_sha256=None):
+def _safe_asset_name(
+        file, page, item_id, suffix="", source_sha256=None,
+        crop_spec_sha256=None):
     # keep subdirs (sanitized) so lecture/ch01.pdf and solutions/ch01.pdf don't collide on the same page
     stem = re.sub(r"[^\w.\-]", "_", os.path.splitext(file or "src")[0])
     if re.fullmatch(r"[.\-_]*", stem):         # all-dots/dashes/underscores (e.g. a ".." name) → a token
         stem = "src"
     sid = re.sub(r"[^\w.\-]", "_", str(item_id))
     revision = "_%s" % source_sha256[:12] if source_sha256 else ""
-    return "%s%s_p%03d_%s%s.png" % (stem, revision, int(page), sid, suffix)
+    crop_revision = (
+        "_crop_%s" % crop_spec_sha256[:12]
+        if crop_spec_sha256 else ""
+    )
+    return "%s%s_p%03d_%s%s%s.png" % (
+        stem, revision, int(page), sid, suffix, crop_revision
+    )
+
+
+def _crop_renderer_contract(backend):
+    """Return stable renderer identity/config for a crop spec."""
+
+    renderer_id = getattr(backend, "render_lib", None) or getattr(
+        backend, "name", "unknown"
+    )
+    renderer_id = re.sub(
+        r"[^a-z0-9_.-]", "-", str(renderer_id).lower()
+    ).strip("-.") or "unknown"
+    explicit_version = getattr(backend, "renderer_version", None)
+    if explicit_version:
+        renderer_version = str(explicit_version).strip()
+    else:
+        distribution = {
+            "pymupdf": "PyMuPDF",
+            "pypdfium2": "pypdfium2",
+        }.get(renderer_id)
+        try:
+            renderer_version = (
+                importlib.metadata.version(distribution)
+                if distribution else "unknown"
+            )
+        except importlib.metadata.PackageNotFoundError:
+            renderer_version = "unknown"
+    config = getattr(backend, "crop_renderer_config", None)
+    if not isinstance(config, dict):
+        config = {
+            "clip_coordinate_space": "pdf_points",
+            "output_format": "png",
+            "scale": 2.0,
+            "whole_page_fallback": False,
+        }
+    return renderer_id, renderer_version, crop_canonical_sha256(config)
+
+
+def _item_crop_source_pages(item, side):
+    """Return the source locations already attributed to one item side."""
+
+    pages = set()
+    if side == "prompt":
+        source_file = item.get("source_file")
+        pages.update(
+            (source_file, page) for page in (item.get("source_pages") or ())
+            if isinstance(source_file, str) and type(page) is int
+        )
+        tuple_fields = ("_question_pages", "_question_crops")
+    else:
+        # ``inline_material`` binds exact text on the prompt's own page; it is
+        # not a request to publish that physical page a second time as an
+        # answer-side model asset.  Explicit answer crop/page plans, if ever
+        # introduced by a reviewed producer, remain visible below.
+        if item.get("answer_origin") != "inline_material":
+            source_file = item.get("answer_source_file") or item.get("source_file")
+            pages.update(
+                (source_file, page) for page in (item.get("answer_source_pages") or ())
+                if isinstance(source_file, str) and type(page) is int
+            )
+        tuple_fields = ("_answer_pages", "_answer_crops")
+    for field in tuple_fields:
+        for row in item.get(field) or ():
+            if (isinstance(row, (list, tuple)) and len(row) >= 2
+                    and isinstance(row[0], str) and type(row[1]) is int):
+                pages.add((row[0].replace("\\", "/"), row[1]))
+    return pages
+
+
+def _load_crop_annotations(
+        annotation_path, materials, source_snapshot_hashes, page_pdf_all,
+        items, backend):
+    """Load and verify explicit JSONL annotations without materializing assets.
+
+    Each JSONL row contains the exact ``CropAnnotation`` fields plus one
+    ``preview_path`` relative to the JSONL directory.  The locator is excluded
+    from the annotation hash; the exact preview bytes/hash/dimensions are in the
+    annotation itself.  Source revision, source page, the exact live preview
+    bytes produced by this builder backend, and item-side attribution are all
+    checked before a bbox is accepted.  A merely similar-sized or
+    aspect-ratio-compatible preview is deliberately insufficient.
+    """
+
+    annotation_path = os.path.abspath(annotation_path)
+    if _path_has_link_or_reparse(annotation_path):
+        raise ValueError("crop annotation path contains a link/reparse point")
+    payload, snapshot = stable_read_bytes(annotation_path)
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("crop annotations must be UTF-8 JSONL") from exc
+    source_hash_by_file = {
+        _rel(path, materials): digest
+        for path, digest in source_snapshot_hashes.items()
+    }
+    items_by_id = {
+        str(item.get("id")): item for item in items
+        if isinstance(item, dict) and item.get("id") not in (None, "")
+    }
+    layout_reader = getattr(backend, "page_layout", None)
+    if not callable(layout_reader):
+        raise ValueError(
+            "crop annotations require PDF page geometry; whole-page fallback is forbidden"
+        )
+    base = os.path.dirname(annotation_path)
+    expected_row_fields = set(CropAnnotation.FIELDS) | {"preview_path"}
+    seen = set()
+    records = []
+    for line_number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = strict_json.loads(line)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "crop annotations line %d is not strict JSON" % line_number
+            ) from exc
+        if not isinstance(row, dict) or set(row) != expected_row_fields:
+            missing = sorted(expected_row_fields - set(row or ())) if isinstance(row, dict) else []
+            unknown = sorted(set(row) - expected_row_fields) if isinstance(row, dict) else []
+            raise ValueError(
+                "crop annotations line %d schema mismatch; missing=%r unknown=%r"
+                % (line_number, missing, unknown)
+            )
+        preview_relative = normalize_workspace_path(row["preview_path"])
+        if preview_relative != row["preview_path"]:
+            raise ValueError(
+                "crop annotations line %d preview_path must use POSIX separators"
+                % line_number
+            )
+        annotation_payload = {
+            field: row[field] for field in CropAnnotation.FIELDS
+        }
+        try:
+            annotation = CropAnnotation.from_dict(annotation_payload)
+        except CropContractError as exc:
+            raise ValueError(
+                "crop annotations line %d: %s" % (line_number, exc)
+            ) from exc
+        if annotation.selection_method == "layout_auto":
+            raise ValueError(
+                "crop annotations line %d must use model_vision or human"
+                % line_number
+            )
+        item = items_by_id.get(annotation.item_id)
+        if item is None:
+            raise ValueError(
+                "crop annotations line %d references an unknown item_id"
+                % line_number
+            )
+        source_key = (annotation.source_file, annotation.source_page)
+        if source_key not in _item_crop_source_pages(item, annotation.side):
+            raise ValueError(
+                "crop annotations line %d source page is not attributed to that item side"
+                % line_number
+            )
+        pdf_path = page_pdf_all.get(source_key)
+        expected_source_sha256 = source_hash_by_file.get(annotation.source_file)
+        if pdf_path is None or expected_source_sha256 is None:
+            raise ValueError(
+                "crop annotations line %d does not identify a current PDF page"
+                % line_number
+            )
+        if annotation.source_sha256 != expected_source_sha256:
+            raise ValueError(
+                "crop annotations line %d source_sha256 drifted" % line_number
+            )
+        preview_path = os.path.join(base, *preview_relative.split("/"))
+        if not _under(base, preview_path) or _path_has_link_or_reparse(preview_path):
+            raise ValueError(
+                "crop annotations line %d preview path is unsafe" % line_number
+            )
+        preview_payload, preview_snapshot = stable_read_bytes(preview_path)
+        if preview_snapshot["sha256"] != annotation.preview_sha256:
+            raise ValueError(
+                "crop annotations line %d preview_sha256 drifted" % line_number
+            )
+        try:
+            preview_width, preview_height = png_dimensions(preview_payload)
+        except ImageValidationError as exc:
+            raise ValueError(
+                "crop annotations line %d preview is not a valid PNG: %s"
+                % (line_number, exc)
+            ) from exc
+        if (preview_width != annotation.preview_width
+                or preview_height != annotation.preview_height):
+            raise ValueError(
+                "crop annotations line %d preview dimensions drifted" % line_number
+            )
+        preview_renderer = getattr(backend, "render_page_png", None)
+        if not callable(preview_renderer):
+            raise ValueError(
+                "crop annotations line %d cannot reproduce the bound preview "
+                "with the current builder backend" % line_number
+            )
+        try:
+            live_preview = preview_renderer(
+                pdf_path, annotation.source_page - 1
+            )
+        except Exception as exc:
+            raise ValueError(
+                "crop annotations line %d live preview rendering failed: %s"
+                % (line_number, exc)
+            ) from exc
+        if not live_preview:
+            raise ValueError(
+                "crop annotations line %d current builder backend returned no "
+                "live preview" % line_number
+            )
+        live_preview = bytes(live_preview)
+        try:
+            live_width, live_height = png_dimensions(live_preview)
+        except ImageValidationError as exc:
+            raise ValueError(
+                "crop annotations line %d current builder backend returned an "
+                "invalid preview PNG: %s" % (line_number, exc)
+            ) from exc
+        live_sha256 = hashlib.sha256(live_preview).hexdigest()
+        if (live_preview != preview_payload
+                or live_sha256 != annotation.preview_sha256
+                or live_width != annotation.preview_width
+                or live_height != annotation.preview_height):
+            raise ValueError(
+                "crop annotations line %d preview is not the exact current-page "
+                "render from this builder backend (bytes/hash/dimensions differ)"
+                % line_number
+            )
+        layout = layout_reader(pdf_path, annotation.source_page - 1)
+        page_box = layout.get("page_bbox") if isinstance(layout, dict) else None
+        if not (isinstance(page_box, (list, tuple)) and len(page_box) == 4):
+            raise ValueError(
+                "crop annotations line %d cannot bind PDF page geometry" % line_number
+            )
+        page_width = float(page_box[2]) - float(page_box[0])
+        page_height = float(page_box[3]) - float(page_box[1])
+        if page_width <= 0 or page_height <= 0:
+            raise ValueError(
+                "crop annotations line %d has invalid PDF page dimensions" % line_number
+            )
+        bbox_pdf_points = annotation_bbox_pdf_points(annotation, page_box)
+        # The reviewer signs the exact target-only crop bytes, not merely a
+        # page preview plus an unchecked rectangle.  Reproduce that crop with
+        # the current backend now and close the explicit semantic verdict to
+        # its bytes and to the full preview/source/bbox evidence packet.
+        try:
+            reviewed_crop, _crop_width, _crop_height = render_crop_png(
+                backend,
+                pdf_path,
+                annotation.source_page - 1,
+                bbox_pdf_points,
+            )
+        except CropContractError as exc:
+            raise ValueError(
+                "crop annotations line %d cannot reproduce the reviewed crop: %s"
+                % (line_number, exc)
+            ) from exc
+        reviewed_crop_sha256 = hashlib.sha256(reviewed_crop).hexdigest()
+        try:
+            annotation.semantic_purity.validate(
+                expected_item_id=annotation.item_id,
+                expected_side=annotation.side,
+                expected_crop_sha256=reviewed_crop_sha256,
+            )
+        except CropContractError as exc:
+            raise ValueError(
+                "crop annotations line %d semantic verdict does not bind the "
+                "reproduced crop: %s" % (line_number, exc)
+            ) from exc
+        semantic_evidence = {
+            "schema_version": 1,
+            "evidence_kind": "builder_preview_bbox_crop",
+            "target_item_id": annotation.item_id,
+            "side": annotation.side,
+            "source_id": annotation.source_id,
+            "source_file": annotation.source_file,
+            "source_sha256": annotation.source_sha256,
+            "source_page": annotation.source_page,
+            "preview_sha256": annotation.preview_sha256,
+            "preview_width": annotation.preview_width,
+            "preview_height": annotation.preview_height,
+            "bbox_preview_pixels": list(annotation.bbox_preview_pixels),
+            "crop_sha256": reviewed_crop_sha256,
+        }
+        if annotation.semantic_purity.schema_version >= 2:
+            semantic_evidence["required_context_ids"] = list(
+                annotation.semantic_purity.required_context_ids
+            )
+        evidence_binding_sha256 = crop_canonical_sha256(semantic_evidence)
+        if (annotation.semantic_purity.evidence_binding_sha256
+                != evidence_binding_sha256):
+            raise ValueError(
+                "crop annotations line %d semantic evidence binding does not "
+                "match the exact source/preview/bbox/crop evidence" % line_number
+            )
+        identity = (
+            annotation.item_id, annotation.side,
+            annotation.source_file, annotation.source_page,
+        )
+        if identity in seen:
+            raise ValueError(
+                "crop annotations line %d duplicates one item/side/source/page"
+                % line_number
+            )
+        seen.add(identity)
+        records.append({
+            "item_id": annotation.item_id,
+            "side": annotation.side,
+            "role": annotation.role,
+            "content_scope": annotation.content_scope,
+            "source_file": annotation.source_file,
+            "source_page": annotation.source_page,
+            "source_sha256": annotation.source_sha256,
+            "page_box_pdf_points": [float(value) for value in page_box],
+            "bbox_pdf_points": bbox_pdf_points,
+            "selection_method": annotation.selection_method,
+            "selection_evidence_sha256": annotation.annotation_sha256,
+            "preview_sha256": annotation.preview_sha256,
+            "semantic_purity": annotation.semantic_purity.to_dict(),
+        })
+    if not records:
+        raise ValueError("crop annotations JSONL contains no records")
+    confirmation, confirmation_snapshot = stable_read_bytes(annotation_path)
+    if (confirmation != payload
+            or confirmation_snapshot["sha256"] != snapshot["sha256"]):
+        raise ValueError("crop annotations changed while previews were verified")
+    return sorted(
+        records,
+        key=lambda row: (
+            row["item_id"], row["side"], row["source_file"], row["source_page"]
+        ),
+    ), {
+        "file_sha256": snapshot["sha256"],
+        "record_count": len(records),
+    }
 
 
 def _sha256_path(path, cache):
@@ -2303,8 +2890,13 @@ def build_raw_input(course_name, sections, lecture_items, homework_items=None):
                     if str(it.get("id", "")).startswith("lecture_example_") else None))
 
     def _teaching_only_worked_example(it):
-        return (_teaching_role(it) == "worked_example"
-                and not _has_independent_grade_key(it))
+        return (
+            _teaching_role(it) == "worked_example"
+            and (
+                it.get("answer_origin") == "inline_material"
+                or not _has_independent_grade_key(it)
+            )
+        )
 
     bank = [
         _clean(it) for it in lecture_items
@@ -2320,6 +2912,20 @@ def build_raw_input(course_name, sections, lecture_items, homework_items=None):
             snap["gradable"] = False
         snap["title"] = it.get("_teaching_title") or str(it.get("id"))
         teaching_examples.append(snap)
+    expected_teaching_ids = [
+        str(it.get("id")) for it in lecture_items
+        if str(it.get("id", "")).startswith("lecture_example_")
+    ]
+    actual_teaching_ids = [str(item.get("id")) for item in teaching_examples]
+    if (
+        len(expected_teaching_ids) != len(set(expected_teaching_ids))
+        or len(actual_teaching_ids) != len(set(actual_teaching_ids))
+        or set(actual_teaching_ids) != set(expected_teaching_ids)
+    ):
+        raise ValueError(
+            "teaching_examples postcondition failed: every detected lecture example "
+            "must have exactly one current teaching snapshot"
+        )
     return {"course_name": course_name, "phases": phases, "quiz_bank": bank,
             "teaching_examples": teaching_examples}   # optional parallel teaching layer
 
@@ -2483,15 +3089,26 @@ class RealBackend(object):
                         "pixel_width": image[2],
                         "pixel_height": image[3],
                     })
+            raw_blocks = [
+                block for block in page.get_text("blocks")
+                if len(block) >= 5 and str(block[4]).strip()
+            ]
             text_boxes = [
                 [block[0], block[1], block[2], block[3]]
-                for block in page.get_text("blocks")
-                if len(block) >= 5 and str(block[4]).strip()
+                for block in raw_blocks
+            ]
+            text_blocks = [
+                {
+                    "bbox": [block[0], block[1], block[2], block[3]],
+                    "text": str(block[4]),
+                }
+                for block in raw_blocks
             ]
             return {
                 "page_bbox": [page.rect.x0, page.rect.y0, page.rect.x1, page.rect.y1],
                 "images": images,
                 "text_boxes": text_boxes,
+                "text_blocks": text_blocks,
             }
         finally:
             doc.close()
@@ -3255,6 +3872,15 @@ def build_arg_parser():
                    help="extract homework items (incl. auto-pairing of split question/answer PDFs and inline Solutions): never/auto")
     p.add_argument("--course-name", default=None, help="subject name (defaults to the materials directory name)")
     p.add_argument(
+        "--crop-annotations",
+        default=None,
+        help=(
+            "optional UTF-8 JSONL of explicit model/human target-item crop "
+            "annotations; each row adds preview_path beside the strict "
+            "CropAnnotation fields"
+        ),
+    )
+    p.add_argument(
         "--ingest-adapter", choices=("core", "docling", "mineru"), default="core",
         help=argparse.SUPPRESS,
     )
@@ -3299,7 +3925,6 @@ def _validate_distinct_publication_targets(args):
 def _publication_workspace(args, explicit=None):
     """Resolve the workspace whose validator-visible outputs this run publishes.
 
-    Standalone compatibility outputs outside ``.ingest`` remain ordinary files.
     The official workspace shape is unambiguous from ``.ingest/*.json`` and/or
     ``references/assets``.  Reject mixed roots instead of locking one workspace
     while writing another.
@@ -3330,7 +3955,11 @@ def _publication_workspace(args, explicit=None):
             )
         candidates.append(os.path.dirname(references))
     if not candidates:
-        return None
+        raise ValueError(
+            "standalone material scanning is not exposed by the student CLI; use the "
+            "lightweight visual path or canonical ingest_course.py with an explicitly "
+            "confirmed full workspace"
+        )
     canonical = {os.path.normcase(os.path.normpath(path)) for path in candidates}
     if len(canonical) != 1:
         raise ValueError("validator-visible builder outputs target different workspaces")
@@ -3355,6 +3984,14 @@ def _publication_workspace(args, explicit=None):
         )
     if _path_has_link_or_reparse(workspace):
         raise ValueError("builder publication workspace is link/reparse-backed")
+    try:
+        exam_start.require_full_processing(
+            workspace,
+            materials=getattr(args, "materials", None),
+            purpose="workspace material builder publication",
+        )
+    except exam_start.FullProcessingRequired as exc:
+        raise ValueError(str(exc)) from exc
     os.makedirs(workspace, exist_ok=True)
     if not os.path.isdir(workspace) or _path_has_link_or_reparse(workspace):
         raise ValueError("builder publication workspace is not a safe directory")
@@ -3379,7 +4016,27 @@ def _run_unlocked_core(args, backend=None, adapter_runner=None):
               "examples_detected": 0, "quizzes_detected": 0, "pairs_detected": 0,
               "teaching_examples_detected": 0,
               "teaching_example_roles": {"paired_problem": 0, "worked_example": 0},
-              "skipped": [], "warnings": [], "ai_review": []}
+              "skipped": [], "warnings": [], "ai_review": [],
+              "crop_receipts": []}
+
+    # Heavy parsers belong to a separately configured remote/cloud integration,
+    # not this local builder process.  Reject before scanning or hashing any course
+    # material, and never accept a callable as an implied local integration.
+    if args.ingest_adapter != "core":
+        try:
+            selected = resolve_adapter(args.ingest_adapter, runner=adapter_runner)
+            report["parser_adapter_capability"] = selected.probe().to_dict()
+        except AdapterError as exc:
+            return 3, {"error": str(exc)}, report
+        return 3, {
+            "error": (
+                "%s is remote/cloud-host-only. The local student runtime never "
+                "probes, downloads, installs, imports, executes, or accepts a local "
+                "runner for Docling/MinerU. Use a separately configured remote host "
+                "only after an explicit named request and upload/privacy consent."
+                % args.ingest_adapter
+            )
+        }, report
 
     materials = args.materials
     if not os.path.isdir(materials):
@@ -3445,22 +4102,6 @@ def _run_unlocked_core(args, backend=None, adapter_runner=None):
     }
 
     selected_adapter = None
-    if args.ingest_adapter != "core":
-        try:
-            selected_adapter = resolve_adapter(
-                args.ingest_adapter, runner=adapter_runner
-            )
-            capability = selected_adapter.probe().to_dict()
-        except AdapterError as exc:
-            return 3, {"error": "可选解析器配置无效：%s" % exc}, report
-        report["parser_adapter_capability"] = capability
-        if not capability.get("available") or not capability.get("runner_configured"):
-            return 3, {
-                "error": (
-                    "%s 仅在 host 显式配置本地 runner 后可用；本工具不会自动安装、"
-                    "下载模型、联网或上传材料。" % args.ingest_adapter
-                )
-            }, report
 
     # Honest dependency failure: PDFs present but no text backend → stop with a clear, actionable error.
     if pdfs and selected_adapter is None and not backend.can_text():
@@ -3793,16 +4434,43 @@ def _run_unlocked_core(args, backend=None, adapter_runner=None):
     lecture_pages = [pg for pg in pages if pg["file"] not in hw_related]
     lecture_items = []
     if args.extract_lecture_questions != "never":
-        lecture_items = extract_lecture_items(lecture_pages)
+        lecture_items = extract_lecture_items(lecture_pages, backend=backend)
         report["examples_detected"] = sum(1 for it in lecture_items if it["id"].startswith("lecture_example"))
         report["quizzes_detected"] = sum(1 for it in lecture_items if it["id"].startswith("lecture_quiz"))
-        report["pairs_detected"] = sum(1 for it in lecture_items if it.get("answer_source_pages"))
+        report["pairs_detected"] = sum(
+            1 for it in lecture_items
+            if it.get("answer_source_pages")
+            and it.get("answer_origin") != "inline_material"
+        )
+        report["inline_material_examples_detected"] = sum(
+            1 for it in lecture_items
+            if it.get("answer_origin") == "inline_material"
+        )
         _teaching = [it for it in lecture_items if it["id"].startswith("lecture_example")]
         report["teaching_examples_detected"] = len(_teaching)
         report["teaching_example_roles"] = {
             role: sum(1 for it in _teaching if it.get("_teaching_role") == role)
             for role in ("paired_problem", "worked_example")
         }
+        for item in _teaching:
+            if (
+                item.get("_teaching_role") == "worked_example"
+                and item.get("answer") in (None, "", [], {})
+                and len(item.get("source_pages") or ()) == 1
+            ):
+                report["ai_review"].append({
+                    "kind": "inline_worked_answer_candidate",
+                    "file": item.get("source_file"),
+                    "pages": list(item.get("source_pages") or ()),
+                    "external_ids": [item.get("id")],
+                    "action": (
+                        "A bare Example is teaching-only but is not automatically an answer. "
+                        "After a semantic-v2 target-scoped prompt crop exists, run "
+                        "ingest_review.py register-inline-worked with the exact question, "
+                        "same-page native material text unit, and crop receipt; then claim, "
+                        "draft, validate, and apply the resulting ledger patch."
+                    ),
+                })
         # fail-loud: a solution detected with no matching problem (mis-detected pair) → surface it
         for k in orphan_solution_keys(lecture_pages):
             variant_label = "(%s)" % k[3].upper() if len(k) > 3 else ""
@@ -3829,6 +4497,44 @@ def _run_unlocked_core(args, backend=None, adapter_runner=None):
     page_pdf = {(pg["file"], pg["page"]): pg["_pdf"] for pg in pages if pg.get("_pdf")}
     page_pdf_all = dict(page_pdf_all_raw)   # 含残渣页——「见下页图」的图页往往正是无文本页
     page_pdf_all.update(page_pdf)
+
+    explicit_crop_records = []
+    if getattr(args, "crop_annotations", None):
+        try:
+            explicit_crop_records, annotation_summary = _load_crop_annotations(
+                args.crop_annotations,
+                materials,
+                source_snapshot_hashes,
+                page_pdf_all,
+                list(lecture_items) + list(homework_items),
+                backend,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            message = "explicit crop annotations rejected: %s" % exc
+            report["warnings"].append("crop_annotation_invalid: %s" % exc)
+            report["ai_review"].append({
+                "kind": "item_asset_crop_not_materialized",
+                "file": os.path.basename(str(args.crop_annotations)),
+                "pages": [],
+                "external_ids": [],
+                "action": (
+                    message
+                    + "; regenerate a source/preview-hash-bound JSONL annotation. "
+                      "The builder will not fall back to a whole-page item image."
+                ),
+            })
+            return 2, {"error": message}, report
+        report["crop_annotations"] = annotation_summary
+        by_item = {}
+        for record in explicit_crop_records:
+            by_item.setdefault(record["item_id"], {}).setdefault(
+                record["side"], []
+            ).append(record)
+        for item in list(lecture_items) + list(homework_items):
+            records = by_item.get(str(item.get("id")))
+            if records:
+                item["_crop_annotations"] = records
+                item["_render"] = True
 
     want_render = args.render_pages in ("auto", "required")
     render_materials_present = bool(pdfs)
@@ -3924,7 +4630,85 @@ def _run_unlocked_core(args, backend=None, adapter_runner=None):
         elif args.render_pages == "required":
             missing_required.append("%s p.%d (AI 接管证据页不可用)" % (file, page))
 
-    for it in list(lecture_items) + list(homework_items):
+    render_items = list(lecture_items) + list(homework_items)
+    page_item_owners = {"prompt": {}, "answer": {}}
+    for candidate in render_items:
+        candidate_id = str(candidate.get("id"))
+        for side in ("prompt", "answer"):
+            for key in _item_crop_source_pages(candidate, side):
+                page_item_owners[side].setdefault(key, set()).add(candidate_id)
+    page_marker_counts = {}
+    for page_row in pages:
+        key = (page_row.get("file"), page_row.get("page"))
+        text = page_row.get("text") or ""
+        lecture_markers = _iter_markers(text)
+        homework_markers = _hw_markers(text)
+        page_marker_counts[key] = {
+            "prompt": (
+                sum(1 for marker in lecture_markers
+                    if marker.get("role") == "problem" and not marker.get("continued"))
+                + sum(1 for marker in homework_markers
+                      if marker.get("role") == "problem" and not marker.get("continued"))
+            ),
+            "answer": (
+                sum(1 for marker in lecture_markers
+                    if marker.get("role") == "solution" and not marker.get("continued"))
+                + sum(1 for marker in homework_markers
+                      if marker.get("role") == "solution" and not marker.get("continued"))
+            ),
+        }
+    crop_reviewed = set()
+
+    def _whole_page_item_safe(item, side, source_file, source_page):
+        key = (source_file, source_page)
+        item_id = str(item.get("id"))
+        side_owners = page_item_owners[side].get(key, set())
+        opposite = "answer" if side == "prompt" else "prompt"
+        opposite_owners = page_item_owners[opposite].get(key, set())
+        marker_counts = page_marker_counts.get(key, {})
+        side_marker_count = marker_counts.get(side, 0)
+        opposite_marker_count = marker_counts.get(opposite, 0)
+
+        # A whole page may be represented as a target-only crop only when the
+        # parsed evidence positively proves exclusivity.  Absence of detected
+        # text is not proof: scans/OCR failures commonly report zero markers,
+        # and checking only one side can leak an answer on a prompt page (or a
+        # different prompt on an answer page).  Continuations and markerless
+        # figure pages therefore need a smaller deterministic crop or an exact
+        # source/preview-bound vision/human CropAnnotation.
+        proven_exclusive = (
+            side_owners == {item_id}
+            and not opposite_owners
+            and side_marker_count == 1
+            and opposite_marker_count == 0
+        )
+        if proven_exclusive:
+            return True
+        review_key = (item_id, side, source_file, source_page)
+        if review_key not in crop_reviewed:
+            crop_reviewed.add(review_key)
+            report["warnings"].append(
+                "item_asset_crop_not_materialized: %s (%s %s p.%d)"
+                % (item_id, side, source_file, source_page)
+            )
+            report["ai_review"].append({
+                "kind": "item_asset_crop_not_materialized",
+                "file": source_file,
+                "pages": [source_page],
+                "external_ids": [item_id],
+                "side": side,
+                "action": (
+                    "The builder cannot positively prove that this whole page "
+                    "contains exactly one target-side item and no opposite-side "
+                    "question/answer content. Provide a source- and preview-hash-"
+                    "bound --crop-annotations JSONL bbox or repair deterministic "
+                    "layout anchors. Zero OCR markers and same-page prompt/answer "
+                    "content are not accepted as target-item isolation evidence."
+                ),
+            })
+        return False
+
+    for it in render_items:
         ans_files = {f for (f, _p) in it.get("_answer_pages", [])}
         if len(ans_files) > 1:   # answer pages span >1 source file → page numbers are ambiguous
             report["warnings"].append("answer_spans_multiple_files: %s (%s)"
@@ -3979,18 +4763,153 @@ def _run_unlocked_core(args, backend=None, adapter_runner=None):
                 return "student_attempt"
             return "answer_context"
 
-        plan = ([("question_context", f, p, "_qcrop%d" % index, bbox, "crop_image")
-                 for index, (f, p, bbox) in enumerate(it.get("_question_crops", []), 1)]
-                + [("question_context", f, p, "", None, "page_image")
-                   for (f, p) in it.get("_question_pages", [])]
-                + [("question_context", f, p, "_adj", None, "page_image") for (f, p) in _adj]
-                + [(_answer_visual_role(f), f, p, "_acrop%d" % index, bbox, "crop_image")
-                   for index, (f, p, bbox) in enumerate(it.get("_answer_crops", []), 1)]
-                + [(_answer_visual_role(f), f, p, "_sol", None, "page_image")
-                   for (f, p) in it.get("_answer_pages", [])])
-        for role, file, page, suffix, bbox, asset_type in plan:
+        annotation_groups = it.get("_crop_annotations") or {}
+        explicit_prompt = list(annotation_groups.get("prompt") or ())
+        explicit_answer = list(annotation_groups.get("answer") or ())
+        explicit_prompt_pages = {
+            (row["source_file"], row["source_page"])
+            for row in explicit_prompt
+        }
+        explicit_answer_pages = {
+            (row["source_file"], row["source_page"])
+            for row in explicit_answer
+        }
+        question_crops = [
+            row for row in (it.get("_question_crops") or ())
+            if (row[0], row[1]) not in explicit_prompt_pages
+        ]
+        answer_crops = [
+            row for row in (it.get("_answer_crops") or ())
+            if (row[0], row[1]) not in explicit_answer_pages
+        ]
+
+        def _safe_page_plans(side, rows, suffix, role_factory):
+            output = []
+            for source_file, source_page in rows:
+                if ((source_file, source_page) in (
+                        explicit_prompt_pages if side == "prompt"
+                        else explicit_answer_pages)):
+                    continue
+                if _whole_page_item_safe(
+                        it, side, source_file, source_page):
+                    # A page that passed the one-item exclusivity gate is still
+                    # materialized through the crop protocol.  The page box is
+                    # an explicit target-item isolation selection, so downstream
+                    # authoring receives the same receipt/spec/source controls as
+                    # a smaller layout or vision crop.  It must never silently
+                    # regress to a bare ``page_image`` declaration.
+                    pdf = page_pdf_all.get((source_file, source_page))
+                    layout_reader = getattr(backend, "page_layout", None)
+                    page_box = None
+                    detail = None
+                    if pdf is None:
+                        detail = "current PDF page is unavailable"
+                    elif not callable(layout_reader):
+                        detail = "PDF page geometry is unavailable"
+                    else:
+                        try:
+                            layout = layout_reader(pdf, source_page - 1)
+                            candidate = (
+                                layout.get("page_bbox")
+                                if isinstance(layout, dict) else None
+                            )
+                            if (isinstance(candidate, (list, tuple))
+                                    and len(candidate) == 4):
+                                page_box = [float(value) for value in candidate]
+                                if (page_box[2] <= page_box[0]
+                                        or page_box[3] <= page_box[1]):
+                                    page_box = None
+                                    detail = "PDF page box has no positive area"
+                            else:
+                                detail = "PDF page geometry has no page_bbox"
+                        except Exception as exc:
+                            detail = "PDF page geometry failed: %s" % exc
+                    if page_box is not None:
+                        output.append((
+                            role_factory(source_file), source_file, source_page,
+                            suffix + "_isolated", page_box, "crop_image", None,
+                        ))
+                    else:
+                        review_key = (
+                            str(it["id"]), side, source_file, source_page
+                        )
+                        if review_key not in crop_reviewed:
+                            crop_reviewed.add(review_key)
+                            report["warnings"].append(
+                                "item_asset_crop_not_materialized: %s (%s %s p.%d)"
+                                % (it["id"], side, source_file, source_page)
+                            )
+                            report["ai_review"].append({
+                                "kind": "item_asset_crop_not_materialized",
+                                "file": source_file,
+                                "pages": [source_page],
+                                "external_ids": [str(it["id"])],
+                                "side": side,
+                                "action": (
+                                    "The page passed the one-item gate but its "
+                                    "page-box crop could not be materialized (%s). "
+                                    "Repair page geometry or provide a source- and "
+                                    "preview-hash-bound --crop-annotations record. "
+                                    "Whole-page fallback is forbidden."
+                                ) % (detail or "unknown geometry failure"),
+                            })
+                        if it.get("_render"):
+                            missing_required.append(
+                                "%s (%s page-box crop required, %s p.%d)"
+                                % (it["id"], side, source_file, source_page)
+                            )
+                elif it.get("_render"):
+                    missing_required.append(
+                        "%s (%s crop required, %s p.%d)"
+                        % (it["id"], side, source_file, source_page)
+                    )
+            return output
+
+        plan = (
+            [
+                (row["role"], row["source_file"], row["source_page"],
+                 "_qannotation%d" % index, row["bbox_pdf_points"],
+                 "crop_image", row)
+                for index, row in enumerate(explicit_prompt, 1)
+            ]
+            + [
+                ("question_context", f, p, "_qcrop%d" % index, bbox,
+                 "crop_image", None)
+                for index, (f, p, bbox) in enumerate(question_crops, 1)
+            ]
+            + _safe_page_plans(
+                "prompt", it.get("_question_pages") or (), "",
+                lambda unused_source: "question_context",
+            )
+            + _safe_page_plans(
+                "prompt", _adj, "_adj",
+                lambda unused_source: "question_context",
+            )
+            + [
+                (row["role"], row["source_file"], row["source_page"],
+                 "_aannotation%d" % index, row["bbox_pdf_points"],
+                 "crop_image", row)
+                for index, row in enumerate(explicit_answer, 1)
+            ]
+            + [
+                (_answer_visual_role(f), f, p, "_acrop%d" % index, bbox,
+                 "crop_image", None)
+                for index, (f, p, bbox) in enumerate(answer_crops, 1)
+            ]
+            + _safe_page_plans(
+                "answer", it.get("_answer_pages") or (), "_sol",
+                _answer_visual_role,
+            )
+        )
+        for role, file, page, suffix, bbox, asset_type, crop_annotation in plan:
             wrote = False
             asset_sha256 = None
+            crop_spec = None
+            crop_spec_sha256 = None
+            crop_receipt = None
+            crop_asset = None
+            crop_dimensions = None
+            crop_setup_error = None
             pdf = page_pdf_all.get((file, page))
             try:
                 source_sha256 = _sha256_path(pdf, source_hash_cache) if pdf else None
@@ -3999,23 +4918,143 @@ def _run_unlocked_core(args, backend=None, adapter_runner=None):
                 report["skipped"].append({
                     "file": file, "why": "页图源读取失败 p.%d: %s" % (page, exc)
                 })
+            if bbox is not None and pdf is not None and source_sha256:
+                try:
+                    layout_reader = getattr(backend, "page_layout", None)
+                    if not callable(layout_reader):
+                        raise CropContractError(
+                            "crop page geometry is unavailable; whole-page fallback is forbidden"
+                        )
+                    layout = layout_reader(pdf, page - 1)
+                    page_box = (
+                        layout.get("page_bbox") if isinstance(layout, dict) else None
+                    )
+                    if page_box is None:
+                        raise CropContractError("crop page geometry has no page_bbox")
+                    if crop_annotation is not None:
+                        if source_sha256 != crop_annotation["source_sha256"]:
+                            raise CropContractError(
+                                "annotated crop source revision drifted after validation"
+                            )
+                        if ([float(value) for value in page_box]
+                                != crop_annotation["page_box_pdf_points"]):
+                            raise CropContractError(
+                                "annotated crop page geometry drifted after validation"
+                            )
+                        if ([float(value) for value in bbox]
+                                != crop_annotation["bbox_pdf_points"]):
+                            raise CropContractError(
+                                "annotated crop bbox drifted after validation"
+                            )
+                        side = crop_annotation["side"]
+                        content_scope = crop_annotation["content_scope"]
+                        selection_method = crop_annotation["selection_method"]
+                        selection_evidence_sha256 = crop_annotation[
+                            "selection_evidence_sha256"
+                        ]
+                        semantic_purity = crop_annotation["semantic_purity"]
+                    else:
+                        # Keep automatic layout crops usable for ordinary
+                        # teaching/quiz ingestion, but do not mint a current
+                        # strict receipt without an explicit semantic review.
+                        # Visual Study Guide authoring will fail closed on this
+                        # unreceipted legacy declaration and can upgrade it via
+                        # the incremental crop-receipt backfill command.
+                        side = "prompt" if role == "question_context" else "answer"
+                        content_scope = (
+                            "full_prompt" if side == "prompt" else "full_answer"
+                        )
+                    try:
+                        chapter_id = "ch%02d" % int(it.get("chapter"))
+                    except (TypeError, ValueError):
+                        chapter_id = "unassigned"
+                    if crop_annotation is not None:
+                        renderer_id, renderer_version, renderer_config_sha256 = (
+                            _crop_renderer_contract(backend)
+                        )
+                        crop_spec = {
+                            "item_id": str(it["id"]),
+                            "chapter_id": chapter_id,
+                            "side": side,
+                            "role": role,
+                            "content_scope": content_scope,
+                            "isolation": (
+                                "target_with_required_context"
+                                if semantic_purity.get("required_context_ids")
+                                else "target_item_only"
+                            ),
+                            "source_id": make_source_id(file),
+                            "source_file": file,
+                            "source_sha256": source_sha256,
+                            "source_page": page,
+                            "page_box_pdf_points": page_box,
+                            "bbox_pdf_points": bbox,
+                            "selection_method": selection_method,
+                            "selection_evidence_sha256": selection_evidence_sha256,
+                            "renderer_id": renderer_id,
+                            "renderer_version": renderer_version,
+                            "renderer_config_sha256": renderer_config_sha256,
+                            "semantic_purity": semantic_purity,
+                        }
+                        crop_spec_sha256 = make_crop_spec_sha256(**crop_spec)
+                except (CropContractError, OSError, ValueError) as exc:
+                    crop_setup_error = str(exc)
+                    report["skipped"].append({
+                        "file": file,
+                        "why": "crop_contract_failed p.%d: %s" % (page, exc),
+                    })
             name = _safe_asset_name(
-                file, page, it["id"], suffix, source_sha256=source_sha256
+                file, page, it["id"], suffix, source_sha256=source_sha256,
+                crop_spec_sha256=crop_spec_sha256,
             )
             rel_path = "references/assets/" + name
             if can_write and pdf is not None and source_sha256:
                 try:
                     if bbox is None:
                         png = backend.render_page_png(pdf, page - 1)
+                    elif crop_setup_error is not None:
+                        png = None
                     else:
-                        crop_renderer = getattr(backend, "render_page_clip_png", None)
-                        # Deliberately no whole-page fallback: failing closed is
-                        # safer than exposing handwriting before the question.
-                        png = (crop_renderer(pdf, page - 1, bbox)
-                               if callable(crop_renderer) else None)
+                        # ``render_crop_png`` only calls the clip renderer.  A
+                        # missing/failed clip is never replaced by a whole page.
+                        png, crop_width, crop_height = render_crop_png(
+                            backend, pdf, page - 1, bbox
+                        )
+                        crop_dimensions = (crop_width, crop_height)
                 except Exception as e:   # a single malformed/encrypted page must not crash the whole run
                     png = None
                     report["skipped"].append({"file": file, "why": "渲染失败 p.%d: %s" % (page, e)})
+                if png:
+                    if bbox is not None:
+                        try:
+                            if crop_dimensions is None:
+                                raise CropContractError(
+                                    "crop dimensions were not established"
+                                )
+                            candidate_sha256 = hashlib.sha256(bytes(png)).hexdigest()
+                            if crop_spec is not None:
+                                crop_receipt = CropReceipt.create(
+                                    output_path=rel_path,
+                                    output_sha256=candidate_sha256,
+                                    output_width=crop_dimensions[0],
+                                    output_height=crop_dimensions[1],
+                                    supersedes=(),
+                                    **crop_spec
+                                )
+                                crop_asset = compact_asset_from_receipt(crop_receipt)
+                                if crop_receipt.side == "prompt":
+                                    crop_asset["contains_full_prompt"] = (
+                                        crop_receipt.content_scope == "full_prompt"
+                                    )
+                                validate_crop_asset_binding(crop_asset, crop_receipt)
+                        except (CropContractError, ValueError) as exc:
+                            png = None
+                            crop_receipt = None
+                            crop_asset = None
+                            report["skipped"].append({
+                                "file": file,
+                                "why": "crop_receipt_failed p.%d: %s" % (page, exc),
+                            })
                 if png:
                     full = os.path.join(asset_root, name)
                     if not _under(asset_root, full):   # name is sanitized; defensive belt-and-braces
@@ -4023,6 +5062,11 @@ def _run_unlocked_core(args, backend=None, adapter_runner=None):
                     else:
                         try:
                             asset_sha256 = _write_png_atomic(asset_root, name, png)
+                            if (crop_receipt is not None
+                                    and asset_sha256 != crop_receipt.output_sha256):
+                                raise ValueError(
+                                    "published crop hash differs from its receipt"
+                                )
                             wrote = True
                             rendered += 1
                         except (OSError, ValueError) as exc:
@@ -4030,7 +5074,26 @@ def _run_unlocked_core(args, backend=None, adapter_runner=None):
                                 "file": file,
                                 "why": "PNG 写入/格式校验失败 p.%d: %s" % (page, exc),
                             })
-            if not wrote and role in ("answer_context", "student_attempt"):
+            if not wrote and bbox is not None:
+                side = "prompt" if role == "question_context" else "answer"
+                review_key = (str(it["id"]), side, file, page)
+                if review_key not in crop_reviewed:
+                    crop_reviewed.add(review_key)
+                    detail = crop_setup_error or "clip render/receipt publication failed"
+                    report["ai_review"].append({
+                        "kind": "item_asset_crop_not_materialized",
+                        "file": file,
+                        "pages": [page],
+                        "external_ids": [str(it["id"])],
+                        "side": side,
+                        "action": (
+                            "Target-only crop was not materialized (%s). Inspect the "
+                            "bound source page and provide a corrected --crop-annotations "
+                            "record. Whole-page fallback is forbidden."
+                        ) % detail,
+                    })
+            if not wrote and role in (
+                    "answer_context", "worked_solution", "student_attempt"):
                 # don't DECLARE a missing answer-side asset — it would fail-close an otherwise-valid
                 # question whose own figure rendered fine (the text `answer` already covers it).
                 report["warnings"].append("answer_image_unavailable: %s (p.%d)" % (it["id"], page))
@@ -4051,22 +5114,70 @@ def _run_unlocked_core(args, backend=None, adapter_runner=None):
                 # run.  A same-named file left by an older workspace build cannot
                 # silently satisfy the new question.
                 continue
-            assets.append({
-                "path": rel_path,
-                "role": role,
-                "type": asset_type,
-                "caption": "%s p.%d (%s)" % (file, page, role),
-                "sha256": asset_sha256,
-                # An answer-side crop may legitimately come from the submitted
-                # homework while ``answer_source_file`` points at a separate
-                # official solution booklet. Bind each asset to its own source.
-                "source_file": file,
-                "source_sha256": source_sha256,
-            })
             if bbox is not None:
-                assets[-1]["source_bbox_pdf_points"] = [float(value) for value in bbox]
+                if crop_receipt is None or crop_asset is None:
+                    # The automatic layout crop is intentionally a readable
+                    # legacy declaration, not authoring-grade evidence.  It
+                    # remains available to normal tutoring and gives the
+                    # backfill command exact bytes to audit later.
+                    declared = {
+                        "path": rel_path,
+                        "role": role,
+                        "type": "crop_image",
+                        "sha256": asset_sha256,
+                        "source_file": file,
+                        "source_sha256": source_sha256,
+                        "source_page": page,
+                        "source_bbox_pdf_points": [float(value) for value in bbox],
+                    }
+                    report["warnings"].append(
+                        "crop_semantic_review_required: %s (%s p.%d)"
+                        % (it["id"], file, page)
+                    )
+                    report["ai_review"].append({
+                        "kind": "item_asset_crop_semantic_review_required",
+                        "file": file,
+                        "pages": [page],
+                        "external_ids": [str(it["id"])],
+                        "side": (
+                            "prompt" if role == "question_context" else "answer"
+                        ),
+                        "action": (
+                            "Review this exact crop for target-item-only semantic "
+                            "purity, then provide a schema-v2 crop annotation or "
+                            "run incremental crop-receipt backfill."
+                        ),
+                    })
+                else:
+                    declared = dict(crop_asset)
+                declared["caption"] = "%s p.%d (%s crop)" % (file, page, role)
+                assets.append(declared)
+                if crop_receipt is not None:
+                    report["crop_receipts"].append(crop_receipt.to_dict())
+            else:
+                assets.append({
+                    "path": rel_path,
+                    "role": role,
+                    "type": asset_type,
+                    "caption": "%s p.%d (%s)" % (file, page, role),
+                    "sha256": asset_sha256,
+                    # An answer-side visual may legitimately come from the
+                    # submission while answer_source_file points elsewhere.
+                    "source_file": file,
+                    "source_sha256": source_sha256,
+                })
         it["assets"] = assets
     report["pages_rendered"] = rendered
+    report["crop_receipts"] = sorted(
+        report["crop_receipts"], key=lambda row: row["crop_receipt_id"]
+    )
+    report["crop_receipt_index_sha256"] = crop_canonical_sha256(
+        report["crop_receipts"]
+    )
+    # Re-parse the exact report view before publication.  This catches duplicate
+    # IDs/output paths, ordering drift, malformed full receipts, or a digest
+    # mismatch inside the builder rather than deferring discovery to authoring.
+    validate_crop_receipt_index(report)
 
     # --render-pages required must FAIL (not just warn) when a required figure couldn't be produced,
     # else we'd emit requires_assets=true items with missing images that the validator then rejects.
@@ -4180,13 +5291,35 @@ def _run_unlocked_core(args, backend=None, adapter_runner=None):
     structured_questions = _structured_question_union(
         raw_input["quiz_bank"], raw_input.get("teaching_examples") or ()
     )
+    # The public quiz/teaching views deliberately replace an image-backed
+    # prompt with a short page-reference sentence and strip private builder
+    # fields.  The typed ingestion fact must nevertheless preserve the exact
+    # source-language prompt text that was used for language classification.
+    # Overlay only this private producer field on a copy passed to the IR
+    # builder; it never leaks back into quiz_bank/teaching_examples.
+    source_items_by_id = {
+        str(item.get("id")): item
+        for item in list(lecture_items or ()) + list(homework_items or ())
+        if isinstance(item, dict) and item.get("id") not in (None, "")
+    }
+    ingestion_questions = []
+    for item in structured_questions:
+        current = dict(item)
+        source_item = source_items_by_id.get(str(item.get("id")))
+        source_prompt = (
+            source_item.get("_prompt_text")
+            if isinstance(source_item, dict) else None
+        )
+        if isinstance(source_prompt, str) and source_prompt.strip():
+            current["_prompt_text"] = source_prompt
+        ingestion_questions.append(current)
     try:
         raw_input["ingestion"] = build_ingestion_payload(
             materials,
             all_source_paths,
             ingestion_pages,
             sections=sections,
-            quiz_items=structured_questions,
+            quiz_items=ingestion_questions,
             report=report,
             parser_receipts=_merge_parser_receipts(
                 _core_parser_receipts(

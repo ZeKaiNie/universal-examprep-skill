@@ -4,215 +4,217 @@
 
 # Exam Cram Coach
 
-*One night left. You studied nothing. Every answer should show where it came from.*
+*Turn your slides, homework, and past papers into a source-aware tutor that remembers your progress.*
 
-English · [中文](README.zh.md)
+English · [Chinese](README.zh.md)
 
 [![stars](https://img.shields.io/github/stars/ZeKaiNie/universal-examprep-skill?style=flat&color=blue)](https://github.com/ZeKaiNie/universal-examprep-skill/stargazers)
 [![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/ZeKaiNie/universal-examprep-skill/actions/workflows/ci.yml/badge.svg)](https://github.com/ZeKaiNie/universal-examprep-skill/actions)
 
-**Grounded to your course materials** · bank-only quizzes · source-labeled AI supplements · chapter-sliced retrieval
+**Teach from your materials · Show figures before solving · Explain key questions step by step · Keep progress across chats**
 
 </div>
 
-You know him. Night before the exam, hair a mess, eyes wide open, hasn't read a single page of the course. This skill is for him: it grounds teaching in *your* materials, labels any AI supplement, and says when the materials do not support an answer.
+Give the agent your course folder, then say how soon the exam is, where you want to start, and which reply language you want. It teaches each concept beside the matching examples from lectures, homework, quizzes, and practice exams. It explains which formula applies, how the values fit, and why the answer follows.
 
-**30-second start** — clone the repo, then say one line to your agent:
+Its most important feature is visible provenance:
 
-```bash
-git clone https://github.com/ZeKaiNie/universal-examprep-skill .claude/skills/universal-exam-cram-coach
-# In Claude Code / Cursor, say: "use this skill to set up my exam-prep space", then drop in your materials
-```
+- 🟢 From your materials: traceable to the original file and location;
+- 🟡 AI-supplemented — may differ from what your teacher taught;
+- ⚠️ AI-generated answer — not from your teacher or textbook.
 
----
+When the materials do not support a conclusion, the agent should say so instead of pretending to know.
 
-## Before / after
+## Start studying in one minute
 
-**With the skill** — answers and key walkthroughs carry provenance, so you can check them:
+1. [Install the skill](#install).
+2. Put your slides, notes, homework, solutions, quizzes, and practice exams in one materials folder.
+3. Tell the agent:
 
-> **[#vis_q1]** In the figure, which set relation does the shaded region show?
-> **The intersection of A and B.**
-> `Question source: hw02.pdf p.3 | Answer source: hw02_sol.pdf | 🟢 From your materials`
+> Use Exam Cram Coach to review `D:\Course Materials`. I am starting from zero, my exam is tomorrow, reply in English, and begin with Chapter 1. Use lightweight on-demand mode.
 
-**Closed-book / plain agent** — sounds just as confident, but you can't tell if it's true:
+4. The agent shows the absolute materials/workspace path, study mode, time budget, reply language, and processing choice before teaching.
 
-> The shaded region is the **union**. <sub>(It's actually the intersection; no source label, nothing to check against — this is where hallucination happens.)</sub>
+You do not need to learn any commands first. Commands below are only for automation or troubleshooting.
 
-The difference isn't tone. It's whether the answer exposes the evidence and any AI-added part.
+## Choose a processing mode
 
----
+The skill asks once. If you are unsure, choose lightweight on-demand.
 
-## Numbers
+| Mode | What it does | Best for | Limitations |
+|---|---|---|---|
+| **Lightweight on-demand (default, recommended)** | Processes only the pages you are studying now, inspects their visuals, teaches in chat, and saves progress and notes | An exam tomorrow, a large folder, or anyone who wants to start quickly | Does not organize the whole course in advance; one active batch has at most 8 primary pages; does not create a complete Study Guide or printable PDF; without an unchanged standard bank that existed before initialization, a chapter is capped at `covered_unverified` |
+| **Full knowledge-base build** | Organizes the whole course into a chapter wiki, standard question bank, and review queue; can later produce chapter Study Guides | Large or messy courses, systematic review, and students willing to wait longer | Initial processing is slower and uses more disk; scans, complex layouts, and question-answer pairing can still need AI or human review; a completed build does not prove every detail was recognized correctly |
 
-The skill's value is **grounding**: connecting what's in your materials but not in the model's head, while making unsupported answers visible. The figures below are results from the named benchmark courses/models, not a guarantee for every subject or host (judge: Sonnet):
+Lightweight mode saves the cost of processing the whole course up front. It does not shorten the explanation shown to the student.
 
-**① Material-specific retrieval improved on these runs.** Details mined from course transcripts (the professor's examples, obscure studies, exact numbers) are difficult to answer from world knowledge alone; the table reports the measured result for each listed course/model:
+Processing and output are separate choices:
 
-<div align="center"><img src="benchmark/docs/img/hard_psyc_correct_en.svg" width="600" alt="materials-specific: closed-book vs with the skill" /></div>
+- Chat is the default output: teaching appears in the conversation and notebook, without automatic HTML/PDF work.
+- Visual output creates a web Study Guide and can produce a printable PDF.
+- In lightweight mode, a saved visual preference stays dormant. Switch explicitly to full mode before building a Study Guide.
 
-| Course · Model | Closed-book | Raw files + generic agent | With the skill |
-|---|:--:|:--:|:--:|
-| PSYC 110 · Opus 4.8 | 11% | 98% | **100%** |
-| PSYC 110 · Sonnet 4.6 | 13% | 100% | **100%** |
-| PSYC 110 · Haiku 4.5 | 11% | 98% | **100%** |
-| 6.006 · Haiku 4.5 | 45% | 89% | **91%** |
+## How it teaches a chapter
 
-**② Out-of-scope abstention reached 100% in this benchmark slice.** Across the tested probes, three models and two courses abstained on every out-of-scope item with the skill (and with raw files); closed-book measured 60%–90%. See the report for sample design and limitations.
+Each chapter continues until its concepts and matching examples have been covered:
 
-<div align="center"><img src="benchmark/docs/img/oos_psyc_abst_en.svg" width="560" alt="out-of-scope probes: honest abstention rate" /></div>
+1. Explain the concept in everyday language without assuming prior knowledge.
+2. Show only the relevant question text and figures, not a full page of unrelated items.
+3. State what the problem asks and what values can be read from the figure.
+4. Explain why the formula or rule applies.
+5. Substitute values and work through every step.
+6. Explain in beginner-friendly language why the answer follows.
+7. Link the concept, question, and answer back to their original file and location.
 
-In these runs, chapter retrieval had similar accuracy to the raw-files arm with the per-question costs shown below. The mechanism retrieves relevant chapter slices instead of re-scanning the whole pile:
+If a question or solution depends on an image, the image must be visibly rendered before it is used. Questions with missing required figures are not served. Tree, traversal, state-machine, and similar problems are computed deterministically before a diagram is drawn.
 
-<details><summary>Cost per question (same accuracy, less spend)</summary>
+Quizzes come only from the workspace's standard question bank; temporary AI-written questions are never passed off as course quizzes. Wrong answers, skipped items, and “why/how” questions are saved for review.
 
-| Cost / question | Closed-book | Raw files agent | With the skill |
-|---|:--:|:--:|:--:|
-| PSYC 110 | $0.033 | $0.117 | **$0.102** |
-| 6.006 | $0.034 | $0.066 | **$0.063** |
+## Ordinary features and extensions
 
-</details>
+Ordinary features cover what most students need. Extensions are off by default because they take longer, use more storage, or depend on an external service and separate permission.
 
-Full method, three-arm design, judge calibration, cost, limitations → **[test report](benchmark/REPORT.en.md)**.
+| Feature | Default | How to enable | Inherent limitations |
+|---|---|---|---|
+| Lightweight teaching, visual inspection, detailed walkthroughs, progress, and notes | On | Choose lightweight on-demand, or accept the default | Processes only the current pages and does not prebuild the whole course |
+| Full wiki, standard bank, and source-conflict review | Off | Explicitly choose a full knowledge-base build | Slower first run; unresolved review items must be fixed or clearly reported |
+| One key question per teaching turn | Off | In full mode, ask for one question at a time or set `--interaction-style step_by_step` | Changes teaching cadence only; it does not prove quiz mastery or chapter completion, and concurrent tutors can still select the same pending item |
+| Web Study Guide and printable PDF | Off | In full mode, explicitly request a visual Study Guide or printable version | Requires complete content, item-specific crops, source checks, and page-by-page visual QA; costs time and disk; unavailable in lightweight mode |
+| A separate external-model call for each answer explanation | Off | First approve local-only planning; after reviewing exact items, images, call count, privacy boundary, and a current-price estimate, approve the exact upload plan | Not every agent host can make fresh, stateless, tool-disabled calls; a ChatGPT or Codex subscription is separate from API billing; N items require at least N calls; listed questions, answers, or crops are sent to the external provider |
+| Remote MinerU or Docling parsing | Off | The user must name it and the host must already provide a remote integration; confirm upload terms separately | This project never downloads or runs either parser on the student's computer; the service may be unavailable, expands the privacy boundary, and still needs review |
+| Remote LangGraph orchestration | Off | The user must name it and the host must already provide a remote integration | It can arrange steps but cannot replace local course state or source records; no heavy local dependency is installed automatically |
+| Dense + sparse retrieval, RRF, and reranking | Experimental, off | Consider only after real multi-course recall testing shows a stable advantage | Current evidence is insufficient; it can increase latency, size, dependencies, and false retrievals, so BM25 remains the default |
 
----
+If an extension is unavailable, the agent must continue with ordinary features and state the limitation. It must not invent a remote-parse or isolated-call receipt.
 
-## How it works
+### External model calls and privacy
 
-A ladder of "don't make it up unless you have to":
+Ordinary features do not start a second provider API call by themselves. Your materials are still handled under the privacy policy of the agent host you are already using; this is not a promise that the entire session is offline.
 
-1. **Quiz only from the prebuilt bank** — questions come from the provenance-labeled `quiz_bank.json`, never improvised. Bank entries may be material-sourced or explicitly AI-generated; the label is never hidden.
-2. **Forced source labels** — every claim tagged `🟢 From your materials` / `🟡 AI-supplemented — may differ from what your teacher taught` / `⚠️ AI-generated answer — not from your teacher or textbook`, never passed off as the textbook.
-3. **If it's not in the materials, say so** — abstains honestly on unsupported questions instead of forcing an answer.
-4. **Draw-it questions run the algorithm first** — for binary trees / graph traversal, it runs the real algorithm in the background to get the topology, then renders — no imagining.
-5. **Figure-dependent questions won't be served without the figure** — no unanswerable question handed to the student.
-6. **Chapter-sliced knowledge base, loaded on demand** — reads the current chapter slice instead of loading the full course into every turn.
+The per-item external-call extension requires two separate approvals:
 
-The local core ingest path accepts PDF, DOCX, PPTX, XLSX, common standalone raster images, plain text, and Markdown. XLSX and raster files use dedicated standard-library routes: worksheets retain ordered cells, formulas/cached values, table metadata, and supported embedded raster images without requiring Excel; a standalone image retains its dimensions, digest, and local asset, then creates an OCR/vision review task when it has no usable UTF-8 sidecar. `scripts/ingest_course.py` is the single regular orchestrator: it builds structured content units and location anchors, compiles the wiki/bank, initializes state, and validates the result. It returns `0` for `ready` or `usable_with_gaps`; return code `10` means the build ran but unresolved review work blocks teaching. The agent then works through the typed review queue and append-only patch ledger before rebuilding and validating again—never by silently editing a generated wiki or pretending a warning disappeared. Large reviewed queues can use `ingest_review.py apply-batch --patch-list <json>`: every issue still keeps an independently validated patch and ledger entry, while expensive derivatives compile once per batch instead of once per issue.
+1. A planning approval lists the exact questions, images, call count, and expected output locally without uploading course content.
+2. After you review that scope, current pricing assumptions, and the provider's retention/privacy boundary, upload approval must bind the exact plan ID and call count.
 
-An ingestion-v2 workspace also records one `.ingest/parser_receipts.json` entry for every discovered source. Each receipt binds the exact source digest and media type to the selected parser/version/config, the enumerated output anchors, and a local-only policy (`network=false`, `upload=false`, `install=false`); missing, stale, or inconsistent receipts fail validation. These booleans are validated configuration declarations: the bundled adapter does not perform those actions, but it neither sandboxes nor attests a host-supplied runner, whose operator must enforce the policy. Location IDs are deliberately not content-derived: `source_id` comes from the canonical relative path, while `unit_id` comes from source ID + location/bbox + kind + ordinal; source and unit hashes bind the exact revision. A DOCX `page` is only a logical segment split at an explicit page break—not a physical Word page. PPTX uses slide order, XLSX uses worksheet order, and a standalone raster uses one page-equivalent anchor.
+Keep API keys in the host or operating system's secret storage, never in a course workspace, receipt, log, or Git. A git-ignored `.env.local` is only a plaintext fallback, not an encrypted vault. Setup and failure behavior are documented in [the external-model adapter guide](docs/openai-study-guide-adapter.md).
 
-The v2 fact layer derives exact duplicate groups and explicit cross-source conflicts without rewriting source occurrences or unit IDs. Near matches remain review candidates; similar formulas or visual variants at different locations inside one source are not treated as evidence that the locations assert the same claim. Source priority is evidence metadata, never a silent winner, and every unresolved cross-source conflict fails closed. An ingestion-v2 Study Guide must also pass the exact-location claim gate: each covered material assertion carries a strict `claim_id` on the same source reference and `source_unit_id`, with a compatible concept/formula/question/answer role. The typed-guide validator recomputes the `location_only` receipt against the canonical strict-JSON guide hash and the live source/content/group/conflict/claim hashes. It covers directly material-backed knowledge-point explanations in the rendered source language, every formula, printed prompt text that is not replaced by a full-prompt image, and every answer language labelled `material`; AI translations or supplements are never disguised as material claims. Unreferenced sidecar records are absent from the verified ID list, although the receipt still binds the full sidecar hash. This proves guide membership/text identity plus location/revision—not that the quote entails or semantically supports the authored claim. Legacy ingestion-v1 guides remain on their compatibility path rather than fabricating v2 evidence.
+## Study mode, time budget, and language
 
-The answer-time retriever remains the zero-dependency BM25 path. Dense + sparse retrieval, RRF, and reranking are experimental candidates only; they may become opt-in only after a sufficient frozen **real, multi-course** recall Gold Set passes the documented safety/resource gate. The committed synthetic sample is intentionally insufficient evidence. Likewise, [`scripts/host_adapters/langgraph_exam.py`](scripts/host_adapters/langgraph_exam.py) is an optional adapter for hosts that already use LangGraph, not the workflow truth: local commands, `study_state.json`, `.ingest/`, and their receipts remain authoritative. See [workspace formats](docs/file-format.md), [retrieval evaluation](docs/retrieval-evaluation.md), and the [LangGraph host boundary](docs/langgraph-host-adapter.md).
+The skill remembers these choices across chats:
 
----
+| Choice | Options | Effect |
+|---|---|---|
+| Starting point | Teach from scratch / Start mid-course and shore up weak spots / Fill the gaps | Controls explanation depth and the starting chapter |
+| Time before the exam | ≤ 1 day / 1–3 days / 3–7 days / > 7 days | Controls pace and how often earlier material is checked |
+| Reply language | Chinese / English / bilingual | Controls agent-authored explanations; source evidence stays in its original language |
 
-## Study modes · time budget · preferences
+With ≤ 1 day, the agent skips unnecessary opening and reflective questions and starts with the essentials; **standard-bank drills/checkpoints may still verify mastery**. If you explicitly ask for no questions, it saves `no_questions=true`; the chapter is then capped at `covered_unverified` rather than pretending that a checkpoint was passed.
 
-The skill adapts how deep it teaches, how fast, and whether it asks you questions — all kept in `study_state.json`, persistent across chats.
-
-**3 study modes** (how it teaches):
-
-| Mode | For |
-|---|---|
-| **Teach from scratch** | Haven't studied at all — walk every chapter from zero, 7-step walkthrough per key question |
-| **Start mid-course, shore up weak spots** | Know some — start from a chapter you name, target the weak parts |
-| **Fill the gaps** | Mostly covered — just quiz to find blind spots, mistakes first |
-
-**4 time budgets** (how fast):
-
-| Budget | Behavior |
-|---|---|
-| **≤ 1 day** | All-out sprint — skips opening clarification/preference questions and reflective follow-ups, silently infers defaults, and goes straight in; standard-bank drills/checkpoints may still verify mastery |
-| **1–3 days** | Hits the essentials, compresses the rest |
-| **3–7 days** | Normal pace, asks which chapters you're solid on |
-| **> 7 days** | Relaxed — for chapters you say you know, it **quizzes to verify** rather than taking your word |
-
-**Preferences** (remembers your habits): whether walkthroughs append the "common mistakes" / "3-minute recap" closing blocks, reply language (Chinese / English / bilingual), an explicit `no_questions` request (which suppresses all interactive questions and caps a phase at `covered_unverified`), and per-chapter mastery windows (`window-add` / `window-set-status`) — all persisted, changed by a single line anytime. See [`docs/language-policy.md`](docs/language-policy.md) and [`docs/skill-architecture.md`](docs/skill-architecture.md).
-
----
+Bilingual replies must be chosen explicitly. English mode does not mechanically append Chinese to every paragraph, and Chinese mode does not mechanically append English. Bilingual mode supplies both languages for each complete explanation block.
 
 ## Install
 
 ### Claude Code
 
-**Recommended — the runtime bundle** (just the runtime skill, without benchmarks and development tests):
+Download `universal-exam-cram-coach.zip` from the [latest release](https://github.com/ZeKaiNie/universal-examprep-skill/releases/latest), then unzip it into either location:
 
-Download `universal-exam-cram-coach.zip` from the [latest release](https://github.com/ZeKaiNie/universal-examprep-skill/releases/latest) and unzip it into `.claude/skills/universal-exam-cram-coach/` (project-local or global `~/.claude/skills/`).
+- Project-local: `.claude/skills/universal-exam-cram-coach/`
+- Global: `~/.claude/skills/universal-exam-cram-coach/`
 
-Basic TXT/Markdown/DOCX/PPTX/XLSX and standalone-raster metadata/sidecar ingestion uses the standard library. Before the first build, the agent runs the bundled dependency preflight (`scripts/check_deps.py`); if the selected PDF or visual route needs an optional package, it asks before installing it. Unsupported, encrypted, damaged, or scan-only content is reported into the review workflow instead of being silently skipped.
-
-**Or clone the repo** (developer path — includes benchmarks, tests, and maintainer documentation):
+You can also clone the complete repository. It includes tests, benchmark data, and maintainer documentation:
 
 ```bash
 git clone https://github.com/ZeKaiNie/universal-examprep-skill .claude/skills/universal-exam-cram-coach
 ```
 
-### Codex / Cursor / Windsurf / Antigravity
+### Codex, Cursor, Windsurf, and Antigravity
 
-Clone the repo; have the agent read `AGENTS.md` (a one-screen fallback contract) or load `skills/`. These tools write files and run scripts directly.
+Clone the repository and have the agent read [`AGENTS.md`](AGENTS.md) or load [`skills/`](skills/). These hosts can usually work with local files and scripts directly.
 
-### Web (ChatGPT / DeepSeek / Gemini)
+### ChatGPT, DeepSeek, Gemini, and other web clients
 
-Can't write local files — use the drop-in prompt instead: copy [`prompts/web_prompt.en.md`](prompts/web_prompt.en.md) and send it, then paste your materials.
+If the client cannot write local files, copy the [English web prompt](prompts/web_prompt.en.md), send it, and then provide your materials. This is a portable fallback; it cannot fully reproduce persistent local state, strict item cropping, or the verified publication chain.
 
-> Full load matrix (per-agent support, entry files) in [`docs/agent-portability.md`](docs/agent-portability.md). The trigger entry is [`SKILL.md`](SKILL.md), a language-neutral router. It loads the shared control rules under [`skills/`](skills/) plus the compact English compatibility/wording entry at [`locales/en/SKILL.md`](locales/en/SKILL.md); neither locale is a second behavior manual.
+See [agent portability](docs/agent-portability.md) for the support matrix. The compact English entry is [`locales/en/SKILL.md`](locales/en/SKILL.md), and the English web fallback is [`prompts/web_prompt.en.md`](prompts/web_prompt.en.md).
 
----
+## What appears in the study workspace
 
-## Sub-skills
+Students usually need to recognize only these paths:
 
-The monolith is split into 10 single-purpose skills the agent loads on demand:
-
-| Sub-skill | What it does |
+| Path | Purpose |
 |---|---|
-| `exam-cram` | Orchestrator — runs the 4-step workflow + study-mode routing |
-| `exam-ingest` | Orchestrates PDF/DOCX/PPTX/XLSX/raster/text ingestion, typed AI review, compilation, and readiness validation |
-| `exam-tutor` | Lazy per-chapter teaching (7-step walkthroughs, draw-it-runs-algorithm-first) |
-| `exam-study-guide` | Compiles one chapter into formula-readable, self-contained HTML and optional visually checked PDF |
-| `exam-quiz` | Draws & grades from the bank (6 question types: MC / short / draw / fill / T-F / code) |
-| `exam-review` | Mistakes and concept-confusion review |
-| `exam-cheatsheet` | Pre-exam cheat sheet |
-| `exam-audit` | Read-only workspace health check |
-| `exam-help` | One-screen quick reference (workflow / modes / file conventions) |
-| [`confusion-tracker`](skills/confusion-tracker/SKILL.md) | Logs concept questions as you go into a pre-exam blind-spot list |
+| `study_state.json` | Source of truth for learning progress, modes, and preferences; do not edit it by hand |
+| `study_progress.md` | Human-readable progress summary generated from the state |
+| `notebook/` | Taught material, mistakes, and chapter notes |
+| `references/wiki/` | Chapter knowledge base created by full mode |
+| `references/quiz_bank.json` | Standard question bank with source records |
+| `.ingest/` | Full-build parsing records, review items, and provenance evidence; mainly for the agent and audit tools |
+| `.lightweight/` | Current-page images and processing records for lightweight mode |
 
-All ten live under [`skills/`](skills/) (e.g. [`skills/exam-study-guide/SKILL.md`](skills/exam-study-guide/SKILL.md)), loaded on demand. PDF tooling is routed per host without silent downloads; see [`docs/pdf-capability-adapters.md`](docs/pdf-capability-adapters.md).
+See [workspace file formats](docs/file-format.md) for the full contract.
 
-Chapter artifacts are opt-in. The default `chat` output mode keeps teaching in the conversation (plus the normal progress/notebook files) and does not automatically build HTML/PDF. Say “save tokens / chat only” or set `--artifact-mode chat`; say “visual study guide / I want printable PDFs” or set `--artifact-mode visual` for automatic chapter HTML + visually checked PDF. An agent must never guess this from your subscription plan, and a one-off PDF request does not silently change the saved preference.
+## How to read the benchmark
 
----
+The published benchmark compares three primary arms: `closedbook`, `rawfiles`, and `skill`. A material/dump-all route appears only as a legacy stress footnote, not as the primary fair comparison. On the named courses, models, and question sets, course-specific accuracy improved and unsupported questions were more likely to receive an honest abstention.
 
-## Development
-
-Zero-cost structured checks you can run often (no API spend):
-
-```bash
-python -m unittest discover -s tests -v          # unit tests (pure stdlib, in CI)
-python scripts/validate_workspace.py path/to/ws  # validate a built exam-prep workspace
-```
-
-The real paid benchmark is expensive (tens of dollars / hours per matrix), run manually only — see [`benchmark/docs/running-real-runs.md`](benchmark/docs/running-real-runs.md) and the tiering in [`benchmark/docs/test_tiers.md`](benchmark/docs/test_tiers.md). Workspace file format: [`docs/file-format.md`](docs/file-format.md).
-
----
+Those results describe only the reported courses, models, prompts, judge, and datasets. They do not guarantee the same improvement for every subject or agent host. The goal is traceable answers and visible gaps, not a claim that the skill is always correct. See the [full benchmark report](benchmark/REPORT.en.md) for the exact results, costs, method, and limitations.
 
 ## FAQ
 
-**No Python installed?** After confirming the interpreter truly cannot start, the core workspace can use a disclosed manual-write fallback with reduced validation. A script/data error while Python runs must be fixed or reported; it must not trigger that fallback. The MathML HTML/PDF renderer requires Python and fails loudly with the missing prerequisite.
+**Why are there no images in Chapter 1?** Check that the question-side image is actually visible, not merely printed as a file path. Lightweight mode must inspect the current pages; full mode must have the relevant visual index/crops and no unresolved review issue. A chapter with missing required figures must not be called complete.
 
-**On a limited plan?** `artifact_mode=chat` is the safe default, so normal tutoring does not spend extra generation effort on chapter HTML/PDF. Switch to `visual` only when you want printable chapter artifacts; PDF rendering itself is local, but the richer material workflow can consume more context and generation.
+**Why do formulas still look like raw LaTeX?** Chat teaching should unpack formulas in plain language. A visual Study Guide must render formulas into readable notation. Raw formula strings may remain as machine evidence, but they cannot be the only student-facing display.
 
-**Only photos / scanned PDFs / a recording?** Give the original files to the ingest workflow. It renders/reads PDF pages where supported and puts each scanned, skipped, or review-needed item into a typed queue for AI takeover; the agent must claim and resolve it or report the exact file and reason. Audio still needs a transcript before ingestion.
+**What if I only have scans or photos?** Lightweight mode can inspect the current image or rendered PDF page. Full mode puts uncertain recognition into a review queue instead of silently skipping it. Audio still needs a transcript first.
 
-**Stuck on one quiz question?** Just say "this is too hard / I want to skip" — it files the item to your mistake log, lets you through, and revisits it at the end.
+**What if Python is unavailable?** Use the reduced manual fallback only after confirming that the interpreter truly cannot start. A script error is not the same as having no Python; fix or report the actual error.
 
-**How is this different from just dropping a folder at an AI?** It adds a persistent state, chapter retrieval, a standard question bank, provenance labels, and fail-closed visual checks. The benchmark compares accuracy/cost for its tested courses; see the [report](benchmark/REPORT.en.md).
+**Can I skip a hard question?** Yes. Say that you want to skip it; the item is saved to the mistake record, teaching continues, and the item returns during review.
 
----
+**How do I audit an existing workspace?** Use [`skills/exam-audit/`](skills/exam-audit/) for a read-only check of material revisions, missing visuals, review issues, bank coverage, and learning state.
+
+## For developers and maintainers
+
+The root [`SKILL.md`](SKILL.md) routes activation. Shared behavior lives under [`skills/`](skills/), while [`locales/`](locales/) contains compact language compatibility and wording entries. The sub-skills cover orchestration, ingestion, tutoring, quizzes, review, Study Guides, cheat sheets, audits, help, and concept-confusion tracking at [`skills/confusion-tracker`](skills/confusion-tracker/SKILL.md).
+
+Useful checks:
+
+```bash
+python -m unittest discover -s tests -v
+python scripts/validate_workspace.py path/to/workspace
+python scripts/build_dist.py
+```
+
+See [skill architecture](docs/skill-architecture.md), [agent portability](docs/agent-portability.md), [PDF capability adapters](docs/pdf-capability-adapters.md), and [language policy](docs/language-policy.md). Release history belongs in [`CHANGELOG.md`](CHANGELOG.md).
+
+<details>
+<summary>Maintainer-only behavior-smoke scenario registry</summary>
+
+These fixture identifiers are kept here so documentation coverage cannot silently drift from the deterministic smoke suite:
+
+- `quiz_bank_only`
+- `provenance_labels`
+- `hint_skip_mistake_archive`
+- `confusion_tracking`
+- `checkpoint_recovery`
+- `no_python_fallback`
+- `zero_basic_key_question`
+- `time_budget_no_questions`
+- `knowledge_window_recheck`
+- `teaching_template`
+- `visual_first_assets`
+- `lazy_load_best_effort`
+- `scope_override`
+- `language_first_ask`
+- `artifact_mode_routing`
+- `notebook_persist_ok`
+- `workspace_confirm_ok`
+
+The corresponding intent and coverage live in the [behavior-smoke coverage matrix](benchmark/docs/coverage-matrix.md).
+
+</details>
 
 ## License
 
-[MIT](LICENSE). PRs for more subjects' templates or scripts welcome. Good luck on the cram. 🎓
-
-<div align="center">
-
-<a href="https://www.star-history.com/?repos=ZeKaiNie%2Funiversal-examprep-skill&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=ZeKaiNie/universal-examprep-skill&type=date&theme=dark&legend=top-left&sealed_token=q2eC20GmpWMHMen634RnHHNopx3dtYK6mzpbK0tB8B7sBn_LT0IKz-TYsaaWMY5xLJ6i7bsHedSzBxs4DU6cD5vZ8HFc-ZD2XAlqm5MnqBbf-ZbEq8zr2A" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=ZeKaiNie/universal-examprep-skill&type=date&legend=top-left&sealed_token=q2eC20GmpWMHMen634RnHHNopx3dtYK6mzpbK0tB8B7sBn_LT0IKz-TYsaaWMY5xLJ6i7bsHedSzBxs4DU6cD5vZ8HFc-ZD2XAlqm5MnqBbf-ZbEq8zr2A" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=ZeKaiNie/universal-examprep-skill&type=date&legend=top-left&sealed_token=q2eC20GmpWMHMen634RnHHNopx3dtYK6mzpbK0tB8B7sBn_LT0IKz-TYsaaWMY5xLJ6i7bsHedSzBxs4DU6cD5vZ8HFc-ZD2XAlqm5MnqBbf-ZbEq8zr2A" />
- </picture>
-</a>
-
-</div>
+[MIT](LICENSE). Contributions of subject templates, parser adapters, and real-course regression samples are welcome. Good luck with your exam. 🎓
