@@ -562,7 +562,12 @@ class BoundedValidatorOutput(unittest.TestCase):
             warnings = [{"level": "warning", "msg": "formula warning %d" % i}
                         for i in range(100)]
             out = io.StringIO()
-            with mock.patch.object(validate_workspace, "validate",
+            # main() owns the validation lock and calls the unlocked core so
+            # the dependency snapshots, validation, and capability matrix all
+            # observe one generation.  Mock that core here; mocking the public
+            # validate() wrapper would bypass nothing and leave this output-
+            # bounding test dependent on an otherwise empty temp workspace.
+            with mock.patch.object(validate_workspace, "_validate_unlocked",
                                    return_value=(errors, warnings, {"sentinel": 1})):
                 with mock.patch.object(
                         validate_workspace._readiness_matrix, "capability_readiness",

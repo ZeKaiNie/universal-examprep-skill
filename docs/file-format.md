@@ -11,6 +11,9 @@
   exam_runtime_receipt.json; ingest_report.json
   .ingest/                         # 构建/审查事实；不得手改
     source_raw_input.json; parse_report.json; source_manifest.json
+    material_build_pending.json; material_build_receipt.json
+    material_build_recovery/<generation_id>.json
+    pending_ingest.json             # 仅编译回滚事务中存在
     parser_receipts.json           # v2 每来源一条 local-only receipt
     base_content_units.jsonl; content_units.jsonl
     base_chapter_phase_mappings.jsonl; chapter_phase_mappings.jsonl
@@ -29,9 +32,14 @@
 ```
 
 - `study_state.json` 是进度事实源；`study_progress.md` 是生成视图。`references/wiki/` 只接受安全相对名 `^[\w.\-]+\.md$`，其章节应与 `study_plan.md`/当前阶段一致；疑难点由 confusion-tracker 写入 state 并投影视图。
-- `exam_start.py confirm` 是 `exam_runtime_receipt.json` 唯一 writer。receipt 绑定绝对 package root、根 `SKILL.md` 版本、运行面 SHA-256、Git identity（或不可用原因）、Python 与 UTC；workspace 必须在 package 外。每次 ingestion 重算 identity，缺失、畸形、link-backed 或漂移均 fail-closed，绝不修改安装包求匹配。
+- `exam_start.py` 的 `confirm` 与 `recover-material-build` 是 `exam_runtime_receipt.json` 仅有的受支持 writers：`confirm` 只用于普通首次/无 pending 确认，`recover-material-build` 只用于已确认 pair 且存在精确 pending generation 的显式恢复。receipt 绑定绝对 package root、根 `SKILL.md` 版本、运行面 SHA-256、Git identity（或不可用原因）、Python 与 UTC；workspace 必须在 package 外。每次 ingestion 重算 identity，缺失、畸形、link-backed 或漂移均 fail-closed，绝不修改安装包求匹配。
 - `.ingest/` 的 manifest、units、review ledger 与 build manifest 必须同代；材料或派生 hash 漂移即拒绝旧产物。v2 还强制 parser receipts 与四个 dedup/conflict sidecar；缺文件、schema/revision/page graph/policy 不一致均 fail-closed。v1 可读但不得冒充 v2 门禁。
 - `pending_patch.json` 只允许事务中存在；残留即阻断并要求恢复/重建。`mutation.lock` 仅互斥，不是内容事实。
+- `material_build_pending.json` 是 builder→compiler 的 fail-closed 代际门闩。只有 builder 成功才发布新一代：pending 必须先于本轮资产、raw input 和 parse report 变更，并绑定旧 build manifest、新 raw/report、候选三层资产策略及迁移收据。Builder 返回非零时不替换 canonical raw/report 或公开资产，诊断只在当次命令结果中；发布失败且无法完整回滚时则保留 blocker。Pending 存在时，普通 mutation/publication（包括 review、claim、Guide）和 validation 全部拒绝；只有明确 generation-aware 的 builder/compiler 路径可绕过该检查。唯一允许的旧角色修正是有一一对应收据的 `answer_context → student_attempt`。
+- Material compiler 为结构化事实、build manifest、wiki、题库/教学例题、检索索引、报告/计划及 material pending/receipt 切换建立一个有界事务。它在任一 target 变更前写 `pending_ingest.json` 与备份；显式失败立即回滚，进程中断则使 validation 保持 blocked，并由下一次持锁 mutation 先恢复全部登记 target。Builder 已发布的 candidate 资产/raw/report 不在该 compiler 回滚集中，因而 material pending 会继续阻断并允许重试同一 generation。
+- 成功 finalization 写入 `material_build_receipt.json`，把 build manifest 设为 schema `2`，以严格 `material_build` 对象和 `artifacts` 中的 raw/report/receipt 三元精确 hash 绑定 generation，复验 live bytes 后才最后删除 material pending。当前协议产物不得被 refresh/重写成 schema `1`；缺失或漂移的 receipt、`material_build` 契约或三元 artifact binding 都阻断 validation。Legacy schema `1` 仍可读，但不声称通过该 generation gate。`ingest_course.py` 只在 compiler 子进程成功后才初始化 `study_state.json`/写入 artifact preference；这些 learner-state 操作不属于 compiler 事务。
+- Pending 存续期间若 `exam_runtime_receipt.json` 缺失或漂移，普通 `exam_start.py confirm` 不得改写 provenance；必须显式运行 `exam_start.py recover-material-build --action resume|supersede`。`resume` 只接受同一 generation：源文件完整时直接消费原字节，blocker-first 中断导致源缺失时允许 builder 重建，但重建 generation 不同则零发布失败并要求 `supersede`。`supersede` 产生 schema `2` successor，`supersedes_generation_id` 只指向直接前代。
+- `.ingest/material_build_recovery/<generation_id>.json` 是严格、generation-addressed 的恢复日志；单日志最多 64 个 authorization event，祖先链最多 64 条 direct-child edge。每个 abandoned outcome 必须指向直接 child，receipt 最多记录 64 条 ancestor abandonment 加 1 条当前 resume completion（共 65 行）。Compiler 回滚事务同时覆盖 pending、receipt、当前及全部祖先日志；最终 manifest 的保留键 `material_build_recovery:<generation_id>` 必须与 receipt 声明集合完全一致并绑定 live hash，额外/缺失/漂移均阻断。不得手改或删除这些事实来解除 blocker。
 
 ### 结构化 ingestion 事实源
 

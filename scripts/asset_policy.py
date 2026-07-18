@@ -781,12 +781,189 @@ def audit_asset_policy(
     }
 
 
+def _promotion_identity_resolver(root, identities=None):
+    """Resolve each lexical path once while preserving physical-file aliases."""
+
+    identities = {} if identities is None else identities
+
+    def resolve(path):
+        key = physical_asset_key(path)
+        if key is None:
+            raise ValueError("asset path is unsafe or invalid: %r" % path)
+        canonical = normalize_workspace_path(path)
+        if canonical not in identities:
+            identity, problem = _stable_workspace_asset_identity(root, path, key)
+            if problem:
+                raise ValueError(problem)
+            identities[canonical] = (
+                path, _asset_identity_token(identity) or "path:" + key
+            )
+        return identities[canonical][1]
+
+    return resolve
+
+
+def _promotion_policy_index(policy, resolve):
+    """Index all promotion facts in one pass over a complete policy snapshot."""
+
+    index = {}
+
+    def facts(identity):
+        return index.setdefault(identity, {
+            "roles": set(), "paths": set(), "groups": set(),
+            "revisions": set(), "incomplete": False, "owners": [],
+        })
+
+    rows = tuple(policy.get(name) or () for name in (
+        "quiz_rows", "teaching_rows", "content_units"
+    ))
+    for layer, collection in enumerate(rows):
+        for row in collection:
+            row_identities = set()
+            for declared, role in iter_asset_declarations((row,)):
+                identity = resolve(declared)
+                item = facts(identity)
+                item["roles"].add(role)
+                item["paths"].add(normalize_workspace_path(declared))
+                row_identities.add(identity)
+            if isinstance(row, dict):
+                if layer < 2 and row_identities:
+                    try:
+                        source = normalize_workspace_path(row.get("source_file"))
+                    except ValueError:
+                        source = None
+                    owner = (row.get("source_type"), source)
+                    for identity in row_identities:
+                        facts(identity)["owners"].append(owner)
+                for asset in _nested_assets(row):
+                    if not isinstance(asset, dict):
+                        continue
+                    identity = resolve(asset.get("path"))
+                    try:
+                        revision = (
+                            asset.get("sha256"),
+                            normalize_workspace_path(asset.get("path")),
+                            normalize_workspace_path(asset.get("source_file")),
+                            asset.get("source_sha256"),
+                        )
+                    except ValueError:
+                        revision = ()
+                    item = facts(identity)
+                    if (len(revision) != 4 or any(
+                            not isinstance(value, str) for value in revision)
+                            or not re.fullmatch(r"[0-9a-f]{64}", revision[0])
+                            or not re.fullmatch(r"[0-9a-f]{64}", revision[3])):
+                        item["incomplete"] = True
+                    else:
+                        item["revisions"].add(revision)
+    for group, declarations in (policy.get("item_groups") or {}).items():
+        for declared, _role, _key in declarations:
+            facts(resolve(declared))["groups"].add(group)
+    return index
+
+
+def legacy_attempt_promotion_receipts(requests, old, new, workspace):
+    """Authorize many legacy corrections with one old/new policy scan each.
+
+    ``requests`` contains ``(path, sha256)`` pairs.  Every returned receipt is
+    subjected to the same role, physical identity, path, owner, item-group, and
+    provenance constraints as the singular API.  One shared live-identity
+    snapshot plus a full end-of-window recheck removes the previous
+    promotions-by-declarations Cartesian scan without trusting alias drift.
+    """
+
+    requests = tuple(requests)
+    if not requests:
+        return ()
+    root = _asset_workspace_root(workspace)
+    identities = {}
+    resolve = _promotion_identity_resolver(root, identities)
+    targets = []
+    for request in requests:
+        if not isinstance(request, (list, tuple)) or len(request) != 2:
+            raise ValueError("legacy role correction request must be (path, sha256)")
+        path, sha256 = request
+        targets.append((
+            path, normalize_workspace_path(path), sha256, resolve(path),
+        ))
+    before_index = _promotion_policy_index(old, resolve)
+    after_index = _promotion_policy_index(new, resolve)
+    final_resolve = _promotion_identity_resolver(root)
+    for canonical, (declared, identity) in identities.items():
+        if final_resolve(declared) != identity:
+            raise ValueError(
+                "legacy asset promotion policy path identity drifted during authorization: %s"
+                % canonical
+            )
+    receipts = []
+    for path, canonical, sha256, identity in targets:
+        before = before_index.get(identity) or {
+            "roles": set(), "paths": set(), "groups": set(),
+            "revisions": set(), "incomplete": False, "owners": [],
+        }
+        after = after_index.get(identity) or {
+            "roles": set(), "paths": set(), "groups": set(),
+            "revisions": set(), "incomplete": False, "owners": [],
+        }
+        if (before["roles"] != {"answer_context"}
+                or after["roles"] != {STUDENT_ATTEMPT}
+                or before["paths"] != {canonical}
+                or after["paths"] != {canonical}
+                or before["groups"] != after["groups"]
+                or len(before["groups"]) != 1):
+            raise ValueError("legacy role correction conflicts with workspace ownership")
+        group = next(iter(before["groups"]))
+        if (not isinstance(group, tuple) or len(group) != 3
+                or group[0] != "item" or not group[1] or not group[2]):
+            raise ValueError("legacy role correction lacks a stable item owner")
+        if (before["incomplete"] or after["incomplete"]
+                or before["revisions"] != after["revisions"]
+                or len(before["revisions"]) != 1):
+            raise ValueError("legacy role correction has invalid provenance")
+        asset_sha, asset_path, source_path, source_sha = next(
+            iter(before["revisions"])
+        )
+        if asset_sha != sha256:
+            raise ValueError(
+                "legacy role correction provenance does not match staged bytes"
+            )
+        for item in (before, after):
+            if (not item["owners"] or any(
+                    kind != "homework" or source != source_path
+                    for kind, source in item["owners"])):
+                raise ValueError(
+                    "legacy role correction owner is not the same homework source"
+                )
+        receipts.append({
+            "path": asset_path,
+            "from_roles": ["answer_context"],
+            "to_roles": [STUDENT_ATTEMPT],
+            "sha256": sha256,
+            "source_file": source_path,
+            "source_sha256": source_sha,
+            "item_chapter": group[1],
+            "item_id": group[2],
+            "reason": "legacy_answer_context_to_student_attempt",
+        })
+    return tuple(receipts)
+
+
+def legacy_attempt_promotion_receipt(path, sha256, old, new, workspace):
+    """Compatibility wrapper for one live-evidence role correction."""
+
+    return legacy_attempt_promotion_receipts(
+        ((path, sha256),), old, new, workspace
+    )[0]
+
+
 __all__ = [
     "STUDENT_ATTEMPT",
     "collect_asset_roles",
     "has_tainted_official_asset",
     "is_student_attempt_tainted",
     "iter_asset_declarations",
+    "legacy_attempt_promotion_receipt",
+    "legacy_attempt_promotion_receipts",
     "physical_asset_key",
     "student_attempt_tainted_keys",
     "workspace_asset_is_student_attempt",

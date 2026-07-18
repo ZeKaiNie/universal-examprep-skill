@@ -39,12 +39,14 @@ try:
         normalize_workspace_path,
         safe_workspace_entry,
     )
+    from ingestion.storage import stable_read_bytes
 except ImportError:  # imported as scripts.retrieve in unit tests
     from scripts.ingestion.identifiers import (
         is_link_or_reparse,
         normalize_workspace_path,
         safe_workspace_entry,
     )
+    from scripts.ingestion.storage import stable_read_bytes
 
 for _s in ("stdout", "stderr"):
     try:
@@ -143,28 +145,49 @@ def build_index(chunks, integrity=None):
 
 # ---------------- query-time ----------------
 
-def load_terms(ws):
+def load_terms(ws, expected_sha256=None):
     """zh↔en glossary → symmetric expansion map token→set(tokens). Missing file = no expansion."""
-    path = os.path.join(ws, TERMS_NAME)
-    # 与 retrieval_index.json 同一读入纪律（Codex r5）：符号链接/越界的术语表会把外部词汇
-    # 注进查询扩展（并经弃答 payload 泄出）——拒读，不静默当无术语表
-    if is_link_or_reparse(path):
-        _die("terms.json 不得为符号链接（可能指向工作区外）——拒绝读取")
-    if not os.path.isfile(path):
-        return {}
-    _assert_contained(ws, path, "terms.json")
+    if (expected_sha256 is not None
+            and (not isinstance(expected_sha256, str)
+                 or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256))):
+        _die("terms.json integrity binding is invalid——请重跑 ingest 重建")
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = strict_json.load(f)
-    except ValueError as e:
+        path = safe_workspace_entry(ws, TERMS_NAME)
+    except (TypeError, ValueError) as exc:
+        _die("terms.json path is unsafe: %s" % exc)
+    if not os.path.lexists(str(path)):
+        if expected_sha256 is not None:
+            _die("索引依赖文件缺失: references/terms.json——请重跑 ingest 重建")
+        return {}
+    if expected_sha256 is None:
+        _die(
+            "stale_index: references/terms.json exists but the index does not bind "
+            "it——请重跑 ingest 重建"
+        )
+    try:
+        payload, snapshot = stable_read_bytes(path)
+    except Exception as exc:
+        _die("terms.json 不能安全稳定读取: %s" % exc)
+    if snapshot.get("sha256") != expected_sha256:
+        _die("stale_index: references/terms.json 已变更——拒绝旧索引，请重跑 ingest 重建")
+    try:
+        raw = strict_json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as e:
         _die("terms.json 不是合法 JSON: %s" % e)
     if not isinstance(raw, dict):
         _die("terms.json 顶层必须是 {术语: [对应术语,…]} 对象")
     exp = {}
     for k, vals in raw.items():
-        if not isinstance(vals, list):
-            continue
-        group = [k] + [v for v in vals if isinstance(v, str)]
+        if (not isinstance(k, str) or not k or k != k.strip()
+                or not isinstance(vals, list) or not vals
+                or any(not isinstance(v, str) or not v or v != v.strip()
+                       for v in vals)
+                or len(vals) != len(set(vals))):
+            _die(
+                "terms.json entries must use trimmed non-empty term keys and "
+                "non-empty unique arrays of trimmed non-empty strings"
+            )
+        group = [k] + vals
         toks_per_term = [tokenize(t) for t in group]
         for i, src in enumerate(toks_per_term):
             for st in src:
@@ -237,7 +260,12 @@ def _snippet(ws, doc, q_tokens, width=240):
 
 
 def search(ws, index, query, top_k=DEFAULT_TOP_K, min_score=0.0):
-    exp = load_terms(ws)
+    integrity = index.get("integrity") if isinstance(index, dict) else None
+    terms_binding = integrity.get("terms") if isinstance(integrity, dict) else None
+    expected_terms_sha256 = (
+        terms_binding.get("sha256") if isinstance(terms_binding, dict) else None
+    )
+    exp = load_terms(ws, expected_sha256=expected_terms_sha256)
     q_tokens = expand_query(informative_terms(tokenize(query)), exp)
     if not q_tokens:
         # 查询里没有任何信息词（全是英文功能词）——不允许功能词重合冒充「材料覆盖」，走弃答
@@ -284,6 +312,7 @@ def _verify_integrity(ws, integrity):
         "source_conflicts": ".ingest/source_conflicts.jsonl",
         "quiz_bank": "references/quiz_bank.json",
         "teaching_examples": TEACHING_EXAMPLES_NAME,
+        "terms": "references/terms.json",
     }
     rows = list(wiki)
     for key, fixed_file in fixed_files.items():
@@ -308,6 +337,15 @@ def _verify_integrity(ws, integrity):
         _die(
             "stale_index: references/teaching_examples.json exists but the index "
             "does not bind it——请重跑 ingest 重建"
+        )
+    try:
+        terms_path = str(safe_workspace_entry(ws, TERMS_NAME))
+    except (TypeError, ValueError) as exc:
+        _die("terms path is unsafe: %s" % exc)
+    if os.path.lexists(terms_path) and integrity.get("terms") is None:
+        _die(
+            "stale_index: references/terms.json exists but the index does not bind "
+            "it——请重跑 ingest 重建"
         )
     for row in rows:
         if not isinstance(row, dict) or set(row) != {"file", "sha256"}:
@@ -366,7 +404,7 @@ def load_index(ws):
         integrity_rows = list(idx["integrity"].get("wiki") or ())
         for key in (
             "source_manifest", "content_units", "canonical_groups",
-            "source_conflicts", "quiz_bank", "teaching_examples",
+            "source_conflicts", "quiz_bank", "teaching_examples", "terms",
         ):
             if idx["integrity"].get(key) is not None:
                 integrity_rows.append(idx["integrity"][key])
@@ -431,6 +469,14 @@ def load_index(ws):
                 _die("retrieval_index.json posting 无效——请重跑 ingest")
             seen_docs.add(posting[0])
     _verify_integrity(ws, idx["integrity"])
+    terms_binding = idx["integrity"].get("terms")
+    load_terms(
+        ws,
+        expected_sha256=(
+            terms_binding.get("sha256")
+            if isinstance(terms_binding, dict) else None
+        ),
+    )
     return idx
 
 

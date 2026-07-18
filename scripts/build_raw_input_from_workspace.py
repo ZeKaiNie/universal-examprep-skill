@@ -31,6 +31,7 @@ Usage:
   python scripts/validate_workspace.py skill_workspace
 """
 import argparse
+import copy
 import hashlib
 import importlib
 import importlib.metadata
@@ -50,7 +51,10 @@ try:
         SOURCE_UNIT_LANGUAGE_CODES,
         is_language_neutral_formula,
         is_link_or_reparse,
+        normalize_workspace_path,
+        read_json,
         source_language_evidence,
+        stable_read_bytes,
         workspace_publication_lock,
     )
     from ingestion.ooxml import OOXMLExtractionError, extract_ooxml
@@ -66,6 +70,7 @@ try:
         STUDENT_ATTEMPT,
         audit_asset_policy,
         iter_asset_declarations,
+        legacy_attempt_promotion_receipts,
         physical_asset_key,
         workspace_asset_identity_key,
         workspace_asset_is_student_attempt,
@@ -80,7 +85,10 @@ except ImportError:  # imported as scripts.build_raw_input_from_workspace in uni
         SOURCE_UNIT_LANGUAGE_CODES,
         is_language_neutral_formula,
         is_link_or_reparse,
+        normalize_workspace_path,
+        read_json,
         source_language_evidence,
+        stable_read_bytes,
         workspace_publication_lock,
     )
     from scripts.ingestion.ooxml import OOXMLExtractionError, extract_ooxml
@@ -96,12 +104,28 @@ except ImportError:  # imported as scripts.build_raw_input_from_workspace in uni
         STUDENT_ATTEMPT,
         audit_asset_policy,
         iter_asset_declarations,
+        legacy_attempt_promotion_receipts,
         physical_asset_key,
         workspace_asset_identity_key,
         workspace_asset_is_student_attempt,
     )
     from scripts.validate_workspace import workspace_asset_policy_snapshot
     from scripts.image_validation import ImageValidationError, png_dimensions
+
+try:
+    from material_generation import (
+        MATERIAL_BUILD_PENDING_PATH,
+        material_recovery_path,
+        validate_generation,
+        validate_runtime_recovery_log,
+    )
+except ImportError:
+    from scripts.material_generation import (
+        MATERIAL_BUILD_PENDING_PATH,
+        material_recovery_path,
+        validate_generation,
+        validate_runtime_recovery_log,
+    )
 
 try:
     from pdf_capabilities import PDF_RENDER_CANDIDATES, PDF_TEXT_CANDIDATES
@@ -4195,12 +4219,122 @@ def _asset_role_map(*collections, workspace=None):
     return roles
 
 
+def _validate_pre_ingestion_generation_facts(workspace, ingest_path):
+    """Validate the narrow generation files allowed before first compilation."""
+
+    pending_relative = MATERIAL_BUILD_PENDING_PATH
+    pending_path = os.path.join(workspace, *pending_relative.split("/"))
+    if not os.path.isfile(pending_path) or _path_has_link_or_reparse(pending_path):
+        raise ValueError("pre-ingestion material pending marker is missing or unsafe")
+    pending = read_json(pending_path)
+    validate_generation(pending, expected_status="pending")
+    pending_payload, _pending_snapshot = stable_read_bytes(pending_path)
+    pending_sha = hashlib.sha256(pending_payload).hexdigest()
+    for binding in (pending["raw_input"], pending["parse_report"]):
+        source = os.path.join(workspace, *binding["path"].split("/"))
+        try:
+            source_payload, _source_snapshot = stable_read_bytes(source)
+            source_matches = (
+                hashlib.sha256(source_payload).hexdigest() == binding["sha256"]
+            )
+        except (OSError, TypeError, ValueError):
+            source_matches = False
+        if not source_matches:
+            # Blocker-first publication may expose the self-authenticating
+            # marker before either source document.  The orchestrator permits
+            # this fact set only to rebuild a candidate and then requires exact
+            # generation equality (or an explicit supersede authorization)
+            # before publication.  A standalone builder remains blocked by the
+            # ordinary material-pending mutation gate.
+            pass
+
+    recovery_root = os.path.join(ingest_path, "material_build_recovery")
+    recovery_logs = {}
+    if os.path.lexists(recovery_root):
+        if (not os.path.isdir(recovery_root)
+                or _path_has_link_or_reparse(recovery_root)):
+            raise ValueError("pre-ingestion material recovery directory is unsafe")
+        for name in sorted(os.listdir(recovery_root)):
+            path = os.path.join(recovery_root, name)
+            generation_id, extension = os.path.splitext(name)
+            if (extension != ".json" or not os.path.isfile(path)
+                    or _path_has_link_or_reparse(path)):
+                raise ValueError("pre-ingestion material recovery entry is unsafe")
+            if material_recovery_path(generation_id).split("/")[-1] != name:
+                raise ValueError("pre-ingestion material recovery filename is invalid")
+            value = read_json(path)
+            validate_runtime_recovery_log(value)
+            if value["generation_id"] != generation_id:
+                raise ValueError("pre-ingestion material recovery identity drifted")
+            recovery_logs[generation_id] = value
+
+    current_generation = pending["generation_id"]
+    current = recovery_logs.get(current_generation)
+    if current is not None:
+        validate_runtime_recovery_log(
+            current, pending=pending, pending_sha256=pending_sha
+        )
+        if current["records"][-1]["outcome"] is not None:
+            raise ValueError("pre-ingestion pending recovery is already closed")
+
+    expected_recovery_ids = {current_generation} if current is not None else set()
+    seen = {current_generation}
+    child_generation = current_generation
+    predecessor_id = pending.get("supersedes_generation_id")
+    while predecessor_id is not None:
+        if predecessor_id in seen or len(seen) > 64:
+            raise ValueError(
+                "pre-ingestion recovery ancestry is cyclic or too deep"
+            )
+        seen.add(predecessor_id)
+        predecessor = recovery_logs.get(predecessor_id)
+        if predecessor is None:
+            raise ValueError(
+                "pre-ingestion successor lacks predecessor recovery audit"
+            )
+        latest = predecessor["records"][-1]
+        authorization = latest["authorization"]
+        outcome = latest["outcome"]
+        binding = authorization["pending"]
+        if (binding["generation_id"] != predecessor_id
+                or authorization["action"] != "supersede"
+                or (outcome is not None and (
+                    outcome.get("status") != "abandoned"
+                    or outcome.get("replacement_generation_id")
+                    != child_generation))):
+            raise ValueError("pre-ingestion predecessor recovery audit is invalid")
+        expected_recovery_ids.add(predecessor_id)
+        child_generation = predecessor_id
+        predecessor_id = binding.get("supersedes_generation_id")
+    if set(recovery_logs) != expected_recovery_ids:
+        raise ValueError("pre-ingestion recovery audit is unrelated to pending generation")
+
+    transactions = os.path.join(ingest_path, "transactions")
+    if os.path.lexists(transactions) and (
+            not os.path.isdir(transactions)
+            or _path_has_link_or_reparse(transactions)
+            or os.listdir(transactions)):
+        raise ValueError("pre-ingestion recovery transaction directory is unsafe")
+
+
+def _validate_empty_pre_ingestion_transactions(ingest_path):
+    """Accept the empty journal directory created by first-run locking only."""
+
+    transactions = os.path.join(ingest_path, "transactions")
+    if not os.path.lexists(transactions):
+        return
+    if (not os.path.isdir(transactions)
+            or _path_has_link_or_reparse(transactions)
+            or os.listdir(transactions)):
+        raise ValueError("pre-ingestion recovery transaction directory is unsafe")
+
+
 def _existing_workspace_asset_policy(workspace):
     """Load every durable asset layer, while permitting a genuinely new workspace."""
 
     empty = {"quiz_rows": [], "teaching_rows": [], "content_units": [],
              "tainted_keys": set(), "tainted_identity_keys": set(),
-             "conflicts": [], "unsafe_paths": []}
+             "conflicts": [], "unsafe_paths": [], "item_groups": {}}
     if not workspace:
         return empty
     quiz_path = os.path.join(workspace, "references", "quiz_bank.json")
@@ -4216,6 +4350,8 @@ def _existing_workspace_asset_policy(workspace):
         pre_ingestion_names = {
             "mutation.lock", "publication.lock", "source_raw_input.json",
             "parse_report.json", "ai_review_manifest.json",
+            "material_build_pending.json", "material_build_recovery",
+            "transactions",
         }
         extra_ingest = []
         if os.path.isdir(ingest_path) and not _path_has_link_or_reparse(ingest_path):
@@ -4225,6 +4361,15 @@ def _existing_workspace_asset_policy(workspace):
             raise ValueError(
                 "existing .ingest is missing content_units.jsonl"
             )
+        generation_names = {
+            name for name in (
+                "material_build_pending.json", "material_build_recovery"
+            ) if os.path.lexists(os.path.join(ingest_path, name))
+        }
+        if generation_names:
+            _validate_pre_ingestion_generation_facts(workspace, ingest_path)
+        else:
+            _validate_empty_pre_ingestion_transactions(ingest_path)
         return empty
     if not os.path.isfile(quiz_path) or _path_has_link_or_reparse(quiz_path):
         raise ValueError(
@@ -4349,6 +4494,11 @@ def _plan_staged_assets(stage_root, destination_root, raw_input, workspace):
         existing.get("content_units"),
         workspace=identity_workspace,
     )
+    candidate_policy = {
+        "quiz_rows": quiz_rows, "teaching_rows": teaching_rows,
+        "content_units": content_units,
+        "item_groups": candidate_audit["item_groups"],
+    }
     staged_keys = {
         (workspace_asset_identity_key(record["workspace_path"], identity_workspace)
          if identity_workspace is not None else record["key"])
@@ -4371,6 +4521,7 @@ def _plan_staged_assets(stage_root, destination_root, raw_input, workspace):
     if _path_has_link_or_reparse(destination_root):
         raise ValueError("destination asset root is link/reparse-backed")
     publication = []
+    promotion_requests = []
     for record in staged:
         comparison_key = (
             workspace_asset_identity_key(
@@ -4379,11 +4530,18 @@ def _plan_staged_assets(stage_root, destination_root, raw_input, workspace):
         )
         old_roles = existing_roles.get(comparison_key, set())
         new_roles = candidate_roles.get(comparison_key, set())
+        role_changed = bool(old_roles and old_roles != new_roles)
+        promotes_to_student_attempt = (
+            role_changed
+            and old_roles == {"answer_context"}
+            and new_roles == {STUDENT_ATTEMPT}
+        )
         if old_roles:
             # The policy audits above decide whether a role combination is legal.
-            # Publication only permits an idempotent rebuild of the exact same
-            # physical asset ownership; any role-set change is rejected.
-            if old_roles != new_roles:
+            # Publication permits an idempotent rebuild or the one monotonic
+            # promotion above.  Byte identity is still checked below before a
+            # promotion becomes part of the immutable plan.
+            if role_changed and not promotes_to_student_attempt:
                 raise ValueError(
                     "staged target conflicts with existing workspace ownership: %s "
                     "(%s -> %s)" % (
@@ -4409,6 +4567,12 @@ def _plan_staged_assets(stage_root, destination_root, raw_input, workspace):
                     "refusing to overwrite an existing asset target with different bytes: %s"
                     % record["workspace_path"]
                 )
+            if promotes_to_student_attempt:
+                promotion_requests.append((
+                    comparison_key,
+                    record["workspace_path"],
+                    hashlib.sha256(record["payload"]).hexdigest(),
+                ))
             publication.append((record, destination, False))
         else:
             if old_roles:
@@ -4418,10 +4582,71 @@ def _plan_staged_assets(stage_root, destination_root, raw_input, workspace):
                 )
             publication.append((record, destination, True))
 
+    role_promotions = legacy_attempt_promotion_receipts(
+        tuple((path, sha256) for _identity, path, sha256 in promotion_requests),
+        existing,
+        candidate_policy,
+        identity_workspace,
+    ) if promotion_requests else ()
+    promotion_authorizations = tuple(
+        (request[0], receipt)
+        for request, receipt in zip(promotion_requests, role_promotions)
+    )
     return {
         "destination_root": destination_root,
         "publication": tuple(publication),
+        "role_promotions": tuple(role_promotions),
+        "promotion_authorizations": promotion_authorizations,
+        "promotion_workspace": identity_workspace,
+        "promotion_candidate_policy": (
+            copy.deepcopy(candidate_policy) if role_promotions else None
+        ),
+        "promotion_candidate_findings": (
+            (tuple(candidate_audit["invalid_declarations"]),
+             tuple(candidate_audit["conflicts"])) if role_promotions else None
+        ),
     }
+
+
+def _recheck_role_promotions(plan):
+    authorizations = plan.get("promotion_authorizations") or ()
+    if not authorizations:
+        return
+    workspace = plan.get("promotion_workspace")
+    live = _existing_workspace_asset_policy(workspace)
+    if (live.get("unsafe_paths") or live.get("conflicts")):
+        raise ValueError("legacy asset promotion policy changed before publication")
+    frozen = plan.get("promotion_candidate_policy") or {}
+    candidate_audit = audit_asset_policy(
+        quiz_rows=frozen.get("quiz_rows"),
+        teaching_rows=frozen.get("teaching_rows"),
+        content_units=frozen.get("content_units"),
+        workspace=workspace,
+        allow_missing_workspace_assets=True,
+    )
+    findings = (
+        tuple(candidate_audit["invalid_declarations"]),
+        tuple(candidate_audit["conflicts"]),
+    )
+    if findings != plan.get("promotion_candidate_findings"):
+        raise ValueError("legacy candidate asset policy drifted before publication")
+    candidate_policy = dict(frozen)
+    candidate_policy["item_groups"] = candidate_audit["item_groups"]
+    for planned_identity, receipt in authorizations:
+        current_identity = workspace_asset_identity_key(receipt["path"], workspace)
+        if current_identity != planned_identity:
+            raise ValueError("legacy asset promotion authority drifted before publication")
+    verified_receipts = legacy_attempt_promotion_receipts(
+        tuple((receipt["path"], receipt["sha256"])
+              for _identity, receipt in authorizations),
+        live,
+        candidate_policy,
+        workspace,
+    )
+    for (_planned_identity, receipt), verified in zip(
+            authorizations, verified_receipts):
+        if verified != receipt:
+            raise ValueError("legacy asset promotion provenance drifted before publication")
 
 
 def _publish_asset_plan(plan, journal=None):
@@ -4439,6 +4664,7 @@ def _publish_asset_plan(plan, journal=None):
     created_files = journal["created_files"]
     created_dirs = journal["created_dirs"]
     try:
+        _recheck_role_promotions(plan)
         if _path_has_link_or_reparse(destination_root):
             raise ValueError("destination asset root changed after publication preflight")
         missing_root_dirs = []
@@ -4777,7 +5003,25 @@ def _rollback_asset_journal(journal):
     return failures
 
 
-def _publish_builder_transaction(json_publications, asset_plans=()):
+def _retain_publication_blockers(entries, blockers, attempted_paths):
+    """Keep the current fail-closed marker after an incomplete rollback."""
+
+    failures = []
+    attempted = set(attempted_paths)
+    payloads = {
+        entry["path"]: entry["payload"] for entry in entries
+        if entry["path"] in blockers
+    }
+    for path in sorted(blockers & attempted):
+        try:
+            _atomic_restore_publication_bytes(path, payloads[path])
+        except OSError as exc:
+            failures.append("%s: %s" % (path, exc))
+    return failures
+
+
+def _publish_builder_transaction(
+        json_publications, asset_plans=(), blocker_paths=()):
     """Commit every builder JSON and asset as one rollback-protected batch."""
 
     stage_journal = {"entries": [], "states": {}, "created_dirs": []}
@@ -4786,9 +5030,25 @@ def _publish_builder_transaction(json_publications, asset_plans=()):
     json_created_dirs = stage_journal["created_dirs"]
     asset_journals = []
     attempted = []
+    blockers = {os.path.abspath(str(path)) for path in blocker_paths or ()}
     try:
         _stage_json_publications(json_publications, journal=stage_journal)
         states = stage_journal["states"]
+        staged_paths = {entry["path"] for entry in entries}
+        if not blockers.issubset(staged_paths):
+            raise ValueError("builder blocker path is not part of the JSON transaction")
+        # Publish the fail-closed marker before the first asset or source fact.
+        # A caught failure rolls it back with the rest of the batch; a hard
+        # process interruption leaves it visible so validators cannot accept a
+        # mixed builder/compiler generation.
+        for entry in entries:
+            path = entry["path"]
+            if path not in blockers:
+                continue
+            _revalidate_publication_target(path, states[path])
+            attempted.append(path)
+            _replace_publication_stage(entry["temporary"], path)
+            entry["temporary"] = None
         for plan in asset_plans or ():
             # Register the journal with the outer transaction before the first
             # asset mutation, so even a failure after the inner publisher's
@@ -4796,8 +5056,15 @@ def _publish_builder_transaction(json_publications, asset_plans=()):
             journal = {"created_files": [], "created_dirs": []}
             asset_journals.append(journal)
             _publish_asset_plan(plan, journal=journal)
+        # Rebind migration authority after all asset work and immediately
+        # before the first JSON replacement.  This catches a hardlink/identity
+        # change introduced inside the publication window.
+        for plan in asset_plans or ():
+            _recheck_role_promotions(plan)
         for entry in entries:
             path = entry["path"]
+            if path in blockers:
+                continue
             _revalidate_publication_target(path, states[path])
             attempted.append(path)
             _replace_publication_stage(entry["temporary"], path)
@@ -4806,8 +5073,25 @@ def _publish_builder_transaction(json_publications, asset_plans=()):
         rollback_failures = _cleanup_staged_json(entries)
         for journal in reversed(asset_journals):
             rollback_failures.extend(_rollback_asset_journal(journal))
-        rollback_failures.extend(_restore_publication_targets(states, attempted))
-        rollback_failures.extend(_remove_created_directories(json_created_dirs))
+        non_blockers = [path for path in attempted if path not in blockers]
+        blocker_attempts = [path for path in attempted if path in blockers]
+        rollback_failures.extend(
+            _restore_publication_targets(states, non_blockers)
+        )
+        if rollback_failures:
+            # Never erase the only validator-visible blocker while another
+            # asset/JSON rollback is incomplete.  Re-publish its staged bytes
+            # even if an earlier rollback step happened to disturb it.
+            rollback_failures.extend(
+                _retain_publication_blockers(entries, blockers, attempted)
+            )
+        else:
+            rollback_failures.extend(
+                _restore_publication_targets(states, blocker_attempts)
+            )
+            rollback_failures.extend(
+                _remove_created_directories(json_created_dirs)
+            )
         if rollback_failures:
             raise OSError(
                 "builder publication rollback failed: %s"
@@ -4844,6 +5128,10 @@ def _run_unlocked(
             plan = _plan_staged_assets(
                 stage_root, original_root, raw_input, workspace
             )
+            if plan.get("role_promotions"):
+                report.setdefault("asset_role_promotions", []).extend(
+                    plan["role_promotions"]
+                )
             if deferred_asset_plans is None:
                 _publish_asset_plan(plan)
             else:
@@ -4920,6 +5208,12 @@ def _main_locked(args, backend=None, publication_workspace=None):
                 print("[!] AI 接管清单：%d 条未能自动处理的材料 → %s（请逐条处理）"
                       % (len(report["ai_review"]), mp))
         return code
+    if any(plan.get("role_promotions") for plan in asset_plans):
+        sys.stderr.write(
+            "legacy asset-role migration requires scripts/ingest_course.py so "
+            "the builder-to-compiler generation remains fail closed\n"
+        )
+        return 5
     manifest_path = os.path.join(os.path.dirname(os.path.abspath(args.report)), "ai_review_manifest.json")
     _publish_builder_transaction(
         (

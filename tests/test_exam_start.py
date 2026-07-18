@@ -11,12 +11,17 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import exam_start
+from scripts.material_generation import (
+    build_pending_generation,
+    material_recovery_path,
+    validate_runtime_recovery_log,
+)
 
 
 class ExamStartTest(unittest.TestCase):
     def _run(self, home, arguments):
         output = io.StringIO()
-        if arguments and arguments[0] == "confirm":
+        if arguments and arguments[0] in ("confirm", "recover-material-build"):
             # Confirm intentionally captures twice (write, then fail-closed
             # verification). Freeze one real snapshot so unrelated parallel
             # repository edits cannot make this unit test nondeterministic.
@@ -30,6 +35,16 @@ class ExamStartTest(unittest.TestCase):
                 contextlib.redirect_stdout(output):
             code = exam_start.run(arguments + ["--json"])
         return code, json.loads(output.getvalue())
+
+    @staticmethod
+    def _write_json(path, value):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, indent=2
+        ) + "\n"
+        with open(path, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(payload)
+        return exam_start.hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _fake_package(root):
@@ -209,6 +224,64 @@ class ExamStartTest(unittest.TestCase):
                 "materials_mismatch",
                 mismatch["workspace_confirmation"]["reason"],
             )
+
+    def test_pending_runtime_loss_requires_explicit_generation_bound_recovery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "registry"
+            materials = root / "materials"
+            workspace = root / "workspace"
+            materials.mkdir()
+            common = [
+                "--course", "EEC160", "--materials", str(materials),
+                "--workspace", str(workspace), "--mode", "from_scratch",
+                "--time-budget", "le1d", "--language", "en",
+            ]
+            code, _payload = self._run(home, ["confirm"] + common)
+            self.assertEqual(0, code)
+
+            raw = {
+                "quiz_bank": [], "teaching_examples": [],
+                "ingestion": {"content_units": []},
+            }
+            report = {"asset_role_promotions": []}
+            raw_sha = self._write_json(
+                workspace / ".ingest" / "source_raw_input.json", raw
+            )
+            report_sha = self._write_json(
+                workspace / ".ingest" / "parse_report.json", report
+            )
+            pending = build_pending_generation(raw_sha, report_sha, raw, report)
+            self._write_json(
+                workspace / ".ingest" / "material_build_pending.json", pending
+            )
+            (workspace / "exam_runtime_receipt.json").unlink()
+
+            blocked_code, blocked = self._run(home, ["confirm"] + common)
+            self.assertEqual(2, blocked_code, blocked)
+            self.assertEqual("material_build_recovery", blocked["failed_step"])
+            self.assertIn("recover-material-build", blocked["next_action"])
+            self.assertFalse((workspace / "exam_runtime_receipt.json").exists())
+
+            recovered_code, recovered = self._run(home, [
+                "recover-material-build", "--materials", str(materials),
+                "--workspace", str(workspace), "--action", "resume",
+            ])
+            self.assertEqual(0, recovered_code, recovered)
+            self.assertTrue(recovered["ready_to_ingest"])
+            self.assertEqual(pending["generation_id"], recovered["generation_id"])
+            recovery_path = workspace.joinpath(*material_recovery_path(
+                pending["generation_id"]
+            ).split("/"))
+            recovery_log = json.loads(recovery_path.read_text(encoding="utf-8"))
+            validate_runtime_recovery_log(recovery_log)
+            authorization = recovery_log["records"][-1]["authorization"]
+            self.assertEqual("resume", authorization["action"])
+            self.assertEqual(pending["generation_id"],
+                             authorization["pending"]["generation_id"])
+            self.assertEqual("missing",
+                             authorization["previous_runtime_receipt"]["state"])
+            self.assertTrue((workspace / "exam_runtime_receipt.json").is_file())
 
     def test_reconfirm_transfers_one_workspace_and_legacy_duplicates_fail_closed(self):
         with tempfile.TemporaryDirectory() as temp:

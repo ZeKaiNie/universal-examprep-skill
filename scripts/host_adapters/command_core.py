@@ -229,6 +229,9 @@ def collect_dependency_snapshot(workspace):
 
     records = []
     directories = []
+    generation_roots = []
+    generation_directories = []
+    generation_records = []
     total_bytes = 0
     total_path_bytes = 0
     path_count = 0
@@ -242,6 +245,18 @@ def collect_dependency_snapshot(workspace):
                 or not os.path.isdir(root["path"])
                 or is_link_or_reparse(root["path"])):
             raise CommandCoreError("dependency snapshot root is unsafe or over-bound")
+        try:
+            root_stat = os.stat(root["path"], follow_symlinks=False)
+        except OSError as exc:
+            raise CommandCoreError(
+                "cannot stat dependency snapshot root %s: %s"
+                % (root["path"], exc)
+            ) from exc
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise CommandCoreError("dependency snapshot root is not a directory")
+        generation_roots.append({
+            "root": root["name"], "identity": list(_stat_identity(root_stat)),
+        })
         for directory, names, files in os.walk(
                 root["path"], topdown=True, onerror=walk_error, followlinks=False):
             names.sort()
@@ -276,6 +291,20 @@ def collect_dependency_snapshot(workspace):
                     raise CommandCoreError(
                         "dependency snapshot path data exceeds its bounded limits")
                 directories.append({"root": root["name"], "path": relative})
+                try:
+                    directory_stat = os.stat(candidate, follow_symlinks=False)
+                except OSError as exc:
+                    raise CommandCoreError(
+                        "cannot stat dependency directory %s: %s"
+                        % (candidate, exc)
+                    ) from exc
+                if not stat.S_ISDIR(directory_stat.st_mode):
+                    raise CommandCoreError(
+                        "dependency snapshot directory changed type: %s" % candidate)
+                generation_directories.append({
+                    "root": root["name"], "path": relative,
+                    "identity": list(_stat_identity(directory_stat)),
+                })
                 retained_names.append(name)
             names[:] = retained_names
             for name in files:
@@ -323,6 +352,10 @@ def collect_dependency_snapshot(workspace):
                     "root": root["name"], "path": relative,
                     "size_bytes": file_stat.st_size, "sha256": digest,
                 })
+                generation_records.append({
+                    "root": root["name"], "path": relative,
+                    "identity": list(_stat_identity(file_stat)),
+                })
     if _snapshot_source_root(workspace) != source_root:
         raise CommandCoreError(
             "dependency source root changed while snapshot was being collected")
@@ -351,10 +384,24 @@ def collect_dependency_snapshot(workspace):
         "file_count": len(content_records),
         "total_bytes": sum(row["size_bytes"] for row in content_records),
     }
+    # This private witness deliberately stays out of the portable public
+    # receipt: it binds filesystem generations (identity + timestamps), not
+    # just bytes.  Host-side before/after checks can therefore reject an
+    # A->B->A rewrite whose final bytes reproduce A.  Normal coordinated
+    # writers use atomic replacement, so inode/change metadata makes that ABA
+    # visible even when size and SHA-256 return to their original values.
+    generation_basis = {
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "algorithm": "stat-tree-generation-v1",
+        "roots": generation_roots,
+        "directories": generation_directories,
+        "records": generation_records,
+    }
     return dict(
         basis,
         snapshot_sha256=_canonical_sha256(basis),
         content_sha256=_canonical_sha256(content_basis),
+        _generation_sha256=_canonical_sha256(generation_basis),
     )
 
 
@@ -618,17 +665,30 @@ def validate_workspace(workspace, chapter=None, runner=None):
         if type(chapter) is not int or chapter < 1:
             raise CommandCoreError("chapter must be a positive integer")
         argv.extend(("--chapter", str(chapter)))
-    snapshot_before = dependency_snapshot_receipt(
-        collect_dependency_snapshot(workspace))
+    # Materialize and briefly hold the same read-only lock files the child
+    # validator uses before recording the generation witness.  Lock files are excluded
+    # from the public tree; without this endpoint guard, their first creation
+    # would legitimately advance the parent directory metadata and look like
+    # an ABA rewrite on an otherwise untouched fresh workspace.
+    with _completion_guard(workspace):
+        snapshot_before = collect_dependency_snapshot(workspace)
+    snapshot_before_receipt = dependency_snapshot_receipt(snapshot_before)
     receipt = run_json_command("validate_workspace", argv, runner=runner)
     actual_chapter = receipt["payload"]["capabilities"]["chapter"]
     if chapter is not None and actual_chapter != chapter:
         raise CommandCoreError("validator capability chapter disagrees with requested chapter")
     snapshot_document = receipt["payload"].get("dependency_snapshot")
-    assert_dependency_snapshot_current(snapshot_document, workspace)
-    if snapshot_before != snapshot_document:
+    with _completion_guard(workspace):
+        snapshot_after = assert_dependency_snapshot_current(
+            snapshot_document, workspace)
+    if snapshot_before_receipt != snapshot_document:
         raise CommandCoreError(
             "workspace dependencies changed while validate_workspace was running")
+    if (snapshot_before.get("_generation_sha256")
+            != snapshot_after.get("_generation_sha256")):
+        raise CommandCoreError(
+            "workspace dependency generation changed while validate_workspace "
+            "was running (possible ABA rewrite)")
     receipt["binding"] = validation_binding(
         receipt["payload"], actual_chapter, snapshot_document["content_sha256"])
     return receipt
@@ -674,27 +734,59 @@ def progress_show(workspace, runner=None):
 @contextmanager
 def _completion_guard(workspace):
     try:
-        from ..ingestion import workspace_publication_lock
+        from ..ingestion import ConflictError, workspace_validation_lock
     except (ImportError, ValueError):
-        from ingestion import workspace_publication_lock
-    with workspace_publication_lock(workspace):
-        yield
+        from ingestion import ConflictError, workspace_validation_lock
+    try:
+        # A completion endpoint is read-only.  The validation lock uses the
+        # same state->ingestion ordering as publishers but never performs the
+        # mutation lock's interrupted-transaction recovery side effect.
+        with workspace_validation_lock(workspace):
+            yield
+    except (ConflictError, OSError, ValueError) as exc:
+        raise CommandCoreError(
+            "host endpoint snapshot lock is unavailable: %s" % exc) from exc
 
 
 def completion_snapshot(workspace, chapter=None, runner=None):
-    """Read validation and progress from one locked, post-checked dependency state."""
+    """Bind validation and progress to one quiescent dependency generation.
+
+    Child commands must acquire the workspace validation/state locks themselves,
+    so no subprocess is started while the parent holds a workspace lock.  The
+    parent instead takes short read-locked endpoint snapshots and rejects byte drift,
+    generation drift (including ordinary A->B->A rewrites), or a progress state
+    that is not part of the validator's exact dependency tree.
+    """
 
     workspace = _absolute(workspace, "workspace")
+    # Establish A while every coordinated state/artifact writer is excluded,
+    # then release the lock before spawning validate_workspace.
     with _completion_guard(workspace):
         baseline = collect_dependency_snapshot(workspace)
-        validation_receipt = validate_workspace(
-            workspace, chapter=chapter, runner=runner)
-        dependency_snapshot = validation_receipt["payload"]["dependency_snapshot"]
-        if dependency_snapshot_receipt(baseline) != dependency_snapshot:
+
+    validation_receipt = validate_workspace(
+        workspace, chapter=chapter, runner=runner)
+    dependency_snapshot = validation_receipt["payload"]["dependency_snapshot"]
+    if dependency_snapshot_receipt(baseline) != dependency_snapshot:
+        raise CommandCoreError(
+            "workspace dependencies changed before completion validation")
+
+    # progress_show is also kept outside the parent lock.  It binds its child
+    # payload to a stable read of study_state.json; the final locked snapshot
+    # below proves that exact state survived into the completion receipt.
+    progress_receipt = progress_show(workspace, runner=runner)
+
+    with _completion_guard(workspace):
+        final_snapshot = collect_dependency_snapshot(workspace)
+        if dependency_snapshot_receipt(final_snapshot) != dependency_snapshot:
             raise CommandCoreError(
-                "workspace dependencies changed before completion validation")
-        progress_receipt = progress_show(workspace, runner=runner)
-        state_record = next((row for row in baseline["records"]
+                "workspace dependencies changed across completion binding")
+        if (baseline.get("_generation_sha256")
+                != final_snapshot.get("_generation_sha256")):
+            raise CommandCoreError(
+                "workspace dependency generation changed across completion "
+                "binding (possible ABA rewrite)")
+        state_record = next((row for row in final_snapshot["records"]
                              if row["root"] == "workspace"
                              and row["path"] == "study_state.json"), None)
         state_binding = progress_receipt.get("state_binding") or {}
@@ -703,7 +795,6 @@ def completion_snapshot(workspace, chapter=None, runner=None):
                 or state_binding.get("size_bytes") != state_record.get("size_bytes")):
             raise CommandCoreError(
                 "progress state does not belong to the validated dependency snapshot")
-        assert_dependency_snapshot_current(dependency_snapshot, workspace)
         return {
             "schema_version": SCHEMA_VERSION,
             "validation_receipt": validation_receipt,

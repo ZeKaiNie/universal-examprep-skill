@@ -33,6 +33,7 @@ from image_validation import (
 )
 from asset_policy import audit_asset_policy as _audit_asset_policy
 from ingestion.identifiers import is_link_or_reparse
+from ingestion.storage import ConflictError, workspace_validation_lock
 from host_adapters.command_core import (
     CommandCoreError as _SnapshotError,
     collect_dependency_snapshot as _collect_dependency_snapshot,
@@ -439,13 +440,14 @@ def workspace_asset_policy_snapshot(ws):
         "tainted_keys": audit["tainted_keys"],
         "tainted_identity_keys": audit["tainted_identity_keys"],
         "conflicts": audit["conflicts"],
+        "item_groups": audit["item_groups"],
         # Preserve the established consumer key while broadening it from unsafe
         # paths to every malformed/unknown asset declaration.
         "unsafe_paths": audit["invalid_declarations"],
     }
 
 
-def validate(ws):
+def _validate_unlocked(ws):
     """Return (errors, warnings, stats). errors may carry level 'error' or 'fatal'."""
     errors, warnings, stats = [], [], {}
     ingestion_source_hashes = {}
@@ -498,11 +500,29 @@ def validate(ws):
                 or (ingest_real != ws_real and not ingest_real.startswith(ws_real + os.sep))):
             err(".ingest/ 不是工作区内的常规目录（拒绝读取结构化事实源）")
         else:
+            material_pending_path = os.path.join(
+                ingest_dir, "material_build_pending.json"
+            )
+            if os.path.lexists(material_pending_path):
+                if (_is_symlink(material_pending_path)
+                        or not os.path.isfile(material_pending_path)):
+                    err(
+                        ".ingest/material_build_pending.json is unsafe; "
+                        "the workspace remains blocked",
+                        level="fatal",
+                    )
+                else:
+                    err(
+                        ".ingest/material_build_pending.json means material "
+                        "compilation did not finish; rerun ingest.py or "
+                        "ingest_course.py before teaching"
+                    )
             try:
                 from ingestion import IngestionStore, read_json
                 from ingestion.pipeline import (
                     _validate_parser_review_consistency,
                     _validated_parser_receipts,
+                    verify_material_build_receipt,
                 )
                 from ingestion.dedup import validate_workspace_fact_integrity
             except ImportError as exc:
@@ -512,6 +532,7 @@ def validate(ws):
                 validate_workspace_fact_integrity = None
                 _validate_parser_review_consistency = None
                 _validated_parser_receipts = None
+                verify_material_build_receipt = None
 
             build_path = os.path.join(ingest_dir, "build_manifest.json")
             if not os.path.isfile(build_path) or _is_symlink(build_path):
@@ -523,6 +544,27 @@ def validate(ws):
                 except Exception as exc:
                     err(f".ingest/build_manifest.json 无法严格读取: {exc}", level="fatal")
                     build_manifest = None
+
+            if (isinstance(build_manifest, dict)
+                    and verify_material_build_receipt is not None):
+                try:
+                    verify_material_build_receipt(
+                        ws, build_manifest=build_manifest
+                    )
+                except Exception as exc:
+                    err(
+                        "material build generation receipt is invalid: %s" % exc,
+                        level="fatal",
+                    )
+
+            if isinstance(build_manifest, dict):
+                manifest_schema = build_manifest.get("schema_version")
+                if (type(manifest_schema) is not int
+                        or manifest_schema not in (1, 2)):
+                    err(
+                        ".ingest/build_manifest.json schema_version must be integer 1 or 2",
+                        level="fatal",
+                    )
 
             if isinstance(build_manifest, dict) and IngestionStore is not None:
                 pipeline_version = build_manifest.get("pipeline_version")
@@ -1758,6 +1800,28 @@ def validate(ws):
     return errors, warnings, stats
 
 
+def _validation_conflict_result(exc):
+    return ([{
+        "level": "fatal",
+        "msg": "workspace validation snapshot is unavailable: %s" % exc,
+    }], [], {})
+
+
+def validate(ws):
+    """Validate one lock-consistent workspace snapshot."""
+
+    if not os.path.isdir(ws):
+        return _validate_unlocked(ws)
+    try:
+        with workspace_validation_lock(ws):
+            return _validate_unlocked(ws)
+    except (ConflictError, OSError, ValueError) as exc:
+        # An unsafe workspace root or an unavailable lock must never downgrade
+        # into an unlocked read.  Doing so would reintroduce the mixed-snapshot
+        # window this wrapper exists to close.
+        return _validation_conflict_result(exc)
+
+
 def _exit_code(errors):
     if any(e.get("level") == "fatal" for e in errors):
         return 2
@@ -1858,50 +1922,81 @@ def main(argv=None):
     if args.dependency_snapshot and args.details_file:
         ap.error("--dependency-snapshot cannot be combined with --details-file")
 
-    dependency_snapshot = None
-    snapshot_before = None
-    snapshot_failure = None
     snapshot_workspace = os.path.abspath(args.workspace)
-    if args.dependency_snapshot:
-        try:
-            snapshot_before = _collect_dependency_snapshot(snapshot_workspace)
-        except _SnapshotError as exc:
-            snapshot_failure = str(exc)
 
-    if snapshot_failure is None:
-        errors, warnings, stats = validate(args.workspace)
-        capabilities = _readiness_matrix.capability_readiness(
-            args.workspace, errors, warnings, stats, chapter=args.chapter
-        )
-    else:
-        errors = [{
-            "level": "fatal",
-            "msg": "dependency_snapshot_failed before validation: %s" % snapshot_failure,
-        }]
-        warnings = []
-        stats = {}
-        capabilities = _snapshot_blocked_capabilities(
-            args.chapter, "dependency_snapshot_failed")
+    def locked_validation_generation():
+        """Create the dependency receipt around the reads it authenticates.
 
-    if args.dependency_snapshot and snapshot_failure is None:
-        try:
-            snapshot_after = _collect_dependency_snapshot(snapshot_workspace)
-        except _SnapshotError as exc:
-            snapshot_failure = str(exc)
+        The caller holds ``workspace_validation_lock`` for this entire helper
+        when the workspace exists.  In particular, neither snapshot endpoint
+        may sit outside the lock: otherwise A -> validate(B) -> A can sign a B
+        result with an A receipt.
+        """
+
+        dependency_snapshot = None
+        snapshot_before = None
+        snapshot_failure = None
+        if args.dependency_snapshot:
+            try:
+                snapshot_before = _collect_dependency_snapshot(snapshot_workspace)
+            except _SnapshotError as exc:
+                snapshot_failure = str(exc)
+
+        if snapshot_failure is None:
+            errors, warnings, stats = _validate_unlocked(args.workspace)
+            capabilities = _readiness_matrix.capability_readiness(
+                args.workspace, errors, warnings, stats, chapter=args.chapter
+            )
         else:
-            before_receipt = _dependency_snapshot_receipt(snapshot_before)
-            after_receipt = _dependency_snapshot_receipt(snapshot_after)
-            if before_receipt != after_receipt:
-                snapshot_failure = "dependencies changed across validator reads"
-            else:
-                dependency_snapshot = after_receipt
-        if snapshot_failure is not None:
-            errors.append({
+            errors = [{
                 "level": "fatal",
-                "msg": "dependency_snapshot_drift: %s" % snapshot_failure,
-            })
+                "msg": "dependency_snapshot_failed before validation: %s"
+                       % snapshot_failure,
+            }]
+            warnings = []
+            stats = {}
             capabilities = _snapshot_blocked_capabilities(
-                capabilities.get("chapter"), "dependency_snapshot_drift")
+                args.chapter, "dependency_snapshot_failed")
+
+        if args.dependency_snapshot and snapshot_failure is None:
+            try:
+                snapshot_after = _collect_dependency_snapshot(snapshot_workspace)
+            except _SnapshotError as exc:
+                snapshot_failure = str(exc)
+            else:
+                before_receipt = _dependency_snapshot_receipt(snapshot_before)
+                after_receipt = _dependency_snapshot_receipt(snapshot_after)
+                if before_receipt != after_receipt:
+                    snapshot_failure = "dependencies changed across validator reads"
+                elif (snapshot_before.get("_generation_sha256")
+                      != snapshot_after.get("_generation_sha256")):
+                    snapshot_failure = (
+                        "dependency generation changed across validator reads "
+                        "(possible ABA rewrite)"
+                    )
+                else:
+                    dependency_snapshot = after_receipt
+            if snapshot_failure is not None:
+                errors.append({
+                    "level": "fatal",
+                    "msg": "dependency_snapshot_drift: %s" % snapshot_failure,
+                })
+                capabilities = _snapshot_blocked_capabilities(
+                    capabilities.get("chapter"), "dependency_snapshot_drift")
+        return errors, warnings, stats, capabilities, dependency_snapshot
+
+    try:
+        if not os.path.isdir(args.workspace):
+            result = locked_validation_generation()
+        else:
+            with workspace_validation_lock(args.workspace):
+                result = locked_validation_generation()
+        errors, warnings, stats, capabilities, dependency_snapshot = result
+    except (ConflictError, OSError, ValueError) as exc:
+        errors, warnings, stats = _validation_conflict_result(exc)
+        capabilities = _snapshot_blocked_capabilities(
+            args.chapter, "workspace_snapshot_unavailable")
+        dependency_snapshot = None
 
     code = _exit_code(errors)
     readiness = _readiness(errors, warnings)

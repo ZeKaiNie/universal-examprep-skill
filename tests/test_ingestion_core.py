@@ -1,6 +1,9 @@
 import copy
 import hashlib
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,6 +29,7 @@ from scripts.ingestion import (
     normalize_workspace_path,
     read_json,
     read_jsonl,
+    workspace_publication_lock,
 )
 
 
@@ -852,6 +856,69 @@ class IngestionCoreTest(unittest.TestCase):
         self.assertTrue(sentinel.exists())
         self.assertTrue(self.store.pending_ingest_path.exists())
         self.assertTrue(transaction.exists())
+
+    def test_hard_crash_restores_material_blocker_and_all_targets(self):
+        old_target = self.workspace / "old-target.txt"
+        new_target = self.workspace / "new-target.txt"
+        old_target.write_bytes(b"old generation")
+        self.store.material_build_pending_path.parent.mkdir(
+            parents=True, exist_ok=True
+        )
+        self.store.material_build_pending_path.write_bytes(b"pending generation")
+        script = (
+            "import os; from pathlib import Path; "
+            "from scripts.ingestion import IngestionStore; "
+            "root=Path(%r); store=IngestionStore(root); "
+            "old=root/'old-target.txt'; new=root/'new-target.txt'; "
+            "lock=store.mutation_lock(allow_material_generation=True); "
+            "lock.__enter__(); tx=store.ingest_transaction(["
+            "'old-target.txt','new-target.txt',"
+            "'.ingest/material_build_pending.json']); tx.__enter__(); "
+            "old.write_bytes(b'partial generation'); "
+            "new.write_bytes(b'new partial file'); "
+            "store.material_build_pending_path.unlink(); os._exit(73)"
+        ) % str(self.workspace)
+        crashed = subprocess.run([sys.executable, "-B", "-c", script])
+        self.assertEqual(73, crashed.returncode)
+        self.assertEqual(b"partial generation", old_target.read_bytes())
+        self.assertEqual(b"new partial file", new_target.read_bytes())
+        self.assertFalse(self.store.material_build_pending_path.exists())
+        self.assertTrue(self.store.pending_ingest_path.exists())
+
+        with self.assertRaisesRegex(
+                ConflictError, "requires recovery before validation"):
+            with self.store.validation_lock():
+                pass
+        self.assertEqual(b"partial generation", old_target.read_bytes())
+
+        # Mutation recovery runs first, then the restored material blocker
+        # prevents this ordinary mutation from proceeding.
+        with self.assertRaisesRegex(
+                ConflictError, "material_build_pending.json"):
+            with self.store.mutation_lock():
+                pass
+        self.assertEqual(b"old generation", old_target.read_bytes())
+        self.assertFalse(new_target.exists())
+        self.assertEqual(
+            b"pending generation",
+            self.store.material_build_pending_path.read_bytes(),
+        )
+        self.assertFalse(self.store.pending_ingest_path.exists())
+        self.assertEqual([], list(self.store.transactions_path.iterdir()))
+
+    def test_material_pending_blocks_ordinary_publication_lock(self):
+        self.store.material_build_pending_path.parent.mkdir(
+            parents=True, exist_ok=True
+        )
+        self.store.material_build_pending_path.write_bytes(b"pending")
+
+        with self.assertRaisesRegex(
+                ConflictError, "material_build_pending.json"):
+            with workspace_publication_lock(self.workspace):
+                pass
+        with workspace_publication_lock(
+                self.workspace, allow_material_generation=True):
+            self.assertTrue(self.store.material_build_pending_path.exists())
 
     def test_assign_chapter_inherits_to_cross_source_paired_answer(self):
         solution_path = self.workspace / "materials" / "solutions.pdf"

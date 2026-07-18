@@ -26,9 +26,17 @@ SCRIPTS = os.path.join(REPO_ROOT, "scripts")
 sys.path.insert(0, SCRIPTS)
 
 from scripts import ingest as ingest_module
+from scripts import validate_workspace
 from scripts.ingestion import ContentUnit
-from scripts.ingestion.pipeline import build_payload
-from scripts.ingestion.storage import workspace_publication_lock
+from scripts.ingestion.pipeline import build_payload, verify_material_build_receipt
+from scripts.ingestion.storage import atomic_write_json, workspace_publication_lock
+from scripts.material_generation import (
+    append_runtime_recovery,
+    build_pending_generation,
+    build_runtime_recovery,
+    json_sha256,
+    material_recovery_path,
+)
 UnsafePathError = ingest_module.UnsafePathError
 
 INGEST = os.path.join(SCRIPTS, "ingest.py")
@@ -64,6 +72,11 @@ def run_ingest(input_obj, out_dir, *extra):
 def read(*parts):
     with open(os.path.join(*parts), encoding="utf-8") as f:
         return f.read()
+
+
+def read_bytes(*parts):
+    with open(os.path.join(*parts), "rb") as stream:
+        return stream.read()
 
 
 class IngestEndToEndTest(unittest.TestCase):
@@ -337,6 +350,262 @@ class IngestEndToEndTest(unittest.TestCase):
         self.assertFalse(os.path.exists(
             os.path.join(workspace, "references", "wiki", "ch1.md")
         ))
+
+    def test_pending_generation_rolls_back_late_compile_failure_and_retries(self):
+        workspace, input_obj = self.structured_input()
+        input_obj["terms"] = {"legacy glossary": ["stale expansion"]}
+        first = run_ingest(input_obj, workspace)
+        self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+
+        critical = [
+            ".ingest/build_manifest.json",
+            ".ingest/base_content_units.jsonl",
+            ".ingest/content_units.jsonl",
+            "references/wiki/ch1.md",
+            "references/quiz_bank.json",
+            "references/teaching_examples.json",
+            "references/teaching_baseline.json",
+            "references/retrieval_index.json",
+            "references/terms.json",
+            "ingest_report.json",
+            "study_plan.md",
+        ]
+        baseline = {
+            relative: read_bytes(workspace, *relative.split("/"))
+            for relative in critical
+        }
+        ingest_dir = os.path.join(workspace, ".ingest")
+        raw_path = os.path.join(ingest_dir, "source_raw_input.json")
+        report_path = os.path.join(ingest_dir, "parse_report.json")
+        pending_path = os.path.join(ingest_dir, "material_build_pending.json")
+        raw_obj = json.loads(json.dumps(input_obj, ensure_ascii=False))
+        raw_obj.pop("terms")
+        ingest_module.validate(raw_obj)
+        atomic_write_json(raw_path, raw_obj)
+        report = {"asset_role_promotions": [], "warnings": [], "ai_review": []}
+        atomic_write_json(report_path, report)
+        manifest_sha = hashlib.sha256(
+            read_bytes(ingest_dir, "build_manifest.json")
+        ).hexdigest()
+        pending = build_pending_generation(
+            hashlib.sha256(read_bytes(raw_path)).hexdigest(),
+            hashlib.sha256(read_bytes(report_path)).hexdigest(),
+            raw_obj,
+            report,
+            manifest_sha,
+        )
+        atomic_write_json(pending_path, pending)
+        expected_sha = hashlib.sha256(read_bytes(raw_path)).hexdigest()
+        argv = [
+            INGEST, "-i", raw_path, "-o", workspace,
+            "--expected-input-sha256", expected_sha,
+        ]
+
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                ingest_module, "_compile_visuals_unlocked",
+                side_effect=RuntimeError("injected late compiler failure")), \
+                redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+            ingest_module.main()
+
+        self.assertTrue(os.path.isfile(pending_path))
+        self.assertFalse(os.path.exists(
+            os.path.join(ingest_dir, "pending_ingest.json")
+        ))
+        for relative, expected in baseline.items():
+            with open(os.path.join(workspace, *relative.split("/")), "rb") as stream:
+                self.assertEqual(expected, stream.read(), relative)
+        self.assertFalse(os.path.exists(
+            os.path.join(ingest_dir, "material_build_receipt.json")
+        ))
+
+        with mock.patch.object(sys, "argv", argv), redirect_stdout(io.StringIO()):
+            ingest_module.main()
+        self.assertFalse(os.path.exists(pending_path))
+        self.assertFalse(os.path.exists(
+            os.path.join(workspace, "references", "terms.json")
+        ))
+        receipt_path = os.path.join(ingest_dir, "material_build_receipt.json")
+        self.assertTrue(os.path.isfile(receipt_path))
+        manifest_path = os.path.join(ingest_dir, "build_manifest.json")
+        manifest = json.loads(read(manifest_path))
+        self.assertEqual(2, manifest["schema_version"])
+        self.assertEqual(
+            json.loads(read(receipt_path))["generation_id"],
+            manifest["material_build"]["generation_id"],
+        )
+
+        # JSON booleans compare equal to integers in Python.  Neither the
+        # generation schema nor the manifest protocol may therefore rely on
+        # ordinary ``== 1`` equality.
+        valid_receipt = json.loads(read(receipt_path))
+        boolean_receipt = json.loads(json.dumps(valid_receipt))
+        boolean_receipt["schema_version"] = True
+        unsigned = dict(boolean_receipt)
+        unsigned.pop("status")
+        unsigned.pop("generation_id")
+        boolean_receipt["generation_id"] = json_sha256(unsigned)
+        atomic_write_json(receipt_path, boolean_receipt)
+        with self.assertRaisesRegex(ValueError, "generation schema"):
+            verify_material_build_receipt(workspace, required=True)
+        atomic_write_json(receipt_path, valid_receipt)
+
+        boolean_manifest = json.loads(json.dumps(manifest))
+        boolean_manifest["material_build"]["protocol_version"] = True
+        atomic_write_json(manifest_path, boolean_manifest)
+        with self.assertRaisesRegex(ValueError, "protocol_version"):
+            verify_material_build_receipt(workspace, required=True)
+        atomic_write_json(manifest_path, manifest)
+
+        # A current-protocol workspace cannot be downgraded by deleting both
+        # the receipt and its generic artifact row.
+        os.unlink(receipt_path)
+        manifest["artifacts"].pop("material_build_receipt")
+        atomic_write_json(manifest_path, manifest)
+        errors, _warnings, _stats = validate_workspace.validate(workspace)
+        self.assertTrue(errors)
+        self.assertIn(
+            "required material build receipt is missing",
+            " | ".join(row["msg"] for row in errors),
+        )
+
+    def test_completed_recovery_log_rolls_back_if_final_manifest_write_crashes(self):
+        workspace, input_obj = self.structured_input()
+        first = run_ingest(input_obj, workspace)
+        self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+
+        ingest_dir = os.path.join(workspace, ".ingest")
+        raw_path = os.path.join(ingest_dir, "source_raw_input.json")
+        report_path = os.path.join(ingest_dir, "parse_report.json")
+        pending_path = os.path.join(ingest_dir, "material_build_pending.json")
+        manifest_path = os.path.join(ingest_dir, "build_manifest.json")
+        receipt_path = os.path.join(ingest_dir, "material_build_receipt.json")
+        raw_obj = json.loads(json.dumps(input_obj, ensure_ascii=False))
+        ingest_module.validate(raw_obj)
+        atomic_write_json(raw_path, raw_obj)
+        report = {"asset_role_promotions": [], "warnings": [], "ai_review": []}
+        atomic_write_json(report_path, report)
+        pending = build_pending_generation(
+            hashlib.sha256(read_bytes(raw_path)).hexdigest(),
+            hashlib.sha256(read_bytes(report_path)).hexdigest(),
+            raw_obj,
+            report,
+            hashlib.sha256(read_bytes(manifest_path)).hexdigest(),
+        )
+        atomic_write_json(pending_path, pending)
+        recovery = build_runtime_recovery(
+            pending,
+            hashlib.sha256(read_bytes(pending_path)).hexdigest(),
+            "resume",
+            {
+                "path": "exam_runtime_receipt.json", "state": "missing",
+                "sha256": None, "runtime_digest": None,
+            },
+            {
+                "path": "exam_runtime_receipt.json", "state": "valid",
+                "sha256": "4" * 64, "runtime_digest": "5" * 64,
+            },
+            "2026-07-16T00:00:00Z",
+        )
+        recovery_relative = material_recovery_path(pending["generation_id"])
+        recovery_path = os.path.join(workspace, *recovery_relative.split("/"))
+        atomic_write_json(recovery_path, append_runtime_recovery(None, recovery))
+        baseline = {
+            "pending": read_bytes(pending_path),
+            "recovery": read_bytes(recovery_path),
+            "manifest": read_bytes(manifest_path),
+        }
+        argv = [
+            INGEST, "-i", raw_path, "-o", workspace,
+            "--expected-input-sha256",
+            hashlib.sha256(read_bytes(raw_path)).hexdigest(),
+        ]
+        finalizer_globals = ingest_module.finalize_material_build_generation.__globals__
+        original_atomic_write = finalizer_globals["atomic_write_json"]
+        observed_recovery_status = []
+
+        def crash_after_completed_log(path, value):
+            result = original_atomic_write(path, value)
+            # GitHub Windows TEMP may expose one physical file through an
+            # 8.3/reparse alias while the finalizer uses its resolved path.
+            # Compare file identity so the injected crash cannot miss there.
+            is_recovery_path = os.path.samefile(path, recovery_path)
+            if (is_recovery_path
+                    and isinstance(value, dict)
+                    and value.get("records")
+                    and (value["records"][-1].get("outcome") or {}).get(
+                        "status"
+                    ) == "completed"):
+                live = json.loads(read(recovery_path))
+                observed_recovery_status.append(
+                    live["records"][-1]["outcome"]["status"]
+                )
+                raise RuntimeError("injected crash after completed recovery log")
+            return result
+
+        with mock.patch.object(sys, "argv", argv), mock.patch.dict(
+                finalizer_globals, {"atomic_write_json": crash_after_completed_log}
+                ), redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+            ingest_module.main()
+
+        self.assertEqual(["completed"], observed_recovery_status)
+        self.assertEqual(baseline["pending"], read_bytes(pending_path))
+        self.assertEqual(baseline["recovery"], read_bytes(recovery_path))
+        self.assertEqual(baseline["manifest"], read_bytes(manifest_path))
+        self.assertFalse(os.path.exists(receipt_path))
+        self.assertFalse(os.path.exists(
+            os.path.join(ingest_dir, "pending_ingest.json")
+        ))
+
+        with mock.patch.object(sys, "argv", argv), redirect_stdout(io.StringIO()):
+            ingest_module.main()
+        self.assertFalse(os.path.exists(pending_path))
+        completed = json.loads(read(recovery_path))
+        self.assertEqual(
+            "completed", completed["records"][-1]["outcome"]["status"]
+        )
+
+    def test_validator_rejects_invalid_legacy_build_manifest_schema(self):
+        workspace, input_obj = self.structured_input()
+        compiled = run_ingest(input_obj, workspace)
+        self.assertEqual(0, compiled.returncode, compiled.stdout + compiled.stderr)
+        errors, _warnings, _stats = validate_workspace.validate(workspace)
+        self.assertNotIn(
+            "schema_version must be integer 1 or 2",
+            " | ".join(row["msg"] for row in errors),
+        )
+
+        manifest_path = os.path.join(
+            workspace, ".ingest", "build_manifest.json"
+        )
+        manifest = json.loads(read(manifest_path))
+        manifest["schema_version"] = True
+        atomic_write_json(manifest_path, manifest)
+
+        errors, _warnings, _stats = validate_workspace.validate(workspace)
+        self.assertEqual(2, validate_workspace._exit_code(errors))
+        self.assertIn(
+            "schema_version must be integer 1 or 2",
+            " | ".join(row["msg"] for row in errors),
+        )
+
+    def test_malformed_terms_fail_before_glossary_publication(self):
+        malformed = (
+            ["not", "an", "object"],
+            {"probability": "概率"},
+            {"probability": []},
+            {" probability": ["概率"]},
+            {"probability": ["概率", "概率"]},
+        )
+        for index, terms in enumerate(malformed):
+            with self.subTest(terms=terms):
+                workspace = os.path.join(self.tmp, "bad-terms-%d" % index)
+                raw = json.loads(json.dumps(VALID, ensure_ascii=False))
+                raw["terms"] = terms
+                result = run_ingest(raw, workspace)
+                self.assertNotEqual(0, result.returncode)
+                self.assertFalse(os.path.exists(
+                    os.path.join(workspace, "references", "terms.json")
+                ))
 
     def test_path_guard_error_is_reported_without_traceback(self):
         output = io.StringIO()

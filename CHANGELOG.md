@@ -4,6 +4,13 @@
 
 ## Unreleased
 
+- **材料代次显式恢复与可审计替代**：Pending generation 遇到 runtime receipt 缺失/漂移时，普通 `confirm` 不再形成互锁或覆盖 provenance；新增 generation-bound `recover-material-build --action resume|supersede`。`resume` 只允许同代精确重建，candidate 不同即零发布失败；`supersede` 通过 schema `2` 逐条绑定 direct predecessor。Generation-addressed 恢复日志、64-event/64-edge/65-receipt 上限、compiler 全事务回滚、receipt completion 与 manifest 精确保留键/hash 集合共同阻止静默丢代、shortcut ancestry 与崩溃后的半完成状态。
+- **Builder→compiler 代际失败关闭**：`ingest_course.py` 只在 builder 成功时发布新一代，且在任何资产、raw input 或 parse report 变更前先写入 hash-bound `material_build_pending.json`；builder 返回非零时不覆盖 canonical parse report/raw input，也不发布候选资产，而发布回滚若不完整则保留 blocker。Pending 绑定旧 build manifest、新 raw/report、完整候选资产策略与迁移收据；普通 mutation/publication（含 review、claim 与 Guide）以及 validation 在 pending 期间全部 fail closed。编译器只接受实际角色差异与收据一一对应的 `answer_context → student_attempt`。
+- **全编译器事务与可恢复意图**：material generation 的结构化事实、build manifest、wiki/题库/教学例题、检索索引、报告/计划及 pending→receipt 切换现在纳入同一个有界 `pending_ingest.json` 回滚事务。进程中断时 validator 拒绝读为 ready，下一次 mutation 先恢复全部登记 target 再继续；成功后写入 build-manifest schema `2` 的严格 `material_build` 契约与 raw/report/receipt 三元 hash，不得降格到 schema `1`。`ingest_course.py` 后置的 learner-state 初始化/偏好写入不在该编译事务内。
+- **旧版作业截图角色迁移**：仅在路径、章节/题目归属、作业来源、嵌套 provenance、源文件与资产 SHA-256、实时字节及物理文件身份全部唯一且一致时，允许把旧版 `answer_context` 精确升级为 `student_attempt`；候选策略会被冻结并在资产处理后、首个 JSON 替换前重新审计，任何别名、hardlink 或并发漂移都失败关闭。
+- **失败建库不再污染最后一次成功报告**：builder 返回非零时，`ingest_course.py` 不替换 canonical raw input、parse report 或公开资产；失败诊断只返回在当次命令 payload/stderr。Marker 仍只接受布尔值，成功却请求抑制发布、或使用非布尔值都会拒绝执行。
+- **跨平台发行包可复现且保持轻量**：`build_dist.py` 在压缩前把运行时文本统一规范化为 LF，并仅移除 Python tokenizer 标记为非语义布局的 `NL`；显著 token、AST、shebang 与编码声明均有回归保护。CRLF/LF checkout 因而生成同一份 ZIP，同时继续执行原有 570 KB 上限。
+
 - **完整章节 Study Guide 门禁**：`profile=full` 现在以当前章全部 teaching examples、全部 bank 记录（含 `gradable=false` 教学项）和 typed question units 为去重分母；章节/语言、题面替代、答案 provenance、notebook、逐字段 claim 与 live source revision 均在导入和渲染前失败关闭。
 - **来源与资产完整性**：统一按安全物理身份识别 hardlink/路径别名和全局 `student_attempt` 污染，绑定声明 SHA-256 与 live bytes；PNG/JPEG/WebP/GIF/BMP 使用共享严格解码校验，损坏图片不能进入建库、教学显示、Guide、QA 或小抄。
 - **整批原子发布与代际一致性**：builder、visual index、Study Guide 与 cheatsheet 的多文件/图片发布新增预检、journal、回滚及故障注入覆盖；normal ingestion 将编译输入绑定到 builder 产出的精确 raw-input generation，避免两次锁之间混入另一轮建库结果。

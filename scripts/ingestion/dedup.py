@@ -1390,7 +1390,8 @@ def validate_workspace_fact_integrity(workspace):
     manifest, manifest_capture = stable_read_json(manifest_path)
     manifest_sha256 = manifest_capture["sha256"]
     if (not isinstance(manifest, dict)
-            or manifest.get("schema_version") != 1
+            or type(manifest.get("schema_version")) is not int
+            or manifest.get("schema_version") not in (1, 2)
             or manifest.get("pipeline_version") != "ingestion-v2"):
         raise FactValidationError(
             "workspace fact integrity requires an ingestion-v2 build manifest"

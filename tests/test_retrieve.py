@@ -32,6 +32,10 @@ def make_ws(chunks, terms=None, write_index=True):
         with open(path, "w", encoding="utf-8") as f:
             f.write(c["text"])
     os.makedirs(os.path.join(ws, "references"), exist_ok=True)
+    terms_path = os.path.join(ws, "references", "terms.json")
+    if terms is not None:
+        with open(terms_path, "w", encoding="utf-8") as f:
+            json.dump(terms, f, ensure_ascii=False)
     if write_index:
         integrity = {"wiki": []}
         for relative in sorted({chunk["file"] for chunk in chunks}):
@@ -40,12 +44,15 @@ def make_ws(chunks, terms=None, write_index=True):
                     "file": relative,
                     "sha256": hashlib.sha256(stream.read()).hexdigest(),
                 })
+        if terms is not None:
+            with open(terms_path, "rb") as stream:
+                integrity["terms"] = {
+                    "file": "references/terms.json",
+                    "sha256": hashlib.sha256(stream.read()).hexdigest(),
+                }
         idx = retrieve.build_index(chunks, integrity=integrity)
         with open(os.path.join(ws, "references", "retrieval_index.json"), "w", encoding="utf-8") as f:
             json.dump(idx, f, ensure_ascii=False)
-    if terms is not None:
-        with open(os.path.join(ws, "references", "terms.json"), "w", encoding="utf-8") as f:
-            json.dump(terms, f, ensure_ascii=False)
     return ws
 
 
@@ -298,6 +305,53 @@ class CliContract(unittest.TestCase):
             # wiki/quiz/content index.
             with open(teaching_path, "w", encoding="utf-8") as stream:
                 json.dump([{"id": "new-example"}], stream)
+            with self.assertRaises(SystemExit):
+                retrieve.load_index(ws)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_present_terms_require_exact_integrity_binding(self):
+        ws = make_ws(CORPUS)
+        try:
+            terms_relative = "references/terms.json"
+            terms_path = os.path.join(ws, *terms_relative.split("/"))
+            with open(terms_path, "w", encoding="utf-8") as stream:
+                json.dump({"旁观者效应": ["bystander effect"]}, stream,
+                          ensure_ascii=False)
+
+            with self.assertRaises(SystemExit):
+                retrieve.load_index(ws)
+
+            index_path = os.path.join(ws, "references", "retrieval_index.json")
+            with open(index_path, "r", encoding="utf-8") as stream:
+                index = json.load(stream)
+            with open(terms_path, "rb") as stream:
+                terms_sha = hashlib.sha256(stream.read()).hexdigest()
+            index["integrity"]["terms"] = {
+                "file": terms_relative, "sha256": terms_sha,
+            }
+            with open(index_path, "w", encoding="utf-8") as stream:
+                json.dump(index, stream)
+            loaded = retrieve.load_index(ws)
+            self.assertIsNotNone(loaded)
+
+            with open(terms_path, "w", encoding="utf-8") as stream:
+                json.dump({"旁观者效应": ["changed"]}, stream,
+                          ensure_ascii=False)
+            # The glossary can change after the index has been loaded.  Search
+            # must verify and parse one stable byte snapshot against the hash
+            # carried by that already-loaded index, rather than reopening an
+            # unbound live glossary.
+            with self.assertRaises(SystemExit):
+                retrieve.search(ws, loaded, "旁观者效应")
+            with self.assertRaises(SystemExit):
+                retrieve.load_index(ws)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_bound_malformed_terms_fail_closed(self):
+        ws = make_ws(CORPUS, terms={"bad": ["duplicate", "duplicate"]})
+        try:
             with self.assertRaises(SystemExit):
                 retrieve.load_index(ws)
         finally:

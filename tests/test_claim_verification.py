@@ -69,6 +69,41 @@ class ClaimVerificationTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_current_material_manifest_requires_live_receipt(self):
+        ingest = self.workspace / ".ingest"
+        ingest.mkdir()
+        current = {
+            "schema_version": 2,
+            "pipeline_version": "ingestion-v2",
+            "material_build": {"protocol_version": 1},
+        }
+        atomic_write_json(ingest / "build_manifest.json", current)
+
+        with mock.patch.object(
+                verify_claims, "verify_material_build_receipt",
+                return_value={}):
+            self.assertEqual(
+                "ingestion-v2", verify_claims._pipeline_version(self.workspace)
+            )
+        with mock.patch.object(
+                verify_claims, "verify_material_build_receipt",
+                side_effect=ValueError("required material build receipt is missing")):
+            with self.assertRaisesRegex(
+                    ClaimValidationError,
+                    "required material build receipt is missing"):
+                verify_claims._pipeline_version(self.workspace)
+
+        atomic_write_json(ingest / "build_manifest.json", {
+            "schema_version": 1,
+            "pipeline_version": "ingestion-v1",
+        })
+        with mock.patch.object(
+                verify_claims, "verify_material_build_receipt",
+                side_effect=ValueError("stale legacy material receipt")):
+            with self.assertRaisesRegex(
+                    ClaimValidationError, "stale legacy material receipt"):
+                verify_claims._pipeline_version(self.workspace)
+
     def claim(
         self,
         unit=None,

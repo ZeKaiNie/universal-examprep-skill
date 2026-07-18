@@ -1,12 +1,20 @@
+import copy
 import hashlib
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
-from scripts.asset_policy import physical_asset_key
-from scripts import retrieve, validate_workspace
+from scripts.asset_policy import (
+    audit_asset_policy,
+    iter_asset_declarations,
+    legacy_attempt_promotion_receipt,
+    legacy_attempt_promotion_receipts,
+    physical_asset_key,
+)
+from scripts import asset_policy, retrieve, validate_workspace
 from scripts.ingestion import (
     ContentUnit,
     IngestionStore,
@@ -27,13 +35,16 @@ from scripts.ingestion.pipeline import (
     _deduplicate_bound_candidates,
     _metadata_assets,
     _new_quiz_item,
+    _persist_payload_unlocked,
     _update_quiz_item_from_units,
+    authorize_material_build_generation,
     build_payload,
     compile_review_outputs,
     compile_structured_visuals,
     persist_payload,
 )
 from scripts.ingestion.storage import atomic_write_json, atomic_write_jsonl
+from scripts.material_generation import build_pending_generation
 
 
 class IngestionPipelineTest(unittest.TestCase):
@@ -2152,6 +2163,275 @@ class IngestionPipelineTest(unittest.TestCase):
         }
         self.assertEqual(before, after)
         self.assertFalse((self.workspace / ".ingest").exists())
+
+    def test_batch_attempt_promotions_resolve_each_policy_path_once(self):
+        count = 24
+        old_rows, new_rows, requests = [], [], []
+        for index in range(count):
+            relative = "references/assets/legacy-%03d.png" % index
+            asset = self.workspace.joinpath(*relative.split("/"))
+            asset.parent.mkdir(parents=True, exist_ok=True)
+            asset.write_bytes(("asset-%03d" % index).encode("ascii"))
+            asset_sha = hashlib.sha256(asset.read_bytes()).hexdigest()
+            source_file = "homework/hw-%03d.pdf" % index
+            source_sha = hashlib.sha256(source_file.encode("ascii")).hexdigest()
+
+            def row(role):
+                return {
+                    "id": "hw-%03d" % index,
+                    "chapter": 1,
+                    "source_type": "homework",
+                    "source_file": source_file,
+                    "assets": [{
+                        "path": relative,
+                        "role": role,
+                        "sha256": asset_sha,
+                        "source_file": source_file,
+                        "source_sha256": source_sha,
+                    }],
+                }
+
+            old_rows.append(row("answer_context"))
+            new_rows.append(row("student_attempt"))
+            requests.append((relative, asset_sha))
+
+        old_audit = audit_asset_policy(
+            quiz_rows=old_rows, workspace=self.workspace
+        )
+        new_audit = audit_asset_policy(
+            quiz_rows=new_rows, workspace=self.workspace
+        )
+        old_policy = {
+            "quiz_rows": old_rows, "teaching_rows": [], "content_units": [],
+            "item_groups": old_audit["item_groups"],
+        }
+        new_policy = {
+            "quiz_rows": new_rows, "teaching_rows": [], "content_units": [],
+            "item_groups": new_audit["item_groups"],
+        }
+        original = asset_policy._stable_workspace_asset_identity
+        with mock.patch.object(
+                asset_policy, "_stable_workspace_asset_identity",
+                wraps=original) as identity_probe:
+            receipts = legacy_attempt_promotion_receipts(
+                requests, old_policy, new_policy, self.workspace
+            )
+
+        self.assertEqual(count, len(receipts))
+        self.assertEqual(count * 2, identity_probe.call_count)
+        self.assertEqual(
+            [request[0] for request in requests],
+            [receipt["path"] for receipt in receipts],
+        )
+
+    def test_batch_attempt_promotions_reject_non_target_alias_drift(self):
+        target_path = "references/assets/legacy-answer.png"
+        other_path = "references/assets/unrelated-prompt.png"
+        for relative, payload in (
+                (target_path, b"student submission"),
+                (other_path, b"unrelated official prompt")):
+            target = self.workspace.joinpath(*relative.split("/"))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
+
+        def item(item_id, path, role, source_file):
+            asset_file = self.workspace.joinpath(*path.split("/"))
+            return {
+                "id": item_id, "chapter": 1, "source_type": "homework",
+                "source_file": source_file,
+                "assets": [{
+                    "path": path, "role": role,
+                    "sha256": hashlib.sha256(asset_file.read_bytes()).hexdigest(),
+                    "source_file": source_file,
+                    "source_sha256": hashlib.sha256(
+                        source_file.encode("ascii")
+                    ).hexdigest(),
+                }],
+            }
+
+        old_rows = [
+            item("hw-1", target_path, "answer_context", "homework/hw-1.pdf"),
+            item("hw-2", other_path, "question_context", "homework/hw-2.pdf"),
+        ]
+        new_rows = copy.deepcopy(old_rows)
+        new_rows[0]["assets"][0]["role"] = "student_attempt"
+        old_audit = audit_asset_policy(
+            quiz_rows=old_rows, workspace=self.workspace
+        )
+        new_audit = audit_asset_policy(
+            quiz_rows=new_rows, workspace=self.workspace
+        )
+        old_policy = {
+            "quiz_rows": old_rows, "teaching_rows": [], "content_units": [],
+            "item_groups": old_audit["item_groups"],
+        }
+        new_policy = {
+            "quiz_rows": new_rows, "teaching_rows": [], "content_units": [],
+            "item_groups": new_audit["item_groups"],
+        }
+        target_sha = old_rows[0]["assets"][0]["sha256"]
+        original = asset_policy._stable_workspace_asset_identity
+        visits = {}
+
+        def inject_alias(root, path, key):
+            canonical = path.replace("\\", "/")
+            visits[canonical] = visits.get(canonical, 0) + 1
+            if canonical == other_path and visits[canonical] == 2:
+                return original(root, target_path, physical_asset_key(target_path))
+            return original(root, path, key)
+
+        with mock.patch.object(
+                asset_policy, "_stable_workspace_asset_identity",
+                side_effect=inject_alias):
+            with self.assertRaisesRegex(ValueError, "policy path identity drifted"):
+                legacy_attempt_promotion_receipts(
+                    [(target_path, target_sha)],
+                    old_policy,
+                    new_policy,
+                    self.workspace,
+                )
+
+    def test_pending_generation_authorizes_only_receipted_attempt_migration(self):
+        asset_path = "references/assets/legacy-answer.png"
+        asset_file = self.workspace.joinpath(*asset_path.split("/"))
+        asset_file.parent.mkdir(parents=True)
+        asset_file.write_bytes(b"legacy-student-submission")
+        asset_sha = hashlib.sha256(asset_file.read_bytes()).hexdigest()
+        source_sha = hashlib.sha256(self.source.read_bytes()).hexdigest()
+
+        def item(role):
+            return {
+                "id": "hw-1", "chapter": 1, "type": "subjective",
+                "question": "Submit the worked homework solution.",
+                "answer": "Legacy extracted submission.",
+                "source": "material", "source_type": "homework",
+                "source_file": "ch01.txt", "source_pages": [1],
+                "answer_source_pages": [1],
+                "assets": [{
+                    "path": asset_path,
+                    "role": role,
+                    "sha256": asset_sha,
+                    "source_file": "ch01.txt",
+                    "source_sha256": source_sha,
+                }],
+            }
+
+        def payload(quiz_item):
+            return build_payload(
+                str(self.materials),
+                [str(self.source)],
+                [{"file": "ch01.txt", "page": 1,
+                  "text": "Chapter 1\nHomework problem"}],
+                sections=[{
+                    "chapter": 1,
+                    "page_keys": [("ch01.txt", 1)],
+                }],
+                quiz_items=[quiz_item],
+                report={"warnings": [], "skipped": [], "ai_review": []},
+            )
+
+        old_item = item("answer_context")
+        candidate_item = item("student_attempt")
+        references = self.workspace / "references"
+        (references / "quiz_bank.json").write_text(
+            json.dumps([old_item]), encoding="utf-8"
+        )
+        (references / "teaching_examples.json").write_text(
+            "[]", encoding="utf-8"
+        )
+        old_payload = payload(old_item)
+        persist_payload(self.workspace, old_payload)
+        store = IngestionStore(self.workspace, source_root=self.materials)
+        old_units = [unit.to_dict() for unit in store.units().values()]
+
+        candidate_payload = payload(candidate_item)
+        old_audit = audit_asset_policy(
+            quiz_rows=[old_item], teaching_rows=[], content_units=old_units,
+            workspace=self.workspace,
+        )
+        candidate_audit = audit_asset_policy(
+            quiz_rows=[candidate_item], teaching_rows=[],
+            content_units=candidate_payload["content_units"],
+            workspace=self.workspace,
+        )
+        self.assertEqual([], old_audit["conflicts"])
+        self.assertEqual([], candidate_audit["conflicts"])
+        old_policy = {
+            "quiz_rows": [old_item], "teaching_rows": [],
+            "content_units": old_units,
+            "item_groups": old_audit["item_groups"],
+        }
+        candidate_policy = {
+            "quiz_rows": [candidate_item], "teaching_rows": [],
+            "content_units": candidate_payload["content_units"],
+            "item_groups": candidate_audit["item_groups"],
+        }
+        receipt = legacy_attempt_promotion_receipt(
+            asset_path, asset_sha, old_policy, candidate_policy,
+            self.workspace,
+        )
+        raw = {
+            "quiz_bank": [candidate_item],
+            "teaching_examples": [],
+            "ingestion": candidate_payload,
+        }
+        ingest = self.workspace / ".ingest"
+        raw_path = ingest / "source_raw_input.json"
+        report_path = ingest / "parse_report.json"
+        manifest_path = ingest / "build_manifest.json"
+        previous_manifest_sha = hashlib.sha256(
+            manifest_path.read_bytes()
+        ).hexdigest()
+        atomic_write_json(raw_path, raw)
+
+        def publish_generation(receipts):
+            report = {"asset_role_promotions": receipts}
+            atomic_write_json(report_path, report)
+            pending = build_pending_generation(
+                hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+                hashlib.sha256(report_path.read_bytes()).hexdigest(),
+                raw,
+                report,
+                previous_manifest_sha,
+            )
+            atomic_write_json(
+                ingest / "material_build_pending.json", pending
+            )
+
+        publish_generation([])
+        with self.assertRaisesRegex(ValueError, "do not match actual"):
+            authorize_material_build_generation(self.workspace, raw)
+        publish_generation([receipt, copy.deepcopy(receipt)])
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            authorize_material_build_generation(self.workspace, raw)
+        publish_generation([receipt])
+        asset_file.write_bytes(b"tampered-in-place")
+        with self.assertRaisesRegex(ValueError, "revision drift"):
+            authorize_material_build_generation(self.workspace, raw)
+        asset_file.write_bytes(b"legacy-student-submission")
+        publish_generation([receipt])
+
+        with store.mutation_lock(allow_material_generation=True):
+            with self.assertRaisesRegex(ValueError, "student_attempt-tainted"):
+                _persist_payload_unlocked(self.workspace, candidate_payload)
+            authorization = authorize_material_build_generation(
+                self.workspace, raw
+            )
+            _persist_payload_unlocked(
+                self.workspace,
+                candidate_payload,
+                material_generation=authorization,
+            )
+
+        compiled = IngestionStore(
+            self.workspace, source_root=self.materials
+        ).units().values()
+        roles = {
+            role for _path, role in iter_asset_declarations(compiled)
+            if _path == asset_path
+        }
+        self.assertEqual({"student_attempt"}, roles)
+        self.assertTrue((ingest / "material_build_pending.json").is_file())
 
     def test_review_compile_rejects_cross_unit_attempt_laundering_without_bank_overwrite(self):
         payload = self.payload(missing_answer=False)
