@@ -60,7 +60,7 @@ class ExamStartTest(unittest.TestCase):
         (package / "scripts" / "entry.py").write_text("VALUE = 1\n", encoding="utf-8")
         return package
 
-    def test_state_status_reports_transition_interaction_style_semantics(self):
+    def test_state_status_reports_fail_closed_interaction_style_semantics(self):
         with tempfile.TemporaryDirectory() as temp:
             workspace = Path(temp) / "workspace"
             workspace.mkdir()
@@ -73,11 +73,20 @@ class ExamStartTest(unittest.TestCase):
             }
             self._write_json(workspace / "study_state.json", state)
 
-            historical = exam_start._load_state_status(str(workspace))
-            self.assertTrue(historical["ready"])
+            missing_mode = exam_start._load_state_status(str(workspace))
+            self.assertTrue(missing_mode["ready"])
             self.assertEqual(
-                historical["interaction_style_effective"], "step_by_step")
-            self.assertFalse(historical["interaction_style_dormant"])
+                missing_mode["interaction_style_effective"], "batch")
+            self.assertTrue(missing_mode["interaction_style_dormant"])
+            self.assertEqual(missing_mode["interaction_style_dormant_reason"],
+                             "processing_mode_not_full")
+
+            state["processing_mode"] = "full"
+            self._write_json(workspace / "study_state.json", state)
+            full = exam_start._load_state_status(str(workspace))
+            self.assertEqual(full["interaction_style_effective"],
+                             "step_by_step")
+            self.assertFalse(full["interaction_style_dormant"])
 
             state["processing_mode"] = "lightweight"
             self._write_json(workspace / "study_state.json", state)
@@ -104,7 +113,10 @@ class ExamStartTest(unittest.TestCase):
             self.assertEqual(0, code)
             self.assertFalse(payload["ready_to_ingest"])
             self.assertEqual(
-                ["workspace_confirmation", "learning_choices", "runtime_provenance"],
+                [
+                    "workspace_confirmation", "learning_choices",
+                    "runtime_provenance", "processing_mode_lightweight",
+                ],
                 payload["ingestion_permission"]["blockers"],
             )
             self.assertEqual(
@@ -186,7 +198,7 @@ class ExamStartTest(unittest.TestCase):
             self.assertFalse(workspace.exists())
             self.assertFalse(home.exists())
 
-    def test_confirm_creates_exact_receipt_and_sets_choices_together(self):
+    def test_confirm_creates_exact_receipt_and_defaults_to_lightweight(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             home = root / "registry"
@@ -202,12 +214,19 @@ class ExamStartTest(unittest.TestCase):
             ])
 
             self.assertEqual(0, code)
-            self.assertTrue(payload["ready_to_ingest"])
+            self.assertTrue(payload["ready_to_start"])
+            self.assertFalse(payload["ready_to_ingest"])
+            self.assertEqual("lightweight", payload["processing_mode"])
+            self.assertEqual(
+                ["processing_mode_lightweight"],
+                payload["ingestion_permission"]["blockers"],
+            )
             state = json.loads((workspace / "study_state.json").read_text(encoding="utf-8"))
             self.assertEqual("from_scratch", state["mode"])
             self.assertEqual("le1d", state["time_budget"])
             self.assertEqual("bilingual", state["language"])
             self.assertEqual("visual", state["artifact_mode"])
+            self.assertEqual("lightweight", state["processing_mode"])
             registry = json.loads((home / "workspaces.json").read_text(encoding="utf-8"))
             receipt = registry["workspaces"][0]["confirmation"]
             self.assertTrue(receipt["confirmed"])
@@ -224,7 +243,7 @@ class ExamStartTest(unittest.TestCase):
             runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
             self.assertEqual(1, runtime["schema_version"])
             self.assertEqual("exam_runtime", runtime["receipt_type"])
-            self.assertEqual("4.2", runtime["skill"]["version"])
+            self.assertEqual("4.3", runtime["skill"]["version"])
             self.assertTrue(runtime["created_at"].endswith("Z"))
             self.assertEqual(str(Path(exam_start.PACKAGE_ROOT).resolve()), runtime["package_root"])
             self.assertEqual(str(Path(os.sys.executable).resolve()), runtime["python"]["executable"])
@@ -239,8 +258,16 @@ class ExamStartTest(unittest.TestCase):
 
             with mock.patch.dict(os.environ, {"EXAMPREP_HOME": str(home)}):
                 workspace_gate = exam_start.check_registered_workspace_gate(str(workspace))
-            self.assertTrue(workspace_gate["ready_to_use"])
-            self.assertEqual(str(materials.resolve()), workspace_gate["materials"])
+            self.assertFalse(workspace_gate["ready_to_use"])
+            self.assertEqual(
+                "registered_workspace_gate_blocked", workspace_gate["reason"])
+            self.assertEqual("lightweight", workspace_gate["processing_mode"])
+            self.assertEqual(
+                [str(materials.resolve())], workspace_gate["candidate_materials"])
+            self.assertEqual(
+                ["processing_mode_lightweight"],
+                workspace_gate["attempts"][0]["blockers"],
+            )
 
             other_materials = root / "other-materials"
             other_materials.mkdir()
@@ -265,6 +292,7 @@ class ExamStartTest(unittest.TestCase):
                 "--course", "EEC160", "--materials", str(materials),
                 "--workspace", str(workspace), "--mode", "from_scratch",
                 "--time-budget", "le1d", "--language", "en",
+                "--processing-mode", "full",
             ]
             code, _payload = self._run(home, ["confirm"] + common)
             self.assertEqual(0, code)
@@ -325,6 +353,7 @@ class ExamStartTest(unittest.TestCase):
             common = [
                 "--workspace", str(workspace), "--mode", "from_scratch",
                 "--time-budget", "le1d", "--language", "en",
+                "--processing-mode", "full",
             ]
             code_a, first = self._run(home, [
                 "confirm", "--course", "course-a", "--materials", str(materials_a),
@@ -377,6 +406,7 @@ class ExamStartTest(unittest.TestCase):
                 "confirm", "--course", "course", "--materials", str(materials),
                 "--workspace", str(workspace), "--mode", "from_scratch",
                 "--time-budget", "le1d", "--language", "en",
+                "--processing-mode", "full",
             ])
             self.assertEqual(0, code)
             self.assertTrue(payload["ready_to_ingest"])
@@ -408,7 +438,7 @@ class ExamStartTest(unittest.TestCase):
                 "confirm", "--course", "EEC160",
                 "--materials", str(materials), "--workspace", str(workspace),
                 "--mode", "from_scratch", "--time-budget", "le1d",
-                "--language", "en",
+                "--language", "en", "--processing-mode", "full",
             ])
             self.assertEqual(0, code)
             receipt_path = workspace / "exam_runtime_receipt.json"
@@ -463,7 +493,7 @@ class ExamStartTest(unittest.TestCase):
                 "confirm", "--course", "EEC160",
                 "--materials", str(materials), "--workspace", str(workspace),
                 "--mode", "from_scratch", "--time-budget", "le1d",
-                "--language", "en",
+                "--language", "en", "--processing-mode", "full",
             ]
             code, first = self._run(home, arguments)
             self.assertEqual(0, code)
@@ -501,7 +531,7 @@ class ExamStartTest(unittest.TestCase):
                 "confirm", "--course", "EEC160",
                 "--materials", str(materials), "--workspace", str(workspace),
                 "--mode", "from_scratch", "--time-budget", "le1d",
-                "--language", "en",
+                "--language", "en", "--processing-mode", "full",
             ])
             self.assertEqual(0, code)
             current = exam_start._capture_runtime_identity()
@@ -536,7 +566,7 @@ class ExamStartTest(unittest.TestCase):
                 "confirm", "--course", "EEC160",
                 "--materials", str(materials), "--workspace", str(workspace),
                 "--mode", "from_scratch", "--time-budget", "le1d",
-                "--language", "en",
+                "--language", "en", "--processing-mode", "full",
             ])
             self.assertEqual(0, code)
             receipt = json.loads(
@@ -604,7 +634,7 @@ class ExamStartTest(unittest.TestCase):
                 "confirm", "--course", "EEC160",
                 "--materials", str(materials), "--workspace", str(workspace),
                 "--mode", "from_scratch", "--time-budget", "le1d",
-                "--language", "en",
+                "--language", "en", "--processing-mode", "full",
             ])
             self.assertEqual(0, code)
             receipt_path = workspace / "exam_runtime_receipt.json"

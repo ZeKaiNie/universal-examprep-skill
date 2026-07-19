@@ -64,10 +64,27 @@ class ClaimVerificationTest(unittest.TestCase):
             1,
             ordinal=1,
             chapter_id="ch01",
+            metadata={"source_language": "zh"},
         )
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def allow_claim_cli_preconditions(self):
+        """Keep narrow CLI behavior tests below the two independent runtime gates."""
+        patches = (
+            mock.patch.object(
+                verify_claims.exam_start,
+                "require_full_processing",
+                return_value={"processing_mode": "full", "ready_to_ingest": True},
+            ),
+            mock.patch.object(
+                verify_claims, "_require_ingestion_v2", return_value="ingestion-v2"
+            ),
+        )
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
 
     def test_current_material_manifest_requires_live_receipt(self):
         ingest = self.workspace / ".ingest"
@@ -145,7 +162,13 @@ class ClaimVerificationTest(unittest.TestCase):
         return ingest
 
     def manifest(self, record, reference=True, extra_knowledge_points=()):
-        refs = [{"claim_id": record.claim_id}] if reference else []
+        refs = ([{
+            "claim_id": record.claim_id,
+            "source_file": self.unit.source_file,
+            "pages": [self.unit.page],
+            "source_unit_id": self.unit.unit_id,
+            "role": "concept",
+        }] if reference else [])
         return {
             "schema_version": 1,
             "chapter": 1,
@@ -665,7 +688,36 @@ class ClaimVerificationTest(unittest.TestCase):
         self.assertEqual(explicit["quote"]["start"], records[0].quote.start)
         self.assertEqual(UnitRevisionRef.from_unit(repeated), records[0].source.unit_ref)
 
+    def test_cli_rejects_unregistered_workspace_before_claim_mutation(self):
+        with self.assertRaisesRegex(
+                ClaimValidationError, "exact confirmed workspace/materials pair"):
+            verify_claims.run([
+                "create", "--workspace", str(self.workspace),
+                "--input-proposals", str(self.workspace / "missing.json"), "--json",
+            ])
+        self.assertFalse(
+            (self.workspace / ".ingest" / "claim_records.jsonl").exists()
+        )
+
+    def test_cli_keeps_ingestion_v1_read_only_after_full_gate(self):
+        ingest = self.workspace / ".ingest"
+        ingest.mkdir()
+        atomic_write_json(ingest / "build_manifest.json", {
+            "schema_version": 1, "pipeline_version": "ingestion-v1",
+        })
+        with mock.patch.object(
+                verify_claims.exam_start,
+                "require_full_processing",
+                return_value={"processing_mode": "full", "ready_to_ingest": True},
+        ), self.assertRaisesRegex(ClaimValidationError, "ingestion-v1 is read-only"):
+            verify_claims.run([
+                "create", "--workspace", str(self.workspace),
+                "--input-proposals", str(self.workspace / "missing.json"), "--json",
+            ])
+        self.assertFalse((ingest / "claim_records.jsonl").exists())
+
     def test_cli_import_and_verify_paths(self):
+        self.allow_claim_cli_preconditions()
         ingest = self.workspace / ".ingest"
         ingest.mkdir()
         atomic_write_json(
@@ -705,7 +757,14 @@ class ClaimVerificationTest(unittest.TestCase):
         real_lock = verify_claims.workspace_publication_lock
         with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(
                 verify_claims, "workspace_publication_lock",
-                side_effect=real_lock) as lock_call:
+                side_effect=real_lock) as lock_call, mock.patch.object(
+                verify_claims,
+                "validate_workspace_fact_integrity",
+                return_value={
+                    "conflicts": (),
+                    "snapshot": {"schema_version": 1, "test_fixture": True},
+                },
+        ):
             self.assertEqual(
                 0,
                 verify_claims.run(
@@ -746,6 +805,7 @@ class ClaimVerificationTest(unittest.TestCase):
         )
 
     def test_cli_import_honors_quiz_attempt_taint_and_allows_distinct_path(self):
+        self.allow_claim_cli_preconditions()
         ingest = self.workspace / ".ingest"
         ingest.mkdir()
         shared = "references/assets/shared.png"
@@ -816,6 +876,7 @@ class ClaimVerificationTest(unittest.TestCase):
         self.assertEqual('{"sentinel":true}\n', control.read_text(encoding="utf-8"))
 
     def test_study_guide_v2_gate_recomputes_receipt_and_material_coverage(self):
+        self.allow_claim_cli_preconditions()
         unit = ContentUnit.create(
             self.source.source_id,
             self.source.sha256,
@@ -999,6 +1060,7 @@ class ClaimVerificationTest(unittest.TestCase):
             )
 
     def test_v2_claim_and_guide_gates_rederive_facts_and_accept_ledger_terminal_state(self):
+        self.allow_claim_cli_preconditions()
         materials = self.workspace / "materials"
         source_a = materials / "a.txt"
         source_b = materials / "b.txt"
@@ -1614,6 +1676,7 @@ class ClaimVerificationTest(unittest.TestCase):
             validate_guide_claim_coverage((), manifest, "ch01", ())
 
     def test_create_merges_chapters_and_replaces_only_matching_subject(self):
+        self.allow_claim_cli_preconditions()
         second = ContentUnit.create(
             self.source.source_id,
             self.source.sha256,

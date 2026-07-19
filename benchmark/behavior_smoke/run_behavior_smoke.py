@@ -179,7 +179,8 @@ def scope_override_declared(text):
 # 长名在前，保证正则交替优先匹配更长的文科变体（如「材料里要读的关键句」先于「材料里要读的关键」）。
 _TT_SECTION_NAMES = ("材料里要读的关键句/概念", "材料里要读的关键概念", "材料里要读的关键句",
                      "材料里要读的关键", "这题在问什么", "这题考什么", "知识点溯源", "图里要读的量",
-                     "逐步演算", "逐步代入", "逐点展开", "核心概念", "核心公式", "答案自检", "题面图")
+                     "逐步演算", "逐步代入", "逐点展开", "核心概念", "核心公式",
+                     "为什么这个答案成立", "题面图")
 # 0 容差边界：块名后必须紧跟分隔符（冒号/空白/行尾）才算「新节标题」；否则是正文里的子步骤
 # （如「① 核心公式代入得地址。」——名字后是「代」不是分隔符，不切）。
 _CIRCLED_SECTION = (r"[①②③④⑤⑥⑦⑧⑨⑩]\s*(?:" + "|".join(_TT_SECTION_NAMES) + r")(?=[：:\s]|$)")
@@ -244,7 +245,7 @@ _SEVEN_STEPS = (
             "材料里要读的关键句", "材料里要读的关键")),
     ("④", ("核心公式", "核心概念")),
     ("⑤", ("逐步演算", "逐步代入", "逐点展开论证", "逐点展开")),
-    ("⑥", ("答案自检",)),
+    ("⑥", ("为什么这个答案成立",)),
     ("⑦", ("知识点溯源",)),
 )
 # 块名后的合法标题终止符：冒号 / 空白 / 行尾 / 括注起始（AI 答案 ⑤ 标题「逐步演算（⚠️…）」）/ 加粗星号 / 方括号收尾。
@@ -1388,9 +1389,14 @@ def run_mock(verbose=True):
 
 def check_fixture(verbose=True):
     ok, errors, warnings, stats = validate_fixture_workspace(FIXTURE)
-    # the fixture is documented as 0-error AND 0-warning — a warning means a recommended field
-    # (keywords / diagram_type / code tests …) was lost, which would weaken the six-type smoke.
-    clean = ok and not warnings
+    # This committed mini-course is intentionally not a live learner session, so it has no
+    # machine-bound lightweight receipt.  That one warning is expected; every content/schema
+    # warning (keywords / diagram_type / code tests …) still fails the fixture loudly.
+    unexpected_warnings = [
+        row for row in warnings
+        if "lightweight session has not been initialized" not in row.get("msg", "")
+    ]
+    clean = ok and not unexpected_warnings
     if verbose:
         print(f"fixture: {FIXTURE}")
         print(f"  valid={ok}  warnings={len(warnings)}  stats={stats}")

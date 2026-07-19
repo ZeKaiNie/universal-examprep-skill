@@ -16,7 +16,7 @@ The default reply language is English. The student may explicitly switch to `中
 ## Teaching and key questions
 
 - Explain difficult ideas with one concrete metaphor. For formulas, define every symbol/unit and add a tiny mental-arithmetic example.
-- A key question always uses this order: ① Question figure → ② What's being asked → ③ What to read off the figure/source → ④ Core formula/framework → ⑤ Step-by-step solution → ⑥ Answer self-check → ⑦ Source trace.
+- A key question always uses this order: ① Question figure → ② What's being asked → ③ What to read off the figure/source → ④ Core formula/framework → ⑤ Step-by-step solution → ⑥ Why this answer works (beginner-first detail; no generic answer-self-check panel) → ⑦ Source trace.
 - End each question with `Question source: … | Answer source: … | <full provenance label>`. Unknown evidence stays `Source unknown` or `Source page unknown`; never invent a file/page.
 - Default output stops there. Common pitfalls / 3-minute mnemonic / Your turn appear only when requested.
 

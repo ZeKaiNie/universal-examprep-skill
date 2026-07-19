@@ -23,8 +23,10 @@ silently deleted. A write failure is FAIL-LOUD (non-zero exit) — never silentl
     python scripts/notebook.py --workspace <ws> rebuild              # regenerate both index.md
     python scripts/notebook.py --workspace <ws> list [--json]        # entries inventory
 
-Headings/labels come from i18n msgids (--lang zh|en; default: study_state.json language,
-falling back to zh). Entry anchors are GitHub-style slugs of "[#<id>] <title>", so index
+Headings/labels come from i18n msgids (--lang zh|en|bilingual; default:
+study_state.json language, falling back to zh). Bilingual metadata and derived-index
+headings mirror the Chinese and English labels in one durable file. Entry anchors are
+GitHub-style slugs of "[#<id>] <title>", so index
 links jump straight to the entry. Chapter files are parsed back by their "## [#<id>]"
 block markers, fence-aware: a "## " line inside a fenced code block is content, never a
 block boundary. Exit codes: 0 ok · 1 read/write failure · 2 bad input/usage.
@@ -170,12 +172,37 @@ def _load_state(ws):
 
 
 def _resolve_lang(arg_lang, state):
-    """--lang 显式覆盖 > study_state.json 的 language（经 i18n 归一） > zh；
-    bilingual 的落盘标题走 zh（双语=zh 包+镜像组合，文件只落一份标题）。"""
+    """--lang explicit override > canonical state language > zh fallback."""
     if arg_lang:
         return arg_lang
     lang = i18n.workspace_language(state)
-    return lang if lang in ("zh", "en") else "zh"
+    return lang if lang in ("zh", "en", "bilingual") else "zh"
+
+
+def _mirror_inline(zh_text, en_text):
+    """Join one zh/en UI label without producing two Markdown block markers."""
+    if not isinstance(zh_text, str) or not isinstance(en_text, str):
+        return zh_text if isinstance(zh_text, str) else en_text
+    zh_match = re.match(r"^(#{1,6}\s+)(.*)$", zh_text)
+    en_match = re.match(r"^(#{1,6}\s+)(.*)$", en_text)
+    if zh_match and en_match and zh_match.group(1) == en_match.group(1):
+        return "%s%s / %s" % (
+            zh_match.group(1), zh_match.group(2), en_match.group(2))
+    return "%s / %s" % (zh_text, en_text)
+
+
+def _msg(msgid, lang, **fmt):
+    if lang != "bilingual":
+        return i18n.msg(msgid, lang, **fmt)
+    return _mirror_inline(
+        i18n.msg(msgid, "zh", **fmt), i18n.msg(msgid, "en", **fmt))
+
+
+def _display(kind, code, lang):
+    if lang != "bilingual":
+        return i18n.display(kind, code, lang)
+    return _mirror_inline(
+        i18n.display(kind, code, "zh"), i18n.display(kind, code, "en"))
 
 
 # ---------------- chapter-file parsing / rendering (fence-aware block model) ----------------
@@ -264,7 +291,8 @@ def block_has_teaching_example_marker(block, eid):
 
 
 def block_sha256(block):
-    """Hash one parsed entry in the canonical form used by progress bindings."""
+    """Hash one parsed entry in the canonical block form used by Guide bindings."""
+
     lines = block.get("lines") if isinstance(block, dict) else None
     if not isinstance(lines, list) or any(not isinstance(line, str) for line in lines):
         raise ValueError("notebook block lines must be a string array")
@@ -298,7 +326,7 @@ def _block_meta(lines):
 
 
 def _label_to_type():
-    """Reverse map: zh/en display labels (and the canonical codes themselves) → type code."""
+    """Reverse map: zh/en/bilingual labels (and canonical codes) → type code."""
     rev = {t: t for t in TYPES}
     for lang in ("zh", "en"):
         cat = i18n.catalog(lang)
@@ -306,6 +334,8 @@ def _label_to_type():
             lab = cat.get("notebook_type." + t)
             if lab:
                 rev[lab] = t
+    for t in TYPES:
+        rev[_display("notebook_type", t, "bilingual")] = t
     return rev
 
 
@@ -384,11 +414,11 @@ def render_index(title_msgid, chapters, lang, status_map=None):
     """Deterministic TOC: title heading, one '## 章' section per non-empty chapter, one link
     per entry. mistakes/index.md additionally joins each entry to its study_state mistake
     row by id and appends the status (rendered in the pack language)."""
-    lines = [i18n.msg(title_msgid, lang), ""]
+    lines = [_msg(title_msgid, lang), ""]
     for num, fname, blocks, pre in chapters:
         if not blocks:
             continue
-        lines.append("## " + i18n.msg("notebook.chapter_heading", lang, num=num))
+        lines.append("## " + _msg("notebook.chapter_heading", lang, num=num))
         lines.append("")
         for b, anchor in zip(blocks, anchors_for(pre, blocks)):
             # 链接文字里的 [] 会破坏 md 链接结构——换全角括号（标题原文在章文件里，无损）
@@ -396,8 +426,8 @@ def render_index(title_msgid, chapters, lang, status_map=None):
             line = "- [%s](%s#%s)" % (text, fname, anchor)
             if status_map and b["id"] in status_map:
                 code = i18n.canon_row_status(status_map[b["id"]])
-                line += " " + i18n.msg("mistakes.status_suffix", lang,
-                                       status=i18n.display("row", code, lang))
+                line += " " + _msg("mistakes.status_suffix", lang,
+                                    status=_display("row", code, lang))
             lines.append(line)
         lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"
@@ -472,7 +502,7 @@ def cmd_add_entry(ws, args):
     state = _load_state(ws)
     lang = _resolve_lang(args.lang, state)
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    label = i18n.display("notebook_type", args.type, lang)
+    label = _display("notebook_type", args.type, lang)
     new_lines = make_entry_lines(
         eid, title, label, ts, body, teaching_example=teaching_example)
     ch_name = "ch%02d.md" % args.chapter
@@ -572,11 +602,11 @@ def run(argv=None):
         help="mark this walkthrough as an explicitly taught manifest example; required by "
              "update_progress record-taught-example",
     )
-    p_add.add_argument("--lang", choices=["zh", "en"], default=None,
+    p_add.add_argument("--lang", choices=["zh", "en", "bilingual"], default=None,
                        help="heading language (default: study_state.json language, "
                             "falling back to zh)")
     p_reb = sub.add_parser("rebuild")
-    p_reb.add_argument("--lang", choices=["zh", "en"], default=None,
+    p_reb.add_argument("--lang", choices=["zh", "en", "bilingual"], default=None,
                        help="heading language (default: study_state.json language, "
                             "falling back to zh)")
     p_list = sub.add_parser("list")

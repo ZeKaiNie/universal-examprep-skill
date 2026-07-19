@@ -4,220 +4,208 @@
 
 # 期末极速备考教练
 
-*只剩一晚。你什么都没复习。每个答案都应该说清来源。*
+*把你的课件、作业和往年题，变成一位知道出处、记得进度的考前老师。*
 
 中文 · [English](README.md)
 
-[![stars](https://img.shields.io/github/stars/ZeKaiNie/universal-examprep-skill?style=flat&color=blue)](https://github.com/ZeKaiNie/universal-examprep-skill/stargazers)
+[![收藏数](https://img.shields.io/github/stars/ZeKaiNie/universal-examprep-skill?style=flat&color=blue)](https://github.com/ZeKaiNie/universal-examprep-skill/stargazers)
 [![MIT](https://img.shields.io/badge/协议-MIT-blue.svg)](LICENSE)
-[![CI](https://github.com/ZeKaiNie/universal-examprep-skill/actions/workflows/ci.yml/badge.svg)](https://github.com/ZeKaiNie/universal-examprep-skill/actions)
+[![持续集成](https://github.com/ZeKaiNie/universal-examprep-skill/actions/workflows/ci.yml/badge.svg)](https://github.com/ZeKaiNie/universal-examprep-skill/actions)
 
-**围绕你的课程资料作答** · 题库限定出题 · AI 补充强制标注 · 分章按需检索
+**按你的材料讲课 · 有图题先看图 · 重点题逐步讲 · 进度不会随对话丢失**
 
 </div>
 
-你认识他。考试前夜，头发乱成一团，眼睛瞪得溜圆，一整门课一个字没看。这个技能是给他的：围绕你的材料讲，AI 补充会明确标注，材料支撑不了的答案会如实说明。
+你把课程文件夹交给智能体（例如 Claude Code 或 Codex 里的助手），再告诉它还有几天考试、从哪里开始、用什么语言。选“轻量按需”，它只处理你现在学到的页面；选“完整建库”，它会先整理整门课，再按章节讲。两种方式都会说明公式为什么这样选、数字怎样代入、答案为什么成立。遇到看不清、找不到答案或无法确定的内容，它会把问题列出来请你复核，不会悄悄跳过。
 
-**30 秒上手** —— 克隆整个仓库，然后对你的智能体说一句话：
+它最重要的特点不是“回答得像老师”，而是让你看得出回答从哪里来：
 
-```bash
-git clone https://github.com/ZeKaiNie/universal-examprep-skill .claude/skills/universal-exam-cram-coach
-# 对 Claude Code / Cursor 说："用这个技能初始化我的备考空间"，再把讲义/大纲/真题丢进来
-```
+- 🟢 来自资料：能追到原文件和页码；
+- 🟡 AI 补充：材料没有讲全，智能体补充了背景；
+- ⚠️ AI 生成答案：不是老师或教材给出的标准答案。
 
----
+材料撑不起一个结论时，它应该直接说不知道，而不是装作确定。
 
-## 装上前后
+## 一分钟开始复习
 
-**装上技能**——答案与重点题讲解带来源，能核对：
+1. [安装这个技能](#安装)。
+2. 把讲义、课件、作业、答案、小测和模拟题放进一个材料文件夹。
+3. 对智能体说：
 
-> **[#vis_q1]** 题面图里阴影区域表示哪个集合关系？
-> **A 与 B 的交集。**
-> `题目来源：hw02.pdf 第 3 页｜答案来源：hw02_sol.pdf｜🟢 来自资料`
+> 用期末极速备考教练复习 `D:\课程资料`。我零基础，明天考试，用中文，从第一章开始。先用轻量按需模式。
 
-**闭卷 / 裸智能体**——听起来一样自信，但你无从判断真假：
+4. 智能体会显示材料路径、学习模式、剩余时间、回复语言和处理方式。确认无误后就开始讲。
 
-> 阴影是**并集**。<sub>（资料里其实是交集；没有来源标注，无从核对——这正是"瞎编"发生的地方。）</sub>
+想先整理整门课，可以改说：
 
-区别不在口气，在于**答案是否暴露证据，以及哪些部分是 AI 补充**。
+> 用完整建库处理 `D:\课程资料`。我零基础，三天后考试，用中文，从第一章开始。
 
----
+建库完成后想得到方便阅读或打印的讲义，可以继续说：
 
-## 实测数据
+> 为第一章制作可视化复习讲义和打印版。公式要直接显示，题目只保留相关区域，图片不能缺失。
 
-技能的价值是 **grounding**：把你材料里、但模型本来不知道的内容接上去，同时让无依据答案显形。下面数字只代表表中课程、模型和题集的实测结果，不是对所有学科和宿主的保证（判分 Sonnet）：
+你不必先学会任何命令。下面的命令只给需要排错或自动化的用户。
 
-**① 这些实测中的材料专属题正确率明显提高。** 教授的例子、冷门研究、具体数字等细节很难靠常识回答；下表逐项给出所列课程与模型的测量结果：
+## 先选哪一种处理方式
 
-<div align="center"><img src="benchmark/docs/img/hard_psyc_correct_zh.svg" width="600" alt="材料专属题：闭卷 vs 装上技能" /></div>
+第一次使用时，技能会让你在两种方式中选一种。拿不准就选“轻量按需”。
 
-| 课程 · 模型 | 闭卷 | 裸文件 + 通用智能体 | 装上技能 |
-|---|:--:|:--:|:--:|
-| PSYC 110 · Opus 4.8 | 11% | 98% | **100%** |
-| PSYC 110 · Sonnet 4.6 | 13% | 100% | **100%** |
-| PSYC 110 · Haiku 4.5 | 11% | 98% | **100%** |
-| 6.006 · Haiku 4.5 | 45% | 89% | **91%** |
+| 方式 | 它会做什么 | 适合谁 | 你要接受的限制 |
+|---|---|---|---|
+| **轻量按需（默认、推荐）** | 只处理你现在学到的页；看完图后直接在对话里细讲；保存学习进度和笔记 | 明天就考试、材料很多、想尽快开讲的人 | 不提前整理整门课；一次最多处理 8 个主要页面；不生成完整复习讲义或打印版；没有可靠题库时，只能确认内容已经讲过，不能确认你已经掌握 |
+| **完整建库** | 先把全课程整理成分章知识库、标准题库和待审清单；之后可制作章节复习讲义 | 材料多而杂、要系统复习、愿意等更久的人 | 首次处理通常更慢、更占磁盘；扫描件、复杂版面、题目与答案配对仍可能需要智能体或人工复核；“处理完成”不等于“所有内容都识别正确” |
 
-**② 这组越界题实测的如实弃答率为 100%。** 在所测两门课、三个模型的探针中，技能组（及裸文件组）对全部越界题都选择弃答；闭卷组测得 60%–90%。样本设计与局限见测试报告。
+轻量按需不会为了省输入而缩短讲解。它省的是“一开始就处理整门课”的成本，不是学生看到的解释。
 
-<div align="center"><img src="benchmark/docs/img/oos_psyc_abst_zh.svg" width="560" alt="越界探针：如实弃答率" /></div>
+处理方式和输出方式是两件事：
 
-在这些实测中，分章检索与裸文件组精度接近，每题成本如下。其机制是只取相关章节，不是每题翻检整堆原始文件：
+- 对话教学是默认输出，只在聊天和学习笔记中讲；
+- 可视化输出会制作网页讲义，并可进一步生成打印版；
+- 轻量按需时，可视化选择只会被记住，不会真的开始制作讲义。要制作讲义，必须明确切到完整建库。
 
-<details><summary>每题成本（同精度更省）</summary>
+## 它怎样讲你当前在学的内容
 
-| 每题成本 | 闭卷 | 裸文件智能体 | 装上技能 |
-|---|:--:|:--:|:--:|
-| PSYC 110 | $0.033 | $0.117 | **$0.102** |
-| 6.006 | $0.034 | $0.066 | **$0.063** |
+每个已经找到的知识点和对应例题都会按下面的顺序讲完。轻量按需只对当前指定页面作这个承诺；完整建库则以已经整理出的全章清单为范围，并把未识别、未配对或仍待复核的内容单独列出来。
 
-</details>
+1. 用日常语言解释知识点，不假设你已经会术语；
+2. 展示这道题真正需要的题面和图片，不把整页其他题一起塞给你；
+3. 说清题目问什么、图里能读出哪些量；
+4. 解释为什么选这个公式，而不只是把公式贴出来；
+5. 逐行代入、计算，并解释每一步；
+6. 用初学者能听懂的话说明答案为什么成立；
+7. 标出知识点、题目和答案分别来自哪个文件、哪一页。
 
-完整方法、三臂设计、判分校准、成本、局限 → **[测试报告](benchmark/REPORT.md)**。
+题面或答案有图时，图片必须先显示出来。缺少必要图片的题不会拿来考你。二叉树、遍历、状态机等题会先用确定的算法算出结果，再画图。
 
----
+测验只从工作区已有的标准题库抽题，不会把临时编出的题冒充课程测验。错题、跳过的题和“为什么会这样”一类疑问都会记入复习记录。
 
-## 怎么做到的
+## 普通功能与延展功能
 
-一条"能不编就不编"的阶梯：
+普通功能是大多数学生直接能用的部分。延展功能默认关闭，因为它们更慢、更占空间，或者需要你正在使用的平台提供额外能力、外部服务和单独授权。
 
-1. **只从预建题库出题** —— 测验题来自带来源标签的 `quiz_bank.json`，不即兴编题。题库条目可以来自材料，也可以是明确标注的 AI 生成题，但绝不隐藏来源。
-2. **来源强制标注** —— 每条结论标 `🟢 来自资料` / `🟡 AI补充，可能与你老师讲的不完全一致` / `⚠️ AI生成答案，非老师/教材提供`，绝不冒充教材。
-3. **资料里没有就说没有** —— 遇到资料未覆盖的问题，如实弃答，不强行给答案。
-4. **画图题先跑算法再画** —— 二叉树 / 图遍历这类题，后台跑标准算法求出拓扑再渲染，禁止凭空想象。
-5. **图依赖题缺图不出** —— 需要配图却没图的题绝不出，不给学生一道没法答的题。
-6. **分章知识库按需加载** —— 每轮只读当前章切片，不把整门课反复塞进上下文。
+| 功能 | 默认状态 | 怎样启用 | 固有限制 |
+|---|---|---|---|
+| 轻量按需教学、看图、详细讲题、学习进度和笔记 | 开启 | 启动时选“轻量按需”，或者不作选择 | 只处理当前页面，不预建整门课 |
+| 完整知识库、标准题库、来源冲突检查 | 关闭 | 启动时明确选“完整建库” | 首次处理较慢；待审问题必须解决或明确列出 |
+| 每轮只讲一道例题 | 关闭 | 完整建库后说“以后每次只讲一道题” | 只改变讲题节奏，不代表题库测验或章节已经完成 |
+| 网页复习讲义和打印版 | 关闭 | 完整建库后明确要求“制作可视化复习讲义”或“打印版” | 要先把每题相关图片单独裁好、核对出处，并逐页确认讲义没有缺图或错版；耗时并占空间；轻量按需不可用 |
+| 让外部模型为每道题单独写详解 | 关闭 | 完整建库后说“启用逐题独立模型详解”；先同意只在本地列计划、不上传，看清范围和费用后，再对这份准确计划作第二次上传同意 | 不是所有智能体都能发起独立调用；ChatGPT 或 Codex 订阅不等于另行计费的接口余额；有多少道题，至少会发起多少次调用；清单中的题目、答案或裁剪图片会交给外部服务 |
+| 远程高精度 PDF 解析（MinerU / Docling） | 关闭 | 必须由用户点名，而且你正在使用的平台已经配置远程服务；上传前再次确认 | 本项目不会在学生电脑上下载或运行它们；远程服务可能不可用，也会扩大材料的隐私边界；解析结果仍需复核 |
+| 远程流程调度（LangGraph） | 关闭 | 必须由用户点名，而且你正在使用的平台已有远程集成 | 它只负责安排步骤，不能代替本地学习状态和来源记录；本地重型依赖不会自动安装 |
+| 实验性搜索改进 | 目前不可用 | 只有真实多课程测试证明它稳定更好后才会开放 | 目前没有足够真实数据证明收益；默认继续使用轻量、可复现的搜索方式 |
 
-本地建库支持 PDF、DOCX、PPTX、纯文本和 Markdown。`scripts/ingest_course.py` 是唯一常规 orchestrator：建立结构化内容单元与页锚点、编译 wiki/题库、初始化状态并完成校验。返回码 `0` 表示 `ready` 或 `usable_with_gaps`；返回码 `10` 表示流程跑完但仍有待审问题，必须阻断授课。智能体随后逐条处理类型化审查队列与 append-only 补丁账本，再重建并复验；不能手改派生 wiki 来假装警告消失。
+如果你正在使用的平台没有某项延展能力，智能体必须继续使用普通功能并说明限制，不能伪造“已经隔离调用”或“已经远程解析”的证明。
 
----
+### 关于外部模型调用和隐私
 
-## 复习模式 · 时间宽裕度 · 偏好
+普通功能不会为了逐题详解，额外调用一个独立的模型 API。不过，当前智能体本身怎样处理材料，仍受你正在使用的平台的隐私政策约束，并不等于全程离线。
 
-技能会按你的处境调节讲解的深浅、节奏和是否追问，都记在 `study_state.json` 里、跨对话不丢。
+延展的逐题调用必须经过两次同意：
 
-**3 种复习模式**（怎么讲）：
+1. 第一次只允许在本地列出会处理哪些题、会上传哪些图片、会调用几次和大约花多少钱，不上传材料；
+2. 你看清服务商会保留什么、保留多久之后，第二次只同意这份准确清单，不能临时扩大范围。
 
-| 模式 | 适合 |
-|---|---|
-| **零基础从头讲** | 完全没学过，从第一章逐步讲透、每道重点题走七步模板 |
-| **某章起步补弱** | 前面会一些，从指定章节开始、重点补薄弱环节 |
-| **查缺补漏** | 大致都学过，只做题扫盲区、错题优先 |
+**不要把 API 密钥粘贴进聊天、课程材料、截图或会提交到 Git 的文件。** 技术用户应优先使用平台或操作系统的密钥存储；具体启用命令和密钥存储方法见[外部模型适配器说明](docs/openai-study-guide-adapter.md)。
 
-**4 档时间宽裕度**（多快）：
+## 复习方式、剩余时间和语言
 
-| 宽裕度 | 行为 |
-|---|---|
-| **≤ 1 天** | 极限冲刺——跳过开场澄清、模板偏好和反思式追问，静默推断默认并直接开讲；仍可用标准题库练习或阶段测验验证掌握 |
-| **1–3 天** | 抓重点，压缩非核心 |
-| **3–7 天** | 正常节奏，会回问你哪些章有把握 |
-| **> 7 天** | 从容——对你说"有把握"的章**出题实测**而非只口头确认 |
+技能会记住下面这些选择，换一个对话也能继续：
 
-**偏好**（记住你的习惯）：讲解模板要不要带【易错点】/【3 分钟速记】收尾块、回复语言（中文 / English / 双语）、明确的 `no_questions` 请求（不再输出互动题，阶段最高为 `covered_unverified`）、每章的知识点掌握窗口（`window-add` / `window-set-status`）——都持久化，随时说一句就改。详见 [`docs/language-policy.md`](docs/language-policy.md) 与 [`docs/skill-architecture.md`](docs/skill-architecture.md)。
+| 选择 | 可选值 | 实际影响 |
+|---|---|---|
+| 从哪里开始 | 零基础从头讲 / 某章起步补弱 / 查缺补漏 | 决定解释深度和从哪一章开始 |
+| 还有多久考试 | ≤ 1 天 / 1–3 天 / 3–7 天 / > 7 天 | 决定节奏和复查频率 |
+| 回复语言 | 中文 / 英文 / 双语 | 决定智能体自己写出的讲解语言；原材料证据保留原语言 |
 
-**可选的普通教学节奏：**新旧状态都默认 `batch`（批量讲解）。在明确启用完整建库模式后，可选 `step_by_step`，让智能体严格按 `teaching_examples.json` 清单顺序，每轮完整讲完一道题的七步精讲：
+“≤ 1 天”会跳过不必要的开场追问，直接开始讲重点；**仍可用标准题库练习或阶段测验验证掌握**。如果你明确说“不要出题、不要问我”，系统只会记录这一章已经讲过，不会假装你已经通过测验。
 
-```bash
-python scripts/update_progress.py --workspace <工作区> set --interaction-style step_by_step
-# 也可以在 exam_start.py confirm 时附加 --interaction-style step_by_step。
-```
-
-它是普通功能中的可选偏好，不是第四项启动必答题；只有 `processing_mode=full` 且 `no_questions=false` 时才有效，否则保留已存选择并报告为 dormant，当前有效节奏为 `batch`。`≤1天` 档不会主动询问。选择器只覆盖完整模式的教学例题，并在同一个 workspace 锁定快照中读取 manifest、state、baseline 与 notebook；回复“继续”不是完成证据。一次 `record-taught-example` 必须绑定当前 manifest 顺序里的第一道 pending 题，并把保留 marker 的 walkthrough 固化为 `{id, notebook_ref, notebook_block_sha256, manifest_item_sha256}`。quiz/teaching/notebook/Guide 共用 1–200 字符的安全 Unicode ID 规范，拒绝空白、Markdown/路径分隔符、控制/格式/代理/替换字符和 Unicode noncharacter；两个 binding 也不得复用同一 `notebook_ref`。未绑定的旧 ID 仍是合法 batch 历史；一旦有 binding，即使切换节奏也必须持续通过 live 校验。只有文件/条目缺失以及 anchor、marker、hash、revision 漂移可重新变成 pending；重解析点、非目录/非普通文件、越界、非法 UTF-8、未闭围栏、坏 block、重复或越出 roster 的证据都保持 fail closed。已完成 full 章节若只出现结构合法的新 roster 项或上述可修复 stale 项，挂载时降为 `usable_with_gaps` 以便按顺序重讲；Guide 与阶段完成仍严格失效，记录第一道 pending 后须重建 Guide 并重新完成。保留基线中的每个 ID 都必须在同一 canonical chapter 拥有当前 teaching snapshot，且 `policy` 必须精确为 `append_only`；只有 quiz_bank 副本不能替代。章节原有门禁仍全部生效，`teaching_example_roster_exhausted=true` 即使在零例题时也不等于章节完成；切换回复语言不会自动把已记录题目重新排入队列。
-
-> 过渡兼容：该 PR 所在的上游基线尚未引入显式处理模式选择器，因此缺少 `processing_mode` 会被视为旧版隐式 `full`；若宿主已显式写入非 `full` 值，逐题偏好仍休眠。后续处理模式迁移会接管缺字段默认语义。
-
----
+双语必须明确选择。中文模式不会在每段后面机械附英文，英文模式也不会混入中文；双语模式会为每个完整讲解块提供中英两份内容。
 
 ## 安装
 
 ### Claude Code
 
-**推荐——运行时精简包**（只含运行时技能，不带开发用 benchmark 与测试）：
+最省事的方法是到[最新发布页](https://github.com/ZeKaiNie/universal-examprep-skill/releases/latest)下载 `universal-exam-cram-coach.zip`，解压到下面任一位置：
 
-到[最新 release](https://github.com/ZeKaiNie/universal-examprep-skill/releases/latest) 下载 `universal-exam-cram-coach.zip`，解压到 `.claude/skills/universal-exam-cram-coach/`（项目内或全局 `~/.claude/skills/` 均可）。
+- 当前项目：`.claude/skills/universal-exam-cram-coach/`
+- 全局使用：`~/.claude/skills/universal-exam-cram-coach/`
 
-TXT/Markdown/DOCX/PPTX 的基础建库使用标准库。首次建库前，智能体会运行自带的依赖预检（`scripts/check_deps.py`）；只有所选 PDF 或视觉路线确实需要可选包时才征求安装同意。不支持、加密、损坏或纯扫描内容会进入审查流程，不会被静默跳过。
-
-**或克隆整仓**（开发者路径，包含 benchmark、测试和维护者文档）：
+也可以克隆完整仓库。完整仓库包含测试、测试数据和维护文档，适合开发者：
 
 ```bash
 git clone https://github.com/ZeKaiNie/universal-examprep-skill .claude/skills/universal-exam-cram-coach
 ```
 
-### Codex / Cursor / Windsurf / Antigravity
+### Codex
 
-克隆仓库，让智能体读 `AGENTS.md`（一屏兜底契约）或加载 `skills/`。这些工具能直接写盘、跑脚本。
+直接对 Codex 说：“从 `ZeKaiNie/universal-examprep-skill` 安装最新版技能，名称为 `universal-exam-cram-coach`。”支持技能安装器的版本会把它放入 Codex 的技能目录。安装完成后重新开始一个对话，让新技能进入可用列表。
 
-### 网页版（ChatGPT / DeepSeek / Gemini / 豆包）
+### Cursor、Windsurf、Antigravity 和其他本地编程助手
 
-无法写本地文件，改用一键平替提示词：复制 [`prompts/web_prompt.md`](prompts/web_prompt.md)（英文版 [`web_prompt.en.md`](prompts/web_prompt.en.md)）发给它，再贴上材料。
-
-> 完整加载矩阵（各智能体支持程度、入口文件）见 [`docs/agent-portability.md`](docs/agent-portability.md)。根 [`SKILL.md`](SKILL.md) 是语言中性路由器，加载 [`skills/`](skills/) 的共享控制规则与 [`locales/zh/SKILL.md`](locales/zh/SKILL.md) / [`locales/en/SKILL.md`](locales/en/SKILL.md) 的轻量兼容文案入口；两种语言都不是第二份行为手册。
-
----
-
-## 子技能
-
-单体技能拆成 10 个单一职责技能，智能体按需加载：
-
-| 子技能 | 做什么 |
-|---|---|
-| `exam-cram` | 主协调器——编排四步工作流 + 学习模式路由 |
-| `exam-ingest` | 编排 PDF/DOCX/PPTX/文本建库、类型化 AI 审查、编译与 readiness 校验 |
-| `exam-tutor` | 按章惰性授课（含零基础七步精讲、画图先跑算法） |
-| `exam-study-guide` | 把单章编译为公式可读、自包含的 HTML，并可选生成经视觉验收的 PDF |
-| `exam-quiz` | 题库抽题判分（选择 / 主观 / 画图 / 填空 / 判断 / 代码 6 题型） |
-| `exam-review` | 错题与概念疑难点复盘 |
-| `exam-cheatsheet` | 考前速记小抄 |
-| `exam-audit` | 只读检查工作区健康度 |
-| `exam-help` | 一屏速查卡（工作流 / 模式 / 文件约定） |
-| `confusion-tracker` | 自动记录复习中的概念疑问，形成考前盲区清单 |
-
-十个技能都在 [`skills/`](skills/) 目录下（如 [`skills/exam-study-guide/SKILL.md`](skills/exam-study-guide/SKILL.md)），按任务惰性加载。PDF 工具按宿主区分且不会静默下载，详见 [`docs/pdf-capability-adapters.md`](docs/pdf-capability-adapters.md)。
-
-章节教材是可选输出。默认 `chat`（对话省额）在对话中教学，同时照常保存必要的进度/笔记，但不自动生成 HTML/PDF；说“省 token / 只在对话讲”或设置 `--artifact-mode chat` 即可保持此模式。说“不在乎 token / 以后每章给我打印版”或设置 `--artifact-mode visual`，才会自动生成章节 HTML + 经逐页验收的 PDF。智能体不得根据订阅套餐自行猜测；一次性的 PDF 请求也不会暗中改变长期偏好。
-
----
-
-## 开发
-
-零成本、可频繁跑的结构化校验（不烧额度）：
+这些平台没有统一的全局技能目录。最稳妥的方式是把仓库克隆到你的项目旁边，再让助手读取 [`AGENTS.md`](AGENTS.md)；如果平台支持技能集合，则让它加载 [`skills/`](skills/)：
 
 ```bash
-python -m unittest discover -s tests -v          # 单元测试（纯标准库，进 CI）
-python scripts/validate_workspace.py path/to/ws  # 校验一个建好的备考工作区
+git clone https://github.com/ZeKaiNie/universal-examprep-skill
 ```
 
-真·付费实测很贵（一次矩阵几十美元 / 几小时），只手动跑——操作手册见 [`benchmark/docs/running-real-runs.md`](benchmark/docs/running-real-runs.md)，分层策略见 [`benchmark/docs/test_tiers.md`](benchmark/docs/test_tiers.md)。工作区文件格式见 [`docs/file-format.md`](docs/file-format.md)。
+### ChatGPT、DeepSeek、Gemini 等网页版
 
----
+如果网页端不能写本地文件，就复制[网页版中文提示词](prompts/web_prompt.md)，再粘贴材料。它是便携替代方案，但不能长期保存本地学习进度，也不能保证逐题裁掉无关内容并核对最终讲义与原材料完全一致。
+
+各平台能做到什么，见[平台兼容说明](docs/agent-portability.md)。英文入口位于 [`locales/en/SKILL.md`](locales/en/SKILL.md)，英文网页提示词位于 [`prompts/web_prompt.en.md`](prompts/web_prompt.en.md)。
+
+## 你会在学习工作区看到什么
+
+普通学生只需要认识这几项：
+
+| 文件或文件夹 | 用途 |
+|---|---|
+| `study_state.json` | 真正的学习进度、模式和偏好；不要手改 |
+| `study_progress.md` | 给人看的进度摘要，由脚本生成 |
+| `notebook/` | 已讲内容、错题和每章复习笔记 |
+| `references/wiki/` | 完整建库后生成的分章知识库 |
+| `references/quiz_bank.json` | 有来源记录的标准题库 |
+| `.ingest/` | 完整建库的解析记录、待审问题和来源证明；主要给智能体和审计工具使用 |
+| `.lightweight/` | 轻量按需模式当前页面的图片与处理记录 |
+
+详细文件约定见[工作区文件说明](docs/file-format.md)。
+
+## 实测结果该怎样看
+
+项目做过“闭卷”“直接把原文件交给通用智能体”“使用本技能”三种方式的对照。测试课程中，针对课程材料出题时，正确率明显提高；材料里找不到依据的问题，也更愿意直接说明无法确认。完整数字、模型、题集、费用和限制见[测试报告](benchmark/REPORT.md)。
+
+这些结果只说明表中课程、模型和题集的表现，不能保证所有学科都得到相同提升。项目的目标是让答案有证据、缺口能暴露，而不是用一组数字证明“永远正确”。
 
 ## 常见问题
 
-**电脑没装 Python？** 只有直接探测确认解释器确实无法启动后，核心工作区才可明确降级为验证能力较弱的手动写盘模式。Python 能运行时的脚本或数据错误必须修复或报告，不能触发这条降级。MathML HTML/PDF 教材渲染器需要 Python，缺项会明确报出。
+**为什么第一章没有图片？** 先检查题面图是否真正显示，而不是只输出了文件路径。然后让智能体运行只读审计，列出哪些原页有图、哪些题缺图、还有哪些问题没处理。缺图时不能声称本章已经完整。
 
-**订阅额度较低？** `artifact_mode=chat` 是安全默认，正常授课不会额外组织章节 HTML/PDF。只有想要可打印视觉教材时再切到 `visual`；PDF 打印主要使用本地计算，但更详细的教材组织仍可能增加上下文与生成量。
+**为什么公式还是 `$...$` 这样的原始公式代码（LaTeX）？** 对话里应把公式拆成通俗语言解释；可视化复习讲义必须把公式渲染成人能直接阅读的形式。原始公式字符串可以作为机器记录保留，但不能作为最终教材的唯一展示。
 
-**只有照片 / PDF 扫描件 / 录音？** 把原文件直接交给建库流程：支持时会渲染并读取 PDF 页面，并把每个扫描页、跳过项和待审项放入类型化队列给 AI 接管；智能体必须认领并处理，或报告准确文件名与原因。录音仍需先转录再建库。
+**只有扫描件或照片怎么办？** 轻量按需可直接看当前图片或渲染后的 PDF 页面。完整建库会把识别不稳的页面放进待审清单，而不是静默跳过。录音仍需先转成文字。
 
-**测验卡在一道题？** 直接说"这题太难 / 我想跳过"，会自动归档到错题本、放行，最后统一重温。
+**没有 Python 怎么办？** 只有确认 Python 程序真的无法启动时，才使用能力较弱的手工方式。某条脚本报错不等于电脑没有 Python，应先修复或明确报告实际错误。
 
-**跟"直接把文件夹丢给 AI"有啥区别？** 多了可恢复状态、分章检索、标准题库、来源标注和缺图失败关闭。实测报告只比较其中两门课程的精度与成本，详见[报告](benchmark/REPORT.md)。
+**一道题太难，能跳过吗？** 可以。说“跳过”或“这题不会”，它会把题记入错题记录，继续往下，并在复盘时重新出现。
 
----
+**怎样审查一个已经生成的工作区？** 使用 [`skills/exam-audit/`](skills/exam-audit/) 做只读检查。它会列出材料版本、缺图、待审问题、题库和学习状态是否一致，不会默认修改文件。
+
+## 给开发者和维护者
+
+根 [`SKILL.md`](SKILL.md) 负责入口路由；共享行为规则位于 [`skills/`](skills/)；中英文兼容入口位于 [`locales/`](locales/)。十个子技能中包括授课、建库、测验、错题复盘、复习讲义、速记小抄、审计和 [`skills/confusion-tracker`](skills/confusion-tracker/SKILL.md) 疑难追踪。
+
+内部状态约定：用户明确要求“不出题、不提问”时保存 `no_questions=true`；因此章节完成状态最多为 `covered_unverified`。这些名称只供脚本、测试和维护者使用，学生不需要手动设置。
+
+常用检查：
+
+```bash
+python -m unittest discover -s tests -v
+python scripts/validate_workspace.py path/to/workspace
+python scripts/build_dist.py
+```
+
+架构和边界见[技能架构](docs/skill-architecture.md)、[平台兼容说明](docs/agent-portability.md)、[PDF 能力适配](docs/pdf-capability-adapters.md)和[语言规则](docs/language-policy.md)。历史版本只记录在 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ## 开源协议
 
-[MIT](LICENSE)。欢迎提交贡献更多科目模板或脚本。祝临考冲刺的你考神附体。🎓
-
-<div align="center">
-
-<a href="https://www.star-history.com/?repos=ZeKaiNie%2Funiversal-examprep-skill&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=ZeKaiNie/universal-examprep-skill&type=date&theme=dark&legend=top-left&sealed_token=q2eC20GmpWMHMen634RnHHNopx3dtYK6mzpbK0tB8B7sBn_LT0IKz-TYsaaWMY5xLJ6i7bsHedSzBxs4DU6cD5vZ8HFc-ZD2XAlqm5MnqBbf-ZbEq8zr2A" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=ZeKaiNie/universal-examprep-skill&type=date&legend=top-left&sealed_token=q2eC20GmpWMHMen634RnHHNopx3dtYK6mzpbK0tB8B7sBn_LT0IKz-TYsaaWMY5xLJ6i7bsHedSzBxs4DU6cD5vZ8HFc-ZD2XAlqm5MnqBbf-ZbEq8zr2A" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=ZeKaiNie/universal-examprep-skill&type=date&legend=top-left&sealed_token=q2eC20GmpWMHMen634RnHHNopx3dtYK6mzpbK0tB8B7sBn_LT0IKz-TYsaaWMY5xLJ6i7bsHedSzBxs4DU6cD5vZ8HFc-ZD2XAlqm5MnqBbf-ZbEq8zr2A" />
- </picture>
-</a>
-
-</div>
+[MIT](LICENSE)。欢迎提交新的学科模板、解析适配和真实课程回归样本。祝你复习顺利。🎓

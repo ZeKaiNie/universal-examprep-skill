@@ -33,6 +33,12 @@ for _s in ("stdout", "stderr"):
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# v4.3 ships both the lightweight default and the opt-in full ingestion / strict
+# Study Guide toolchain in one dependency-free archive. Keep a hard ceiling so
+# accidental dev-surface leaks still fail CI, while leaving a small deterministic
+# margin above the audited roughly 795 KB v4.3 release candidate.
+MAX_RUNTIME_ZIP_BYTES = 850_000
+
 # ---- the executable definition of the runtime surface ----
 # Directories are included RECURSIVELY but only with the listed extensions; single files verbatim.
 RUNTIME_FILES = (
@@ -78,8 +84,8 @@ PATH_EXCLUDES = (
 )
 
 RUNTIME_SUBSTITUTES = {
-    # Keep every established runtime link stable while avoiding the exhaustive
-    # contributor/audit schema in each student install.  Exact validation lives
+    # Keep established runtime links stable while avoiding the exhaustive
+    # contributor/audit schema in every student install. Exact validation lives
     # in shipped scripts; this compact reference retains the agent-facing rules.
     "docs/file-format.md": "docs/runtime-file-contract.md",
 }

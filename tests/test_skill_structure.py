@@ -82,7 +82,7 @@ class TestSkillCollectionStructure(unittest.TestCase):
         version = nested_frontmatter_value(read("SKILL.md"), "metadata", "version")
         self.assertEqual(
             version,
-            "4.2",
+            "4.3",
             "root SKILL.md metadata must be bumped with the current release; stale metadata "
             "makes a current install look like an older skill",
         )
@@ -156,7 +156,7 @@ class TestSkillCollectionStructure(unittest.TestCase):
         body = read("skills", "exam-tutor", "SKILL.md")
         self.assertIn("list_teaching_examples.py", body)
         self.assertIn("--chapter <N>", body)
-        self.assertIn("nonzero exit", body)
+        self.assertIn("exit is an invalid/unreadable inventory", body)
 
     def test_human_reading_view_is_routed_without_silent_skill_download(self):
         tutor = read("skills", "exam-tutor", "SKILL.md")
@@ -189,7 +189,7 @@ class TestSkillCollectionStructure(unittest.TestCase):
         self.assertIn("one-shot", cram.lower())
         self.assertIn("does not modify the persisted value", cheatsheet)
         self.assertIn("不自动生成章节 `HTML/PDF`", help_zh)
-        self.assertIn("do not automatically build chapter HTML/PDF", help_en)
+        self.assertIn("generate no Study Guide/PDF", help_en)
 
 
 if __name__ == "__main__":

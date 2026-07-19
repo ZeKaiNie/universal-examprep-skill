@@ -1,22 +1,50 @@
 # -*- coding: utf-8 -*-
 """A7 select_hard_questions.py 回归：难度 × 掌握状态 × A6 模式的确定性出题排序。"""
 import json
+import contextlib
+import io
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "scripts", "select_hard_questions.py")
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
+import exam_start  # noqa: E402
 import select_hard_questions as shq  # noqa: E402
+
+
+_RUNTIME_IDENTITY = None
+
+
+def _confirm_full_fixture(materials, workspace, home):
+    """Register the exact pair instead of bypassing the quiz runtime gate."""
+
+    global _RUNTIME_IDENTITY
+    if _RUNTIME_IDENTITY is None:
+        _RUNTIME_IDENTITY = exam_start._capture_runtime_identity()
+    output = io.StringIO()
+    with mock.patch.dict(os.environ, {"EXAMPREP_HOME": home}), mock.patch.object(
+            exam_start, "_capture_runtime_identity",
+            return_value=_RUNTIME_IDENTITY), contextlib.redirect_stdout(output):
+        code = exam_start.run([
+            "confirm", "--course", "hard-question-selector-fixture",
+            "--materials", materials, "--workspace", workspace,
+            "--mode", "from_scratch", "--time-budget", "le1d",
+            "--language", "zh", "--processing-mode", "full", "--json",
+        ])
+    if code != 0:
+        raise AssertionError(output.getvalue())
 
 
 def _q(qid, chapter=1, difficulty=3, **kw):
     d = {"id": qid, "chapter": chapter, "type": "subjective",
-         "question": "q", "answer": "a", "difficulty": difficulty}
+         "question": "q", "answer": "a", "keywords": ["a"],
+         "difficulty": difficulty}
     d.update(kw)
     return d
 
@@ -120,7 +148,12 @@ class OrderUnit(unittest.TestCase):
 
 class CliIO(unittest.TestCase):
     def setUp(self):
-        self.ws = tempfile.mkdtemp(prefix="a7sel_")
+        self.root = tempfile.mkdtemp(prefix="a7sel_")
+        self.ws = os.path.join(self.root, "workspace")
+        self.materials = os.path.join(self.root, "materials")
+        self.home = os.path.join(self.root, "examprep-home")
+        os.makedirs(self.ws)
+        os.makedirs(self.materials)
         os.makedirs(os.path.join(self.ws, "references"))
         self.bank = [
             _q("easy", chapter=1, difficulty=1),
@@ -129,24 +162,32 @@ class CliIO(unittest.TestCase):
         ]
         with open(os.path.join(self.ws, "references", "quiz_bank.json"), "w", encoding="utf-8") as f:
             json.dump(self.bank, f, ensure_ascii=False, indent=2)
+        _confirm_full_fixture(self.materials, self.ws, self.home)
+        self.env = dict(os.environ, EXAMPREP_HOME=self.home)
 
     def tearDown(self):
-        shutil.rmtree(self.ws, ignore_errors=True)
+        shutil.rmtree(self.root, ignore_errors=True)
 
     def _state(self, st):
-        with open(os.path.join(self.ws, "study_state.json"), "w", encoding="utf-8") as f:
-            json.dump(st, f, ensure_ascii=False, indent=2)
+        path = os.path.join(self.ws, "study_state.json")
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        state.update(st)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
 
     def _run(self, *args):
         return subprocess.run([sys.executable, SCRIPT, "--workspace", self.ws, "--json", *args],
-                              capture_output=True, text=True, encoding="utf-8")
+                              capture_output=True, text=True, encoding="utf-8",
+                              env=self.env)
 
     def test_json_shape_and_state_flag(self):
+        self._state({"mode": "fill_gaps"})
         r = self._run()
         self.assertEqual(r.returncode, 0, r.stderr)
         obj = json.loads(r.stdout)
         self.assertEqual(obj["mode"], "fill_gaps")                # v4：--json 载荷携带代号
-        self.assertFalse(obj["state_loaded"])
+        self.assertTrue(obj["state_loaded"])
         self.assertEqual({it["id"] for it in obj["items"]}, {"easy", "mid", "hard"})
 
     def test_legacy_non_gradable_item_is_never_selected(self):
@@ -197,20 +238,23 @@ class CliIO(unittest.TestCase):
     def test_chapter_filter_matches_phase(self):
         # 追加一个只带 phase 的题，--chapter 应按 chapter-OR-phase 命中它
         self.bank.append({"id": "ph2", "phase": 7, "type": "subjective",
-                          "question": "q", "answer": "a", "difficulty": 2})
+                          "question": "q", "answer": "a", "keywords": ["a"],
+                          "difficulty": 2})
         with open(os.path.join(self.ws, "references", "quiz_bank.json"), "w", encoding="utf-8") as f:
             json.dump(self.bank, f, ensure_ascii=False, indent=2)
         obj = json.loads(self._run("--chapter", "7").stdout)
         self.assertEqual([it["id"] for it in obj["items"]], ["ph2"])
 
-    def test_from_chapter_matches_phase_tag(self):
-        # 双标 {chapter:1, phase:3} 的题在 --from-chapter 3 时应保留（chapter 与 phase 都算）
+    def test_conflicting_chapter_phase_tags_fail_closed(self):
+        # 双标 {chapter:1, phase:3} 是矛盾范围，runtime policy 必须先于 selector fail closed。
         self.bank.append({"id": "dual", "chapter": 1, "phase": 3, "type": "subjective",
-                          "question": "q", "answer": "a", "difficulty": 2})
+                          "question": "q", "answer": "a", "keywords": ["a"],
+                          "difficulty": 2})
         with open(os.path.join(self.ws, "references", "quiz_bank.json"), "w", encoding="utf-8") as f:
             json.dump(self.bank, f, ensure_ascii=False, indent=2)
-        obj = json.loads(self._run("--from-chapter", "3").stdout)
-        self.assertIn("dual", [it["id"] for it in obj["items"]])       # phase=3 命中，不因 chapter=1 被剔
+        result = self._run("--from-chapter", "3")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("quiz_runtime_policy_conflict", result.stderr)
 
     def test_from_chapter_numeric(self):
         obj = json.loads(self._run("--from-chapter", "3").stdout)
@@ -225,11 +269,11 @@ class CliIO(unittest.TestCase):
         # homework-only 存档范围：只应返回 source_type=homework，exam/untagged 排除
         self.bank = [
             {"id": "hw1", "chapter": 1, "type": "subjective", "question": "q", "answer": "a",
-             "difficulty": 2, "source_type": "homework"},
+             "keywords": ["a"], "difficulty": 2, "source_type": "homework"},
             {"id": "ex1", "chapter": 1, "type": "subjective", "question": "q", "answer": "a",
-             "difficulty": 4, "source_type": "exam"},
+             "keywords": ["a"], "difficulty": 4, "source_type": "exam"},
             {"id": "untagged", "chapter": 1, "type": "subjective", "question": "q", "answer": "a",
-             "difficulty": 3},
+             "keywords": ["a"], "difficulty": 3},
         ]
         with open(os.path.join(self.ws, "references", "quiz_bank.json"), "w", encoding="utf-8") as f:
             json.dump(self.bank, f, ensure_ascii=False, indent=2)
@@ -307,9 +351,9 @@ class CliIO(unittest.TestCase):
         # 范围过滤下未标签题被排除必须计数上报（finding B / A2 契约）
         self.bank = [
             {"id": "hw", "chapter": 1, "type": "subjective", "question": "q", "answer": "a",
-             "difficulty": 2, "source_type": "homework"},
+             "keywords": ["a"], "difficulty": 2, "source_type": "homework"},
             {"id": "untag", "chapter": 1, "type": "subjective", "question": "q", "answer": "a",
-             "difficulty": 3},
+             "keywords": ["a"], "difficulty": 3},
         ]
         with open(os.path.join(self.ws, "references", "quiz_bank.json"), "w", encoding="utf-8") as f:
             json.dump(self.bank, f, ensure_ascii=False, indent=2)
@@ -325,30 +369,33 @@ class CliIO(unittest.TestCase):
         with open(ext, "w", encoding="utf-8") as f:
             json.dump({"mode": "查缺补漏"}, f, ensure_ascii=False)
         link = os.path.join(self.ws, "study_state.json")
+        os.unlink(link)
         try:
             os.symlink(ext, link)
         except (OSError, NotImplementedError, AttributeError):
             self.skipTest("平台不支持 symlink")
         r = self._run()
         self.assertEqual(r.returncode, 2)
-        self.assertIn("符号链接", r.stderr)
+        self.assertIn("study_state.json", r.stderr)
+        self.assertIn("linked", r.stderr)
 
-    def test_md_only_scope_fallback(self):
-        # 无 study_state.json 但 study_progress.md 记了 homework-only → 仍按范围过滤（不静默放宽）
+    def test_md_only_scope_cannot_bypass_runtime_gate(self):
+        # 生成视图不能替代规范 state/runtime receipt；缺 state 必须先失败关闭。
         self.bank = [
             {"id": "hw", "chapter": 1, "type": "subjective", "question": "q", "answer": "a",
-             "difficulty": 2, "source_type": "homework"},
+             "keywords": ["a"], "difficulty": 2, "source_type": "homework"},
             {"id": "ex", "chapter": 1, "type": "subjective", "question": "q", "answer": "a",
-             "difficulty": 4, "source_type": "exam"},
+             "keywords": ["a"], "difficulty": 4, "source_type": "exam"},
         ]
         with open(os.path.join(self.ws, "references", "quiz_bank.json"), "w", encoding="utf-8") as f:
             json.dump(self.bank, f, ensure_ascii=False, indent=2)
         with open(os.path.join(self.ws, "study_progress.md"), "w", encoding="utf-8") as f:
             f.write("# 学习进度\n\n* **范围/模式**：homework-only ｜ 查缺补漏 ｜ 时间预算 未设定\n")
-        obj = json.loads(self._run().stdout)
-        self.assertTrue(obj["state_loaded"])                 # md 回落也算已读 state
-        self.assertEqual(obj["source_types"], ["homework"])   # 范围行被尊重
-        self.assertEqual([it["id"] for it in obj["items"]], ["hw"])
+        os.unlink(os.path.join(self.ws, "study_state.json"))
+        result = self._run()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("runtime 安全门禁", result.stderr)
+        self.assertIn("study_state.json", result.stderr)
 
     # ---- 某章起步补弱：必须显式 --from-chapter，绝不从 current_phase 猜（阶段号≠章号）----
     def test_weak_start_mode_requires_explicit_scope(self):

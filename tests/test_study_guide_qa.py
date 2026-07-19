@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import study_guide_qa as qa  # noqa: E402
 
 
-def png_payload(width, height, marker=b""):
+def png_payload(width, height, marker=b"", physical_density=None):
     def chunk(kind, payload):
         return (struct.pack(">I", len(payload)) + kind + payload
                 + struct.pack(">I", zlib.crc32(kind + payload) & 0xffffffff))
@@ -27,6 +27,9 @@ def png_payload(width, height, marker=b""):
     return (
         qa.PNG_SIGNATURE
         + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 1, 0, 0, 0, 0))
+        + (chunk(b"pHYs", struct.pack(">IIB", physical_density[0],
+                                      physical_density[1], physical_density[2]))
+           if physical_density else b"")
         + (chunk(b"tEXt", marker) if marker else b"")
         + chunk(b"IDAT", zlib.compress(row * height))
         + chunk(b"IEND", b"")
@@ -66,7 +69,12 @@ class StudyGuideQATest(unittest.TestCase):
         os.makedirs(self.guide)
         os.makedirs(os.path.join(self.ws, "notebook"))
         with open(os.path.join(self.ws, "study_state.json"), "w", encoding="utf-8") as stream:
-            json.dump({"language": "bilingual", "artifact_mode": "visual"}, stream)
+            json.dump({
+                "language": "bilingual",
+                "artifact_mode": "visual",
+                "processing_mode": "full",
+                "answer_explanation_mode": "ordinary",
+            }, stream)
         self.manifest_path = os.path.join(self.ws, "notebook", "ch01.guide.json")
         with open(self.manifest_path, "w", encoding="utf-8") as stream:
             json.dump({"schema_version": 1, "chapter": 1}, stream)
@@ -79,6 +87,9 @@ class StudyGuideQATest(unittest.TestCase):
         self.receipt_path = os.path.join(self.guide, "ch01.receipt.json")
         self.gate = {
             "ready_to_use": True,
+            "ready_to_ingest": True,
+            "processing_mode": "full",
+            "answer_explanation_mode": "ordinary",
             "workspace": self.ws,
             "materials": os.path.join(self.ws, "materials"),
             "registered_course": "fixture-course",
@@ -96,6 +107,9 @@ class StudyGuideQATest(unittest.TestCase):
             "chapter": 1,
             "language": "bilingual",
             "profile": "full",
+            "authoring_protocol_version": 2,
+            "answer_explanation_mode": "ordinary",
+            "ingestion_pipeline_version": "ingestion-v2",
             "expected_item_ids": ["item-1"],
             "walkthrough_item_ids": ["item-1"],
             "omitted_item_ids": [],
@@ -108,8 +122,9 @@ class StudyGuideQATest(unittest.TestCase):
         converter = os.path.abspath("C:/browser/msedge.exe")
         started = "2026-07-14T11:00:00Z"
         completed = "2026-07-14T11:00:01Z"
+        conversion_gate_hash = qa._canonical_hash(gate_snapshot)
         self.write_receipt({
-            "schema_version": 2,
+            "schema_version": 3,
             "artifact_type": "study_guide",
             "chapter": 1,
             "profile": "full",
@@ -125,12 +140,19 @@ class StudyGuideQATest(unittest.TestCase):
             "pdf_sha256": pdf_hash,
             "pdf_backend": "browser",
             "converter": converter,
+            "native_adapter_id": None,
+            "native_adapter_version": None,
             "conversion_input_html_sha256": input_hash,
             "conversion_started_at": started,
             "conversion_completed_at": completed,
+            "conversion_start_gate_sha256": conversion_gate_hash,
             "conversion_run_sha256": qa._conversion_run_hash(
-                1, "full", "bilingual", html_hash, pdf_hash, input_hash,
-                converter, started, completed, gate_snapshot,
+                1, "full", "bilingual",
+                "notebook/ch01.guide.json", qa._sha256_file(self.manifest_path),
+                "study_guide/ch01.html", html_hash,
+                "study_guide/ch01.pdf", pdf_hash, "browser", input_hash,
+                converter, None, None, started, completed,
+                conversion_gate_hash, gate_snapshot,
             ),
             "preflight": {
                 "status": "injected-test-converter", "pdf_backend": "browser",
@@ -150,10 +172,95 @@ class StudyGuideQATest(unittest.TestCase):
             qa.exam_start, "check_registered_workspace_gate",
             side_effect=lambda unused_ws: self.gate,
         )
+        full_gate_patch = mock.patch.object(
+            qa.exam_start, "require_full_processing",
+            side_effect=lambda unused_ws, purpose=None: self.gate,
+        )
         manifest_patch.start()
         gate_patch.start()
+        full_gate_patch.start()
         self.addCleanup(manifest_patch.stop)
         self.addCleanup(gate_patch.stop)
+        self.addCleanup(full_gate_patch.stop)
+
+    def test_pymupdf_backend_uses_matrix_scaling_and_strips_density_metadata(self):
+        calls = []
+
+        class Pixmap(object):
+            width = 2
+            height = 2
+            n = 3
+            samples = b"\xff" * 12
+
+            def tobytes(self, output):
+                return png_payload(2, 2, physical_density=(5906, 5906, 1))
+
+        class Page(object):
+            def get_text(self, mode):
+                return "Page text"
+
+            def get_pixmap(self, **kwargs):
+                calls.append(kwargs)
+                return Pixmap()
+
+        class Document(object):
+            page_count = 1
+
+            def __getitem__(self, index):
+                return Page()
+
+            def close(self):
+                pass
+
+        class Module(object):
+            @staticmethod
+            def Matrix(x, y):
+                return (x, y)
+
+            @staticmethod
+            def open(*args, **kwargs):
+                return Document()
+
+        pages = qa.PyMuPDFBackend(Module).render_pages(b"%PDF")
+        self.assertEqual(1, len(pages))
+        self.assertEqual([{
+            "matrix": (150.0 / 72.0, 150.0 / 72.0),
+            "alpha": False,
+        }], calls)
+        self.assertNotIn("dpi", calls[0])
+        self.assertNotIn(b"pHYs", pages[0]["png"])
+        self.assertEqual((2, 2), qa._png_dimensions(pages[0]["png"]))
+
+    def test_strip_png_physical_density_preserves_other_chunks(self):
+        original = png_payload(
+            9, 7, marker=b"qa-marker", physical_density=(3780, 3780, 1))
+        cleaned = qa._strip_png_physical_density(original)
+        self.assertNotIn(b"pHYs", cleaned)
+        self.assertIn(b"qa-marker", cleaned)
+        self.assertEqual((9, 7), qa._png_dimensions(cleaned))
+
+    def test_orphan_lint_catches_bilingual_and_source_step_headings(self):
+        for tail in (
+                "EN ·",
+                "中文 · 题面翻译 / Prompt translation",
+                "来源证据 / Source evidence",
+                "答案 / Answer",
+                "Answer"):
+            with self.subTest(tail=tail):
+                self.assertTrue(qa._looks_like_orphan_heading(
+                    "Readable page content\n%s\nPage 3 of 9" % tail))
+        # Text extraction cannot tell whether an image follows this heading on
+        # the same page.  The atomic prompt block and mandatory visual review
+        # own that check; treating it as text-only would create false failures.
+        self.assertFalse(qa._looks_like_orphan_heading(
+            "Readable page content\n① Start with the complete prompt\nPage 3 of 9"))
+        self.assertFalse(qa._looks_like_orphan_heading(
+            "来源证据 / Source evidence\nlecture/ch01.pdf · p.4\nPage 3 of 9"))
+        self.assertFalse(qa._looks_like_orphan_heading(
+            "⑦ 来源追踪 / ⑦ Source trace\n"
+            "lecture/ch01.pdf · 第 4 页 / page 4 · 题面 / Question\n"
+            "lecture/ch01.pdf · 第 4 页 / page 4 · 答案 / Answer\n"
+            "Page 5 of 5"))
 
     def write_receipt(self, receipt):
         with open(self.receipt_path, "w", encoding="utf-8") as stream:
@@ -289,7 +396,8 @@ class StudyGuideQATest(unittest.TestCase):
         self.assertEqual(1, code, error)
         self.assertIn("valid PNG", error)
         for path, payload in sentinels.items():
-            self.assertEqual(payload, open(path, "rb").read())
+            with open(path, "rb") as stream:
+                self.assertEqual(payload, stream.read())
         self.assertFalse(any(name.startswith(".ch01-") for name in os.listdir(qa_dir)))
         visual = self.read_receipt()["visual_qa"]
         self.assertEqual("blocked", visual["status"])
@@ -473,7 +581,7 @@ class StudyGuideQATest(unittest.TestCase):
         self.write_receipt(receipt)
         code, unused_out, error = self.invoke("render")
         self.assertEqual(1, code)
-        self.assertIn("external/native PDF binding is forbidden", error)
+        self.assertIn("no complete browser/native PDF binding", error)
 
     def test_conversion_and_current_state_drift_are_rejected(self):
         receipt = self.read_receipt()
@@ -486,14 +594,22 @@ class StudyGuideQATest(unittest.TestCase):
         # Restore the strict fixture by repairing the conversion fields and then drift state.
         receipt["conversion_input_html_sha256"] = qa._conversion_input_hash(self.html)
         receipt["conversion_run_sha256"] = qa._conversion_run_hash(
-            1, receipt["profile"], receipt["language"], receipt["html_sha256"],
-            receipt["pdf_sha256"], receipt["conversion_input_html_sha256"],
-            receipt["converter"], receipt["conversion_started_at"],
-            receipt["conversion_completed_at"], receipt["start_gate"],
+            1, receipt["profile"], receipt["language"],
+            receipt["content_manifest"], receipt["content_manifest_sha256"],
+            receipt["html_file"], receipt["html_sha256"],
+            receipt["pdf_file"], receipt["pdf_sha256"], receipt["pdf_backend"],
+            receipt["conversion_input_html_sha256"], receipt["converter"],
+            receipt["native_adapter_id"], receipt["native_adapter_version"],
+            receipt["conversion_started_at"], receipt["conversion_completed_at"],
+            receipt["conversion_start_gate_sha256"], receipt["start_gate"],
         )
         self.write_receipt(receipt)
         with open(os.path.join(self.ws, "study_state.json"), "w", encoding="utf-8") as stream:
-            json.dump({"language": "en", "artifact_mode": "visual"}, stream)
+            json.dump({
+                "language": "en", "artifact_mode": "visual",
+                "processing_mode": "full",
+                "answer_explanation_mode": "ordinary",
+            }, stream)
         code, unused_out, error = self.invoke("render")
         self.assertEqual(1, code)
         self.assertIn("language drifted", error)

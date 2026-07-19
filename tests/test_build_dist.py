@@ -231,8 +231,8 @@ class Build(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertTrue(os.path.isfile(out))
             self.assertLessEqual(
-                os.path.getsize(out), 570_000,
-                "运行时包必须 ≤570,000 B，为跨平台 ZIP 差异保留余量",
+                os.path.getsize(out), build_dist.MAX_RUNTIME_ZIP_BYTES,
+                "运行时包超过 v4.3 的 850,000 B 硬上限；请排除开发面或重新审计新增运行时能力",
             )
             with zipfile.ZipFile(out) as z:
                 names = set(z.namelist())

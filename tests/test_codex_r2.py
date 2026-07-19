@@ -30,12 +30,29 @@ RAW_OK = {
 
 
 def _run_ingest(raw, tmp):
-    rp = os.path.join(tmp, "raw_input.json")
+    materials = os.path.join(tmp, "materials")
+    os.makedirs(materials, exist_ok=True)
+    rp = os.path.join(materials, "raw_input.json")
     with open(rp, "w", encoding="utf-8") as f:
         json.dump(raw, f, ensure_ascii=False)
     ws = os.path.join(tmp, "ws")
+    env = dict(os.environ)
+    env["EXAMPREP_HOME"] = os.path.join(tmp, ".examprep-home")
+    confirmed = subprocess.run(
+        [
+            PY, os.path.join(SCRIPTS, "exam_start.py"), "confirm",
+            "--course", "codex-r2-fixture",
+            "--materials", materials, "--workspace", ws,
+            "--mode", "from_scratch", "--time-budget", "le1d",
+            "--language", "en", "--processing-mode", "full", "--json",
+        ],
+        capture_output=True, text=True, encoding="utf-8", env=env,
+    )
+    if confirmed.returncode != 0:
+        return ws, confirmed
     r = subprocess.run([PY, os.path.join(SCRIPTS, "ingest.py"), "--input", rp,
-                        "--output-dir", ws], capture_output=True, text=True, encoding="utf-8")
+                        "--output-dir", ws], capture_output=True, text=True,
+                       encoding="utf-8", env=env)
     return ws, r
 
 

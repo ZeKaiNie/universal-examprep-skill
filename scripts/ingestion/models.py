@@ -21,6 +21,16 @@ from .identifiers import (
     validate_stable_id,
 )
 
+try:
+    from stable_ids import stable_item_id_problem
+except ImportError:  # imported as ``scripts.ingestion.models``
+    from scripts.stable_ids import stable_item_id_problem
+
+try:
+    from asset_crops import CropContractError, validate_crop_asset_declaration
+except ImportError:  # imported as ``scripts.ingestion.models``
+    from scripts.asset_crops import CropContractError, validate_crop_asset_declaration
+
 
 SCHEMA_VERSION = 1
 
@@ -73,6 +83,9 @@ ASSET_ROLES = frozenset(
         "other",
     )
 )
+ASSET_TYPES = frozenset(
+    ("page_image", "crop_image", "diagram", "table_image", "other_image")
+)
 ISSUE_STATUSES = frozenset(
     (
         "pending",
@@ -98,6 +111,8 @@ QUIZ_SOURCE_TYPES = frozenset(
     ("homework", "lecture_quiz", "example", "practice_exam", "exam", "other")
 )
 QUESTION_TEXT_STATUSES = frozenset(("full", "stub", "page_reference"))
+TEACHING_ROLES = frozenset(("paired_problem", "worked_example"))
+ANSWER_ORIGINS = frozenset(("inline_material",))
 CONTENT_METADATA_FIELDS = frozenset(
     (
         "quiz_type",
@@ -110,6 +125,10 @@ CONTENT_METADATA_FIELDS = frozenset(
         "source_pages",
         "answer_source_file",
         "answer_source_pages",
+        "answer_origin",
+        "inline_material_source_unit_id",
+        "teaching_role",
+        "teaching_title",
         "assets",
         "requires_assets",
         "maybe_requires_assets",
@@ -489,9 +508,12 @@ class ContentUnit:
         _sha(self.source_sha256, "ContentUnit.source_sha256")
         _path(self.source_file, "ContentUnit.source_file")
         if self.external_id is not None:
-            _nonempty(self.external_id, "ContentUnit.external_id")
-            if any(char in self.external_id for char in ("\x00", "\n", "\r")):
-                _fail("ContentUnit.external_id must be a single-line identifier")
+            problem = stable_item_id_problem(self.external_id)
+            if problem:
+                _fail(
+                    "ContentUnit.external_id violates the shared quiz/teaching/Guide "
+                    "identity contract: %s" % problem
+                )
         _enum(self.kind, UNIT_KINDS, "ContentUnit.kind")
         if not isinstance(self.text, str):
             _fail("ContentUnit.text must be a string")
@@ -577,6 +599,18 @@ class ContentUnit:
             answer_source_file = metadata.get("answer_source_file")
             if answer_source_file is not None:
                 _path(answer_source_file, "ContentUnit.metadata.answer_source_file")
+            teaching_role = metadata.get("teaching_role")
+            if teaching_role is not None:
+                _enum(
+                    teaching_role,
+                    TEACHING_ROLES,
+                    "ContentUnit.metadata.teaching_role",
+                )
+            teaching_title = metadata.get("teaching_title")
+            if teaching_title is not None:
+                _nonempty(teaching_title, "ContentUnit.metadata.teaching_title")
+                if any(char in teaching_title for char in ("\x00", "\n", "\r")):
+                    _fail("ContentUnit.metadata.teaching_title must be single-line text")
             source_language = metadata.get("source_language")
             if source_language is not None:
                 _enum(
@@ -597,6 +631,79 @@ class ContentUnit:
             gradable = metadata.get("gradable")
             if gradable is not None and type(gradable) is not bool:
                 _fail("ContentUnit.metadata.gradable must be a boolean")
+            answer_origin = metadata.get("answer_origin")
+            inline_material_source_unit_id = metadata.get(
+                "inline_material_source_unit_id"
+            )
+            if inline_material_source_unit_id is not None:
+                _stable_id(
+                    inline_material_source_unit_id,
+                    "unit",
+                    "ContentUnit.metadata.inline_material_source_unit_id",
+                )
+                if answer_origin != "inline_material":
+                    _fail(
+                        "inline_material_source_unit_id requires "
+                        "answer_origin=inline_material"
+                    )
+            if answer_origin is not None:
+                _enum(
+                    answer_origin,
+                    ANSWER_ORIGINS,
+                    "ContentUnit.metadata.answer_origin",
+                )
+                if self.kind != "answer":
+                    _fail("ContentUnit.metadata.answer_origin requires kind=answer")
+                if self.provenance != "material":
+                    _fail("inline material answer evidence requires material provenance")
+                if metadata.get("source") != "material":
+                    _fail("inline material answer evidence requires source=material")
+                if teaching_role != "worked_example" or gradable is not False:
+                    _fail(
+                        "inline material answer evidence requires a non-gradable worked_example"
+                    )
+                if teaching_title is None:
+                    _fail("inline material answer evidence requires teaching_title")
+                if inline_material_source_unit_id is None:
+                    _fail(
+                        "inline material answer evidence requires its exact native "
+                        "material source unit"
+                    )
+                if source_language not in ("zh", "en"):
+                    _fail(
+                        "inline material answer evidence requires source_language=zh|en"
+                    )
+                normalized_title = " ".join(teaching_title.split()).casefold()
+                normalized_text = " ".join(self.text.split()).casefold()
+                if not (
+                    normalized_text.startswith(normalized_title)
+                    and len(normalized_text) > len(normalized_title)
+                    and (
+                        normalized_text[len(normalized_title)].isspace()
+                        or normalized_text[len(normalized_title)]
+                        in (":.-" + "\u2013\u2014")
+                    )
+                ):
+                    _fail(
+                        "inline material answer text must begin with its exact teaching title"
+                    )
+                if answer_source_file != self.source_file:
+                    _fail(
+                        "inline material answer evidence must use its own source file"
+                    )
+                if metadata.get("answer_source_pages") != [self.page]:
+                    _fail(
+                        "inline material answer evidence must use exactly its own source page"
+                    )
+                if any(
+                    isinstance(asset, dict)
+                    and asset.get("role") in ("answer_context", "worked_solution")
+                    for asset in metadata.get("assets") or ()
+                ):
+                    _fail(
+                        "inline material answer evidence cannot duplicate its page "
+                        "as an answer-side asset"
+                    )
             question_text_status = metadata.get("question_text_status")
             if question_text_status is not None:
                 _enum(
@@ -622,16 +729,46 @@ class ContentUnit:
                     _fail("ContentUnit.metadata.assets must be a list")
                 for index, asset in enumerate(assets):
                     required = {"path", "role"}
-                    optional = {"sha256", "source_sha256", "source_file"}
+                    optional = {
+                        "sha256", "source_sha256", "source_file", "type",
+                        "contains_full_prompt", "source_page",
+                        "source_bbox_pdf_points", "crop_receipt_id",
+                        "crop_receipt_schema_version", "crop_spec_sha256",
+                        "semantic_purity_sha256", "semantic_purity_schema_version",
+                        "required_context_ids", "content_scope", "isolation",
+                    }
                     if (not isinstance(asset, dict) or not required.issubset(asset)
                             or set(asset) - required - optional):
                         _fail(
-                            "ContentUnit.metadata.assets[%d] needs path/role and optional source/hashes"
+                            "ContentUnit.metadata.assets[%d] needs path/role and optional "
+                            "source/hashes/type/full-prompt control"
                             % index
                         )
                     _path(asset["path"], "ContentUnit.metadata.assets[%d].path" % index)
                     _enum(asset["role"], ASSET_ROLES,
                           "ContentUnit.metadata.assets[%d].role" % index)
+                    if "type" in asset:
+                        _enum(
+                            asset["type"], ASSET_TYPES,
+                            "ContentUnit.metadata.assets[%d].type" % index,
+                        )
+                    if "contains_full_prompt" in asset:
+                        contains = asset["contains_full_prompt"]
+                        if type(contains) is not bool:
+                            _fail(
+                                "ContentUnit.metadata.assets[%d].contains_full_prompt "
+                                "must be a boolean" % index
+                            )
+                        if contains and asset["role"] != "question_context":
+                            _fail(
+                                "ContentUnit.metadata.assets[%d].contains_full_prompt=true "
+                                "requires role=question_context" % index
+                            )
+                        if contains and "sha256" not in asset:
+                            _fail(
+                                "ContentUnit.metadata.assets[%d].contains_full_prompt=true "
+                                "requires an exact asset sha256 revision" % index
+                            )
                     if "source_file" in asset:
                         _path(
                             asset["source_file"],
@@ -643,6 +780,13 @@ class ContentUnit:
                                 asset[hash_field],
                                 "ContentUnit.metadata.assets[%d].%s" % (index, hash_field),
                             )
+                    try:
+                        validate_crop_asset_declaration(asset)
+                    except CropContractError as exc:
+                        _fail(
+                            "ContentUnit.metadata.assets[%d] crop contract: %s"
+                            % (index, exc)
+                        )
             if self.kind == "answer" and "answer_value" in metadata:
                 render_answer_value(metadata["answer_value"])
                 if quiz_type == "true_false":
@@ -920,6 +1064,9 @@ def canonicalize_operation(operation):
     fields = _operation_fields(name)
     if name == "pair_qa" and set(operation) == set(fields).union({"source_revisions"}):
         pass
+    elif (name == "replace_unit"
+          and set(operation) == set(fields).union({"expected_unit_sha256"})):
+        pass
     else:
         _strict_mapping(operation, fields, "ReviewPatch operation %s" % name)
 
@@ -931,6 +1078,11 @@ def canonicalize_operation(operation):
         _stable_id(operation["unit_id"], "unit", "replace_unit.unit_id")
         if result["unit"]["unit_id"] != operation["unit_id"]:
             _fail("replace_unit.unit must retain unit_id")
+        if "expected_unit_sha256" in operation:
+            _sha(
+                operation["expected_unit_sha256"],
+                "replace_unit.expected_unit_sha256",
+            )
     elif name == "assign_chapter":
         _stable_id(operation["unit_id"], "unit", "assign_chapter.unit_id")
         _nonempty(operation["chapter"], "assign_chapter.chapter")

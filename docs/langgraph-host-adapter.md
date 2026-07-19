@@ -1,9 +1,18 @@
-# Optional LangGraph host adapter
+# Remote-only LangGraph host contract
 
-`scripts/host_adapters/langgraph_exam.py` is opt-in/lazy-imported. Hosts supply a
-durable checkpointer; default runs need no LangGraph, install, or network.
+LangGraph is not part of the local student runtime. The package never downloads,
+installs, imports, or executes it. `scripts/host_adapters/langgraph_exam.py` keeps
+bounded receipt validators and routing helpers only so a separately operated
+remote/cloud host can implement the same gates. Calling `build_exam_graph()`
+locally fails explicitly.
 
-The adapter can wrap the full exam workflow without replacing its existing tools:
+A remote host may be proposed only when the learner explicitly asks for
+LangGraph. Before any upload, that host must disclose its service, data boundary,
+retention/privacy terms, and receive separate consent. If no configured remote
+integration exists, report it unavailable and use the normal local command/state
+machine; do not install a local fallback.
+
+The remote graph may coordinate the full workflow, but never becomes its truth:
 
 ```text
 START -> rehydrate -> [confirm] -> ingest -> validate ->
@@ -11,37 +20,23 @@ START -> rehydrate -> [confirm] -> ingest -> validate ->
 atomic completion snapshot -> END
 ```
 
-Guards reread `study_state.json`, `.ingest/`, runtime, Guide, render, and QA
-receipts on every resume. Checkpoints are routing hints, never evidence. Source,
-parser, runtime, build, typed-review, warning, teaching, artifact, or dependency
-drift returns to its canonical gate. The completion node takes a locked fresh
-validation/progress snapshot and post-checks its dependency digest before END.
-Invalid or truncated facts fail closed; validator output is bounded and a partial
-warning list cannot be acknowledged.
+Every transition must reread `study_state.json`, `.ingest/`, runtime, Guide,
+render, and QA receipts. Checkpoints are bounded routing hints, not course or
+learning evidence. Source, parser, runtime, build, review, warning, teaching,
+artifact, or dependency drift returns to its canonical local gate. Interrupt
+nodes perform no side effects before interrupting; mutation commands remain
+idempotent or receipt-protected.
 
-Every invoke/resume reuses one stable `thread_id`. Interrupt nodes perform no side
-effects before `interrupt`; command nodes are idempotent or protected by durable
-operation receipts. Review routing only lists work: evidence inspection,
-claim/patch/apply/rebuild, and validation remain in `ingest_review.py`.
+The default `processing_mode=lightweight` never enters this route. Even under
+`processing_mode=full`, LangGraph remains explicit opt-in and remote-only.
 
-## Study Guide subgraph
+## Study Guide subgraph contract
 
 ```text
 rehydrate -> claim_create -> claim_attach -> claim_verify -> typed_validate ->
 import -> preflight -> html -> pdf -> qa_render -> inspection -> accept -> validate
 ```
 
-The host's read-only, local-only `command_api.study_guide_status(workspace,
-chapter, artifact_mode, draft_path)` reruns the existing validators and returns
-exactly `schema_version`, `chapter`, `artifact_mode`, `stage`, `pdf_sha256`,
-`render_manifest_sha256`, and `pages`. Preflight and HTML publication are separate
-gates; visual inspection/ready bind every ordered PNG hash.
-
-First mount reports current truth. Later same-mode reads may stay, regress, or
-advance one stage; chat goes `import` to `ready`, and v1 mounts after claim gates.
-Inspection exposes every current PNG and requires one `N=pass[:notes]` verdict per
-page. Only canonical `study_guide_qa.py accept` output advances to ready; any defect
-requires rerendering and a fresh first-to-last inspection.
-
-References: [interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts),
-[persistence](https://docs.langchain.com/oss/python/langgraph/persistence).
+The host must expose the same bounded Study Guide status fields and preserve the
+existing progression gates. A remote checkpoint cannot skip claim verification,
+typed import, rendering receipts, or one passing visual verdict per rendered page.

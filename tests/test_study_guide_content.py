@@ -60,6 +60,16 @@ class StudyGuideContentTest(unittest.TestCase):
         )
 
     def setUp(self):
+        full_gate = mock.patch.object(
+            sgc.exam_start,
+            "require_full_processing",
+            return_value={
+                "ready_to_ingest": True,
+                "processing_mode": "full",
+            },
+        )
+        full_gate.start()
+        self.addCleanup(full_gate.stop)
         self.ws = tempfile.mkdtemp(prefix="study-guide-content-")
         self.addCleanup(shutil.rmtree, self.ws, ignore_errors=True)
         os.makedirs(os.path.join(self.ws, "references", "assets"))
@@ -374,7 +384,6 @@ class StudyGuideContentTest(unittest.TestCase):
                 localized("代入并计算 0.4。", "Substitute and calculate 0.4."),
             ],
             "answer": localized("答案是 0.4。", "The answer is 0.4."),
-            "self_check": localized("结果在 0 与 1 之间。", "The result lies between 0 and 1."),
             "source_trace": [self._source("question"), self._source("answer")],
         }
         if not full_prompt:
@@ -395,8 +404,66 @@ class StudyGuideContentTest(unittest.TestCase):
             "omissions": [],
         }
 
+    def _with_explicit_provenance_sidecars(self, manifest=None):
+        manifest = copy.deepcopy(manifest or self._manifest())
+        ai = {"zh": "ai_supplement", "en": "ai_supplement"}
+        knowledge_point = manifest["knowledge_points"][0]
+        knowledge_point["explanation_provenance"] = {
+            "zh": "ai_translation", "en": "material",
+        }
+        formula = knowledge_point["formulas"][0]
+        formula["explanation_provenance"] = copy.deepcopy(ai)
+        formula["applicability_provenance"] = copy.deepcopy(ai)
+        for variable in formula["variables"]:
+            variable["meaning_provenance"] = copy.deepcopy(ai)
+        for walk in manifest["walkthroughs"]:
+            walk["translation_provenance"] = {"zh": "ai_translation"}
+            walk["what_asked_provenance"] = copy.deepcopy(ai)
+            walk["knowledge_point_uses_provenance"] = {
+                kp_id: copy.deepcopy(ai)
+                for kp_id in walk["knowledge_point_uses"]
+            }
+            for quantity in walk["known_quantities"] + walk["unknown_quantities"]:
+                quantity["provenance"] = copy.deepcopy(ai)
+            for formula_use in walk["formula_uses"]:
+                formula_use["why_applicable_provenance"] = copy.deepcopy(ai)
+                formula_use["substitution_provenance"] = "ai_supplement"
+                for mapping in formula_use["variable_mapping"]:
+                    mapping["maps_to_provenance"] = copy.deepcopy(ai)
+            walk["steps_provenance"] = [
+                copy.deepcopy(ai) for unused_step in walk["steps"]
+            ]
+        return manifest
+
+    def _as_protocol_v2(self, manifest=None):
+        manifest = self._with_explicit_provenance_sidecars(manifest)
+        manifest["authoring_protocol_version"] = 2
+        manifest["answer_explanation_mode"] = "ordinary"
+        explanation = localized(
+            "题目要求的是在事件 B 已经发生的前提下，事件 A 发生的概率。先把交集概率看成同时满足 A 和 B 的部分，再用它除以条件事件 B 的概率，就等于在缩小后的样本空间里计算 A 所占的比例。代入题目给出的数值后得到 0.4，这表示在 B 已发生时，A 发生的概率是百分之四十。",
+            "The question asks for the probability that event A occurs after we restrict the sample space to outcomes where event B has already occurred. The intersection probability represents the outcomes satisfying both A and B, so dividing it by the probability of B measures the share of the restricted sample space that also belongs to A. Substituting the supplied values gives 0.4, which means that once B is known to have occurred, A occurs with probability forty percent.",
+        )
+        provenance = {"zh": "ai_supplement", "en": "ai_supplement"}
+        for walk in manifest["walkthroughs"]:
+            walk["answer_explanation"] = copy.deepcopy(explanation)
+            walk["answer_explanation_provenance"] = copy.deepcopy(provenance)
+        self._write_json("study_state.json", {
+            "language": manifest["language"],
+            "answer_explanation_mode": "ordinary",
+        })
+        return manifest
+
     def _draft(self, manifest=None, name="draft.json"):
         return self._write_json(name, manifest if manifest is not None else self._manifest())
+
+    def _publish_for_transaction_test(self, manifest=None):
+        """Seed/exercise publication internals without bypassing the public v2 gate."""
+        manifest = copy.deepcopy(manifest if manifest is not None else self._manifest())
+        report = sgc.validate_manifest(self.ws, 1, manifest)
+        report["notebook_anchor_count"] = sgc._validate_walkthrough_notebook_anchors(
+            self.ws, 1, manifest["walkthroughs"], require_all=True
+        )
+        return sgc._publish_manifest(self.ws, 1, manifest, report)
 
     def assertInvalid(self, manifest, contains=None):
         with self.assertRaises(sgc.ContentError) as stopped:
@@ -408,6 +475,68 @@ class StudyGuideContentTest(unittest.TestCase):
         self.assertEqual(["ex1", "q1"], sgc.expected_item_ids(self.ws, 1))
         self.assertEqual({"ex1": "lecture", "q1": "quiz"},
                          sgc.expected_item_source_types(self.ws, 1))
+
+    def test_explicit_provenance_sidecars_validate_without_inline_display_labels(self):
+        manifest = self._with_explicit_provenance_sidecars()
+        report = sgc.validate_manifest(self.ws, 1, manifest)
+        self.assertTrue(report["ok"])
+        serialized = json.dumps(manifest, ensure_ascii=False)
+        self.assertNotIn("[🟡", serialized)
+        self.assertNotIn(r"\text{AI", serialized)
+
+        formula = manifest["knowledge_points"][0]["formulas"][0]
+        self.assertEqual(
+            {"zh": "ai_supplement", "en": "ai_supplement"},
+            formula["explanation_provenance"],
+        )
+        walk = manifest["walkthroughs"][0]
+        self.assertEqual({"zh": "ai_translation"}, walk["translation_provenance"])
+        self.assertEqual(
+            "ai_supplement",
+            walk["formula_uses"][0]["substitution_provenance"],
+        )
+
+    def test_explicit_provenance_sidecars_fail_closed_on_shape_enum_and_alignment(self):
+        cases = []
+
+        missing_language = self._with_explicit_provenance_sidecars()
+        del missing_language["knowledge_points"][0]["formulas"][0][
+            "explanation_provenance"]["en"]
+        cases.append((missing_language, "must label every authored language exactly"))
+
+        invalid_enum = self._with_explicit_provenance_sidecars()
+        invalid_enum["walkthroughs"][0]["known_quantities"][0][
+            "provenance"]["en"] = "official_enough"
+        cases.append((invalid_enum, "must be one of"))
+
+        wrong_translation = self._with_explicit_provenance_sidecars()
+        wrong_translation["walkthroughs"][0]["translation_provenance"][
+            "zh"] = "ai_supplement"
+        cases.append((wrong_translation, "translation_provenance.zh must be one of"))
+
+        short_steps = self._with_explicit_provenance_sidecars()
+        short_steps["walkthroughs"][0]["steps_provenance"].pop()
+        cases.append((short_steps, "must align one-to-one with steps"))
+
+        wrong_substitution = self._with_explicit_provenance_sidecars()
+        wrong_substitution["walkthroughs"][0]["formula_uses"][0][
+            "substitution_provenance"] = "material"
+        cases.append((wrong_substitution, "must equal ai_supplement"))
+
+        wrong_kp_keys = self._with_explicit_provenance_sidecars()
+        wrong_kp_keys["walkthroughs"][0]["knowledge_point_uses_provenance"] = {}
+        cases.append((wrong_kp_keys, "keys must exactly equal knowledge_point_uses"))
+
+        for manifest, message in cases:
+            with self.subTest(message=message):
+                self.assertInvalid(manifest, message)
+
+    def test_legacy_manifest_without_new_sidecars_remains_compatible(self):
+        manifest = self._manifest()
+        self.assertTrue(sgc.validate_manifest(self.ws, 1, manifest)["ok"])
+        formula = manifest["knowledge_points"][0]["formulas"][0]
+        self.assertNotIn("explanation_provenance", formula)
+        self.assertNotIn("translation_provenance", manifest["walkthroughs"][0])
 
     def test_legacy_ungradable_quiz_is_required_as_full_teaching_example(self):
         quizzes = [
@@ -455,6 +584,50 @@ class StudyGuideContentTest(unittest.TestCase):
             "unit-only": "homework",
         }, sgc.expected_item_source_types(self.ws, 1))
         self.assertTrue(report["structured_workspace"])
+
+    def test_legacy_v1_structured_guide_is_read_only_without_v2_claim_gate(self):
+        manifest = self._structured_manifest()
+        claim_path = os.path.join(self.ws, ".ingest", "claim_records.jsonl")
+        receipt_path = os.path.join(
+            self.ws, ".ingest", "claim_verification_receipts", "ch01.json"
+        )
+        self.assertFalse(os.path.exists(claim_path))
+        self.assertFalse(os.path.exists(receipt_path))
+
+        report = sgc.validate_manifest(self.ws, 1, manifest)
+        self.assertEqual("ingestion-v1", report["ingestion_pipeline_version"])
+        self.assertEqual(
+            {
+                "required": False,
+                "status": "not_applicable",
+                "reason": "legacy_ingestion_v1",
+                "verification_scope": None,
+            },
+            report["claim_verification"],
+        )
+
+        draft = self._draft(manifest, "legacy-structured-guide.json")
+        with self.assertRaisesRegex(
+                sgc.ContentError, "ingestion-v1 Study Guide compatibility is read-only"):
+            sgc.import_manifest(self.ws, 1, draft)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.ws, "notebook", "ch01.guide.json")
+        ))
+        self.assertFalse(os.path.exists(claim_path))
+        self.assertFalse(os.path.exists(receipt_path))
+
+    def test_non_structured_new_import_is_read_only_without_publication(self):
+        draft = self._draft()
+        notebook_path = os.path.join(self.ws, "notebook", "ch01.md")
+        before = open(notebook_path, "rb").read()
+        with self.assertRaisesRegex(
+                sgc.ContentError, "non-structured Study Guide compatibility is read-only"):
+            sgc.import_manifest(self.ws, 1, draft)
+        self.assertEqual(before, open(notebook_path, "rb").read())
+        self.assertFalse(os.path.exists(
+            os.path.join(self.ws, "notebook", "ch01.guide.json")
+        ))
+        self._assert_no_publication_temps()
 
     def test_non_target_chapter_body_controls_do_not_block_target_denominator(self):
         units = self._structured_units()
@@ -852,10 +1025,14 @@ class StudyGuideContentTest(unittest.TestCase):
                     sgc.expected_item_ids(self.ws, 1)
 
     def test_ingestion_v2_fails_closed_without_claim_sidecar_and_receipt(self):
-        manifest = self._structured_manifest()
+        manifest = self._as_protocol_v2(self._structured_manifest())
         self._write_json(
             ".ingest/build_manifest.json",
-            {"schema_version": 1, "pipeline_version": "ingestion-v2"},
+            {
+                "schema_version": 2,
+                "pipeline_version": "ingestion-v2",
+                "material_build": {"protocol_version": 1},
+            },
         )
         self._write_json(
             ".ingest/source_manifest.json",
@@ -863,7 +1040,9 @@ class StudyGuideContentTest(unittest.TestCase):
         )
         self._write_jsonl(".ingest/canonical_groups.jsonl", [])
         self._write_jsonl(".ingest/source_conflicts.jsonl", [])
-        self.assertInvalid(manifest, ".ingest/claim_records.jsonl")
+        with mock.patch.object(
+                sgc, "verify_material_build_receipt", return_value={}):
+            self.assertInvalid(manifest, ".ingest/claim_records.jsonl")
 
     def test_structured_pipeline_version_cannot_be_deleted_to_bypass_claims(self):
         manifest = self._structured_manifest()
@@ -952,6 +1131,167 @@ class StudyGuideContentTest(unittest.TestCase):
         manifest = self._structured_manifest()
         manifest["knowledge_points"][0]["formulas"][0]["latex"] = r"E=mc^2"
         self.assertInvalid(manifest, "formula unit latex does not exactly match")
+
+    def test_formula_quote_span_matches_bound_text_or_latex_payload(self):
+        manifest = self._structured_manifest()
+        units = self._structured_units()
+        formula_unit = next(row for row in units if row["unit_id"] == "sem-formula")
+        formula_unit["text"] = "Conditional probability"
+        self._write_jsonl(".ingest/content_units.jsonl", units)
+
+        formula = manifest["knowledge_points"][0]["formulas"][0]
+        formula["source_refs"][0]["quote_span"] = formula["latex"]
+        self.assertTrue(sgc.validate_manifest(self.ws, 1, manifest)["ok"])
+
+        text_payload = copy.deepcopy(manifest)
+        text_payload["knowledge_points"][0]["formulas"][0]["source_refs"][0][
+            "quote_span"] = "Conditional probability"
+        self.assertTrue(sgc.validate_manifest(self.ws, 1, text_payload)["ok"])
+
+        delimited = copy.deepcopy(manifest)
+        delimited["knowledge_points"][0]["formulas"][0]["source_refs"][0][
+            "quote_span"] = "$%s$" % formula["latex"]
+        self.assertInvalid(delimited, "must exactly match the bound formula unit text or latex")
+
+        mismatched = copy.deepcopy(manifest)
+        mismatched["knowledge_points"][0]["formulas"][0]["source_refs"][0][
+            "quote_span"] = r"E=mc^2"
+        self.assertInvalid(mismatched, "must exactly match the bound formula unit text or latex")
+
+    def test_localized_formula_prose_rejects_bare_tex_but_accepts_standard_math(self):
+        cases = (
+            (
+                "formula variable meaning",
+                lambda manifest, text: manifest["knowledge_points"][0]["formulas"][0]
+                ["variables"][0]["meaning"].__setitem__("en", text),
+                "knowledge_points[0].formulas[0].variables[0].meaning.en",
+            ),
+            (
+                "formula-use mapping prose",
+                lambda manifest, text: manifest["walkthroughs"][0]["formula_uses"][0]
+                ["variable_mapping"][0]["maps_to"].__setitem__("en", text),
+                "walkthroughs[0].formula_uses[0].variable_mapping[0].maps_to.en",
+            ),
+        )
+        for label, mutate, expected_path in cases:
+            with self.subTest(field=label, mode="bare"):
+                manifest = self._manifest()
+                mutate(manifest, r"Use \alpha as the event label.")
+                with self.assertRaises(sgc.ContentError) as stopped:
+                    sgc.validate_manifest(self.ws, 1, manifest)
+                message = str(stopped.exception)
+                self.assertIn(expected_path, message)
+                self.assertIn(r"\alpha", message)
+                self.assertIn("outside standard $...$ or $$...$$ delimiters", message)
+                self.assertIn("automatic rewriting is disabled", message)
+
+            with self.subTest(field=label, mode="delimited"):
+                manifest = self._manifest()
+                mutate(manifest, r"Use $\alpha$ as the event label.")
+                sgc.validate_manifest(self.ws, 1, manifest)
+
+    def test_localized_prose_rejects_raw_super_and_subscripts(self):
+        for raw, delimited in (("Use x^3 here.", "Use $x^3$ here."),
+                               ("Map p_0 first.", "Map $p_0$ first.")):
+            with self.subTest(raw=raw, mode="bare"):
+                manifest = self._manifest()
+                manifest["knowledge_points"][0]["formulas"][0]["variables"][0][
+                    "meaning"]["en"] = raw
+                self.assertInvalid(manifest, "contains unrendered math notation")
+            with self.subTest(raw=raw, mode="delimited"):
+                manifest = self._manifest()
+                manifest["knowledge_points"][0]["formulas"][0]["variables"][0][
+                    "meaning"]["en"] = delimited
+                self.assertTrue(sgc.validate_manifest(self.ws, 1, manifest)["ok"])
+        manifest = self._manifest()
+        manifest["knowledge_points"][0]["formulas"][0]["variables"][0][
+            "meaning"]["en"] = "Open `x^3` in D:\\EEC_160\\notes."
+        self.assertTrue(sgc.validate_manifest(self.ws, 1, manifest)["ok"])
+
+    def test_typed_symbol_fields_are_one_line_delimiter_free_tex(self):
+        manifest = self._manifest()
+        manifest["knowledge_points"][0]["formulas"][0]["variables"][0][
+            "symbol"] = r"$\alpha$"
+        self.assertInvalid(manifest, "one-line TeX without Markdown $ delimiters")
+
+        manifest = self._manifest()
+        manifest["walkthroughs"][0]["known_quantities"][0]["symbol"] = "x\ny"
+        self.assertInvalid(manifest, "one-line TeX without Markdown $ delimiters")
+
+        manifest = self._manifest()
+        manifest["knowledge_points"][0]["formulas"][0]["variables"][0][
+            "symbol"] = r" \alpha "
+        self.assertInvalid(manifest, "trimmed one-line TeX")
+
+    def test_shared_tex_vocabulary_covers_real_chapter_commands_and_masks_paths(self):
+        commands = (
+            r"\bigcap", r"\bigcup", r"\boxed", r"\cdots", r"\iff",
+            r"\implies", r"\land", r"\ldots", r"\lor", r"\ne",
+            r"\quad", r"\varnothing",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    command, sgc.first_bare_latex_command("Use %s here." % command))
+                self.assertIsNone(
+                    sgc.first_bare_latex_command("Use $%s$ here." % command))
+        for path in (r"D:\min\notes", r"C:\beta\file", r"\\server\share\quad"):
+            with self.subTest(path=path):
+                self.assertIsNone(sgc.first_bare_latex_command("Open %s" % path))
+
+    def test_math_layout_hazard_detects_flattened_pdf_fractions_and_sums(self):
+        stacked = sgc.find_math_layout_hazard(
+            "P[A]=P[A_1]P[A_2]=4\n9 , and P[B]=1\n9 .")
+        self.assertEqual("stacked_fraction_flattened", stacked["code"])
+        vertical = sgc.find_math_layout_hazard(
+            "Law of Total Probability\nP[A] =\nm\nX\ni=1\nP[A|B_i]P[B_i]")
+        self.assertIsNotNone(vertical)
+        for safe in (
+                "ordinary prose wraps here\nand continues normally",
+                "P[A]=4/9 and P[B]=1/9",
+                r"Open D:\math\notes and C:\beta\file"):
+            with self.subTest(safe=safe):
+                self.assertIsNone(sgc.find_math_layout_hazard(safe))
+
+    def test_unsafe_material_math_requires_reviewed_teaching_fields(self):
+        concept = self._manifest()
+        kp = concept["knowledge_points"][0]
+        kp["explanation"]["en"] = "P[A] =\nm\nX\ni=1\nP[A|B_i]P[B_i]"
+        kp["explanation_provenance"] = {"zh": "ai_supplement", "en": "material"}
+        self.assertInvalid(concept, "OCR math layout")
+        kp["teaching_explanation"] = localized(
+            "把互斥分支的条件概率加权相加。",
+            "Add the mutually exclusive branches with their probability weights.")
+        kp["teaching_explanation_provenance"] = {
+            "zh": "ai_supplement", "en": "ai_supplement"}
+        self.assertTrue(sgc.validate_manifest(self.ws, 1, concept)["ok"])
+        kp["teaching_explanation"]["en"] = "P[A] =\nm\nX\ni=1\nP[A|B_i]P[B_i]"
+        self.assertInvalid(concept, "teaching copy itself must use readable typeset math")
+
+        answer = self._manifest()
+        walk = answer["walkthroughs"][0]
+        walk["answer"]["en"] = "The result is = 4\n9 ."
+        self.assertInvalid(answer, "OCR math layout")
+        walk["teaching_answer"] = localized(
+            "结果是 $4/9$。", "The result is $4/9$.")
+        walk["teaching_answer_provenance"] = {
+            "zh": "ai_supplemented", "en": "ai_supplemented"}
+        self.assertTrue(sgc.validate_manifest(self.ws, 1, answer)["ok"])
+        walk["teaching_answer"]["en"] = "The result is = 4\n9 ."
+        self.assertInvalid(answer, "teaching copy itself must use readable typeset math")
+
+    def test_exact_material_raw_superscript_needs_safe_teaching_copy(self):
+        manifest = self._manifest()
+        walk = manifest["walkthroughs"][0]
+        walk["answer"]["en"] = "The exact source writes (0.8)^2."
+        self.assertInvalid(manifest, "unrendered math notation")
+        walk["teaching_answer"] = localized(
+            "复核计算为 $(0.8)^2$。", "The reviewed calculation is $(0.8)^2$.")
+        walk["teaching_answer_provenance"] = {
+            "zh": "ai_supplemented", "en": "ai_supplemented"}
+        self.assertTrue(sgc.validate_manifest(self.ws, 1, manifest)["ok"])
+        walk["teaching_answer"]["en"] = "The reviewed calculation is (0.8)^2."
+        self.assertInvalid(manifest, "unrendered math notation")
 
     def test_all_teachable_content_unit_kinds_enter_semantic_denominator(self):
         manifest = self._structured_manifest()
@@ -1197,17 +1537,23 @@ class StudyGuideContentTest(unittest.TestCase):
         self.assertInvalid(self._manifest(), "student_attempt-tainted")
 
     def test_ingestion_v2_full_prompt_requires_asset_revision_digest(self):
-        manifest = self._structured_manifest()
+        manifest = self._as_protocol_v2(self._structured_manifest())
         units = self._structured_units()
         del next(row for row in units if row["unit_id"] == "q-ex1")[
             "metadata"]["assets"][0]["sha256"]
         self._write_jsonl(".ingest/content_units.jsonl", units)
         self._write_json(
             ".ingest/build_manifest.json",
-            {"schema_version": 1, "pipeline_version": "ingestion-v2"},
+            {
+                "schema_version": 2,
+                "pipeline_version": "ingestion-v2",
+                "material_build": {"protocol_version": 1},
+            },
         )
 
-        self.assertInvalid(manifest, "exact sha256 revision")
+        with mock.patch.object(
+                sgc, "verify_material_build_receipt", return_value={}):
+            self.assertInvalid(manifest, "exact sha256 revision")
 
     def test_independent_nested_concept_asset_revision_drift_blocks_inventory(self):
         relative = "references/assets/concept-source.png"
@@ -1634,6 +1980,11 @@ class StudyGuideContentTest(unittest.TestCase):
             "variable_mapping"].pop()
         self.assertInvalid(missing_symbol, "must exactly cover formula")
 
+        empty_symbols = copy.deepcopy(manifest)
+        empty_symbols["knowledge_points"][0]["formulas"][0]["variables"] = []
+        empty_symbols["walkthroughs"][0]["formula_uses"][0]["variable_mapping"] = []
+        self.assertInvalid(empty_symbols, "defines no variables")
+
         non_formula = copy.deepcopy(manifest)
         walk = non_formula["walkthroughs"][0]
         walk["solution_kind"] = "procedure"
@@ -1971,9 +2322,8 @@ class StudyGuideContentTest(unittest.TestCase):
         repeated_original_language["walkthroughs"][0]["translation"]["en"] = "Duplicate"
         self.assertInvalid(repeated_original_language, "already-visible")
 
-    def test_relocalize_is_reversible_and_notebook_view_follows_state_language(self):
-        draft = self._draft()
-        sgc.import_manifest(self.ws, 1, draft)
+    def test_ingestion_v1_relocalize_is_read_only_and_preserves_public_files(self):
+        self._publish_for_transaction_test()
 
         guide = os.path.join(self.ws, "study_guide")
         qa = os.path.join(guide, "qa")
@@ -1989,89 +2339,54 @@ class StudyGuideContentTest(unittest.TestCase):
             with open(path, "wb") as stream:
                 stream.write(b"stale artifact")
 
+        watched = [
+            os.path.join(self.ws, "notebook", "ch01.md"),
+            os.path.join(self.ws, "notebook", "ch01.guide.json"),
+        ] + [os.path.join(guide, *relative.split("/")) for relative in stale + keep]
+        before = self._snapshot_paths(watched)
+
         self._write_json("study_state.json", {"language": "en"})
-        report = sgc.relocalize_manifest(self.ws, 1, "en")
-        self.assertEqual("bilingual", report["relocalized_from"])
-        self.assertEqual(
-            {"study_guide/" + relative for relative in stale},
-            set(report["invalidated_artifacts"]))
-        for relative in stale:
-            self.assertFalse(os.path.exists(os.path.join(guide, *relative.split("/"))))
-        for relative in keep:
-            self.assertTrue(os.path.isfile(os.path.join(guide, *relative.split("/"))))
-        with open(os.path.join(self.ws, "notebook", "ch01.guide.json"),
-                  encoding="utf-8") as stream:
-            manifest = json.load(stream)
-        self.assertEqual("en", manifest["language"])
-        self.assertEqual({"zh": "求条件概率。"},
-                         manifest["walkthroughs"][0]["translation"])
-        with open(os.path.join(self.ws, "notebook", "ch01.md"),
-                  encoding="utf-8") as stream:
-            notebook = stream.read()
-        begin, end, _header = sgc._markers(1)
-        block = notebook.split(begin, 1)[1].split(end, 1)[0]
-        self.assertIsNone(re.search(r"[\u3400-\u9fff]", block), block)
+        with self.assertRaisesRegex(
+                sgc.ContentError, "ingestion-v1 Study Guide compatibility is read-only"):
+            sgc.relocalize_manifest(self.ws, 1, "en")
+        self._assert_paths_match_snapshot(before)
+        self._assert_no_publication_temps()
 
-        self._write_json("study_state.json", {"language": "bilingual"})
-        back = sgc.relocalize_manifest(self.ws, 1, "bilingual")
-        self.assertEqual("en", back["relocalized_from"])
-        with open(os.path.join(self.ws, "notebook", "ch01.guide.json"),
-                  encoding="utf-8") as stream:
-            restored = json.load(stream)
-        self.assertEqual("bilingual", restored["language"])
-        self.assertEqual({"zh": "求条件概率。"},
-                         restored["walkthroughs"][0]["translation"])
-
-    def test_ingestion_v2_relocalize_prepares_unsigned_staging_draft(self):
+    def test_ingestion_v2_relocalize_requires_complete_reauthoring(self):
         manifest = self._structured_manifest()
         self._write_json("notebook/ch01.guide.json", manifest)
         self._write_json("study_state.json", {"language": "en"})
-        self._write_json(
-            ".ingest/build_manifest.json",
-            {"schema_version": 1, "pipeline_version": "ingestion-v2"},
-        )
+        canonical_path = os.path.join(self.ws, "notebook", "ch01.guide.json")
+        before = self._snapshot_paths([canonical_path])
+        message = "rerun study_guide_author.py prepare"
 
-        with self.assertRaisesRegex(sgc.ContentError, "requires --output staging JSON"):
-            sgc.relocalize_manifest(self.ws, 1, "en")
-        for protected in (
-            "study_state.json",
-            ".ingest/source_manifest.json",
-            "notebook/ch02.en.draft.json",
-            "notebook/ch01.guide.json",
-        ):
-            with self.subTest(output=protected), self.assertRaisesRegex(
-                    sgc.ContentError, "must match"):
-                sgc.relocalize_manifest(self.ws, 1, "en", protected)
-        report = sgc.relocalize_manifest(
-            self.ws, 1, "en", "notebook/ch01.en.draft.json"
-        )
-        self.assertTrue(report["prepared"])
-        self.assertFalse(report["imported"])
-        self.assertFalse(report["artifact_ready"])
-        self.assertEqual("pending", report["claim_verification"]["status"])
-        self.assertEqual(
-            "location_only", report["claim_verification"]["verification_scope"]
-        )
-        with open(report["staging_path"], encoding="utf-8") as stream:
-            staged = json.load(stream)
-        with open(os.path.join(self.ws, "notebook", "ch01.guide.json"),
-                  encoding="utf-8") as stream:
-            canonical = json.load(stream)
-        self.assertEqual("en", staged["language"])
-        self.assertEqual("bilingual", canonical["language"])
+        with mock.patch.object(
+                sgc, "_ingestion_pipeline_version", return_value="ingestion-v2"):
+            for output in (None, "notebook/ch01.en.draft.json"):
+                with self.subTest(output=output), self.assertRaisesRegex(
+                        sgc.ContentError, message):
+                    sgc.relocalize_manifest(self.ws, 1, "en", output)
 
-        stdout = io.StringIO()
-        with contextlib.redirect_stdout(stdout):
-            self.assertEqual(
-                0,
-                sgc.run([
-                    "--workspace", self.ws, "relocalize", "--chapter", "1",
-                    "--language", "en", "--output", "notebook/ch01.cli.draft.json",
-                ]),
-            )
-        self.assertIn("unsigned staging prepared", stdout.getvalue())
-        self.assertIn("claim verification pending", stdout.getvalue())
-        self.assertNotIn("content valid", stdout.getvalue())
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertEqual(
+                    1,
+                    sgc.run([
+                        "--workspace", self.ws, "relocalize", "--chapter", "1",
+                        "--language", "en", "--output",
+                        "notebook/ch01.cli.draft.json", "--json",
+                    ]),
+                )
+        receipt = json.loads(stdout.getvalue())
+        self.assertFalse(receipt["ok"])
+        self.assertIn(message, receipt["error"])
+        self._assert_paths_match_snapshot(before)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.ws, "notebook", "ch01.en.draft.json")
+        ))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.ws, "notebook", "ch01.cli.draft.json")
+        ))
 
     def test_single_language_matching_original_needs_no_translation(self):
         self._write_json("study_state.json", {"language": "en"})
@@ -2162,7 +2477,6 @@ class StudyGuideContentTest(unittest.TestCase):
         manifest["knowledge_points"][0]["explanation_provenance"] = {
             "zh": "ai_translation", "en": "material"
         }
-        draft = self._draft(manifest)
         calls = []
         original = os.replace
 
@@ -2171,7 +2485,7 @@ class StudyGuideContentTest(unittest.TestCase):
             return original(source, destination)
 
         with mock.patch.object(sgc.os, "replace", side_effect=recording_replace):
-            report = sgc.import_manifest(self.ws, 1, draft)
+            report = self._publish_for_transaction_test(manifest)
         self.assertTrue(report["imported"])
         self.assertTrue(calls[0].endswith("ch01.md"), calls)
         self.assertTrue(calls[1].endswith("ch01.guide.json"), calls)
@@ -2182,14 +2496,16 @@ class StudyGuideContentTest(unittest.TestCase):
         begin, end, header = sgc._markers(1)
         self.assertIn("Hand-written content.", notebook)
         self.assertIn(r"$P(A\mid B)=0.2/0.5=0.4$", notebook)
-        self.assertIn("**例题来源类型 / Source type:** `lecture`", notebook)
-        self.assertIn(
-            "**答案来源性质 / Answer provenance (中文):** `ai_supplemented`", notebook)
-        self.assertIn(
-            "**答案来源性质 / Answer provenance (English):** `material`", notebook)
-        self.assertIn("AI翻译", notebook)
-        self.assertIn("From your materials", notebook)
-        self.assertIn("**例题来源类型 / Source type:** `quiz`", notebook)
+        self.assertIn("- **例题来源类型：** `lecture`", notebook)
+        self.assertIn("> EN: **Source type:** `lecture`", notebook)
+        self.assertIn("- **答案：** 答案是 0.4。 🟡", notebook)
+        self.assertIn("> EN: **Answer:** The answer is 0.4. 🟢", notebook)
+        self.assertIn("- **解释：** 在已知事件中缩小样本空间。 🌐", notebook)
+        self.assertEqual(1, notebook.count("来源标识（本章仅说明一次）"))
+        self.assertEqual(
+            1, notebook.count("Provenance legend (shown once for this chapter)"))
+        self.assertIn("- **例题来源类型：** `quiz`", notebook)
+        self.assertIn("> EN: **Source type:** `quiz`", notebook)
         self.assertEqual(1, notebook.count(header))
         self.assertEqual(1, notebook.count(begin))
         self.assertEqual(1, notebook.count(end))
@@ -2198,7 +2514,7 @@ class StudyGuideContentTest(unittest.TestCase):
 
         updated = self._manifest()
         updated["knowledge_points"][0]["explanation"]["en"] = "Updated explanation."
-        sgc.import_manifest(self.ws, 1, self._draft(updated, "updated.json"))
+        self._publish_for_transaction_test(updated)
         with open(notebook_path, "r", encoding="utf-8") as stream:
             notebook2 = stream.read()
         self.assertIn("Updated explanation.", notebook2)
@@ -2223,19 +2539,88 @@ class StudyGuideContentTest(unittest.TestCase):
         self.assertEqual(1, after_notebook_write.count(begin))
         self.assertEqual(1, after_notebook_write.count(end))
 
+    def test_bilingual_generated_notebook_view_uses_block_mirrors(self):
+        manifest = self._manifest()
+        manifest["knowledge_points"][0]["explanation_provenance"] = {
+            "zh": "ai_translation", "en": "material",
+        }
+        notebook = sgc.render_notebook_block(manifest)
+
+        self.assertIn("### 知识点\n> EN: **Knowledge points**", notebook)
+        self.assertIn(
+            "#### `kp1` · 条件概率\n> EN: **`kp1` · Conditional probability**",
+            notebook,
+        )
+        self.assertIn("- **解释：** 在已知事件中缩小样本空间。", notebook)
+        self.assertIn("> EN: **Explanation:** Restrict the sample space", notebook)
+        self.assertIn("- **解释：** 在已知事件中缩小样本空间。 🌐", notebook)
+        self.assertIn(
+            "> EN: **Explanation:** Restrict the sample space to the known event. 🟢",
+            notebook,
+        )
+        self.assertIn("### 例题精讲\n> EN: **Worked examples**", notebook)
+        self.assertIn("- **步骤 1：** 先确认条件事件 B。", notebook)
+        self.assertIn("> EN: **Step 1:** First identify", notebook)
+        self.assertIn("- **答案：** 答案是 0.4。", notebook)
+        self.assertIn("> EN: **Answer:** The answer is 0.4.", notebook)
+        self.assertIn("- **来源追踪：** course/ch01.pdf · 第 2 页", notebook)
+        self.assertIn("> EN: **Source trace:** course/ch01.pdf · page 2", notebook)
+        self.assertNotIn("知识点 / Knowledge points", notebook)
+        self.assertNotIn("例题精讲 / Worked examples", notebook)
+        self.assertNotIn("例题来源类型 / Source type", notebook)
+        self.assertNotIn("答案来源性质 / Answer provenance", notebook)
+
+    def test_notebook_prefers_teaching_copy_and_its_provenance_without_mutating_evidence(self):
+        manifest = self._manifest()
+        kp = manifest["knowledge_points"][0]
+        kp["explanation"] = localized(
+            "原始中文证据文本。", "Original English evidence text.")
+        kp["explanation_provenance"] = {"zh": "material", "en": "material"}
+        kp["teaching_explanation"] = localized(
+            "面向学生的中文解释。", "Beginner-facing English explanation.")
+        kp["teaching_explanation_provenance"] = {
+            "zh": "ai_supplement", "en": "ai_supplement"}
+
+        walk = manifest["walkthroughs"][0]
+        walk["answer"] = localized(
+            "原始中文答案证据。", "Original English answer evidence.")
+        walk["teaching_answer"] = localized(
+            "易读的中文答案。", "Readable English answer.")
+        walk["teaching_answer_provenance"] = {
+            "zh": "ai_supplemented", "en": "ai_supplemented"}
+
+        evidence_snapshot = copy.deepcopy(manifest)
+        notebook = sgc.render_notebook_block(manifest)
+
+        self.assertIn("- **解释：** 面向学生的中文解释。", notebook)
+        self.assertIn(
+            "> EN: **Explanation:** Beginner-facing English explanation.", notebook)
+        self.assertIn("- **答案：** 易读的中文答案。", notebook)
+        self.assertIn("> EN: **Answer:** Readable English answer.", notebook)
+        self.assertIn("- **解释：** 面向学生的中文解释。 🟡", notebook)
+        self.assertIn(
+            "> EN: **Answer:** Readable English answer. 🟡", notebook)
+        self.assertNotIn("AI补充，可能与你老师讲的不完全一致", notebook)
+        self.assertNotIn(
+            "AI-supplemented — may differ from what your teacher taught", notebook)
+        self.assertNotIn("原始中文证据文本。", notebook)
+        self.assertNotIn("Original English evidence text.", notebook)
+        self.assertNotIn("原始中文答案证据。", notebook)
+        self.assertNotIn("Original English answer evidence.", notebook)
+        self.assertEqual(evidence_snapshot, manifest)
+
     def test_failed_notebook_stage_never_attempts_public_replacement(self):
-        draft = self._draft()
         with mock.patch.object(sgc, "_stage_text", side_effect=OSError("disk full")) as writer, \
                 mock.patch.object(sgc.os, "replace") as replacer:
             with self.assertRaisesRegex(sgc.ContentError, "cannot stage"):
-                sgc.import_manifest(self.ws, 1, draft)
+                self._publish_for_transaction_test()
         self.assertEqual(1, writer.call_count)
         replacer.assert_not_called()
         self.assertFalse(os.path.exists(os.path.join(self.ws, "notebook", "ch01.guide.json")))
         self._assert_no_publication_temps()
 
     def test_v2_fact_snapshot_is_rechecked_at_manifest_publication(self):
-        sgc.import_manifest(self.ws, 1, self._draft())
+        self._publish_for_transaction_test()
         manifest = self._manifest()
         manifest["knowledge_points"][0]["explanation"]["en"] = "Updated only after recheck."
         expected = {"schema_version": 1, "token": "bound"}
@@ -2259,7 +2644,7 @@ class StudyGuideContentTest(unittest.TestCase):
         self._assert_no_publication_temps()
 
     def test_second_authoritative_replacement_failure_rolls_back_every_public_file(self):
-        sgc.import_manifest(self.ws, 1, self._draft())
+        self._publish_for_transaction_test()
         derived = self._write_derived_artifacts()
         md_path = os.path.join(self.ws, "notebook", "ch01.md")
         json_path = os.path.join(self.ws, "notebook", "ch01.guide.json")
@@ -2278,7 +2663,7 @@ class StudyGuideContentTest(unittest.TestCase):
 
         with mock.patch.object(sgc.os, "replace", side_effect=fail_second), \
                 self.assertRaisesRegex(sgc.ContentError, "cannot atomically publish"):
-            sgc.import_manifest(self.ws, 1, self._draft(updated, "updated.json"))
+            self._publish_for_transaction_test(updated)
         self._assert_paths_match_snapshot(before)
         self._assert_no_publication_temps()
 
@@ -2286,7 +2671,7 @@ class StudyGuideContentTest(unittest.TestCase):
         class InjectedPublicationAbort(BaseException):
             pass
 
-        sgc.import_manifest(self.ws, 1, self._draft())
+        self._publish_for_transaction_test()
         derived = self._write_derived_artifacts()
         md_path = os.path.join(self.ws, "notebook", "ch01.md")
         json_path = os.path.join(self.ws, "notebook", "ch01.guide.json")
@@ -2306,13 +2691,13 @@ class StudyGuideContentTest(unittest.TestCase):
         with mock.patch.object(sgc.os, "replace", side_effect=replace_then_abort):
             with self.assertRaisesRegex(
                     sgc.ContentError, "cannot atomically publish") as caught:
-                sgc.import_manifest(self.ws, 1, self._draft(updated, "updated.json"))
+                self._publish_for_transaction_test(updated)
         self.assertIsInstance(caught.exception.__cause__, InjectedPublicationAbort)
         self._assert_paths_match_snapshot(before)
         self._assert_no_publication_temps()
 
     def test_invalidation_failure_rolls_back_authoritative_pair_and_all_derived_files(self):
-        sgc.import_manifest(self.ws, 1, self._draft())
+        self._publish_for_transaction_test()
         derived = self._write_derived_artifacts()
         md_path = os.path.join(self.ws, "notebook", "ch01.md")
         json_path = os.path.join(self.ws, "notebook", "ch01.guide.json")
@@ -2331,12 +2716,12 @@ class StudyGuideContentTest(unittest.TestCase):
 
         with mock.patch.object(sgc.os, "remove", side_effect=fail_one_invalidation), \
                 self.assertRaisesRegex(sgc.ContentError, "cannot invalidate"):
-            sgc.import_manifest(self.ws, 1, self._draft(updated, "updated.json"))
+            self._publish_for_transaction_test(updated)
         self._assert_paths_match_snapshot(before)
         self._assert_no_publication_temps()
 
     def test_post_remove_memory_error_rolls_back_every_public_file(self):
-        sgc.import_manifest(self.ws, 1, self._draft())
+        self._publish_for_transaction_test()
         derived = self._write_derived_artifacts()
         md_path = os.path.join(self.ws, "notebook", "ch01.md")
         json_path = os.path.join(self.ws, "notebook", "ch01.guide.json")
@@ -2357,36 +2742,30 @@ class StudyGuideContentTest(unittest.TestCase):
         with mock.patch.object(sgc.os, "remove", side_effect=remove_then_abort):
             with self.assertRaisesRegex(
                     sgc.ContentError, "cannot invalidate") as caught:
-                sgc.import_manifest(self.ws, 1, self._draft(updated, "updated.json"))
+                self._publish_for_transaction_test(updated)
         self.assertIsInstance(caught.exception.__cause__, MemoryError)
         self._assert_paths_match_snapshot(before)
         self._assert_no_publication_temps()
 
-    def test_v1_relocalize_uses_same_rollback_order_when_invalidation_fails(self):
-        sgc.import_manifest(self.ws, 1, self._draft())
+    def test_v1_relocalize_rejects_before_any_invalidation(self):
+        self._publish_for_transaction_test()
         derived = self._write_derived_artifacts()
         md_path = os.path.join(self.ws, "notebook", "ch01.md")
         json_path = os.path.join(self.ws, "notebook", "ch01.guide.json")
         before = self._snapshot_paths([md_path, json_path] + derived)
         self._write_json("study_state.json", {"language": "en"})
-        fail_path = os.path.join(self.ws, "study_guide", "ch01.pdf")
-        original_remove = os.remove
-        failed = {"done": False}
-
-        def fail_one_invalidation(path):
-            if path == fail_path and not failed["done"]:
-                failed["done"] = True
-                raise OSError("cannot remove derived PDF")
-            return original_remove(path)
-
-        with mock.patch.object(sgc.os, "remove", side_effect=fail_one_invalidation), \
-                self.assertRaisesRegex(sgc.ContentError, "cannot invalidate"):
+        with mock.patch.object(sgc.os, "remove") as remover, \
+                self.assertRaisesRegex(
+                    sgc.ContentError,
+                    "ingestion-v1 Study Guide compatibility is read-only",
+                ):
             sgc.relocalize_manifest(self.ws, 1, "en")
+        remover.assert_not_called()
         self._assert_paths_match_snapshot(before)
         self._assert_no_publication_temps()
 
     def test_asset_policy_recheck_failure_precedes_every_public_replacement(self):
-        sgc.import_manifest(self.ws, 1, self._draft())
+        self._publish_for_transaction_test()
         derived = self._write_derived_artifacts()
         md_path = os.path.join(self.ws, "notebook", "ch01.md")
         json_path = os.path.join(self.ws, "notebook", "ch01.guide.json")
@@ -2401,7 +2780,7 @@ class StudyGuideContentTest(unittest.TestCase):
         self._assert_no_publication_temps()
 
     def test_malformed_marker_blocks_import_without_mutating_any_public_file(self):
-        sgc.import_manifest(self.ws, 1, self._draft())
+        self._publish_for_transaction_test()
         derived = self._write_derived_artifacts()
         begin, _end, header = sgc._markers(1)
         notebook_path = os.path.join(self.ws, "notebook", "ch01.md")
@@ -2410,7 +2789,7 @@ class StudyGuideContentTest(unittest.TestCase):
         json_path = os.path.join(self.ws, "notebook", "ch01.guide.json")
         before = self._snapshot_paths([notebook_path, json_path] + derived)
         with self.assertRaisesRegex(sgc.ContentError, "unbalanced"):
-            sgc.import_manifest(self.ws, 1, self._draft())
+            self._publish_for_transaction_test()
         self._assert_paths_match_snapshot(before)
         self._assert_no_publication_temps()
 
@@ -2432,39 +2811,24 @@ class StudyGuideContentTest(unittest.TestCase):
             os.path.join(self.ws, "notebook", "ch01.guide.json")
         ))
 
-    def test_validate_and_import_cli_return_machine_receipts(self):
+    def test_validate_and_import_cli_fail_closed_without_registered_full_mode(self):
         draft = self._draft()
-        validated = subprocess.run(
-            [PY, SCRIPT, "--workspace", self.ws, "validate", "--chapter", "1",
-             "--input", draft, "--json"],
-            capture_output=True, text=True, encoding="utf-8",
-        )
-        self.assertEqual(0, validated.returncode, validated.stdout + validated.stderr)
-        validation_receipt = json.loads(validated.stdout)
-        self.assertTrue(validation_receipt["ok"])
-        self.assertEqual("validate", validation_receipt["command"])
-
-        imported = subprocess.run(
-            [PY, SCRIPT, "--workspace", self.ws, "import", "--chapter", "1",
-             "--input", draft, "--json"],
-            capture_output=True, text=True, encoding="utf-8",
-        )
-        self.assertEqual(0, imported.returncode, imported.stdout + imported.stderr)
-        import_receipt = json.loads(imported.stdout)
-        self.assertTrue(import_receipt["imported"])
-        self.assertEqual("import", import_receipt["command"])
-
-        invalid = self._manifest()
-        invalid["walkthroughs"].pop()
-        invalid_path = self._draft(invalid, "invalid.json")
-        failed = subprocess.run(
-            [PY, SCRIPT, "--workspace", self.ws, "validate", "--chapter", "1",
-             "--input", invalid_path, "--json"],
-            capture_output=True, text=True, encoding="utf-8",
-        )
-        self.assertEqual(1, failed.returncode)
-        self.assertFalse(json.loads(failed.stdout)["ok"])
-        self.assertNotIn("Traceback", failed.stderr)
+        for command in ("validate", "import"):
+            with self.subTest(command=command):
+                result = subprocess.run(
+                    [PY, SCRIPT, "--workspace", self.ws, command, "--chapter", "1",
+                     "--input", draft, "--json"],
+                    capture_output=True, text=True, encoding="utf-8",
+                )
+                self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+                receipt = json.loads(result.stdout)
+                self.assertFalse(receipt["ok"])
+                self.assertEqual(2, receipt["exit_code"])
+                self.assertIn("processing_mode=full", receipt["error"])
+                self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.ws, "notebook", "ch01.guide.json")
+        ))
 
 
 if __name__ == "__main__":

@@ -5,9 +5,11 @@ Recall-first is the whole point: a page with an embedded image but NO caption ke
 flagged; detector vocabulary must be multi-domain (circuit/flowchart/waveform …), never bound to one
 subject. Pure stdlib; PDF backends are faked — no real pypdf/PyMuPDF needed, no network, no LLM."""
 import base64
+import contextlib
 import json
 import hashlib
 import copy
+import io
 import os
 import shutil
 import struct
@@ -22,9 +24,87 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(ROOT, "scripts")
 sys.path.insert(0, SCRIPTS)
 import build_visual_index as BVI          # noqa: E402
+import exam_start                         # noqa: E402
 import list_image_questions as LIQ        # noqa: E402
 import list_figure_pages as LFP           # noqa: E402
 import show_question_assets as SQA        # noqa: E402
+
+
+_RUNTIME_IDENTITY = None
+_CONFIRMED_FULL_PAIRS = set()
+
+
+def _confirmed_tool_run(original, argv, *args, **kwargs):
+    """Run a full-workspace tool against an exact confirmed test pair."""
+    global _RUNTIME_IDENTITY
+    arguments = list(argv)
+    try:
+        workspace = os.path.abspath(arguments[arguments.index("--workspace") + 1])
+    except (ValueError, IndexError):
+        return original(argv, *args, **kwargs)
+    if not os.path.isdir(workspace):
+        return original(argv, *args, **kwargs)
+    try:
+        materials = os.path.abspath(arguments[arguments.index("--materials") + 1])
+    except (ValueError, IndexError):
+        parent = os.path.dirname(workspace)
+        materials = os.path.join(parent, ".%s-materials" % os.path.basename(workspace))
+        os.makedirs(materials, exist_ok=True)
+    home = os.path.join(
+        os.path.dirname(workspace),
+        ".%s-examprep-home" % os.path.basename(workspace),
+    )
+    key = (os.path.normcase(workspace), os.path.normcase(materials))
+    with mock.patch.dict(os.environ, {"EXAMPREP_HOME": home}):
+        if key not in _CONFIRMED_FULL_PAIRS and os.path.isdir(materials):
+            if _RUNTIME_IDENTITY is None:
+                _RUNTIME_IDENTITY = exam_start._capture_runtime_identity()
+            output = io.StringIO()
+            with mock.patch.object(
+                    exam_start, "_capture_runtime_identity",
+                    return_value=_RUNTIME_IDENTITY), \
+                    contextlib.redirect_stdout(output):
+                code = exam_start.run([
+                    "confirm", "--course", "visual-index-fixture",
+                    "--materials", materials, "--workspace", workspace,
+                    "--mode", "from_scratch", "--time-budget", "le1d",
+                    "--language", "en", "--processing-mode", "full", "--json",
+                ])
+            if code != 0:
+                raise AssertionError(output.getvalue())
+            _CONFIRMED_FULL_PAIRS.add(key)
+        return original(argv, *args, **kwargs)
+
+
+_BVI_RUN = BVI.run
+_LIQ_RUN = LIQ.run
+_LFP_RUN = LFP.run
+_SQA_RUN = SQA.run
+
+
+def setUpModule():
+    """Scope full-workspace confirmation wrappers to this test module."""
+
+    BVI.run = lambda argv, *args, **kwargs: _confirmed_tool_run(
+        _BVI_RUN, argv, *args, **kwargs
+    )
+    LIQ.run = lambda argv, *args, **kwargs: _confirmed_tool_run(
+        _LIQ_RUN, argv, *args, **kwargs
+    )
+    LFP.run = lambda argv, *args, **kwargs: _confirmed_tool_run(
+        _LFP_RUN, argv, *args, **kwargs
+    )
+    SQA.run = lambda argv, *args, **kwargs: _confirmed_tool_run(
+        _SQA_RUN, argv, *args, **kwargs
+    )
+
+
+def tearDownModule():
+    """Do not leak the full-workspace confirmation wrappers into discovery."""
+    BVI.run = _BVI_RUN
+    LIQ.run = _LIQ_RUN
+    LFP.run = _LFP_RUN
+    SQA.run = _SQA_RUN
 
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
@@ -361,8 +441,12 @@ class BuildIndices(unittest.TestCase):
         self.assertEqual(post["answer_suspects"], [])
         self.assertEqual(post["answer_applied"], 1)
         # the applied workspace must still pass the fail-closed validator (real CLI run)
+        home = os.path.join(
+            os.path.dirname(ws), ".%s-examprep-home" % os.path.basename(ws)
+        )
         r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "validate_workspace.py"), ws],
-                           capture_output=True, text=True, encoding="utf-8")
+                           capture_output=True, text=True, encoding="utf-8",
+                           env=dict(os.environ, EXAMPREP_HOME=home))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def test_apply_rejects_deterministic_target_ownership_before_any_write(self):
@@ -2416,8 +2500,12 @@ class OfficialTools(unittest.TestCase):
         self.assertTrue(any(p.endswith("_p2.png") for p in paths))
         qidx = _load(ws, "image_question_index.json")
         self.assertTrue(any(w.startswith("apply_pruned_stale_asset") for w in qidx["warnings"]))
+        home = os.path.join(
+            os.path.dirname(ws), ".%s-examprep-home" % os.path.basename(ws)
+        )
         r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "validate_workspace.py"), ws],
-                           capture_output=True, text=True, encoding="utf-8")
+                           capture_output=True, text=True, encoding="utf-8",
+                           env=dict(os.environ, EXAMPREP_HOME=home))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)       # applied workspace still validates
 
     def test_figure_pages_surfaces_scan_failures(self):

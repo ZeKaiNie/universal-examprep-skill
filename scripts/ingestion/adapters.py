@@ -1,14 +1,11 @@
-"""Strict, local-only extraction adapters for optional document backends.
+"""Strict local core extraction plus disabled heavy-parser contract identities.
 
-The module deliberately does not import Docling or MinerU.  Capability probes
-inspect installation metadata only, and extraction requires an explicitly
-provided local runner.  This keeps the default runtime stdlib-only and makes
-network/upload/install policy part of every deterministic receipt.
+The student runtime never probes, imports, or executes Docling/MinerU locally.
+They may exist only behind an explicitly requested, separately disclosed remote
+host integration.  Local core receipts retain the deterministic no-network policy.
 """
 
 import hashlib
-import importlib.metadata
-import importlib.util
 import json
 import math
 import os
@@ -67,6 +64,14 @@ class AdapterExecutionError(AdapterError):
     def __init__(self, message, receipt=None):
         super().__init__(message)
         self.receipt = receipt
+
+
+def _heavy_remote_only_message(adapter):
+    return (
+        "%s is remote/cloud-host-only; the local student runtime never probes, "
+        "downloads, installs, imports, executes, or accepts a local runner for "
+        "Docling/MinerU" % adapter
+    )
 
 
 def _sha256(path):
@@ -633,35 +638,18 @@ class _AdapterBase(object):
     module_candidates = ()
 
     def __init__(self, runner=None):
+        if self.adapter_id in ("docling", "mineru") and runner is not None:
+            raise AdapterContractError(_heavy_remote_only_message(self.adapter_id))
         self.runner = runner
 
-    def _probe_distribution(self):
-        for module, distribution in self.module_candidates:
-            try:
-                present = importlib.util.find_spec(module) is not None
-            except (ImportError, AttributeError, ValueError):
-                present = False
-            if not present:
-                continue
-            try:
-                version = importlib.metadata.version(distribution)
-            except importlib.metadata.PackageNotFoundError:
-                version = None
-            return module, distribution, version
-        return None, None, None
-
     def probe(self):
-        module, distribution, version = self._probe_distribution()
-        installed = module is not None
-        # A custom runner is a capability even in an isolated test/host where the
-        # vendor package lives outside the current Python import path.
-        available = installed or self.runner is not None
-        if not available:
-            reason = "optional adapter is not installed"
-        elif self.runner is None:
-            reason = "installed; configure an explicit local runner before extraction"
-        else:
-            reason = None
+        # Heavy parsers may be offered only by a separately configured remote/cloud
+        # host after an explicit learner request and upload/privacy disclosure.  The
+        # student runtime does not even probe local package metadata: package presence
+        # must never become implicit permission to use it.
+        module = distribution = version = None
+        available = False
+        reason = _heavy_remote_only_message(self.adapter_id)
         return CapabilityReceipt(
             schema_version=SCHEMA_VERSION,
             adapter=self.adapter_id,
@@ -669,7 +657,7 @@ class _AdapterBase(object):
             module=module,
             distribution=distribution,
             version=version,
-            runner_configured=self.runner is not None,
+            runner_configured=False,
             policy=dict(LOCAL_ONLY_POLICY),
             reason=reason,
         )
@@ -694,15 +682,11 @@ class _AdapterBase(object):
         )
 
     def _run(self, request):
-        if self.runner is None:
-            raise AdapterUnavailableError(
-                "%s requires an explicitly configured local runner" % self.adapter_id
-            )
-        if not callable(self.runner):
-            raise AdapterContractError("adapter runner must be callable")
-        return self.runner(request)
+        raise AdapterUnavailableError(_heavy_remote_only_message(self.adapter_id))
 
     def extract(self, request):
+        if self.adapter_id in ("docling", "mineru"):
+            raise AdapterUnavailableError(_heavy_remote_only_message(self.adapter_id))
         if not isinstance(request, ExtractionRequest):
             raise AdapterContractError("extract() requires an ExtractionRequest")
         # Re-check immutable content identity immediately before invoking code
@@ -812,7 +796,9 @@ class CoreAdapter(_AdapterBase):
 
     def _run(self, request):
         if self.runner is not None:
-            return super()._run(request)
+            if not callable(self.runner):
+                raise AdapterContractError("core adapter runner must be callable")
+            return self.runner(request)
         extension = os.path.splitext(request.source_path)[1].lower()
         if self.backend is None:
             if extension not in (".txt", ".md", ".markdown", ".csv", ".tsv"):
@@ -875,19 +861,23 @@ def _text_page(source_file, page, text):
 
 
 def resolve_adapter(name="auto", backend=None, runner=None):
-    """Resolve one explicit adapter without importing or installing vendors."""
+    """Resolve an adapter without permitting local heavy-parser execution."""
 
     if not isinstance(name, str):
         raise AdapterContractError("adapter name must be text")
     normalized = name.strip().lower().replace("-", "")
     if normalized in ("auto", "core"):
         return CoreAdapter(backend=backend, runner=runner)
-    if backend is not None:
-        raise AdapterContractError("backend is supported only by the core adapter")
     if normalized == "docling":
+        if backend is not None:
+            raise AdapterContractError(_heavy_remote_only_message("docling"))
         return DoclingAdapter(runner=runner)
     if normalized in ("mineru", "magicpdf"):
+        if backend is not None:
+            raise AdapterContractError(_heavy_remote_only_message("mineru"))
         return MinerUAdapter(runner=runner)
+    if backend is not None:
+        raise AdapterContractError("backend is supported only by the core adapter")
     raise AdapterContractError("unknown adapter: %s" % name)
 
 

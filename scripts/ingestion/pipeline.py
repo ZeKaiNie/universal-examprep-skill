@@ -588,6 +588,8 @@ def _quiz_metadata(item, answer_record=None, answer_value_marker=False):
         ("language", "language"),
         ("expected_behavior", "expected_behavior"),
         ("tests", "tests"),
+        ("teaching_role", "teaching_role"),
+        ("title", "teaching_title"),
     )
     for source_key, target_key in direct:
         value = item.get(source_key)
@@ -596,9 +598,14 @@ def _quiz_metadata(item, answer_record=None, answer_value_marker=False):
 
     language_key = "answer_source_language" if answer_value_marker else "source_language"
     source_language = item.get(language_key)
+    source_prompt = item.get("_prompt_text")
     payload = (
         render_answer_value(item.get("answer"))
-        if answer_value_marker else str(item.get("question") or "").strip()
+        if answer_value_marker else str(
+            source_prompt
+            if isinstance(source_prompt, str) and source_prompt.strip()
+            else item.get("question") or ""
+        ).strip()
     )
     unit_kind = "answer" if answer_value_marker else "question"
     if source_language in SOURCE_UNIT_LANGUAGE_CODES:
@@ -633,20 +640,63 @@ def _quiz_metadata(item, answer_record=None, answer_value_marker=False):
         role = asset.get("role")
         if path and role in ASSET_ROLES:
             normalized = {"path": path, "role": role}
+            for control in (
+                "type", "contains_full_prompt", "source_page",
+                "source_bbox_pdf_points", "crop_receipt_id",
+                "crop_receipt_schema_version", "crop_spec_sha256",
+                "semantic_purity_sha256", "semantic_purity_schema_version",
+                "required_context_ids", "content_scope", "isolation",
+            ):
+                if control in asset:
+                    # Preserve the exact typed value.  ContentUnit validation below
+                    # rejects malformed crop controls instead of silently erasing
+                    # their source-location or receipt binding.
+                    normalized[control] = asset[control]
             source_file = asset.get("source_file")
-            if isinstance(source_file, str) and source_file.strip():
-                normalized["source_file"] = source_file
-            for hash_field in ("sha256", "source_sha256"):
-                value = asset.get(hash_field)
-                if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value):
-                    normalized[hash_field] = value
+            strict_crop = "crop_receipt_id" in asset
+            if strict_crop:
+                # A receipted crop is an exact protocol object.  Preserve even
+                # malformed values so ContentUnit rejects them; filtering here
+                # would turn corruption into an apparently unbound legacy crop.
+                if "source_file" in asset:
+                    normalized["source_file"] = source_file
+                for hash_field in ("sha256", "source_sha256"):
+                    if hash_field in asset:
+                        normalized[hash_field] = asset[hash_field]
+            else:
+                if isinstance(source_file, str) and source_file.strip():
+                    normalized["source_file"] = source_file
+                for hash_field in ("sha256", "source_sha256"):
+                    value = asset.get(hash_field)
+                    if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value):
+                        normalized[hash_field] = value
             if normalized not in assets:
                 assets.append(normalized)
     if assets:
         metadata["assets"] = assets
     if answer_value_marker:
         metadata["answer_value"] = item.get("answer")
+        if item.get("answer_origin") is not None:
+            metadata["answer_origin"] = item.get("answer_origin")
+        if item.get("inline_material_source_unit_id") is not None:
+            metadata["inline_material_source_unit_id"] = item.get(
+                "inline_material_source_unit_id"
+            )
     return metadata
+
+
+def _validate_inline_material_answer_item(item):
+    """Keep inline worked-answer promotion out of raw parser/builder input."""
+
+    origin = item.get("answer_origin")
+    if origin is None:
+        return
+    if origin != "inline_material":
+        raise ValueError("unsupported answer_origin %r" % origin)
+    raise ValueError(
+        "inline_material cannot be supplied by raw ingestion; register, claim, "
+        "draft, validate, and apply it through ingest_review.py"
+    )
 
 
 def _default_parser_receipt(record, produced_pages):
@@ -1010,6 +1060,7 @@ def build_payload(
     for index, item in enumerate(quiz_items or (), 1):
         if not isinstance(item, dict):
             continue
+        _validate_inline_material_answer_item(item)
         question_record = _record_by_file(records, item.get("source_file"))
         pages_for_question = item.get("source_pages") or []
         if question_record is None or not pages_for_question:
@@ -1026,9 +1077,15 @@ def build_payload(
                     and a.get("role") == "question_context" and _asset_path(a.get("path"))]
         q_asset = _asset_path(q_assets[0].get("path")) if q_assets else None
         question_ordinal = _quiz_ordinal(item, index)
+        source_prompt = item.get("_prompt_text")
+        question_payload = (
+            source_prompt
+            if isinstance(source_prompt, str) and source_prompt.strip()
+            else item.get("question") or ""
+        )
         question = ContentUnit.create(
             question_record.source_id, question_record.sha256, question_record.path,
-            "question", str(item.get("question") or "").strip(),
+            "question", str(question_payload).strip(),
             page_number, ordinal=question_ordinal,
             external_id=str(item.get("id")) if item.get("id") is not None else None,
             chapter_id=chapter_id, asset_path=q_asset,
@@ -1754,6 +1811,56 @@ def _material_recovery_ancestor_chain(workspace_root, pending, limit=64):
     return chain
 
 
+def _previous_generation_consumed_promotion_ledger(
+        workspace_root, build_manifest, promotions):
+    """Recognize one exact cumulative ledger already consumed by the live build.
+
+    Older parse reports retain their generation's migration receipts.  An
+    incremental producer may therefore have staged those exact rows again before
+    it was upgraded to emit a generation-local ledger.  Compatibility is safe
+    only when the unchanged previous manifest binds the completed receipt twice,
+    all source bindings agree, and the candidate ledger is byte-semantically the
+    same complete ledger.  Callers must additionally prove that the current
+    old/candidate policy delta is empty.
+    """
+
+    if (not isinstance(build_manifest, dict)
+            or build_manifest.get("schema_version") != 2
+            or not isinstance(promotions, list) or not promotions):
+        return False
+    receipt_path = safe_workspace_entry(
+        workspace_root, MATERIAL_BUILD_RECEIPT_PATH
+    )
+    if not receipt_path.exists():
+        return False
+    try:
+        receipt, receipt_sha = _stable_json_with_sha256(receipt_path)
+        validate_generation(receipt, expected_status="complete")
+    except (OSError, TypeError, ValueError):
+        return False
+    receipt_binding = {
+        "path": MATERIAL_BUILD_RECEIPT_PATH,
+        "sha256": receipt_sha,
+    }
+    artifacts = build_manifest.get("artifacts")
+    if (not isinstance(artifacts, dict)
+            or artifacts.get("material_build_receipt") != receipt_binding):
+        return False
+    if build_manifest.get("material_build") != _material_build_manifest_contract(
+            receipt, receipt_sha):
+        return False
+    for name, key in (
+            ("source_raw_input", "raw_input"),
+            ("parse_report", "parse_report")):
+        if artifacts.get(name) != receipt.get(key):
+            return False
+    return (
+        receipt.get("asset_role_promotion_count") == len(promotions)
+        and receipt.get("asset_role_promotions_sha256")
+        == json_sha256(promotions)
+    )
+
+
 def authorize_material_build_generation(workspace, raw_input):
     """Authorize one hash-bound builder hand-off under the publication lock.
 
@@ -1810,9 +1917,11 @@ def authorize_material_build_generation(workspace, raw_input):
         raise ValueError("pending asset-role promotion ledger drifted")
 
     manifest_path = safe_workspace_entry(workspace_root, BUILD_MANIFEST_PATH)
+    previous_manifest = None
     if manifest_path.exists():
-        _manifest_bytes, _snapshot = stable_read_bytes(manifest_path)
-        previous_manifest_sha = hashlib.sha256(_manifest_bytes).hexdigest()
+        previous_manifest, previous_manifest_sha = _stable_json_with_sha256(
+            manifest_path
+        )
     else:
         previous_manifest_sha = None
     if previous_manifest_sha != pending["previous_build_manifest_sha256"]:
@@ -1840,8 +1949,18 @@ def authorize_material_build_generation(workspace, raw_input):
         if old_roles[identity] != candidate_roles[identity]
     }
 
+    effective_promotions = promotions
+    if (not changed and promotions
+            and _previous_generation_consumed_promotion_ledger(
+                workspace_root, previous_manifest, promotions
+            )):
+        # Exact upgrade recovery only: these rows were already authorized and
+        # consumed by the manifest-bound previous generation.  A non-empty live
+        # role delta can never take this branch.
+        effective_promotions = []
+
     receipt_by_identity = {}
-    for receipt in promotions:
+    for receipt in effective_promotions:
         path = receipt.get("path")
         identity = workspace_asset_identity_key(path, workspace_root)
         if identity in receipt_by_identity:
@@ -2489,8 +2608,15 @@ def persist_payload(workspace, payload):
         return _persist_payload_unlocked(workspace, payload)
 
 
-def refresh_build_manifest(workspace, derived_artifacts=None, fact_summary=None):
-    """Add compiled artifact hashes after wiki/index/question-bank generation."""
+def refresh_build_manifest(
+        workspace, derived_artifacts=None, fact_summary=None, *, rehash_artifacts=True,
+        rehash_artifact_names=None):
+    """Refresh build counts and, by default, compiled artifact hashes.
+
+    Callers that only mutate control-plane records under ``mutation_lock`` may
+    pass ``rehash_artifacts=False``.  That updates counts without blessing
+    unrelated live derived bytes that were not rebuilt by the same operation.
+    """
 
     workspace_path = Path(workspace).resolve()
     path = workspace_path.joinpath(*BUILD_MANIFEST_PATH.split("/"))
@@ -2515,14 +2641,22 @@ def refresh_build_manifest(workspace, derived_artifacts=None, fact_summary=None)
             manifest.get("page_quality")
             if isinstance(manifest.get("page_quality"), list) else []
         )
+    selected_artifacts = None
+    if rehash_artifact_names is not None:
+        selected_artifacts = set(rehash_artifact_names)
+        if not selected_artifacts or not all(
+                isinstance(name, str) and name for name in selected_artifacts):
+            raise ValueError("rehash_artifact_names must contain non-empty names")
     artifacts = manifest.get("artifacts")
-    if isinstance(artifacts, dict):
+    if (rehash_artifacts or selected_artifacts) and isinstance(artifacts, dict):
         immutable_generation_artifacts = {
             "source_raw_input",
             "parse_report",
             "material_build_receipt",
         }
         for name, row in artifacts.items():
+            if not rehash_artifacts and name not in selected_artifacts:
+                continue
             if not isinstance(row, dict) or not isinstance(row.get("path"), str):
                 continue
             # These three hashes are an immutable generation receipt, not a
@@ -2534,7 +2668,7 @@ def refresh_build_manifest(workspace, derived_artifacts=None, fact_summary=None)
             absolute = safe_workspace_entry(workspace_path, row["path"])
             if absolute.is_file() and not absolute.is_symlink():
                 row["sha256"] = file_sha256(absolute)
-    if derived_artifacts is not None:
+    if rehash_artifacts and derived_artifacts is not None:
         derived = {}
         for label, relative in sorted(derived_artifacts.items()):
             normalized = normalize_workspace_path(relative)
@@ -2542,7 +2676,7 @@ def refresh_build_manifest(workspace, derived_artifacts=None, fact_summary=None)
             if absolute.is_file() and not absolute.is_symlink():
                 derived[label] = {"path": normalized, "sha256": file_sha256(absolute)}
         manifest["derived_artifacts"] = derived
-    else:
+    elif rehash_artifacts:
         derived = manifest.get("derived_artifacts")
         if isinstance(derived, dict):
             for row in derived.values():
@@ -2693,6 +2827,19 @@ def _phase_inventory(workspace_path):
 
 
 def _replace_recovery_block(text, rendered):
+    # The original wiki is a derived cache and can still contain parser-era
+    # control bytes after the authoritative unit was repaired in the ledger.
+    # Preserve ordinary Unicode and Markdown whitespace, but never republish
+    # NUL/C0/DEL or Unicode replacement characters into the rebuilt view.
+    def clean(value):
+        return "".join(
+            char for char in value
+            if char != "\ufffd"
+            and not ((ord(char) < 32 and char not in "\t\n\r") or ord(char) == 0x7F)
+        )
+
+    text = clean(text)
+    rendered = clean(rendered)
     pattern = re.compile(
         r"\n?%s.*?%s\n?" % (re.escape(_RECOVERY_START), re.escape(_RECOVERY_END)),
         re.DOTALL,
@@ -2858,9 +3005,12 @@ def _new_quiz_item(question, answer, tainted_keys=None):
         "options", "keywords", "knowledge_point", "knowledge_points", "source_type",
         "requires_assets", "maybe_requires_assets", "gradable",
         "question_text_status", "diagram_type", "language", "expected_behavior", "tests",
+        "teaching_role",
     ):
         if key in metadata:
             item[key] = metadata[key]
+    if "teaching_title" in metadata:
+        item["title"] = metadata["teaching_title"]
     effective_keywords = _effective_quiz_keywords(question, answer)
     if effective_keywords is not None:
         item["keywords"] = effective_keywords
@@ -2880,18 +3030,26 @@ def _new_quiz_item(question, answer, tainted_keys=None):
         item["answer_provenance"] = answer.provenance
         if "source_language" in answer_metadata:
             item["answer_source_language"] = answer_metadata["source_language"]
+        if "answer_origin" in answer_metadata:
+            item["answer_origin"] = answer_metadata["answer_origin"]
+        if "inline_material_source_unit_id" in answer_metadata:
+            item["inline_material_source_unit_id"] = answer_metadata[
+                "inline_material_source_unit_id"
+            ]
         if answer.provenance == "ai_supplemented":
             item["source"] = "ai_generated"
     return item
 
 
 def _update_quiz_item_from_units(
-        item, question, answer, patched_unit_ids, tainted_keys=None):
+        item, question, answer, patched_unit_ids, tainted_keys=None,
+        preserve_omitted_metadata=()):
     tainted_keys = set(
         tainted_keys or student_attempt_tainted_keys(
             tuple(unit for unit in (question, answer) if unit is not None)
         )
     )
+    preserve_omitted_metadata = frozenset(preserve_omitted_metadata)
     _assert_publishable_qa(question, answer, tainted_keys)
     updates = 0
     question_touched = question.unit_id in patched_unit_ids
@@ -2921,14 +3079,21 @@ def _update_quiz_item_from_units(
             "expected_behavior": "expected_behavior",
             "tests": "tests",
             "source_language": "source_language",
+            "teaching_role": "teaching_role",
+            "teaching_title": "title",
         }
         required_metadata = {"quiz_type", "source_pages"}
         for metadata_key, item_key in translated.items():
             if metadata_key == "source_pages":
                 value = metadata.get(metadata_key) or [question.page]
-            elif metadata_key in metadata:
+            elif (metadata_key in metadata
+                    and not (
+                        metadata_key in preserve_omitted_metadata
+                        and metadata[metadata_key] is None
+                    )):
                 value = metadata[metadata_key]
-            elif metadata_key not in required_metadata:
+            elif (metadata_key not in required_metadata
+                    and metadata_key not in preserve_omitted_metadata):
                 if item_key in item:
                     item.pop(item_key)
                     updates += 1
@@ -2956,6 +3121,18 @@ def _update_quiz_item_from_units(
         if item.get("answer") != value:
             item["answer"] = value
             updates += 1
+        has_answer = (
+            value not in (None, "", [], {})
+            and not (isinstance(value, str) and not value.strip())
+        )
+        # ``answer_status`` is the mutually exclusive no-answer fallback.
+        # Once a usable exact answer is compiled, retaining a stale
+        # ``answer_status=unknown`` makes the human view contradict its typed
+        # material evidence.  Asset-only or blank answer units still need the
+        # fallback and therefore do not pass this gate.
+        if has_answer and item.get("answer_status") == "unknown":
+            item.pop("answer_status")
+            updates += 1
         if item.get("answer_provenance") != answer.provenance:
             item["answer_provenance"] = answer.provenance
             updates += 1
@@ -2974,6 +3151,24 @@ def _update_quiz_item_from_units(
                 updates += 1
         elif "answer_source_language" in item:
             item.pop("answer_source_language")
+            updates += 1
+        answer_origin = answer_metadata.get("answer_origin")
+        if answer_origin is not None:
+            if item.get("answer_origin") != answer_origin:
+                item["answer_origin"] = answer_origin
+                updates += 1
+        elif "answer_origin" in item:
+            item.pop("answer_origin")
+            updates += 1
+        inline_source_unit_id = answer_metadata.get(
+            "inline_material_source_unit_id"
+        )
+        if inline_source_unit_id is not None:
+            if item.get("inline_material_source_unit_id") != inline_source_unit_id:
+                item["inline_material_source_unit_id"] = inline_source_unit_id
+                updates += 1
+        elif "inline_material_source_unit_id" in item:
+            item.pop("inline_material_source_unit_id")
             updates += 1
         if answer.provenance == "ai_supplemented" and item.get("source") != "ai_generated":
             item["source"] = "ai_generated"
@@ -3052,6 +3247,17 @@ def _compile_review_outputs_unlocked(workspace):
     # anything, so hand edits cannot be "washed clean" by refreshing hashes.
     expected_units, _expected_mappings = store._expected_compiled_state()
     quiz_bank, teaching_items = _workspace_asset_items(workspace_path)
+    inline_quiz_ids = sorted(
+        str(item.get("id"))
+        for item in quiz_bank
+        if isinstance(item, dict)
+        and item.get("answer_origin") == "inline_material"
+    )
+    if inline_quiz_ids:
+        raise ValueError(
+            "inline_material is teaching-only and cannot exist in quiz_bank: %s"
+            % ", ".join(inline_quiz_ids)
+        )
     tainted_keys = _require_asset_policy(
         quiz=quiz_bank,
         teaching=teaching_items,
@@ -3161,6 +3367,11 @@ def _compile_review_outputs_unlocked(workspace):
         if isinstance(item, dict) and item.get("id") is not None
     }
     quiz_updates = 0
+    teaching_updates = 0
+    teaching_by_id = {}
+    for item in teaching_items:
+        if isinstance(item, dict) and item.get("id") is not None:
+            teaching_by_id.setdefault(str(item["id"]), []).append(item)
     for question in sorted(units.values(), key=lambda unit: unit.unit_id):
         if question.kind != "question" or not question.external_id:
             continue
@@ -3168,9 +3379,34 @@ def _compile_review_outputs_unlocked(workspace):
         answer = units.get(question.paired_unit_id) if question.paired_unit_id else None
         if answer is not None and answer.kind != "answer":
             raise ValueError("question paired_unit_id must refer to an answer unit")
+        if (
+            item is not None
+            and answer is not None
+            and answer.metadata.get("answer_origin") == "inline_material"
+        ):
+            raise ValueError(
+                "inline worked material must remain teaching-only; quiz row exists for %s"
+                % question.external_id
+            )
         _assert_publishable_qa(question, answer, tainted_keys)
+        for teaching_item in teaching_by_id.get(question.external_id, ()):
+            teaching_updates += _update_quiz_item_from_units(
+                teaching_item, question, answer, patched_unit_ids,
+                tainted_keys=tainted_keys,
+                preserve_omitted_metadata={
+                    "teaching_role", "teaching_title",
+                },
+            )
         if item is None:
             if question.unit_id not in patched_unit_ids:
+                continue
+            # A worked demonstration is reachable through the teaching layer,
+            # not a newly manufactured quiz-bank row.  Its exact inline answer
+            # may be patched/recompiled without changing that route boundary.
+            if (
+                question.metadata.get("gradable") is False
+                and question.metadata.get("teaching_role") == "worked_example"
+            ):
                 continue
             item = _new_quiz_item(question, answer, tainted_keys=tainted_keys)
             quiz_bank.append(item)
@@ -3182,6 +3418,11 @@ def _compile_review_outputs_unlocked(workspace):
             tainted_keys=tainted_keys,
         )
     atomic_write_json(quiz_path, quiz_bank)
+    teaching_path = safe_workspace_entry(
+        workspace_path, "references/teaching_examples.json"
+    )
+    if teaching_updates and teaching_path.exists():
+        atomic_write_json(teaching_path, teaching_items)
 
     ingest_report_path = workspace_path / "ingest_report.json"
     if ingest_report_path.is_file() and not ingest_report_path.is_symlink():
@@ -3291,9 +3532,6 @@ def _compile_review_outputs_unlocked(workspace):
             "sha256": file_sha256(quiz_path),
         },
     }
-    teaching_path = safe_workspace_entry(
-        workspace_path, "references/teaching_examples.json"
-    )
     if teaching_path.exists():
         # `_workspace_asset_items` already established that this is a safe
         # regular JSON array.  Bind its fixed canonical identity and exact bytes
@@ -3335,6 +3573,7 @@ def _compile_review_outputs_unlocked(workspace):
         "structured_visuals_by_chapter": visual_counts,
         "recovered_units_by_chapter": recovery_counts,
         "quiz_updates": quiz_updates,
+        "teaching_updates": teaching_updates,
         "retrieval_chunks": len(chunks),
         "fact_summary": fact_summary,
     }

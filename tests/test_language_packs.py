@@ -125,10 +125,15 @@ class P2CatalogParity(unittest.TestCase):
         emb_en = set(i18n._EMBEDDED["en"])
         self.assertEqual(emb_zh, emb_en, u"i18n 内嵌 zh/en 目录键集必须一致")
         for loc, emb in (("zh", emb_zh), ("en", emb_en)):
-            keys = set(json.loads(read_rel("locales/%s/messages.json" % loc)))
+            catalog = json.loads(read_rel("locales/%s/messages.json" % loc))
+            keys = set(catalog)
             self.assertEqual(keys, emb,
                              u"locales/%s/messages.json 键集必须与 scripts/i18n.py 内嵌目录一致"
                              u"（差集: +%r / -%r）" % (loc, sorted(keys - emb), sorted(emb - keys)))
+            self.assertEqual(
+                catalog, i18n._EMBEDDED[loc],
+                u"locales/%s/messages.json 的文案值也必须与内嵌目录完全一致" % loc,
+            )
 
 
 class P3EnTreePurity(unittest.TestCase):

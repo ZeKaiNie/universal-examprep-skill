@@ -4,11 +4,12 @@
 
 ``status`` is read-only. ``confirm`` is the sole convenience command that may
 create a user-confirmed workspace, initialize progress state, set all three
-learning choices in one update, and bind an exact workspace/materials receipt
-in the global registry.  Ingestion imports :func:`check_start_gate` and fails
-closed unless that receipt and the three canonical choices are present.
-The optional interaction cadence is passed through only when explicitly set;
-it is not a fourth readiness choice.
+learning choices plus the independent processing and answer-explanation
+choices and optional teaching cadence in one update, and
+bind an exact workspace/materials receipt in the global registry.  The default
+processing choice is lightweight and does not open the eager ingestion gate.
+Ingestion imports :func:`check_start_gate` and fails closed unless the user has
+explicitly selected ``full`` and the remaining gate evidence is current.
 """
 
 import argparse
@@ -110,6 +111,15 @@ _GIT_OBJECT_ID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
 class RuntimeReceiptError(ValueError):
     """The installed runtime cannot be identified or safely verified."""
+
+
+class FullProcessingRequired(RuntimeError):
+    """Full-workspace publication was attempted without the exact full gate."""
+
+    def __init__(self, message, *, reason=None, blockers=()):
+        super().__init__(message)
+        self.reason = reason
+        self.blockers = tuple(blockers or ())
 
 
 def _utc_now():
@@ -613,18 +623,28 @@ def _emit(payload, as_json):
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
     if payload.get("process_success"):
+        print("ready_to_start=%s" % str(payload.get("ready_to_start", False)).lower())
         print("ready_to_ingest=%s" % str(payload.get("ready_to_ingest", False)).lower())
+        print("processing_mode=%s" % payload.get("processing_mode", "lightweight"))
+        print("artifact_mode_preference=%s" % payload.get(
+            "artifact_mode_preference", "chat"))
+        print("artifact_mode_effective=%s" % payload.get(
+            "artifact_mode_effective", "chat"))
+        print("artifact_mode_dormant=%s" % str(
+            payload.get("artifact_mode_dormant", False)).lower())
+        print("answer_explanation_mode=%s" % payload.get(
+            "answer_explanation_mode", "ordinary"))
+        print("interaction_style_preference=%s" % payload.get(
+            "interaction_style_preference", "batch"))
+        print("interaction_style_effective=%s" % payload.get(
+            "interaction_style_effective", "batch"))
+        print("interaction_style_dormant=%s" % str(
+            payload.get("interaction_style_dormant", False)).lower())
+        if payload.get("interaction_style_dormant_reason"):
+            print("interaction_style_dormant_reason=%s" % payload[
+                "interaction_style_dormant_reason"])
         print("workspace=%s" % payload.get("workspace"))
         print("materials=%s" % payload.get("materials"))
-        print("interaction_style_preference=%s" %
-              payload.get("interaction_style_preference", "batch"))
-        print("interaction_style_effective=%s" %
-              payload.get("interaction_style_effective", "batch"))
-        print("interaction_style_dormant=%s" %
-              str(bool(payload.get("interaction_style_dormant"))).lower())
-        if payload.get("interaction_style_dormant_reason"):
-            print("interaction_style_dormant_reason=%s" %
-                  payload["interaction_style_dormant_reason"])
     else:
         print("exam_start failed: %s" % payload.get("error", "unknown error"))
 
@@ -690,12 +710,19 @@ def _load_state_status(workspace):
     if preferences is not None and not isinstance(preferences, dict):
         invalid["preferences"] = type(preferences).__name__
     elif isinstance(preferences, dict):
-        raw_style = preferences.get("interaction_style", "batch")
-        if raw_style not in update_progress.INTERACTION_STYLES:
-            invalid["interaction_style"] = raw_style
-    style_preference = update_progress.interaction_style_preference(state)
-    style_effective = update_progress.effective_interaction_style(state)
-    style_dormant = update_progress.interaction_style_dormant(state)
+        raw_interaction_style = preferences.get("interaction_style", "batch")
+        if raw_interaction_style not in update_progress.INTERACTION_STYLES:
+            invalid["interaction_style"] = raw_interaction_style
+    interaction_style_preference = i18n.workspace_interaction_style_preference(state)
+    interaction_style_effective = i18n.workspace_effective_interaction_style(state)
+    interaction_style_dormant = i18n.workspace_interaction_style_dormant(state)
+    interaction_style_dormant_reason = None
+    if interaction_style_dormant:
+        interaction_style_dormant_reason = (
+            "processing_mode_not_full"
+            if i18n.workspace_processing_mode(state) != "full"
+            else "no_questions"
+        )
     ready = not missing and not invalid
     return {
         "ready": ready,
@@ -705,14 +732,15 @@ def _load_state_status(workspace):
         "missing": missing,
         "invalid": invalid,
         "values": values,
-        "interaction_style_preference": style_preference,
-        "interaction_style_effective": style_effective,
-        "interaction_style_dormant": style_dormant,
-        "interaction_style_dormant_reason": (
-            "processing_mode_not_full"
-            if style_dormant
-            and not update_progress.interaction_style_full_route(state)
-            else ("no_questions" if style_dormant else None)),
+        "processing_mode": i18n.workspace_processing_mode(state),
+        "artifact_mode_preference": i18n.workspace_artifact_mode(state),
+        "artifact_mode_effective": i18n.workspace_effective_artifact_mode(state),
+        "artifact_mode_dormant": i18n.workspace_artifact_mode_dormant(state),
+        "answer_explanation_mode": i18n.workspace_answer_explanation_mode(state),
+        "interaction_style_preference": interaction_style_preference,
+        "interaction_style_effective": interaction_style_effective,
+        "interaction_style_dormant": interaction_style_dormant,
+        "interaction_style_dormant_reason": interaction_style_dormant_reason,
     }
 
 
@@ -765,7 +793,33 @@ def check_start_gate(workspace, materials):
         operation_errors.append("registry_unreadable")
     if runtime.get("reason") == "runtime_snapshot_failed":
         operation_errors.append("runtime_snapshot_failed")
-    allowed = not blockers
+    ready_to_start = not blockers
+    processing_mode = choices.get("processing_mode") or "lightweight"
+    artifact_mode_preference = choices.get("artifact_mode_preference") or "chat"
+    artifact_mode_effective = choices.get("artifact_mode_effective") or "chat"
+    artifact_mode_dormant = bool(choices.get("artifact_mode_dormant"))
+    answer_explanation_mode = (
+        choices.get("answer_explanation_mode") or "ordinary"
+    )
+    interaction_style_preference = choices.get(
+        "interaction_style_preference") or "batch"
+    interaction_style_effective = choices.get(
+        "interaction_style_effective") or "batch"
+    interaction_style_dormant = bool(choices.get("interaction_style_dormant"))
+    interaction_style_dormant_reason = choices.get(
+        "interaction_style_dormant_reason")
+    ingestion_blockers = list(blockers)
+    if processing_mode != "full":
+        ingestion_blockers.append("processing_mode_lightweight")
+    ready_to_ingest = ready_to_start and processing_mode == "full"
+    if operation_errors:
+        next_action = "repair_start_gate_operation"
+    elif not ready_to_start:
+        next_action = "exam_start confirm"
+    elif processing_mode == "lightweight":
+        next_action = "lightweight_session"
+    else:
+        next_action = "ingest_course"
     return {
         "process_success": not operation_errors,
         "workspace": workspace,
@@ -774,23 +828,27 @@ def check_start_gate(workspace, materials):
         "learning_choices": choices,
         "runtime_provenance": runtime,
         "workspace_location": workspace_location,
-        "interaction_style_preference": choices.get(
-            "interaction_style_preference", "batch"),
-        "interaction_style_effective": choices.get(
-            "interaction_style_effective", "batch"),
-        "interaction_style_dormant": bool(choices.get(
-            "interaction_style_dormant")),
-        "interaction_style_dormant_reason": choices.get(
-            "interaction_style_dormant_reason"),
+        "processing_mode": processing_mode,
+        "artifact_mode_preference": artifact_mode_preference,
+        "artifact_mode_effective": artifact_mode_effective,
+        "artifact_mode_dormant": artifact_mode_dormant,
+        "answer_explanation_mode": answer_explanation_mode,
+        "interaction_style_preference": interaction_style_preference,
+        "interaction_style_effective": interaction_style_effective,
+        "interaction_style_dormant": interaction_style_dormant,
+        "interaction_style_dormant_reason": interaction_style_dormant_reason,
+        "start_permission": {
+            "allowed": ready_to_start,
+            "blockers": list(blockers),
+        },
         "ingestion_permission": {
-            "allowed": allowed,
-            "blockers": blockers,
+            "allowed": ready_to_ingest,
+            "blockers": ingestion_blockers,
         },
         "operation_errors": operation_errors,
-        "ready_to_ingest": allowed,
-        "next_action": "ingest_course" if allowed else (
-            "repair_start_gate_operation" if operation_errors else "exam_start confirm"
-        ),
+        "ready_to_start": ready_to_start,
+        "ready_to_ingest": ready_to_ingest,
+        "next_action": next_action,
     }
 
 
@@ -841,6 +899,13 @@ def check_registered_workspace_gate(workspace):
     for row in rows[:RUNTIME_DIFF_LIMIT]:
         gate = check_start_gate(workspace_lexical, row["materials"])
         blocked.update({
+            "processing_mode": gate.get("processing_mode", "lightweight"),
+            "artifact_mode_preference": gate.get(
+                "artifact_mode_preference", "chat"),
+            "artifact_mode_effective": gate.get("artifact_mode_effective", "chat"),
+            "artifact_mode_dormant": bool(gate.get("artifact_mode_dormant")),
+            "answer_explanation_mode": gate.get(
+                "answer_explanation_mode", "ordinary"),
             "interaction_style_preference": gate.get(
                 "interaction_style_preference", "batch"),
             "interaction_style_effective": gate.get(
@@ -868,6 +933,41 @@ def check_registered_workspace_gate(workspace):
         blocked["process_success"] = False
     blocked["candidate_materials_truncated"] = len(rows) > RUNTIME_DIFF_LIMIT
     return blocked
+
+
+def require_full_processing(workspace, materials=None, purpose="full workspace publication"):
+    """Require the current exact-pair gate and explicit ``processing_mode=full``.
+
+    Lower-level builders/compilers pass ``materials`` and recheck that exact pair.
+    Commands without a materials argument recover the sole registered pair instead.
+    This function is read-only and returns the current gate for caller receipts.
+    """
+
+    workspace = os.path.abspath(workspace)
+    gate = (
+        check_start_gate(workspace, os.path.abspath(materials))
+        if materials is not None
+        else check_registered_workspace_gate(workspace)
+    )
+    if (gate.get("ready_to_ingest") is True
+            and gate.get("processing_mode") == "full"):
+        return gate
+    blockers = list(
+        (gate.get("ingestion_permission") or {}).get("blockers") or []
+    )
+    if (gate.get("processing_mode") != "full"
+            and "processing_mode_lightweight" not in blockers):
+        blockers.append("processing_mode_lightweight")
+    reason = gate.get("reason") or "full_processing_gate_blocked"
+    detail = ", ".join(str(value) for value in blockers[:RUNTIME_DIFF_LIMIT])
+    raise FullProcessingRequired(
+        "%s requires the exact confirmed workspace/materials pair, current runtime "
+        "provenance, complete learning choices, and explicit processing_mode=full "
+        "(reason=%s%s)"
+        % (purpose, reason, "; blockers=" + detail if detail else ""),
+        reason=reason,
+        blockers=blockers,
+    )
 
 
 def _inside_materials(materials, workspace):
@@ -964,6 +1064,7 @@ def _recover_material_build(args):
     materials_lexical = os.path.abspath(args.materials)
     base = {
         "process_success": False,
+        "ready_to_start": False,
         "ready_to_ingest": False,
         "workspace": workspace_lexical,
         "materials": materials_lexical,
@@ -1103,11 +1204,15 @@ def _confirm(args):
     materials_lexical = os.path.abspath(args.materials)
     base = {
         "process_success": False,
+        "ready_to_start": False,
         "ready_to_ingest": False,
         "workspace": workspace_lexical,
         "materials": materials_lexical,
         "course": (args.course or "").strip(),
         "urgent": bool(args.urgent),
+        "processing_mode_requested": args.processing_mode,
+        "answer_explanation_mode_requested": args.answer_explanation_mode,
+        "interaction_style_requested": args.interaction_style,
     }
     choices, missing, inferred, validation = _canonical_choices(args)
     if missing:
@@ -1155,6 +1260,46 @@ def _confirm(args):
     base["materials"] = materials
 
     try:
+        light_session_path = safe_workspace_entry(
+            workspace, ".lightweight/session.json"
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        base["error"] = "lightweight session path is unsafe: %s" % exc
+        base["failed_step"] = "lightweight_pair_binding"
+        return 2, base
+    if os.path.lexists(str(light_session_path)):
+        if (not os.path.isfile(light_session_path)
+                or is_link_or_reparse(light_session_path)):
+            base["error"] = "existing lightweight session ledger is unsafe"
+            base["failed_step"] = "lightweight_pair_binding"
+            return 2, base
+        try:
+            payload, _snapshot = stable_read_bytes(light_session_path)
+            light_session = json.loads(payload.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            base["error"] = "existing lightweight session ledger is invalid: %s" % exc
+            base["failed_step"] = "lightweight_pair_binding"
+            return 2, base
+        recorded_workspace = light_session.get("workspace") \
+            if isinstance(light_session, dict) else None
+        recorded_materials = light_session.get("materials") \
+            if isinstance(light_session, dict) else None
+        if (not isinstance(recorded_workspace, str)
+                or not isinstance(recorded_materials, str)):
+            base["error"] = "existing lightweight session has no canonical path pair"
+            base["failed_step"] = "lightweight_pair_binding"
+            return 2, base
+        if (_resolved_path(recorded_workspace) != workspace
+                or _resolved_path(recorded_materials) != materials):
+            base["error"] = (
+                "this workspace already contains lightweight history for a different "
+                "materials root; choose a new workspace so old evidence remains auditable"
+            )
+            base["failed_step"] = "lightweight_pair_binding"
+            base["next_action"] = "confirm the new materials with a new workspace path"
+            return 2, base
+
+    try:
         pending_snapshot = _stable_pending_generation(
             workspace, require_complete_sources=False
         )
@@ -1188,9 +1333,18 @@ def _confirm(args):
         "--time-budget", choices["time_budget"],
         "--language", choices["language"],
     ]
+    # Reconfirmation is not an implicit processing-mode switch.  Existing state
+    # retains its choice; a newly initialized state already defaults safely to
+    # lightweight.  Only an explicit flag changes this independent preference.
+    if args.processing_mode is not None:
+        set_args.extend(("--processing-mode", args.processing_mode))
     if args.artifact_mode is not None:
         set_args.extend(("--artifact-mode", args.artifact_mode))
-    if getattr(args, "interaction_style", None) is not None:
+    if args.answer_explanation_mode is not None:
+        set_args.extend((
+            "--answer-explanation-mode", args.answer_explanation_mode,
+        ))
+    if args.interaction_style is not None:
         set_args.extend(("--interaction-style", args.interaction_style))
     selected = _run_progress(set_args)
     if selected.returncode != 0:
@@ -1222,21 +1376,28 @@ def _confirm(args):
 
     gate = check_start_gate(workspace, materials)
     base.update({
-        "process_success": gate["ready_to_ingest"],
+        "process_success": gate["ready_to_start"],
+        "ready_to_start": gate["ready_to_start"],
         "ready_to_ingest": gate["ready_to_ingest"],
+        "processing_mode": gate["processing_mode"],
+        "artifact_mode_preference": gate["artifact_mode_preference"],
+        "artifact_mode_effective": gate["artifact_mode_effective"],
+        "artifact_mode_dormant": gate["artifact_mode_dormant"],
+        "answer_explanation_mode": gate["answer_explanation_mode"],
+        "interaction_style_preference": gate["interaction_style_preference"],
+        "interaction_style_effective": gate["interaction_style_effective"],
+        "interaction_style_dormant": gate["interaction_style_dormant"],
+        "interaction_style_dormant_reason": gate[
+            "interaction_style_dormant_reason"],
         "learning_choices": choices,
         "inferred_learning_choices": inferred,
         "workspace_confirmation": gate["workspace_confirmation"],
         "runtime_provenance": gate["runtime_provenance"],
         "runtime_receipt": _runtime_receipt_summary(runtime_receipt),
-        "interaction_style_preference": gate["interaction_style_preference"],
-        "interaction_style_effective": gate["interaction_style_effective"],
-        "interaction_style_dormant": gate["interaction_style_dormant"],
-        "interaction_style_dormant_reason": gate["interaction_style_dormant_reason"],
         "ingestion_permission": gate["ingestion_permission"],
         "next_action": gate["next_action"],
     })
-    if not gate["ready_to_ingest"]:
+    if not gate["ready_to_start"]:
         base["error"] = "confirmation completed but the start gate remains blocked"
         return 1, base
     return 0, base
@@ -1261,10 +1422,27 @@ def build_parser():
     confirm.add_argument("--mode")
     confirm.add_argument("--time-budget", dest="time_budget")
     confirm.add_argument("--language")
+    confirm.add_argument(
+        "--processing-mode", choices=i18n.PROCESSING_MODES,
+        default=None,
+        help=("explicit material-processing choice; omitted reconfirmations preserve "
+              "the existing value, while a newly initialized workspace defaults to "
+              "lightweight"),
+    )
     confirm.add_argument("--artifact-mode", choices=i18n.ARTIFACT_MODES, default=None)
     confirm.add_argument(
-        "--interaction-style", choices=update_progress.INTERACTION_STYLES, default=None,
-        help="optional teaching cadence; omission preserves the existing preference",
+        "--answer-explanation-mode",
+        choices=i18n.ANSWER_EXPLANATION_MODES,
+        default=None,
+        help=("explicit per-item explanation choice; omitted reconfirmations "
+              "preserve the existing value, and new/legacy/invalid state "
+              "defaults safely to ordinary"),
+    )
+    confirm.add_argument(
+        "--interaction-style", choices=update_progress.INTERACTION_STYLES,
+        default=None,
+        help=("optional full-mode teaching cadence; omission preserves the existing "
+              "value, while new and missing legacy state use batch"),
     )
     confirm.add_argument(
         "--urgent", action="store_true",

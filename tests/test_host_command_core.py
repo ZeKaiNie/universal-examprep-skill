@@ -35,7 +35,11 @@ class FakeRunner:
 
 
 def status_payload(ready=False, success=True):
-    return {"process_success": success, "ready_to_ingest": ready}
+    return {
+        "process_success": success,
+        "ready_to_start": ready,
+        "ready_to_ingest": ready,
+    }
 
 
 def validator_payload(workspace, chapter=1, readiness="ready"):
@@ -65,6 +69,8 @@ def complete_progress_state():
         "time_budget": None,
         "language": None,
         "artifact_mode": "chat",
+        "processing_mode": "lightweight",
+        "answer_explanation_mode": "ordinary",
         "preferences": {"interaction_style": "batch"},
         "mistake_archive": [],
         "confusion_log": [],

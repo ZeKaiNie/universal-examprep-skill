@@ -16,6 +16,7 @@ import sys
 import json
 import hashlib
 import argparse
+import time
 from urllib.parse import unquote
 
 # 同包内的 notebook 引擎是锚点词汇（github_slug）的唯一定义点——按 select_hard_questions.py
@@ -24,10 +25,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import notebook as _notebook
 import update_progress as _progress
 import i18n as _i18n
+import exam_start as _exam_start
 import retrieve as _retrieve
 import strict_json as _strict_json
 import readiness as _readiness_matrix
-from stable_ids import stable_item_id_problem
 from image_validation import (
     ImageValidationError as _ImageValidationError,
     validate_image_blob as _validate_image_blob,
@@ -40,6 +41,8 @@ from host_adapters.command_core import (
     collect_dependency_snapshot as _collect_dependency_snapshot,
     dependency_snapshot_receipt as _dependency_snapshot_receipt,
 )
+from math_text_policy import LATEX_COMMAND_RE, mask_windows_paths
+from stable_ids import stable_item_id_problem
 
 SIX_TYPES = {"choice", "subjective", "diagram", "fill_blank", "true_false", "code"}
 MATERIAL_SOURCES = {"teacher", "material"}
@@ -91,22 +94,6 @@ _DANGLING_LECTURE_PROMPT_RE = re.compile(
     re.I,
 )
 
-# Human-facing Markdown must not depend on a host-specific TeX extension.  Standard dollar
-# delimiters are accepted as the durable source form; the study-guide renderer turns them into
-# offline MathML.  A curated command vocabulary avoids treating Windows paths such as D:\\EEC as
-# mathematics while still catching the commands observed in the real EEC 160 notebook.
-LATEX_COMMAND_RE = re.compile(
-    r"\\(?:frac|dfrac|tfrac|sqrt|sum|prod|int|oint|lim|log|ln|sin|cos|tan|exp|"
-    r"min|max|sup|inf|begin|end|left|right|middle|cup|cap|setminus|mid|vert|"
-    r"leq|geq|le|ge|neq|approx|equiv|in|notin|subset|subseteq|supset|supseteq|"
-    r"mathbb|mathcal|mathbf|mathrm|text|operatorname|overline|underline|vec|hat|"
-    r"bar|dot|ddot|cdot|times|div|pm|mp|to|rightarrow|leftarrow|Rightarrow|"
-    r"Leftrightarrow|infty|partial|nabla|forall|exists|Pr|"
-    r"alpha|beta|gamma|delta|epsilon|theta|lambda|mu|pi|rho|sigma|tau|phi|psi|omega)\b",
-    re.IGNORECASE,
-)
-
-
 def _unsafe_ref(s):
     """Reason a provenance file name (source_file/answer_source_file) is unsafe, or None. Subdir
     names like 'lecture/ch01.pdf' are fine; absolute / `..`-traversal / URL names are not — the quiz
@@ -147,12 +134,140 @@ def _read(path):
         return f.read()
 
 
+_FILE_SHA256_CACHE = {}
+_WINDOWS_FILETIME_UNIX_EPOCH_100NS = 116444736000000000
+# Windows change timestamps commonly advance on a coarse system-clock tick.
+# A file changed inside the same tick as the first hash can otherwise look like
+# the same generation after its mtime is restored.  Fresh generations are
+# therefore hashed directly until they are safely outside that collision
+# window; old, unchanged files still receive the normal cache benefit.
+_WINDOWS_CHANGE_TIME_CACHE_GUARD_100NS = 1000000  # 100 ms
+
+
+def _windows_file_change_time(path):
+    """Return the NTFS/Win32 change timestamp, or ``None`` if unavailable.
+
+    ``os.stat().st_ctime_ns`` is a creation timestamp on supported Windows
+    Python versions, so it cannot protect a digest cache from a same-size
+    rewrite whose mtime is restored.  ``FILE_BASIC_INFO.ChangeTime`` is the
+    metadata-change clock maintained by the filesystem and is not settable by
+    the ordinary ``SetFileTime`` API.  A failed probe deliberately disables
+    caching for that file.
+    """
+
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _FileBasicInfo(ctypes.Structure):
+            _fields_ = (
+                ("CreationTime", ctypes.c_longlong),
+                ("LastAccessTime", ctypes.c_longlong),
+                ("LastWriteTime", ctypes.c_longlong),
+                ("ChangeTime", ctypes.c_longlong),
+                ("FileAttributes", wintypes.DWORD),
+            )
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        get_info = kernel32.GetFileInformationByHandleEx
+        get_info.argtypes = (
+            wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+        )
+        get_info.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+
+        # Metadata-only access.  Sharing does not weaken the before/after
+        # generation sandwich below; it avoids disrupting student apps.
+        handle = create_file(
+            os.fspath(path),
+            0,
+            0x00000001 | 0x00000002 | 0x00000004,
+            None,
+            3,
+            0x02000000,
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle in (None, invalid):
+            return None
+        try:
+            info = _FileBasicInfo()
+            if not get_info(handle, 0, ctypes.byref(info), ctypes.sizeof(info)):
+                return None
+            return int(info.ChangeTime)
+        finally:
+            close_handle(handle)
+    except (AttributeError, ImportError, OSError, TypeError, ValueError):
+        return None
+
+
+def _file_hash_generation(path):
+    stat_result = os.stat(path)
+    if os.name == "nt":
+        change_time = _windows_file_change_time(path)
+        if change_time is None or change_time <= 0:
+            cacheable = False
+        else:
+            now_filetime = (
+                time.time_ns() // 100 + _WINDOWS_FILETIME_UNIX_EPOCH_100NS
+            )
+            cacheable = (
+                now_filetime - change_time
+                >= _WINDOWS_CHANGE_TIME_CACHE_GUARD_100NS
+            )
+    else:
+        change_time = int(getattr(
+            stat_result, "st_ctime_ns", int(stat_result.st_ctime * 1000000000)
+        ))
+        cacheable = True
+    generation = (
+        os.path.normcase(os.path.abspath(os.fspath(path))),
+        int(getattr(stat_result, "st_dev", 0)),
+        int(getattr(stat_result, "st_ino", 0)),
+        int(stat_result.st_size),
+        int(getattr(
+            stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1000000000)
+        )),
+        change_time,
+    )
+    return generation, cacheable
+
+
 def _sha256_file(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    absolute = os.path.normcase(os.path.abspath(os.fspath(path)))
+    for unused_attempt in range(3):
+        generation, cacheable = _file_hash_generation(absolute)
+        if cacheable:
+            cached = _FILE_SHA256_CACHE.get(generation)
+            if cached is not None:
+                return cached
+        digest = hashlib.sha256()
+        with open(absolute, "rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        after, after_cacheable = _file_hash_generation(absolute)
+        if after != generation:
+            continue
+        value = digest.hexdigest()
+        if cacheable and after_cacheable:
+            _FILE_SHA256_CACHE[generation] = value
+        return value
+    raise OSError("file changed repeatedly while hashing: %s" % absolute)
 
 
 def _raster_mime(path, media_type=None):
@@ -354,7 +469,7 @@ def _strip_standard_math(text):
 
 def _raw_latex_lines(text):
     """1-based lines containing TeX commands outside standard math/code spans."""
-    prose = _strip_standard_math(_strip_markdown_code(text))
+    prose = mask_windows_paths(_strip_standard_math(_strip_markdown_code(text)))
     return sorted({prose.count("\n", 0, m.start()) + 1 for m in LATEX_COMMAND_RE.finditer(prose)})
 
 
@@ -463,6 +578,23 @@ def _validate_unlocked(ws):
         err(f"workspace directory不存在或不可读: {ws}", level="fatal")
         return errors, warnings, stats
 
+    # Determine the effective processing route before enforcing full-build structure.
+    # This is a best-effort hint only; the authoritative state parser below still
+    # reports every malformed/symlinked state error.  Missing/damaged legacy state
+    # keeps the historical full-workspace requirements rather than failing open.
+    processing_mode_hint = "full"
+    state_hint_path = os.path.join(ws, "study_state.json")
+    if (os.path.isfile(state_hint_path) and not _is_symlink(state_hint_path)
+            and os.path.realpath(state_hint_path).startswith(os.path.realpath(ws) + os.sep)):
+        try:
+            state_hint = _strict_json.loads(_read(state_hint_path))
+            if isinstance(state_hint, dict):
+                processing_mode_hint = _i18n.workspace_processing_mode(state_hint)
+        except (OSError, UnicodeDecodeError, ValueError, TypeError):
+            pass
+    lightweight_workspace = processing_mode_hint == "lightweight"
+    stats["processing_mode_hint"] = processing_mode_hint
+
     # ---- structure ----
     wiki_dir = os.path.join(ws, "references", "wiki")
     wiki_is_link = _is_symlink(wiki_dir)
@@ -475,15 +607,22 @@ def _validate_unlocked(ws):
     has_wiki = os.path.isdir(wiki_dir) and not wiki_is_link and not wiki_escapes
     if wiki_is_link or wiki_escapes:
         err("references/wiki/ 经符号链接逃出工作区（本身或其父目录是指向工作区外的软链）")
-    elif not has_wiki:
+    elif not has_wiki and not lightweight_workspace:
         err("缺少 references/wiki/ 目录")
     qb_path = os.path.join(ws, "references", "quiz_bank.json")
     qb_is_link = _is_symlink(qb_path)
     qb_escapes = os.path.isfile(qb_path) and not os.path.realpath(qb_path).startswith(ws_real + os.sep)
     has_qb = os.path.isfile(qb_path) and not qb_is_link and not qb_escapes
+    if lightweight_workspace:
+        # Existing full-build products are dormant history in lightweight mode.
+        # Preserve only the path-safety verdicts; do not walk their contents.
+        stats["dormant_wiki_present"] = bool(has_wiki)
+        stats["dormant_quiz_bank_present"] = bool(has_qb)
+        has_wiki = False
+        has_qb = False
     if qb_is_link or qb_escapes:
         err("references/quiz_bank.json 经符号链接逃出工作区（指向工作区外的答案源）")
-    elif not has_qb:
+    elif not has_qb and not lightweight_workspace:
         err("缺少 references/quiz_bank.json")
     for name, label in (("study_plan.md", "复习计划"), ("study_progress.md", "进度文件")):
         rp = os.path.join(ws, name)
@@ -491,11 +630,46 @@ def _validate_unlocked(ws):
                                   and not os.path.realpath(rp).startswith(ws_real + os.sep)):
             err(f"{label} 经符号链接逃出工作区（技能会读/写这个路径）: {name}")
         elif not os.path.isfile(rp):
-            err(f"缺少 {label}: {name}")
+            if lightweight_workspace and name == "study_plan.md":
+                # A lightweight session is intentionally state-led and may never
+                # build the full plan artifact.  Record that fact without
+                # downgrading readiness or interrupting every teaching turn.
+                stats["lightweight_study_plan"] = "not_applicable_missing"
+            else:
+                err(f"缺少 {label}: {name}")
 
     # ---- structured ingestion truth + typed AI review queue ----
     ingest_dir = os.path.join(ws, ".ingest")
-    if os.path.lexists(ingest_dir):
+    ingest_active = os.path.lexists(ingest_dir) and not lightweight_workspace
+    if lightweight_workspace and os.path.lexists(ingest_dir):
+        ingest_real = os.path.realpath(ingest_dir)
+        if (_is_symlink(ingest_dir) or not os.path.isdir(ingest_dir)
+                or (ingest_real != ws_real and not ingest_real.startswith(ws_real + os.sep))):
+            err("dormant .ingest/ 不是工作区内的常规目录（轻量模式同样拒绝不安全路径）")
+        else:
+            stats["ingest_dormant"] = True
+            stats["ingest_dormant_validation"] = "path_safety_and_pending_only"
+            for pending_name in (
+                    "material_build_pending.json", "pending_ingest.json",
+                    "pending_patch.json"):
+                pending_path = os.path.join(ingest_dir, pending_name)
+                if not os.path.lexists(pending_path):
+                    continue
+                pending_real = os.path.realpath(pending_path)
+                if (_is_symlink(pending_path) or not os.path.isfile(pending_path)
+                        or not pending_real.startswith(ingest_real + os.sep)):
+                    err(
+                        ".ingest/%s is unsafe; an interrupted transaction cannot "
+                        "be ignored in lightweight mode" % pending_name,
+                        level="fatal",
+                    )
+                else:
+                    err(
+                        ".ingest/%s records an interrupted full-build transaction; "
+                        "repair or roll it back before teaching" % pending_name
+                    )
+        # Do not traverse or validate heavyweight derived facts in lightweight mode.
+    if ingest_active:
         ingest_real = os.path.realpath(ingest_dir)
         if (_is_symlink(ingest_dir) or not os.path.isdir(ingest_dir)
                 or (ingest_real != ws_real and not ingest_real.startswith(ws_real + os.sep))):
@@ -874,7 +1048,8 @@ def _validate_unlocked(ws):
     # A present retrieval index must be self-consistent.  Missing remains a
     # legacy-compatible degradation; a stale index is worse than no index.
     retrieval_path = os.path.join(ws, "references", "retrieval_index.json")
-    if os.path.isfile(retrieval_path) and not _is_symlink(retrieval_path):
+    if (not lightweight_workspace and os.path.isfile(retrieval_path)
+            and not _is_symlink(retrieval_path)):
         try:
             _retrieve.load_index(ws)
         except SystemExit as exc:
@@ -978,7 +1153,8 @@ def _validate_unlocked(ws):
 
     # ---- v4.1 completeness: optional visual index, warning-level (runnable schema stays compatible) ----
     fig_index_path = os.path.join(ws, "references", "figure_page_index.json")
-    if os.path.isfile(fig_index_path) and not _is_symlink(fig_index_path):
+    if (not lightweight_workspace and os.path.isfile(fig_index_path)
+            and not _is_symlink(fig_index_path)):
         try:
             fig_index = _strict_json.loads(_read(fig_index_path))
         except (ValueError, OSError, UnicodeDecodeError) as e:
@@ -1058,7 +1234,8 @@ def _validate_unlocked(ws):
                                 ("（" + "、".join(preview) + "）") if preview else ""))
 
     image_index_path = os.path.join(ws, "references", "image_question_index.json")
-    if os.path.isfile(image_index_path) and not _is_symlink(image_index_path):
+    if (not lightweight_workspace and os.path.isfile(image_index_path)
+            and not _is_symlink(image_index_path)):
         try:
             image_index = _strict_json.loads(_read(image_index_path))
         except (ValueError, OSError, UnicodeDecodeError) as e:
@@ -1128,12 +1305,12 @@ def _validate_unlocked(ws):
                 # （chapter:true 会被当成 1，把题分到错误阶段）。
                 if cv is not None and (isinstance(cv, bool) or not isinstance(cv, (str, int))):
                     err(f"{tag} 的 {f2} 必须是整数或字符串，当前为 {type(cv).__name__}")
-            # id/type must be SCALAR before being used as set/dict keys: a malformed list/object id or
-            # type would raise TypeError (unhashable) and crash before any structured error is returned.
+            # Current ingestion writes canonical string IDs.  Readable legacy integer
+            # IDs remain accepted through the same string identity; float/bool and
+            # Guide-unsafe strings fail closed instead of diverging across selectors.
             qid = q.get("id")
-            if (qid is not None
-                    and (isinstance(qid, bool)
-                         or not isinstance(qid, (str, int)))):
+            if (isinstance(qid, bool)
+                    or not isinstance(qid, (str, int))):
                 err(f"{tag} 的 id 必须是稳定字符串（旧整数可读），当前为 {type(qid).__name__}")
                 qid = None
             if qid is not None:
@@ -1358,11 +1535,12 @@ def _validate_unlocked(ws):
 
     # ---- v4.1 teaching-example reachability (optional, backward compatible) ----
     # This is a PARALLEL teaching snapshot, not another assessment bank.  IDs may therefore
-    # deliberately overlap quiz_bank.  ingest_report.teaching_example_ids is the durable baseline
-    # that lets us warn if later AI review removes an Example from BOTH layers.
+    # deliberately overlap quiz_bank.  The retained baseline requires a current, same-chapter
+    # teaching snapshot; quiz overlap is diagnostic and never substitutes for the teaching layer.
     teaching_path = os.path.join(ws, "references", "teaching_examples.json")
-    teaching_items, teaching_ids, teaching_scope_by_id = [], set(), {}
-    teaching_exists = os.path.exists(teaching_path)
+    teaching_items, teaching_ids = [], set()
+    teaching_scope_by_id = {}
+    teaching_exists = not lightweight_workspace and os.path.exists(teaching_path)
     if teaching_exists:
         teaching_link = _is_symlink(teaching_path)
         teaching_real = os.path.realpath(teaching_path)
@@ -1404,13 +1582,6 @@ def _validate_unlocked(ws):
             else:
                 teaching_ids.add(ex_id)
                 unique_teaching_id = True
-            chapter_scope = _scope_number(ex.get("chapter"))
-            phase_scope = _scope_number(ex.get("phase"))
-            if chapter_scope and phase_scope and chapter_scope != phase_scope:
-                err(f"{tag} chapter={chapter_scope} 与 phase={phase_scope} 冲突")
-            canonical_scope = chapter_scope or phase_scope
-            if unique_teaching_id and canonical_scope:
-                teaching_scope_by_id[ex_id] = canonical_scope
             role = ex.get("teaching_role")
             if role not in role_counts:
                 err(f"{tag} teaching_role 非法: {role!r}（应为 paired_problem/worked_example）")
@@ -1419,10 +1590,35 @@ def _validate_unlocked(ws):
             teaching_gradable = ex.get("gradable")
             if teaching_gradable is not None and not isinstance(teaching_gradable, bool):
                 err(f"{tag} gradable 必须是布尔型 true/false，当前 {teaching_gradable!r}")
+            chapter_scope = (
+                _scope_number(ex.get("chapter"))
+                if ex.get("chapter") not in (None, "")
+                else None
+            )
+            phase_scope = (
+                _scope_number(ex.get("phase"))
+                if ex.get("phase") not in (None, "")
+                else None
+            )
+            if ex.get("chapter") not in (None, "") and chapter_scope is None:
+                err(f"{tag} chapter 无法规范化为正整数章节")
+            if ex.get("phase") not in (None, "") and phase_scope is None:
+                err(f"{tag} phase 无法规范化为正整数章节")
             if ex.get("chapter") in (None, "") and ex.get("phase") in (None, ""):
                 err(f"{tag} 缺少 chapter 或 phase（无法按当前章惰性列举）")
-            elif canonical_scope is None:
-                err(f"{tag} chapter/phase 无法规范为 canonical positive chapter")
+            elif chapter_scope is None and phase_scope is None:
+                err(f"{tag} chapter/phase 无法规范化为正整数章节")
+            elif (
+                chapter_scope is not None
+                and phase_scope is not None
+                and chapter_scope != phase_scope
+            ):
+                err(
+                    f"{tag} chapter={ex.get('chapter')!r} 与 "
+                    f"phase={ex.get('phase')!r} 冲突"
+                )
+            if unique_teaching_id:
+                teaching_scope_by_id[ex_id] = chapter_scope or phase_scope
             question = ex.get("question")
             if not isinstance(question, str) or not question.strip():
                 err(f"{tag} 缺少非空教学内容 question")
@@ -1518,7 +1714,10 @@ def _validate_unlocked(ws):
         # Re-read the live files at this security boundary.  The arrays above are useful for
         # schema diagnostics, but accepting them as a policy cache would let a public caller (or
         # a stale validator-local slice) omit another layer's student-attempt declaration.
-        asset_policy = workspace_asset_policy_snapshot(ws)
+        asset_policy = (
+            {"tainted_keys": set(), "conflicts": [], "unsafe_paths": []}
+            if lightweight_workspace else workspace_asset_policy_snapshot(ws)
+        )
     except ValueError as exc:
         # The underlying schema/path checks above already classify malformed JSON and unsafe
         # entries.  The policy layer must still block, but it should not upgrade an ordinary
@@ -1547,13 +1746,14 @@ def _validate_unlocked(ws):
     expected_teaching_by_chapter = {}
     baseline_source = None
     baseline_name = None
-    if os.path.lexists(teaching_baseline_path):
+    if not lightweight_workspace and os.path.lexists(teaching_baseline_path):
         if _is_symlink(teaching_baseline_path) or not os.path.isfile(teaching_baseline_path):
             err("references/teaching_baseline.json 必须是安全的普通文件")
         else:
             baseline_source = teaching_baseline_path
             baseline_name = "references/teaching_baseline.json"
-    elif os.path.isfile(ingest_report_path) and not _is_symlink(ingest_report_path):
+    elif (not lightweight_workspace and os.path.isfile(ingest_report_path)
+          and not _is_symlink(ingest_report_path)):
         baseline_source = ingest_report_path
         baseline_name = "ingest_report.json"
     if baseline_source:
@@ -1569,12 +1769,13 @@ def _validate_unlocked(ws):
         if (baseline_name == "references/teaching_baseline.json"
                 and isinstance(ingest_report, dict)
                 and ingest_report.get("policy") != "append_only"):
-            err("references/teaching_baseline.json policy 必须为 append_only")
+            err(
+                "references/teaching_baseline.json policy 必须精确为 append_only"
+            )
         raw_expected = ingest_report.get("teaching_example_ids") if isinstance(ingest_report, dict) else None
         if raw_expected is not None:
             if not (isinstance(raw_expected, list)
-                    and all(stable_item_id_problem(x) is None
-                            for x in raw_expected)
+                    and all(stable_item_id_problem(x) is None for x in raw_expected)
                     and len(raw_expected) == len(set(raw_expected))):
                 err(f"{baseline_name} 的 teaching_example_ids 不是非空字符串数组，不能核对保留性")
             else:
@@ -1598,7 +1799,7 @@ def _validate_unlocked(ws):
                                                and all(stable_item_id_problem(x) is None
                                                        for x in raw_ids))):
                         err(f"{baseline_name} teaching_example_ids_by_chapter[{raw_chapter!r}] "
-                             "必须是可解析章节对应的字符串数组")
+                             "必须是 canonical 正整数字符串章节对应的稳定 ID 数组")
                         valid_map = False
                         continue
                     values = set(raw_ids)
@@ -1607,40 +1808,54 @@ def _validate_unlocked(ws):
                         valid_map = False
                     overlap = mapped & values
                     if overlap:
-                        err(f"{baseline_name} 把同一教学例题 ID 分配到多个章节: "
-                            f"{', '.join(sorted(overlap))}")
+                        err(
+                            f"{baseline_name} 把同一教学例题 ID 分配到多个章节: "
+                            f"{', '.join(sorted(overlap))}"
+                        )
                         valid_map = False
+                    if chapter in expected_teaching_by_chapter:
+                        err(
+                            f"{baseline_name} teaching_example_ids_by_chapter contains "
+                            f"duplicate canonical chapter {chapter}"
+                        )
+                        valid_map = False
+                        continue
                     expected_teaching_by_chapter[chapter] = values
                     mapped.update(values)
                 if valid_map and expected_teaching_ids and mapped != expected_teaching_ids:
                     err(f"{baseline_name} 的逐章教学例题 ID 与 teaching_example_ids 全集不一致")
         elif baseline_name == "references/teaching_baseline.json":
             err("references/teaching_baseline.json 缺少 teaching_example_ids_by_chapter")
+    # The retained baseline is a teaching-roster invariant.  A quiz row may
+    # overlap the same stable ID, but it is not a substitute for the parallel
+    # teaching snapshot used by tutoring, completion, and Study Guide flows.
     missing_from_teaching = expected_teaching_ids - teaching_ids
-    quiz_only = missing_from_teaching & reachable_quiz_ids
-    missing_from_both = missing_from_teaching - reachable_quiz_ids
-    chapter_drift = []
-    for expected_chapter, expected_ids in expected_teaching_by_chapter.items():
-        for ident in expected_ids:
-            actual_chapter = teaching_scope_by_id.get(ident)
-            if actual_chapter is not None and actual_chapter != expected_chapter:
-                chapter_drift.append((ident, expected_chapter, actual_chapter))
+    quiz_only_baseline = missing_from_teaching & reachable_quiz_ids
     stats["teaching_examples_expected"] = len(expected_teaching_ids)
     stats["teaching_example_baseline_chapters"] = len(expected_teaching_by_chapter)
     stats["teaching_examples_retained"] = len(expected_teaching_ids & teaching_ids)
     stats["teaching_examples_missing_from_teaching"] = len(missing_from_teaching)
-    stats["teaching_examples_quiz_only"] = len(quiz_only)
-    stats["teaching_examples_missing_from_both"] = len(missing_from_both)
-    stats["teaching_example_chapter_drift"] = len(chapter_drift)
+    stats["teaching_examples_quiz_only"] = len(quiz_only_baseline)
     if missing_from_teaching:
-        err("教学例题保留基线缺少当前 teaching_examples.json 快照: %s——"
-            "即使题目仍在 quiz_bank，quiz-only 也不能替代教学 roster；必须恢复快照或重新导入"
-            % "、".join(sorted(missing_from_teaching)))
-    if chapter_drift:
-        labels = [f"{ident}: baseline ch{expected} -> manifest ch{actual}"
-                  for ident, expected, actual in chapter_drift[:16]]
-        err("教学例题保留基线发生 canonical chapter 漂移: %s%s" %
-            ("；".join(labels), "；其余已截断" if len(chapter_drift) > 16 else ""))
+        suffix = (
+            "（其中仅在 quiz_bank.json 可见: %s）" % "、".join(sorted(quiz_only_baseline))
+            if quiz_only_baseline else ""
+        )
+        err("教学例题保留基线缺少 teaching_examples.json 快照: %s%s——"
+            "quiz 条目不能替代教学 roster，必须恢复教学快照或重新导入"
+            % ("、".join(sorted(missing_from_teaching)), suffix))
+    for chapter, baseline_ids in sorted(expected_teaching_by_chapter.items()):
+        wrong_scope = sorted(
+            ident for ident in baseline_ids
+            if ident in teaching_scope_by_id
+            and teaching_scope_by_id.get(ident) != chapter
+        )
+        if wrong_scope:
+            err(
+                "%s chapter %s baseline IDs no longer have same-chapter current "
+                "teaching snapshots: %s"
+                % (baseline_name, chapter, ", ".join(wrong_scope))
+            )
 
     # ---- study_progress consistency (best-effort, lenient → warnings only) ----
     prog_path = os.path.join(ws, "study_progress.md")
@@ -1663,7 +1878,7 @@ def _validate_unlocked(ws):
 
     # ---- v4-P5: cheatsheet 溯源 lint（PLAN §2.4：小抄每个要点须携带可解析锚点，坏锚即红）----
     cheat_path = os.path.join(ws, "cheatsheet.md")
-    if os.path.isfile(cheat_path):
+    if not lightweight_workspace and os.path.isfile(cheat_path):
         try:
             cheat = _read(cheat_path)
         except OSError:
@@ -1720,7 +1935,8 @@ def _validate_unlocked(ws):
                 err("cheatsheet.md " + b + "（编译产物每个要点必须可溯源到 notebook/mistakes/wiki——"
                     "详见 PLAN 溯源契约）")
             stats["cheatsheet_bullets"] = n_bullets
-    elif os.path.isfile(os.path.join(ws, "walkthrough.md")):
+    elif (not lightweight_workspace
+          and os.path.isfile(os.path.join(ws, "walkthrough.md"))):
         warn("检测到旧版 walkthrough.md 且无 cheatsheet.md——v4 小抄改为带溯源的编译产物"
              "（exam-cheatsheet 重新编译即可，旧文件保留不删）")
 
@@ -1809,8 +2025,23 @@ def _validate_unlocked(ws):
             if stats["interaction_style_dormant"]:
                 stats["interaction_style_dormant_reason"] = (
                     "processing_mode_not_full"
-                    if not _progress.interaction_style_full_route(st)
-                    else "no_questions")
+                    if _i18n.workspace_processing_mode(st) != "full"
+                    else "no_questions"
+                )
+            processing = st.get("processing_mode")
+            if processing is not None and not isinstance(processing, str):
+                err("study_state.json processing_mode must be a string; got %s"
+                    % type(processing).__name__)
+            elif isinstance(processing, str):
+                processing_code, _processing_warning = _i18n.canon_processing_mode(
+                    processing
+                )
+                if processing_code not in _i18n.PROCESSING_MODES:
+                    warn(
+                        "study_state.json processing_mode=%r is non-standard; "
+                        "runtime falls back safely to lightweight" % processing
+                    )
+            stats["processing_mode_effective"] = _i18n.workspace_processing_mode(st)
             artifact = st.get("artifact_mode")
             if artifact is not None and not isinstance(artifact, str):
                 err(f"study_state.json 的 artifact_mode 必须是字符串，当前 {type(artifact).__name__}")
@@ -1819,7 +2050,20 @@ def _validate_unlocked(ws):
                 if artifact_code not in _i18n.ARTIFACT_MODES:
                     warn(f"study_state.json 的 artifact_mode={artifact!r} 非标准；"
                          "运行时将安全回退为 chat（请用 update_progress.py set --artifact-mode 修正）")
-            stats["artifact_mode_effective"] = _i18n.workspace_artifact_mode(st)
+            stats["artifact_mode_preference"] = _i18n.workspace_artifact_mode(st)
+            stats["artifact_mode_effective"] = _i18n.workspace_effective_artifact_mode(st)
+            stats["artifact_mode_dormant"] = _i18n.workspace_artifact_mode_dormant(st)
+            raw_explanation_mode = st.get("answer_explanation_mode")
+            explanation_mode, explanation_warning = (
+                _i18n.canon_answer_explanation_mode(raw_explanation_mode)
+            )
+            if explanation_warning:
+                warn(
+                    "study_state.json answer_explanation_mode=%r is non-standard; "
+                    "runtime falls back safely to ordinary"
+                    % raw_explanation_mode
+                )
+            stats["answer_explanation_mode_effective"] = explanation_mode
             # Phase-completion evidence is a learning-progress gate, not an ingestion-readiness
             # gate.  A fresh/chat-mode workspace may intentionally omit visual manifests; only
             # enforce the manifest trio once a phase has evidence/done state or visual output is the
@@ -1832,7 +2076,7 @@ def _validate_unlocked(ws):
             evidence_started = isinstance(pe, dict) and bool(pe)
             phase_stale_warnings = []
             if (checklist_started or evidence_started
-                    or _i18n.workspace_artifact_mode(st) == "visual"):
+                    or _i18n.workspace_effective_artifact_mode(st) == "visual"):
                 phase_problems = _progress.phase_evidence_errors(
                     ws, st, enforce_manifest_gate=True,
                     recoverable_stale=phase_stale_warnings,
@@ -1853,6 +2097,25 @@ def _validate_unlocked(ws):
                     and x.get("status") == "covered_unverified")
                 stats["phases_verified"] = sum(
                     1 for x in pe.values() if isinstance(x, dict) and x.get("status") == "verified")
+            if _i18n.workspace_processing_mode(st) == "lightweight":
+                try:
+                    import lightweight_session as _lightweight
+                    # Routine validation is deliberately metadata-only.  The phase
+                    # evidence gate above checks immutable receipt/event identity;
+                    # health now checks current taught and active file metadata plus
+                    # physical identity without streaming course bytes.
+                    health = _lightweight.workspace_health(
+                        ws, st, live_current_taught=True, exact_live=False
+                    )
+                except (ImportError, OSError, TypeError, ValueError) as exc:
+                    err("lightweight session validator unavailable: %s" % exc)
+                else:
+                    for problem in health.get("errors") or []:
+                        err("lightweight session：" + str(problem))
+                    for problem in health.get("warnings") or []:
+                        warn("lightweight session：" + str(problem))
+                    if isinstance(health.get("stats"), dict):
+                        stats.update(health["stats"])
             # md is a GENERATED view — a phase mismatch means someone hand-patched it（下次渲染会丢）
             prog_path2 = os.path.join(ws, "study_progress.md")
             if isinstance(cp, int) and os.path.isfile(prog_path2):
@@ -1883,6 +2146,21 @@ def _validation_conflict_result(exc):
     }], [], {})
 
 
+def _validation_gate_result(exc):
+    """Return a stable fail-closed result for runtime/workspace publication gates."""
+
+    reason = getattr(exc, "reason", None) or "full_processing_gate_blocked"
+    blockers = list(getattr(exc, "blockers", ()) or ())
+    return ([{
+        "level": "fatal",
+        "msg": "workspace validation runtime/full-processing gate is blocked: %s" % exc,
+    }], [], {
+        "validation_gate": "full_processing_required",
+        "reason": reason,
+        "blockers": blockers,
+    })
+
+
 def validate(ws):
     """Validate one lock-consistent workspace snapshot."""
 
@@ -1891,6 +2169,8 @@ def validate(ws):
     try:
         with workspace_validation_lock(ws):
             return _validate_unlocked(ws)
+    except _exam_start.FullProcessingRequired as exc:
+        return _validation_gate_result(exc)
     except (ConflictError, OSError, ValueError) as exc:
         # An unsafe workspace root or an unavailable lock must never downgrade
         # into an unlocked read.  Doing so would reintroduce the mixed-snapshot
@@ -2068,6 +2348,11 @@ def main(argv=None):
             with workspace_validation_lock(args.workspace):
                 result = locked_validation_generation()
         errors, warnings, stats, capabilities, dependency_snapshot = result
+    except _exam_start.FullProcessingRequired as exc:
+        errors, warnings, stats = _validation_gate_result(exc)
+        capabilities = _snapshot_blocked_capabilities(
+            args.chapter, "full_processing_gate_blocked")
+        dependency_snapshot = None
     except (ConflictError, OSError, ValueError) as exc:
         errors, warnings, stats = _validation_conflict_result(exc)
         capabilities = _snapshot_blocked_capabilities(

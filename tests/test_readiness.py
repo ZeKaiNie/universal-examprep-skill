@@ -10,7 +10,11 @@ import zlib
 from unittest import mock
 
 from scripts import readiness
+from scripts import exam_start
 from scripts import validate_workspace
+
+
+_RUNTIME_IDENTITY = None
 
 
 def _png_payload(width, height):
@@ -29,14 +33,35 @@ def _png_payload(width, height):
 
 class CapabilityMatrix(unittest.TestCase):
     def setUp(self):
+        global _RUNTIME_IDENTITY
         self.temp = tempfile.TemporaryDirectory()
-        self.ws = self.temp.name
+        self.ws = os.path.join(self.temp.name, "workspace")
+        self.materials = os.path.join(self.temp.name, "materials")
+        self.home = os.path.join(self.temp.name, "examprep-home")
+        os.makedirs(self.ws)
+        os.makedirs(self.materials)
+        self.environment = mock.patch.dict(
+            os.environ, {"EXAMPREP_HOME": self.home}
+        )
+        self.environment.start()
+        if _RUNTIME_IDENTITY is None:
+            _RUNTIME_IDENTITY = exam_start._capture_runtime_identity()
+        confirm_output = io.StringIO()
+        with mock.patch.object(
+                exam_start, "_capture_runtime_identity",
+                return_value=_RUNTIME_IDENTITY), contextlib.redirect_stdout(confirm_output):
+            code = exam_start.run([
+                "confirm", "--course", "readiness-fixture",
+                "--materials", self.materials, "--workspace", self.ws,
+                "--mode", "from_scratch", "--time-budget", "le1d",
+                "--language", "bilingual", "--processing-mode", "full", "--json",
+            ])
+        if code != 0:
+            self.fail(confirm_output.getvalue())
         os.makedirs(os.path.join(self.ws, "references", "wiki"))
         os.makedirs(os.path.join(self.ws, "notebook"))
         with open(os.path.join(self.ws, "references", "wiki", "ch01.md"), "w", encoding="utf-8") as f:
             f.write("# Chapter 1\n\nA source-backed concept.\n")
-        with open(os.path.join(self.ws, "study_state.json"), "w", encoding="utf-8") as f:
-            json.dump({"current_phase": 1, "language": "bilingual"}, f)
         # The shared asset-policy snapshot treats the bank as a required
         # workspace layer. Individual tests overwrite this benign baseline.
         with open(os.path.join(self.ws, "references", "quiz_bank.json"),
@@ -44,6 +69,7 @@ class CapabilityMatrix(unittest.TestCase):
             json.dump([], f)
 
     def tearDown(self):
+        self.environment.stop()
         self.temp.cleanup()
 
     def test_control_quality_reason_aliases_are_artifact_high_risk(self):
@@ -79,6 +105,8 @@ class CapabilityMatrix(unittest.TestCase):
             "chapter": 1,
             "profile": "full",
             "language": "bilingual",
+            "ingestion_pipeline_version": "ingestion-v2",
+            "authoring_protocol_version": 2,
             "expected_item_ids": ["item-1"],
             "walkthrough_item_ids": ["item-1"],
             "omitted_item_ids": [],
@@ -97,7 +125,10 @@ class CapabilityMatrix(unittest.TestCase):
         matrix = readiness.capability_readiness(self.ws, [], [], {}, chapter=1)
         self.assertEqual("ready", matrix["workspace_structural"]["status"])
         self.assertEqual("blocked", matrix["quiz_ready"]["status"])
-        self.assertIn("no_gradable_chapter_items", matrix["quiz_ready"]["reason_codes"])
+        self.assertIn(
+            "no_runtime_eligible_chapter_items",
+            matrix["quiz_ready"]["reason_codes"],
+        )
         self.assertEqual("blocked", matrix["artifact_ready"]["status"])
         self.assertIn("chapter_teaching_manifest_missing",
                       matrix["artifact_ready"]["reason_codes"])
@@ -106,6 +137,7 @@ class CapabilityMatrix(unittest.TestCase):
         self._json("references/quiz_bank.json", [{
             "id": "q1", "chapter": 1, "type": "subjective", "gradable": True,
             "question": "Explain it", "answer": "An answer", "keywords": ["answer"],
+            "source": "material", "ai_generated": False,
         }, {
             "id": "legacy-demo", "chapter": 1, "type": "subjective", "gradable": False,
             "question": "Worked demonstration", "answer": "",
@@ -114,8 +146,12 @@ class CapabilityMatrix(unittest.TestCase):
         with self._validated_manifest() as loader:
             matrix = readiness.capability_readiness(self.ws, [], [], {}, chapter=1)
         loader.assert_called_once_with(self.ws, 1)
-        self.assertEqual("ready", matrix["quiz_ready"]["status"])
-        self.assertEqual(1, matrix["quiz_ready"]["counts"]["candidate_items"])
+        self.assertEqual("usable_with_gaps", matrix["quiz_ready"]["status"])
+        self.assertEqual(2, matrix["quiz_ready"]["counts"]["candidate_items"])
+        self.assertEqual(1, matrix["quiz_ready"]["counts"]["valid_items"])
+        self.assertEqual(
+            {"non_gradable": 1}, matrix["quiz_ready"]["counts"]["exclusions"]
+        )
         self.assertEqual("ready", matrix["artifact_ready"]["status"])
         self.assertEqual("none", matrix["artifact_ready"]["counts"]["math_status"])
 
@@ -426,6 +462,7 @@ class CapabilityMatrix(unittest.TestCase):
         self._json("notebook/ch01.guide.json", {"schema_version": 1, "chapter": 1})
         self._json("study_state.json", {
             "current_phase": 1, "language": "bilingual", "artifact_mode": "visual",
+            "processing_mode": "full", "answer_explanation_mode": "ordinary",
         })
         guide = os.path.join(self.ws, "study_guide")
         os.makedirs(guide)
@@ -462,11 +499,12 @@ class CapabilityMatrix(unittest.TestCase):
         pdf_hash = artifact_qa._sha256_file(pdf_path)
         input_hash = artifact_qa._conversion_input_hash(html_path)
         start_gate = artifact_qa._start_gate_snapshot(gate)
+        conversion_gate_hash = artifact_qa._canonical_hash(start_gate)
         converter = os.path.abspath("C:/browser/msedge.exe")
         started = "2026-07-14T10:00:00Z"
         completed = "2026-07-14T10:00:01Z"
         self._json("study_guide/ch01.receipt.json", {
-            "schema_version": 2,
+            "schema_version": 3,
             "artifact_type": "study_guide",
             "chapter": 1,
             "profile": "full",
@@ -482,14 +520,24 @@ class CapabilityMatrix(unittest.TestCase):
             "pdf_sha256": pdf_hash,
             "pdf_backend": "browser",
             "converter": converter,
+            "native_adapter_id": None,
+            "native_adapter_version": None,
             "conversion_input_html_sha256": input_hash,
             "conversion_started_at": started,
             "conversion_completed_at": completed,
+            "conversion_start_gate_sha256": conversion_gate_hash,
             "conversion_run_sha256": artifact_qa._conversion_run_hash(
-                1, "full", "bilingual", html_hash, pdf_hash, input_hash,
-                converter, started, completed, start_gate,
+                1, "full", "bilingual",
+                "notebook/ch01.guide.json", artifact_qa._sha256_file(manifest_path),
+                "study_guide/ch01.html", html_hash,
+                "study_guide/ch01.pdf", pdf_hash, "browser", input_hash,
+                converter, None, None, started, completed,
+                conversion_gate_hash, start_gate,
             ),
-            "preflight": {"status": "passed", "pdf_backend": "browser"},
+            "preflight": {
+                "status": "passed", "pdf_backend": "browser",
+                "missing_needed": [], "probe_error": None,
+            },
             "start_gate": start_gate,
             "generated_at": "2026-07-14T10:00:02Z",
             "status": "qa_pending",
@@ -541,6 +589,7 @@ class CapabilityMatrix(unittest.TestCase):
         self._json("notebook/ch01.guide.json", {"schema_version": 1, "chapter": 1})
         self._json("study_state.json", {
             "current_phase": 1, "language": "bilingual", "artifact_mode": "visual",
+            "processing_mode": "full", "answer_explanation_mode": "ordinary",
         })
         self._json("study_guide/ch01.receipt.json", {
             "chapter": 1,

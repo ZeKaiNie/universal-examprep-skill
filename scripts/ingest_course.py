@@ -256,7 +256,7 @@ def _validated_workspace_payload(result):
 
 def run(argv=None, backend=None, adapter_runner=None):
     parser = argparse.ArgumentParser(
-        description="Official lightweight course ingestion orchestrator"
+        description="Explicit full structured course-ingestion orchestrator"
     )
     parser.add_argument("--materials", required=True)
     parser.add_argument("--workspace", required=True)
@@ -268,6 +268,14 @@ def run(argv=None, backend=None, adapter_runner=None):
     )
     parser.add_argument("--render-pages", choices=("never", "auto", "required"), default="auto")
     parser.add_argument("--visual-index", choices=("never", "auto", "required"), default="auto")
+    parser.add_argument(
+        "--crop-annotations",
+        default=None,
+        help=(
+            "optional UTF-8 JSONL of source/preview-bound target-item crop "
+            "annotations passed unchanged to the material builder"
+        ),
+    )
     parser.add_argument(
         "--ingest-adapter", choices=("core", "docling", "mineru"), default="core",
         help=argparse.SUPPRESS,
@@ -285,10 +293,12 @@ def run(argv=None, backend=None, adapter_runner=None):
         "workspace": workspace,
         "steps": steps,
     }
-    if args.ingest_adapter != "core" and adapter_runner is None:
+    if args.ingest_adapter != "core":
         payload["error"] = (
-            "optional ingest adapters require a programmatic host-injected adapter_runner; "
-            "the ordinary CLI does not provide a trusted runner registry"
+            "local Docling/MinerU execution is disabled. A learner must explicitly "
+            "request the named parser and use a separately configured remote/cloud "
+            "host integration with disclosed upload/privacy terms; ingest_course.py "
+            "never downloads, installs, imports, or invokes that heavy parser locally"
         )
         _emit(payload, args.as_json)
         return 2
@@ -331,8 +341,9 @@ def run(argv=None, backend=None, adapter_runner=None):
     if not start_gate.get("ready_to_ingest"):
         payload["error"] = (
             "ingestion requires an exact workspace/materials confirmation and "
-            "mode, time_budget, language, and a matching runtime provenance receipt; "
-            "run exam_start.py confirm with the intended installed skill first. "
+            "mode, time_budget, language, an explicit processing_mode=full, and a "
+            "matching runtime provenance receipt; run exam_start.py confirm with "
+            "--processing-mode full and the intended installed skill first. "
             "If material_build_pending.json exists, ordinary confirm must not replace "
             "its provenance: run exam_start.py recover-material-build with an explicit "
             "--action resume or --action supersede instead"
@@ -448,7 +459,9 @@ def run(argv=None, backend=None, adapter_runner=None):
         "--extract-lecture-questions", "auto",
         "--extract-homework", "auto",
         "--ingest-adapter", args.ingest_adapter,
-    ] + (["--course-name", args.course_name] if args.course_name else []))
+    ] + (["--course-name", args.course_name] if args.course_name else [])
+      + (["--crop-annotations", args.crop_annotations]
+         if args.crop_annotations else []))
     publish_ready = False
     code = raw_input = report = None
     raw_input_sha256 = None
@@ -481,6 +494,11 @@ def run(argv=None, backend=None, adapter_runner=None):
             if (locked_pending is not None
                     and locked_pending["action"] == "resume"
                     and locked_pending["sources_exact"]):
+                if args.crop_annotations:
+                    raise ValueError(
+                        "--crop-annotations cannot modify an exact pending resume; "
+                        "authorize recover-material-build --action supersede first"
+                    )
                 # A same-runtime retry, or an explicit resume authorization,
                 # compiles the exact generation already on disk.  It must not
                 # spend another parser pass or silently replace that generation.

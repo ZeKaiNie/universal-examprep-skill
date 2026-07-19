@@ -65,6 +65,35 @@ def warn_text(warnings):
 
 class TestValidateWorkspace(unittest.TestCase):
 
+    def test_file_hash_is_cached_for_the_same_filesystem_generation(self):
+        V._FILE_SHA256_CACHE.clear()
+        with mock.patch("builtins.open", wraps=open) as opened:
+            first = V._sha256_file(__file__)
+            second = V._sha256_file(__file__)
+        self.assertEqual(first, second)
+        hashed_opens = [
+            call for call in opened.call_args_list
+            if os.path.normcase(os.path.abspath(os.fspath(call.args[0])))
+            == os.path.normcase(os.path.abspath(__file__))
+        ]
+        self.assertEqual(1, len(hashed_opens))
+
+    def test_file_hash_cache_rejects_same_size_rewrite_with_restored_mtime(self):
+        V._FILE_SHA256_CACHE.clear()
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "revision.bin")
+            with open(path, "wb") as stream:
+                stream.write(b"AAAA")
+            original = os.stat(path)
+            first = V._sha256_file(path)
+
+            with open(path, "wb") as stream:
+                stream.write(b"BBBB")
+            os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+            second = V._sha256_file(path)
+        self.assertNotEqual(first, second)
+
     def test_material_build_pending_blocks_even_without_build_manifest(self):
         d = self.make_ws([])
         ingest = os.path.join(d, ".ingest")
@@ -314,7 +343,8 @@ class TestValidateWorkspace(unittest.TestCase):
         errors, warnings, stats = V.validate(d)
         self.assertEqual(V._exit_code(errors), 1, err_text(errors))
         self.assertTrue(any("lecture_example_1_2" in e["msg"] for e in errors))
-        self.assertEqual(stats["teaching_examples_missing_from_both"], 1)
+        self.assertEqual(stats["teaching_examples_missing_from_teaching"], 1)
+        self.assertEqual(stats["teaching_examples_quiz_only"], 0)
 
     def test_append_only_baseline_cannot_be_shrunk_by_rewritten_ingest_report(self):
         d = self.make_ws([])
@@ -331,7 +361,8 @@ class TestValidateWorkspace(unittest.TestCase):
         errors, _, stats = V.validate(d)
         self.assertEqual(V._exit_code(errors), 1, err_text(errors))
         self.assertTrue(any("lecture_example_1_2" in e["msg"] for e in errors))
-        self.assertEqual(stats["teaching_examples_missing_from_both"], 1)
+        self.assertEqual(stats["teaching_examples_missing_from_teaching"], 1)
+        self.assertEqual(stats["teaching_examples_quiz_only"], 0)
 
     def test_duplicate_teaching_example_ids_are_rejected(self):
         d = self.make_ws([])
@@ -664,10 +695,7 @@ class TestValidateWorkspace(unittest.TestCase):
                            "question": "q", "answer": "a", "source": "teacher"}])
         errors, _, _ = V.validate(d)   # must not raise
         self.assertEqual(V._exit_code(errors), 1)
-        self.assertTrue(any(
-            "id 必须是稳定字符串（旧整数可读）" in e["msg"]
-            for e in errors
-        ))
+        self.assertTrue(any("id 必须是稳定字符串（旧整数可读）" in e["msg"] for e in errors))
         self.assertTrue(any("type 必须是字符串" in e["msg"] for e in errors))
 
     def test_interaction_style_stats_report_saved_but_dormant_preference(self):
@@ -1354,6 +1382,7 @@ class TestValidateWorkspace(unittest.TestCase):
             record["status"] = status
         state = {"version": 1, "current_phase": 1, "scope": None, "mode": None,
                  "time_budget": "le1d", "language": "zh", "preferences": {},
+                 "processing_mode": "full",
                  "mistake_archive": [], "confusion_log": [], "knowledge_window": [],
                  "phase_checklist": [{"text": "阶段 1：基础", "done": done}],
                  "phase_evidence": {} if status is None else {"1": record}}
@@ -1543,6 +1572,20 @@ class TestValidateWorkspace(unittest.TestCase):
         errors, warnings, _ = V.validate(d)
         self.assertEqual(V._exit_code(errors), 0)
         self.assertNotIn("raw/伪分隔 LaTeX", warn_text(warnings))
+
+    def test_curated_bare_tex_is_linted_without_flagging_absolute_windows_paths(self):
+        d = self.make_ws([self._ok_item()])
+        wiki = os.path.join(d, "references", "wiki", "ch1.md")
+        with open(wiki, "w", encoding="utf-8") as f:
+            f.write(
+                "# ch1\nUse \\boxed{x} only after solving.\n"
+                "Materials: D:\\min\\notes and C:\\beta\\file and "
+                "\\\\server\\share\\quad\n"
+            )
+        errors, warnings, stats = V.validate(d)
+        self.assertEqual(V._exit_code(errors), 0)
+        self.assertIn("raw_latex_files", stats)
+        self.assertEqual(1, stats["raw_latex_occurrences"])
 
     def test_notebook_raw_latex_is_linted_too(self):
         d = self.make_ws([self._ok_item()])

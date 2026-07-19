@@ -10,7 +10,7 @@ license: MIT
 
 ## Purpose
 
-Render one read-only card covering the validated workflow, three modes, four time tiers, `chat|visual`, workspace truth/views, six quiz types, provenance, and subskill routing.
+Render one read-only card covering the validated workflow, three modes, four time tiers, `lightweight|full`, `chat|visual`, workspace truth/views, six quiz types, provenance, and subskill routing.
 
 ## Activation
 
@@ -28,8 +28,47 @@ No files, arguments, or state reads. The caller supplies the selected language.
 
 The card must say:
 
-- `artifact_mode` is never a fourth first-contact question or inferred from subscription. Missing/legacy/unknown means `chat`. Both modes require the validated current `profile=full` typed guide; `chat` stops without PDF, while standing `visual` additionally requires render, receipt hashes, every-page QA, and `artifact_ready=ready`. A one-shot artifact leaves stored state unchanged. Chat final review may stay conversational; cheat-sheet PDF still needs visual or an explicit PDF/print request.
-- `ingest_course.py` is the normal build entry; exit 10 is process success with blocked readiness, and teaching remains forbidden. `.ingest/` is build/review truth, `study_state.json` progress truth, and Markdown is generated view.
+- `processing_mode=lightweight` is the default/recommended startup choice. It
+  inventories names, then visually processes only the current-phase PDF pages or
+  definitely single-frame PNG/JPEG/BMP (maximum eight primary pages and one active
+  batch). Overview contact sheets group at most four pages at roughly 768 px/tile;
+  page/prompt/dependency detail and target-answer-only solution calls use
+  source-qualified locations and canonical PNG evidence under `.lightweight/assets/`.
+  Bind exact external answer pages with `register-answer-dependency`; dependency
+  pages are locator/detail only. Figure prompt/answer crops stay distinct. An
+  unfinished batch can close only through receipt-backed `abandon --reason`; taught
+  progress cannot be abandoned, while `replace-taught --reason` preserves it as
+  superseded history and plans an exact-slice successor. It keeps the page-batch /
+  progress state machines and creates no Study Guide/PDF. `processing_mode=full` is
+  explicit opt-in and opens the complete ingestion/review route. Input-token savings
+  never shorten the teaching explanation.
+- `artifact_mode` is independent from processing intensity and never inferred from
+  subscription. Missing/legacy/unknown means `chat`. In full mode, `chat` stops
+  without PDF while standing `visual` additionally requires typed Guide, render,
+  receipt hashes, every-page QA, and `artifact_ready=ready`. A one-shot artifact
+  leaves stored state unchanged. In lightweight, a saved `visual` preference is
+  dormant and effective output remains `chat`; it never builds a Study Guide.
+- `answer_explanation_mode` is also independent. Missing/legacy/invalid means
+  `ordinary`: every full-Guide item still gets a detailed beginner-first explanation,
+  but no second Provider or isolation receipt is claimed. `isolated` is an off-by-
+  default, full-v2-only extension requiring two-stage consent: Provider/API-billing
+  and retention/privacy disclosure before no-upload planning, then exact plan-bound
+  item/image scope, call count, current-pricing estimate, and upload consent before calls.
+  A GPT model, subscription, API key, `full`, or `visual` does not enable it.
+- `ingest_course.py` is the full-mode build entry; exit 10 is process success with
+  blocked readiness, and teaching remains forbidden. `.ingest/` is full-mode
+  build/review truth, `.lightweight/session.json` is on-demand page-batch truth,
+  `study_state.json` is progress truth, and Markdown is a generated view.
+- Lightweight completion uses current-phase taught-batch/notebook events and skips
+  typed Guide/full-build evidence; superseded predecessors/events remain history but
+  leave the current denominator. `verified` needs revision-bound checkpoints from an
+  unchanged bank that pre-existed lightweight initialization; startup captures only
+  its immutable stat baseline. Routine health checks use metadata/physical identity,
+  not stream hashes; exact hashes occur at transitions/completion or explicit
+  `status --verify-live`. Older taught history is `unchecked_historical` until that
+  phase is resumed.
+- MinerU, Docling, and LangGraph are named-request-only and remote/cloud-only. Never
+  download, install, probe, import, or execute them locally.
 - Provenance is exact: 🟢 来自资料 / 🟡 AI补充，可能与你老师讲的不完全一致 / ⚠️ AI生成答案，非老师/教材提供.
 
 ## Output Contract

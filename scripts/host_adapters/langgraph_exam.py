@@ -1,11 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Optional LangGraph host around the existing command/receipt workflow.
+"""Legacy LangGraph contract helpers for remote-host integrations.
 
-Importing this module never imports LangGraph.  ``build_exam_graph`` performs
-the lazy import only for hosts that explicitly opt in and supply a durable
-checkpointer.  Graph checkpoints are routing hints; every meaningful transition
-is rehydrated from the workspace's existing command receipts and validators.
+The student runtime never imports or executes LangGraph locally.  A learner may
+explicitly request a remote/cloud host that implements this contract, but local
+graph construction remains disabled.  Workspace receipts stay authoritative.
 """
 
 import hashlib
@@ -22,7 +21,7 @@ class LangGraphAdapterError(RuntimeError):
 
 
 class OptionalDependencyUnavailable(LangGraphAdapterError):
-    """LangGraph was explicitly requested but is not installed."""
+    """The local runtime cannot provide the remote-only LangGraph capability."""
 
 
 class ExamGraphState(TypedDict, total=False):
@@ -32,6 +31,7 @@ class ExamGraphState(TypedDict, total=False):
     mode: str
     time_budget: str
     language: str
+    processing_mode: str
     artifact_mode: str
     chapter: int
     has_structured_workspace: bool
@@ -539,6 +539,19 @@ def _artifact_route(state, artifact):
     artifact_counts = _counts(artifact)
     if artifact_counts is None:
         return "operation_error"
+    processing_mode = artifact_counts.get("processing_mode") or state.get(
+        "processing_mode"
+    )
+    if (
+        "lightweight_artifact_generation_disabled" in reasons
+        or artifact_counts.get("generation_enabled") is False
+        or processing_mode == "lightweight"
+    ):
+        # Chat-first lightweight sessions intentionally have no Study Guide
+        # artifact to rehydrate.  Treat that capability as not applicable,
+        # otherwise an optional LangGraph host loops forever on a disabled
+        # branch instead of continuing teaching.
+        return None
     if reasons.intersection(manifest_reasons) or artifact_counts.get(
             "manifest") is False:
         return "study_guide_rehydrate"
@@ -689,407 +702,18 @@ def route_after_completion_check(state):
         else "completion_interrupt"
 
 
-def _resume_object(value, gate):
-    return validate_resume(value, gate)
-
-
 def build_exam_graph(checkpointer, command_api=None):
-    """Build the optional state graph around the unchanged command core.
+    """Reject local construction; retain helpers as a remote-host contract.
 
-    ``checkpointer`` is required because every human/agent gate uses a dynamic
-    interrupt.  Production hosts should provide their own durable saver and a
-    stable ``thread_id`` when invoking the compiled graph.
+    The arguments remain only for source compatibility.  This package contains
+    no local LangGraph import or graph body; a separately configured remote host
+    must implement the documented receipt/routing helpers itself after consent.
     """
 
-    if checkpointer is None:
-        raise LangGraphAdapterError("a host-supplied durable checkpointer is required")
-    try:
-        from langgraph.graph import END, START, StateGraph
-        from langgraph.types import interrupt
-    except ImportError as exc:
-        raise OptionalDependencyUnavailable(
-            "LangGraph is optional and is not installed; install it in the host environment "
-            "only after explicit consent") from exc
-
-    api = command_api or command_core
-
-    def safe_call(function, state, *args, **kwargs):
-        try:
-            return function(*args, **kwargs), None
-        except Exception as exc:  # command_core already bounds subprocess details
-            label = getattr(function, "__name__", function.__class__.__name__)
-            return None, "%s: %s" % (label, str(exc)[:1000])
-
-    def resume_update(response, gate, **values):
-        try:
-            values["last_resume"] = validate_resume(response, gate)
-            values["operation_error"] = ""
-        except LangGraphAdapterError as exc:
-            return {"operation_error": str(exc)}
-        return values
-
-    def rehydrate(state):
-        receipt, error = safe_call(
-            api.exam_start_status, state, state["workspace"], state["materials"])
-        structured = os.path.isdir(os.path.join(state["workspace"], ".ingest"))
-        update = {"has_structured_workspace": structured}
-        if error:
-            update["operation_error"] = error
-        else:
-            update["start_gate_receipt"] = receipt
-            update["operation_error"] = ""
-        return update
-
-    def confirmation_interrupt(state):
-        response = interrupt({
-            "gate": "workspace_confirmation",
-            "workspace": state.get("workspace"),
-            "materials": state.get("materials"),
-            "course": state.get("course"),
-            "mode": state.get("mode"),
-            "time_budget": state.get("time_budget"),
-            "language": state.get("language"),
-            "resume_contract": {"confirmed": True},
-            "instruction": "Confirm the exact pair and all three learning choices.",
-        })
-        try:
-            return {"confirmation_response": validate_resume(response, "confirmation"),
-                    "operation_error": ""}
-        except LangGraphAdapterError as exc:
-            return {"operation_error": str(exc)}
-
-    def confirm(state):
-        response = state.get("confirmation_response") or {}
-        if response.get("confirmed") is not True:
-            return {"operation_error": "exact workspace/materials confirmation was not granted"}
-        receipt, error = safe_call(
-            api.exam_start_confirm, state,
-            state["workspace"], state["materials"], state["course"], state["mode"],
-            state["time_budget"], state["language"], state.get("artifact_mode"), False)
-        return {"operation_error": error or "", "start_gate_receipt": receipt} if receipt \
-            else {"operation_error": error}
-
-    def ingest(state):
-        # Rehydrate first so a crash after a completed prior ingest can route by
-        # current receipts on the next graph invocation.
-        receipt, error = safe_call(
-            api.ingest_course, state, state["workspace"], state["materials"])
-        return {"operation_error": error or "", "ingest_receipt": receipt} if receipt \
-            else {"operation_error": error}
-
-    def validate(state):
-        receipt, error = safe_call(
-            api.validate_workspace, state, state["workspace"], state.get("chapter"))
-        return {"operation_error": error or "", "validation_receipt": receipt} if receipt \
-            else {"operation_error": error}
-
-    def review_interrupt(state):
-        # This read-only list call is safe to replay. Claim/apply/rebuild remain
-        # outside the interrupting node because claim is not idempotent.
-        receipt, error = safe_call(
-            api.review_list, state, state["workspace"],
-            statuses=("pending", "claimed", "validated", "blocked"),
-            summary_only=True)
-        if error:
-            return {"operation_error": error}
-        try:
-            review_payload = validate_review_receipt(receipt)
-        except LangGraphAdapterError as exc:
-            return {"operation_error": str(exc)}
-        response = interrupt({
-            "gate": "typed_review",
-            "workspace": state["workspace"],
-            "summary": review_payload["summary"],
-            "resume_contract": {"review_complete": True},
-            "instruction": (
-                "Use ingest_review list/show/claim, inspect cited evidence, then validate/apply "
-                "a typed patch or mark the issue unrecoverable with evidence. Rebuild and resume."
-            ),
-        })
-        return resume_update(
-            response, "typed_review", review_receipt=receipt)
-
-    def reingest_interrupt(state):
-        response = interrupt({
-            "gate": "source_or_parser_drift",
-            "workspace": state["workspace"],
-            "materials": state.get("materials"),
-            "resume_contract": {"confirmed": True},
-            "instruction": (
-                "The validator reports source/parser/runtime drift. Confirm the exact current "
-                "materials pair, then resume so the canonical ingestion command reruns."
-            ),
-        })
-        return resume_update(response, "source_or_parser_drift")
-
-    def rebuild_interrupt(state):
-        response = interrupt({
-            "gate": "derived_build_drift",
-            "workspace": state["workspace"],
-            "resume_contract": {"rebuild_complete": True},
-            "instruction": (
-                "Rebuild canonical derived ingestion artifacts with the existing rebuild command, "
-                "then resume for a fresh validator receipt."
-            ),
-        })
-        return resume_update(response, "derived_build_drift")
-
-    def warning_interrupt(state):
-        payload = _payload(state.get("validation_receipt")) or {}
-        response = interrupt({
-            "gate": "usable_with_gaps",
-            "warning_count": payload.get("warning_count"),
-            "warning_summary": payload.get("warning_summary") or {},
-            "warnings": payload.get("warnings") or [],
-            "resume_contract": {"acknowledged": True},
-            "instruction": "Surface every remaining warning before continuing.",
-        })
-        try:
-            acknowledgement = hint_receipt(state, "warnings")
-        except LangGraphAdapterError as exc:
-            return {"operation_error": str(exc)}
-        return resume_update(
-            response, "warnings", warning_acknowledgement=acknowledgement)
-
-    def tutor_interrupt(state):
-        response = interrupt({
-            "gate": "tutor_notebook",
-            "workspace": state["workspace"],
-            "chapter": state.get("chapter"),
-            "resume_contract": {"persisted": True},
-            "instruction": (
-                "Run the current-chapter tutor workflow and persist substantive teaching, "
-                "feedback, and evidence through notebook/update_progress commands."
-            ),
-        })
-        try:
-            handoff = hint_receipt(state, "tutor_notebook")
-        except LangGraphAdapterError as exc:
-            return {"operation_error": str(exc)}
-        return resume_update(response, "tutor_notebook", tutor_handoff=handoff)
-
-    def study_guide_rehydrate(state):
-        context = _validation_context(state)
-        if context is None:
-            return {"operation_error": "Study Guide routing requires a current validator receipt"}
-        artifact = context["capabilities"].get("artifact_ready")
-        counts = _counts(artifact)
-        mode = counts.get("artifact_mode") if isinstance(counts, dict) else None
-        if mode not in ("chat", "visual"):
-            return {"operation_error": "validator omitted the canonical artifact_mode"}
-        status_function = getattr(api, "study_guide_status", None)
-        if not callable(status_function):
-            return {"operation_error": (
-                "the host must supply a read-only study_guide_status callback that rereads "
-                "canonical claim/content/render/QA receipts")}
-        draft = "notebook/ch%02d.guide.claim-draft.json" % context["chapter"]
-        receipt, error = safe_call(
-            status_function, state, state["workspace"], context["chapter"], mode,
-            draft)
-        if error:
-            return {"operation_error": error}
-        try:
-            validate_study_guide_gate_transition(
-                state.get("study_guide_gate_receipt"), receipt, state)
-            if receipt["artifact_mode"] != mode:
-                raise LangGraphAdapterError(
-                    "Study Guide gate receipt disagrees with canonical artifact_mode")
-        except LangGraphAdapterError as exc:
-            return {"operation_error": str(exc)}
-        return {"study_guide_gate_receipt": receipt, "operation_error": ""}
-
-    def current_guide_receipt(state, stage):
-        try:
-            receipt = validate_study_guide_gate_receipt(
-                state.get("study_guide_gate_receipt"), state)
-            if receipt["stage"] != stage:
-                raise LangGraphAdapterError("Study Guide stage drifted before interrupt")
-            return receipt, None
-        except LangGraphAdapterError as exc:
-            return None, str(exc)
-
-    def make_guide_interrupt(stage):
-        def node(state):
-            receipt, error = current_guide_receipt(state, stage)
-            if error:
-                return {"operation_error": error}
-            response = interrupt({
-                "gate": "study_guide_%s" % stage, "workspace": state["workspace"],
-                "chapter": receipt["chapter"], "draft_path":
-                    "notebook/ch%02d.guide.claim-draft.json" % receipt["chapter"],
-                "resume_contract": {"completed": True},
-                "instruction": "Complete this canonical stage using the documented command.",
-                "truth_boundary": "Resume is only a hint; canonical validators rerun next.",
-            })
-            return resume_update(response, "study_guide_stage")
-
-        return node
-
-    guide_command_nodes = {
-        "guide_%s_interrupt" % stage: make_guide_interrupt(stage)
-        for stage in _GUIDE_STAGES[:-2]
-    }
-    def guide_inspection_interrupt(state):
-        receipt, error = current_guide_receipt(state, "inspection")
-        if error:
-            return {"operation_error": error}
-        response = interrupt({
-            "gate": "study_guide_all_pages_inspection",
-            "workspace": state["workspace"],
-            "chapter": receipt["chapter"],
-            "pdf_sha256": receipt["pdf_sha256"],
-            "render_manifest_sha256": receipt["render_manifest_sha256"],
-            "pages": receipt["pages"],
-            "resume_contract": {
-                "inspected_pages": "all",
-                "reviewer": "<non-empty name>",
-                "reviewer_kind": "agent|user",
-                "page_verdicts": ["1=pass:<notes>"],
-            },
-            "instruction": (
-                "Actually open and visually inspect every listed current PNG in order. Check math, "
-                "glyphs, images, prompt/answer order, clipping, tables, margins, page breaks, page "
-                "numbers, orphan headings, and blank space. Return one hash-bound pass verdict per "
-                "page; any defect requires a fix, rerender, and a fresh inspection from page 1."
-            ),
-        })
-        try:
-            hint = create_study_guide_inspection_hint(response, receipt)
-        except LangGraphAdapterError as exc:
-            return {"operation_error": str(exc)}
-        return {"study_guide_inspection_hint": hint, "operation_error": ""}
-
-    def guide_accept_interrupt(state):
-        receipt, error = current_guide_receipt(state, "inspection")
-        if error:
-            return {"operation_error": error}
-        hint = state.get("study_guide_inspection_hint")
-        if not study_guide_inspection_hint_is_current(hint, receipt):
-            return {"operation_error": "Study Guide inspection evidence is missing or stale"}
-        response = interrupt({
-            "gate": "study_guide_qa_accept",
-            "workspace": state["workspace"],
-            "chapter": receipt["chapter"],
-            "reviewer": hint["reviewer"],
-            "reviewer_kind": hint["reviewer_kind"],
-            "page_verdicts": hint["page_verdicts"],
-            "resume_contract": {"accepted": True},
-            "instruction": (
-                "Run study_guide_qa.py accept with --inspected-pages all and exactly these "
-                "hash-bound per-page pass verdicts. Resume only after the canonical receipt is "
-                "ready; acknowledgement alone cannot satisfy artifact readiness."
-            ),
-        })
-        return resume_update(response, "guide_accept")
-
-    def completion_interrupt(state):
-        response = interrupt({
-            "gate": "phase_completion",
-            "workspace": state["workspace"],
-            "chapter": state.get("chapter"),
-            "resume_contract": {"progress_updated": True},
-            "instruction": (
-                "Run update_progress complete-phase with the intended status. The command's "
-                "existing evidence and artifact gates remain authoritative."
-            ),
-        })
-        return resume_update(response, "phase_completion")
-
-    def completion_check(state):
-        update, error = safe_call(completion_check_update, state, api, state)
-        if error:
-            return {"operation_error": error}
-        update["operation_error"] = ""
-        return update
-
-    def operation_error(state):
-        return {"terminal_status": "blocked_operation"}
-
-    builder = StateGraph(ExamGraphState)
-    for name, node in (
-        ("rehydrate", rehydrate),
-        ("confirmation_interrupt", confirmation_interrupt),
-        ("confirm", confirm),
-        ("ingest", ingest),
-        ("validate", validate),
-        ("review_interrupt", review_interrupt),
-        ("reingest_interrupt", reingest_interrupt),
-        ("rebuild_interrupt", rebuild_interrupt),
-        ("warning_interrupt", warning_interrupt),
-        ("tutor_interrupt", tutor_interrupt),
-        ("study_guide_rehydrate", study_guide_rehydrate),
-        ("guide_inspection_interrupt", guide_inspection_interrupt),
-        ("guide_accept_interrupt", guide_accept_interrupt),
-        ("completion_interrupt", completion_interrupt),
-        ("completion_check", completion_check),
-        ("halt_operation", operation_error),
-    ):
-        builder.add_node(name, node)
-    for name, node in guide_command_nodes.items():
-        builder.add_node(name, node)
-    builder.add_edge(START, "rehydrate")
-    builder.add_conditional_edges("rehydrate", route_after_rehydrate, {
-        "confirmation_interrupt": "confirmation_interrupt",
-        "ingest": "ingest", "validate": "validate", "operation_error": "halt_operation",
-    })
-    builder.add_conditional_edges("confirmation_interrupt", route_after_interrupt, {
-        "continue": "confirm", "operation_error": "halt_operation",
-    })
-    builder.add_conditional_edges("confirm", route_after_confirm, {
-        "ingest": "ingest", "operation_error": "halt_operation",
-    })
-    builder.add_conditional_edges("ingest", route_after_ingest, {
-        "validate": "validate", "operation_error": "halt_operation",
-    })
-    builder.add_conditional_edges("validate", route_after_validation, {
-        "review_interrupt": "review_interrupt",
-        "reingest_interrupt": "reingest_interrupt",
-        "rebuild_interrupt": "rebuild_interrupt",
-        "warning_interrupt": "warning_interrupt",
-        "tutor_interrupt": "tutor_interrupt",
-        "study_guide_rehydrate": "study_guide_rehydrate",
-        "completion_interrupt": "completion_interrupt",
-        "operation_error": "halt_operation",
-    })
-    builder.add_conditional_edges("reingest_interrupt", route_after_interrupt, {
-        "continue": "ingest", "operation_error": "halt_operation",
-    })
-    builder.add_conditional_edges("rebuild_interrupt", route_after_interrupt, {
-        "continue": "validate", "operation_error": "halt_operation",
-    })
-    for name in ("review_interrupt", "warning_interrupt", "tutor_interrupt"):
-        builder.add_conditional_edges(name, route_after_interrupt, {
-            "continue": "validate", "operation_error": "halt_operation",
-        })
-    guide_routes = dict((name, name) for name in guide_command_nodes)
-    guide_routes.update({
-        "guide_inspection_interrupt": "guide_inspection_interrupt",
-        "guide_accept_interrupt": "guide_accept_interrupt",
-        "validate": "validate", "operation_error": "halt_operation",
-    })
-    builder.add_conditional_edges(
-        "study_guide_rehydrate", route_after_study_guide_gate, guide_routes)
-    for name in tuple(guide_command_nodes) + (
-            "guide_inspection_interrupt", "guide_accept_interrupt"):
-        builder.add_conditional_edges(name, route_after_interrupt, {
-            "continue": "study_guide_rehydrate", "operation_error": "halt_operation",
-        })
-    builder.add_conditional_edges("completion_interrupt", route_after_interrupt, {
-        "continue": "completion_check", "operation_error": "halt_operation",
-    })
-    builder.add_conditional_edges("completion_check", route_after_completion_check, {
-        "end": END,
-        "completion_interrupt": "completion_interrupt",
-        "review_interrupt": "review_interrupt",
-        "reingest_interrupt": "reingest_interrupt",
-        "rebuild_interrupt": "rebuild_interrupt",
-        "warning_interrupt": "warning_interrupt",
-        "tutor_interrupt": "tutor_interrupt",
-        "study_guide_rehydrate": "study_guide_rehydrate",
-        "operation_error": "halt_operation",
-    })
-    builder.add_edge("halt_operation", END)
-    return builder.compile(checkpointer=checkpointer)
+    raise OptionalDependencyUnavailable(
+        "local LangGraph execution is disabled; use a separately configured "
+        "remote/cloud host only after the learner explicitly requests it"
+    )
 
 
 __all__ = [

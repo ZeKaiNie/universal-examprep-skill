@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """依赖预检清单（check_deps.py）：清单结构、材料感知的 needed 判定、退出码契约、分发包收录。"""
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -14,6 +16,16 @@ sys.path.insert(0, SCRIPTS)
 import check_deps  # noqa: E402
 import notebook as notebook_engine  # noqa: E402
 PY = sys.executable
+
+
+def isolated_full_processing_gate():
+    """Bypass only the runtime precondition in chapter-content unit tests."""
+    content_module = check_deps.chapter_math_readiness.__globals__["study_guide_content"]
+    return mock.patch.object(
+        content_module.exam_start,
+        "require_full_processing",
+        return_value={"processing_mode": "full", "ready_to_ingest": True},
+    )
 
 
 def make_workspace(root, wiki="# Chapter 1\n\nNo formulas.\n", teaching=None,
@@ -102,7 +114,11 @@ def make_workspace(root, wiki="# Chapter 1\n\nNo formulas.\n", teaching=None,
     if guide_formula:
         formulas.append({
             "id": "f1", "latex": "x=y", "explanation": {"en": "A formula."},
-            "variables": [], "applicability": {"en": "When the variables apply."},
+            "variables": [
+                {"symbol": "x", "meaning": {"en": "the target value"}},
+                {"symbol": "y", "meaning": {"en": "the supplied value"}},
+            ],
+            "applicability": {"en": "When the variables apply."},
             "source_refs": [dict(source, role="formula")],
         })
     walkthroughs = []
@@ -111,7 +127,11 @@ def make_workspace(root, wiki="# Chapter 1\n\nNo formulas.\n", teaching=None,
         if guide_substitution:
             formula_uses.append({
                 "formula_id": "f1", "why_applicable": {"en": "It applies."},
-                "variable_mapping": [], "substitution": guide_substitution,
+                "variable_mapping": [
+                    {"symbol": "x", "maps_to": {"en": "the target value"}},
+                    {"symbol": "y", "maps_to": {"en": "the supplied value"}},
+                ],
+                "substitution": guide_substitution,
             })
         walkthroughs.append({
             "item_id": item_id, "source_type": source_types.get(item_id, "other"),
@@ -123,7 +143,7 @@ def make_workspace(root, wiki="# Chapter 1\n\nNo formulas.\n", teaching=None,
             "prompt_text": "Question " + item_id, "what_asked": {"en": "Solve it."},
             "known_quantities": [], "unknown_quantities": [],
             "formula_uses": formula_uses, "steps": [{"en": "Work the problem."}],
-            "answer": {"en": "Answer."}, "self_check": {"en": "Check it."},
+            "answer": {"en": "Answer."},
             "source_trace": [dict(source, role="question"), dict(source, role="answer")],
         })
     manifest = {
@@ -142,6 +162,11 @@ def make_workspace(root, wiki="# Chapter 1\n\nNo formulas.\n", teaching=None,
 
 
 class ManifestShape(unittest.TestCase):
+    def setUp(self):
+        gate = isolated_full_processing_gate()
+        gate.start()
+        self.addCleanup(gate.stop)
+
     def test_groups_cover_the_three_capabilities(self):
         ids = {g["id"] for g in check_deps.GROUPS}
         self.assertEqual(ids, {"pdf_text", "pdf_render", "browser", "mathml"})
@@ -186,6 +211,7 @@ class ManifestShape(unittest.TestCase):
                 )
             row = {item["id"]: item for item in report["groups"]}["mathml"]
             self.assertTrue(row["ok"])
+            self.assertEqual(row["available"], ["latex2mathml==3.60.0"])
             self.assertNotIn("mathml", report["missing_needed"])
 
     def test_low_level_capability_probe_exceptions_are_not_missing_results(self):
@@ -312,6 +338,11 @@ class MaterialsAwareness(unittest.TestCase):
 
 
 class ChapterContentAwareness(unittest.TestCase):
+    def setUp(self):
+        gate = isolated_full_processing_gate()
+        gate.start()
+        self.addCleanup(gate.stop)
+
     def row(self, report, group_id):
         return {item["id"]: item for item in report["groups"]}[group_id]
 
@@ -466,17 +497,19 @@ class ChapterContentAwareness(unittest.TestCase):
             rep = check_deps.build_report(
                 artifact_mode="visual", workspace=workspace, chapter=1,
             )
-            result = subprocess.run(
-                [PY, os.path.join(SCRIPTS, "check_deps.py"), "--workspace", workspace,
-                 "--chapter", "1", "--artifact-mode", "visual"],
-                capture_output=True, text=True, encoding="utf-8",
-            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                returncode = check_deps.main([
+                    "--workspace", workspace, "--chapter", "1",
+                    "--artifact-mode", "visual",
+                ])
+            stdout = output.getvalue()
         self.assertIn("--pdf-backend", rep["probe_error"])
         self.assertEqual(self.row(rep, "browser")["needed"], "probe_error")
         self.assertNotIn("browser", rep["missing_needed"])
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("probe_error", result.stdout)
-        self.assertNotIn("↳ 安装", result.stdout)
+        self.assertEqual(returncode, 2)
+        self.assertIn("probe_error", stdout)
+        self.assertNotIn("↳ 安装", stdout)
 
     def test_needed_import_probe_exception_is_probe_error_not_missing(self):
         with tempfile.TemporaryDirectory() as workspace:
@@ -525,17 +558,19 @@ class ChapterContentAwareness(unittest.TestCase):
                 artifact_mode="visual", workspace=workspace, chapter=1,
                 pdf_backend="html",
             )
-            result = subprocess.run(
-                [PY, os.path.join(SCRIPTS, "check_deps.py"), "--workspace", workspace,
-                 "--chapter", "1", "--artifact-mode", "visual", "--pdf-backend", "html"],
-                capture_output=True, text=True, encoding="utf-8",
-            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                returncode = check_deps.main([
+                    "--workspace", workspace, "--chapter", "1",
+                    "--artifact-mode", "visual", "--pdf-backend", "html",
+                ])
+            stdout = output.getvalue()
         self.assertIn("UTF-8", rep["probe_error"])
         self.assertEqual(self.row(rep, "mathml")["needed"], "probe_error")
         self.assertNotIn("mathml", rep["missing_needed"])
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("probe_error", result.stdout)
-        self.assertNotIn("latex2mathml==", result.stdout)
+        self.assertEqual(returncode, 2)
+        self.assertIn("probe_error", stdout)
+        self.assertNotIn("latex2mathml==", stdout)
 
     def test_workspace_and_chapter_must_be_paired(self):
         result = subprocess.run(
@@ -553,6 +588,22 @@ class ChapterContentAwareness(unittest.TestCase):
         self.assertIn("workspace", rep["probe_error"])
         self.assertEqual(self.row(rep, "mathml")["needed"], "probe_error")
         self.assertNotIn("mathml", rep["missing_needed"])
+
+
+class FullProcessingGate(unittest.TestCase):
+    def test_unregistered_workspace_is_probe_error_not_math_absence(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            make_workspace(workspace, wiki="# Formula\n\nUse $x^2$.\n")
+            report = check_deps.build_report(
+                artifact_mode="visual", workspace=workspace, chapter=1,
+                pdf_backend="html",
+            )
+        self.assertIsNone(report["chapter_math_status"])
+        self.assertIsNone(report["chapter_has_standard_math"])
+        self.assertIn("exact confirmed workspace/materials pair", report["probe_error"])
+        mathml = {row["id"]: row for row in report["groups"]}["mathml"]
+        self.assertEqual("probe_error", mathml["needed"])
+        self.assertNotIn("mathml", report["missing_needed"])
 
 
 class ShipsInDist(unittest.TestCase):

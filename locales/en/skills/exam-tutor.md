@@ -13,7 +13,7 @@ Current stage: Stage N | Template: seven-step walkthrough
 ③ What to read off the figure: [given quantities/evidence]
 ④ Core formula: [formula or framework]
 ⑤ Step-by-step solution: [numbered work]
-⑥ Answer self-check: [boundary/unit/logic check]
+⑥ Why this answer works: [for a beginner, explain every symbol/rule, why the formula applies, each substitution or reasoning step, every subpart, and what the result means; state any insufficiency explicitly]
 ⑦ Source trace: [chapter · wiki · clickable original location]
 Question source: … | Answer source: … | 🟢 From your materials
 ```
@@ -31,3 +31,8 @@ Current progress: X of Y key questions covered.
 
 Reply "Continue" for the next key question. If you want this one explained again, name the step that needs more detail.
 ```
+
+Show this prompt only when the reported effective cadence is `step_by_step` (stored
+step preference, full mode, and `no_questions=false`). Derive X/Y from the locked,
+manifest-ordered selector response; never infer it from notebook presence. “Continue”
+is navigation only and must not create completion evidence.

@@ -15,6 +15,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(ROOT, "scripts")
 PY = sys.executable
+EXAM_START = os.path.join(SCRIPTS, "exam_start.py")
 
 RAW = {
     "course_name": "数据结构",
@@ -34,14 +35,51 @@ RAW = {
 }
 
 
-def build_ws_from(raw):
+def _confirm_full_workspace(root, workspace, language="zh"):
+    """Register the exact isolated pair required by the direct compiler gate."""
+    materials = os.path.join(root, "materials")
+    home = os.path.join(root, ".examprep-home")
+    os.makedirs(materials, exist_ok=True)
+    env = dict(os.environ)
+    env["EXAMPREP_HOME"] = home
+    result = subprocess.run(
+        [
+            PY, EXAM_START, "confirm", "--course", "ingest-index-fixture",
+            "--materials", materials, "--workspace", workspace,
+            "--mode", "from_scratch", "--time-budget", "le1d",
+            "--language", language, "--processing-mode", "full", "--json",
+        ],
+        capture_output=True, text=True, encoding="utf-8", env=env,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            "full-mode workspace confirmation failed:\n"
+            + result.stdout + result.stderr
+        )
+    return env
+
+
+def _workspace_env(root):
+    env = dict(os.environ)
+    env["EXAMPREP_HOME"] = os.path.join(root, ".examprep-home")
+    return env
+
+
+def build_ws_from(raw, lang=None):
     tmp = tempfile.mkdtemp(prefix="ing2_")
     raw_path = os.path.join(tmp, "raw_input.json")
     with open(raw_path, "w", encoding="utf-8") as f:
         json.dump(raw, f, ensure_ascii=False)
     ws = os.path.join(tmp, "ws")
-    r = subprocess.run([PY, os.path.join(SCRIPTS, "ingest.py"), "--input", raw_path,
-                        "--output-dir", ws], capture_output=True, text=True, encoding="utf-8")
+    language = lang or "zh"
+    env = _confirm_full_workspace(tmp, ws, language=language)
+    command = [PY, os.path.join(SCRIPTS, "ingest.py"), "--input", raw_path,
+               "--output-dir", ws]
+    if lang is not None:
+        command.extend(["--lang", lang])
+    r = subprocess.run(
+        command, capture_output=True, text=True, encoding="utf-8", env=env,
+    )
     return tmp, ws, r
 
 
@@ -200,14 +238,8 @@ class EnWorkspaceLanguage(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.tmp = tempfile.mkdtemp(prefix="ingen_")
-        raw_path = os.path.join(cls.tmp, "raw_input.json")
-        with open(raw_path, "w", encoding="utf-8") as f:
-            json.dump(RAW_EN, f, ensure_ascii=False)
-        cls.ws = os.path.join(cls.tmp, "ws")
-        cls.r = subprocess.run([PY, os.path.join(SCRIPTS, "ingest.py"), "--input", raw_path,
-                                "--output-dir", cls.ws, "--lang", "en"],
-                               capture_output=True, text=True, encoding="utf-8")
+        cls.tmp, cls.ws, cls.r = build_ws_from(RAW_EN, lang="en")
+        cls.env = _workspace_env(cls.tmp)
         if cls.r.returncode != 0:
             raise AssertionError("ingest --lang en failed:\n" + cls.r.stdout + cls.r.stderr)
 
@@ -232,25 +264,25 @@ class EnWorkspaceLanguage(unittest.TestCase):
                          % sorted(set(_CJK_RE.findall(stripped))))
 
     def test_en_progress_rows_are_english_and_cjk_free(self):
+        # Exact-pair confirmation initializes the canonical state before the
+        # compiler runs.  The progress Markdown is now only its generated view,
+        # so verify language and phase at the source of truth.
         prog = self._read_ws("study_progress.md")
-        self.assertIn("- [ ] **Phase 1**:", prog)
-        self.assertIn("- [ ] **Mock test**:", prog)
-        self.assertIn("Phase 1: Linear lists", prog)              # 断点种子行同语言
-        stripped = _SUBJECT_SPAN_RE.sub("", prog)
-        self.assertFalse(_CJK_RE.search(stripped),
-                         "en study_progress.md 在《科目名称》替换位之外不得有 CJK: %r"
-                         % sorted(set(_CJK_RE.findall(stripped))))
+        self.assertIn("study_state.json", prog)
+        with open(os.path.join(self.ws, "study_state.json"), encoding="utf-8") as f:
+            state = json.load(f)
+        self.assertEqual(state["language"], "en")
+        self.assertEqual(state["current_phase"], 1)
 
     def test_en_workspace_passes_validator(self):
         r = subprocess.run([PY, os.path.join(SCRIPTS, "validate_workspace.py"), self.ws],
-                           capture_output=True, text=True, encoding="utf-8")
+                           capture_output=True, text=True, encoding="utf-8",
+                           env=self.env)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)    # 读侧认 Phase N 行
 
     def test_en_workspace_init_parses_phase(self):
-        r = subprocess.run([PY, os.path.join(SCRIPTS, "update_progress.py"),
-                            "--workspace", self.ws, "init"],
-                           capture_output=True, text=True, encoding="utf-8")
-        self.assertEqual(r.returncode, 0, r.stderr)
+        # Re-running init is intentionally rejected once confirmation created
+        # state.  Direct ingestion must preserve that initialized phase.
         with open(os.path.join(self.ws, "study_state.json"), encoding="utf-8") as f:
             st = json.load(f)
         self.assertEqual(st["current_phase"], 1)
@@ -266,8 +298,11 @@ class EnWorkspaceLanguage(unittest.TestCase):
             self.assertIn("| **模拟测试** | 综合真题自测 | `references/quiz_bank.json` | 未开始 |", plan)
             with open(os.path.join(ws, "study_progress.md"), encoding="utf-8") as f:
                 prog = f.read()
-            self.assertIn("- [ ] **阶段 1**：线性表 (关联 `references/wiki/ch1_linear.md`)", prog)
-            self.assertIn("阶段 1：线性表", prog)
+            self.assertIn("study_state.json", prog)
+            with open(os.path.join(ws, "study_state.json"), encoding="utf-8") as f:
+                state = json.load(f)
+            self.assertEqual(state["language"], "zh")
+            self.assertEqual(state["current_phase"], 1)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -281,8 +316,10 @@ class NoTermsNoFile(unittest.TestCase):
             with open(rp, "w", encoding="utf-8") as f:
                 json.dump(raw, f, ensure_ascii=False)
             ws = os.path.join(tmp, "ws")
+            env = _confirm_full_workspace(tmp, ws)
             r = subprocess.run([PY, os.path.join(SCRIPTS, "ingest.py"), "--input", rp,
-                                "--output-dir", ws], capture_output=True, text=True, encoding="utf-8")
+                                "--output-dir", ws], capture_output=True, text=True,
+                               encoding="utf-8", env=env)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertFalse(os.path.exists(os.path.join(ws, "references", "terms.json")))
             self.assertTrue(os.path.exists(os.path.join(ws, "references", "retrieval_index.json")))

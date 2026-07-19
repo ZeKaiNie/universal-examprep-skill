@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Shared stable item-ID contract for teaching/notebook/Guide boundaries.
+"""Shared stable item-ID contract for quiz/teaching/notebook/Guide boundaries.
 
 IDs are control-plane keys, but they are not required to be English.  The
-typed Study Guide accepts safe Unicode identifiers, so this contract keeps
-that compatibility instead of introducing an ASCII-only migration boundary.
+typed Study Guide has historically accepted safe Unicode identifiers (for
+example ``例题1`` and ``über_2``), so the shared contract deliberately keeps
+that compatibility instead of inventing an ASCII-only migration boundary.
 """
 
 import re

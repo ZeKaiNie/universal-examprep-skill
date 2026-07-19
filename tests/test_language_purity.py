@@ -474,7 +474,7 @@ EN_CANONICAL_VOCAB = (
     ("step-3", u"③ What to read off the figure"),
     ("step-4", u"④ Core formula"),
     ("step-5", u"⑤ Step-by-step solution"),
-    ("step-6", u"⑥ Answer self-check"),
+    ("step-6", u"⑥ Why this answer works"),
     ("step-7", u"⑦ Source trace"),
     # source block
     ("source-block-q", u"Question source:"),
@@ -748,8 +748,8 @@ class T5BilingualComposition(unittest.TestCase):
 ⑤ 逐步演算：从头指针出发，沿 `next` 走三步，遇 `NULL` 停。
 > EN: Start from the head pointer, follow next three times, stop at NULL.
 
-⑥ 答案自检：遍历三个节点，与给定长度一致。
-> EN: Three nodes traversed, matches the given length.
+⑥ 为什么这个答案成立：遍历三个节点，与给定长度一致，因此结论与题目条件相符。
+> EN: Why this answer works: traversing three nodes matches the given length, so the conclusion fits the prompt.
 
 ⑦ 知识点溯源：第 2 章《线性表》 · references/wiki/ch02_linear_list.md · 原文 [lec03.pdf 第 12 页](../lec03.pdf#page=12)
 > EN: Chapter 2 Linear Lists · wiki ch02 · original page 12 of lec03.pdf

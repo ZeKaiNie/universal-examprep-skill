@@ -235,12 +235,12 @@ class StepByStepTeachingContract(unittest.TestCase):
         self.assertEqual(update_progress.effective_interaction_style(state),
                          "step_by_step")
 
-        # This PR targets a transition baseline: missing processing_mode is the
-        # historical implicit full route, while an explicit lightweight value
-        # makes the saved preference dormant.
+        # Missing and explicit lightweight processing modes both fail closed:
+        # they preserve the preference but make step-by-step cadence dormant.
         state.pop("processing_mode")
         self.assertEqual(update_progress.effective_interaction_style(state),
-                         "step_by_step")
+                         "batch")
+        self.assertTrue(update_progress.interaction_style_dormant(state))
         state["processing_mode"] = "lightweight"
         self.assertEqual(update_progress.effective_interaction_style(state), "batch")
         self.assertTrue(update_progress.interaction_style_dormant(state))

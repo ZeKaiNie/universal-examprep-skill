@@ -11,7 +11,8 @@ CLI::
     python scripts/study_guide_content.py --workspace <ws> validate --chapter 1 [--input draft.json]
     python scripts/study_guide_content.py --workspace <ws> import --chapter 1 --input draft.json
 
-Exit codes: 0 valid/imported; 1 unsafe IO or invalid content; 2 argparse usage error.
+Exit codes: 0 valid/imported; 1 unsafe IO or invalid content; 2 argparse usage or
+explicit-full-processing gate failure.
 """
 
 import argparse
@@ -26,6 +27,11 @@ import sys
 import tempfile
 import unicodedata
 from contextlib import contextmanager
+
+try:
+    from . import exam_start
+except (ImportError, ValueError):
+    import exam_start
 
 try:
     from .stable_ids import stable_item_id_problem
@@ -100,6 +106,51 @@ except ImportError:  # package import from the repository root
         physical_asset_key,
     )
 
+try:
+    from asset_crops import (
+        CropContractError,
+        load_crop_receipt_report,
+        verify_crop_asset_live_binding,
+    )
+except ImportError:  # package import from the repository root
+    from scripts.asset_crops import (
+        CropContractError,
+        load_crop_receipt_report,
+        verify_crop_asset_live_binding,
+    )
+
+try:
+    from math_text_policy import (
+        find_math_layout_hazard,
+        find_unrendered_math_hazard,
+        first_bare_latex_command,
+    )
+except ImportError:  # package import from the repository root
+    from scripts.math_text_policy import (
+        find_math_layout_hazard,
+        find_unrendered_math_hazard,
+        first_bare_latex_command,
+    )
+
+try:
+    from study_guide_provenance import (
+        PROVENANCE_ICONS as SHARED_PROVENANCE_ICONS,
+        ProvenanceConflictError,
+        clean_visible_provenance,
+        forbidden_explanation_fragment,
+        notebook_has_provenance_legend,
+        notebook_legend_lines,
+    )
+except ImportError:  # package import from the repository root
+    from scripts.study_guide_provenance import (
+        PROVENANCE_ICONS as SHARED_PROVENANCE_ICONS,
+        ProvenanceConflictError,
+        clean_visible_provenance,
+        forbidden_explanation_fragment,
+        notebook_has_provenance_legend,
+        notebook_legend_lines,
+    )
+
 
 SCHEMA_VERSION = 1
 LANGUAGES = {"zh", "en", "bilingual"}
@@ -111,13 +162,9 @@ SOURCE_ROLES = {"concept", "formula", "question", "answer", "solution"}
 SOURCE_TYPES = {"lecture", "homework", "quiz", "mock_exam", "past_exam", "textbook", "other"}
 ANSWER_PROVENANCE = {"material", "ai_supplemented", "ai_generated"}
 EXPLANATION_PROVENANCE = {"material", "ai_translation", "ai_supplement"}
-EXPLANATION_PROVENANCE_LABELS = {
-    "material": ("🟢 来自资料", "🟢 From your materials"),
-    "ai_translation": ("🟡 AI翻译，原资料为另一种语言",
-                       "🟡 AI translation — source material is in another language"),
-    "ai_supplement": ("🟡 AI补充，可能与你老师讲的不完全一致",
-                      "🟡 AI supplement — may differ from what your teacher taught"),
-}
+ANSWER_EXPLANATION_MODES = {"ordinary", "isolated"}
+MIN_ANSWER_EXPLANATION_CHARS = {"zh": 80, "en": 160}
+PROVENANCE_EMOJI = dict(SHARED_PROVENANCE_ICONS)
 SEMANTIC_UNIT_KINDS = {
     "title", "heading", "text", "list", "table", "formula", "figure", "diagram",
     "caption", "code", "speaker_notes", "other",
@@ -745,7 +792,7 @@ def _target_languages(language):
     return {language}
 
 
-def _localized(value, language, path):
+def _localized(value, language, path, skip_math_codes=()):
     _shape(value, path, (), ("zh", "en"))
     required = _target_languages(language)
     if not required.issubset(value):
@@ -754,8 +801,77 @@ def _localized(value, language, path):
     if not value:
         raise ContentError("%s must contain localized text" % path)
     for key, text in value.items():
-        _text(text, "%s.%s" % (path, key))
+        text_path = "%s.%s" % (path, key)
+        _text(text, text_path)
+        if key not in set(skip_math_codes):
+            _validate_localized_prose_math(text, text_path)
     return value
+
+
+def _field_provenance(value, localized_value, path, allowed=EXPLANATION_PROVENANCE):
+    """Validate one explicit per-language provenance sidecar.
+
+    Legacy manifests may omit the sidecar entirely.  Once present, however, it
+    must describe exactly the authored language keys and use only the declared
+    control-plane vocabulary; partial or decorative provenance is rejected.
+    """
+
+    _shape(value, path, (), ("zh", "en"))
+    if set(value) != set(localized_value):
+        raise ContentError(
+            "%s must label every authored language exactly; missing=%s extra=%s"
+            % (path, sorted(set(localized_value) - set(value)),
+               sorted(set(value) - set(localized_value)))
+        )
+    for code, label in value.items():
+        if label not in allowed:
+            raise ContentError(
+                "%s.%s must be one of %s" % (path, code, sorted(allowed))
+            )
+    return value
+
+
+def _validate_detailed_answer_explanation(value, provenance, answer, language,
+                                          path):
+    """Validate one beginner-facing explanation independent of execution mode."""
+
+    explanation = _localized(value, language, path)
+    expected_languages = _target_languages(language)
+    if set(explanation) != expected_languages:
+        raise ContentError(
+            "%s must contain exactly target languages %s"
+            % (path, sorted(expected_languages))
+        )
+    labels = _field_provenance(
+        provenance, explanation, path + "_provenance",
+        allowed={"ai_supplement"},
+    )
+    if any(label != "ai_supplement" for label in labels.values()):
+        raise ContentError("%s_provenance must be ai_supplement" % path)
+    for code in sorted(expected_languages):
+        text = explanation[code]
+        forbidden_reason = forbidden_explanation_fragment(text)
+        if forbidden_reason:
+            raise ContentError(
+                "%s.%s contains forbidden %s" % (path, code, forbidden_reason)
+            )
+        meaningful = len(re.sub(r"\s+", "", text))
+        minimum = MIN_ANSWER_EXPLANATION_CHARS[code]
+        if meaningful < minimum:
+            raise ContentError(
+                "%s.%s is too short for a detailed beginner explanation; "
+                "need at least %d non-whitespace characters"
+                % (path, code, minimum)
+            )
+        supplied_answer = answer.get(code) if isinstance(answer, dict) else None
+        if (isinstance(supplied_answer, str)
+                and re.sub(r"\s+", "", supplied_answer)
+                == re.sub(r"\s+", "", text)):
+            raise ContentError(
+                "%s.%s merely repeats the answer instead of explaining it"
+                % (path, code)
+            )
+    return explanation
 
 
 def _translation(value, language, original_language, path):
@@ -777,7 +893,40 @@ def _translation(value, language, original_language, path):
             % (path, sorted(required), sorted(missing), sorted(repeated))
         )
     for key, text in value.items():
-        _text(text, "%s.%s" % (path, key))
+        text_path = "%s.%s" % (path, key)
+        _text(text, text_path)
+        _validate_localized_prose_math(text, text_path)
+    return value
+
+
+def _validate_localized_prose_math(value, path):
+    """Reject raw TeX in prose without guessing how the author meant to fix it."""
+
+    command = first_bare_latex_command(value)
+    if command:
+        raise ContentError(
+            "%s contains raw LaTeX command %r outside standard $...$ or $$...$$ "
+            "delimiters; wrap intended math explicitly or rewrite the prose without TeX "
+            "(automatic rewriting is disabled)" % (path, command)
+        )
+    # Preserve the more specific flattened-OCR diagnosis for multiline source
+    # evidence; the reviewed teaching-field gate owns that recovery path.
+    hazard = None if find_math_layout_hazard(value) else find_unrendered_math_hazard(value)
+    if hazard:
+        raise ContentError(
+            "%s contains unrendered math notation %r outside standard $...$ or $$...$$ "
+            "delimiters; wrap intended math explicitly or rewrite the prose "
+            "(automatic rewriting is disabled)"
+            % (path, hazard["snippet"])
+        )
+
+
+def _inline_tex(value, path):
+    value = _text(value, path)
+    if value != value.strip() or "\n" in value or "\r" in value or "$" in value:
+        raise ContentError(
+            "%s must be trimmed one-line TeX without Markdown $ delimiters" % path
+        )
     return value
 
 
@@ -1004,6 +1153,22 @@ def _source_ref(ws, value, path, unit_index=None, structured=False):
         role = value["role"]
         if not isinstance(role, str) or role not in SOURCE_ROLES:
             raise ContentError("%s.role must be one of %s" % (path, sorted(SOURCE_ROLES)))
+    if value.get("role") == "formula" and "quote_span" in value:
+        quote_span = value["quote_span"]
+        if structured and source_unit is not None:
+            matches_latex = (
+                _normalize_exact_latex(quote_span)
+                == _normalize_exact_latex(source_unit.get("latex"))
+            )
+            matches_text = (
+                _normalize_exact_text(quote_span)
+                == _normalize_exact_text(source_unit.get("text"))
+            )
+            if not matches_latex and not matches_text:
+                raise ContentError(
+                    "%s.quote_span must exactly match the bound formula unit text or "
+                    "latex payload after whitespace/Unicode normalization" % path
+                )
     if "asset_path" in value:
         asset_path = _workspace_asset(ws, value["asset_path"], path + ".asset_path")
         if source_unit is not None:
@@ -1111,7 +1276,10 @@ _SOURCE_ITEM_CONTROL_FIELDS = {
 _SOURCE_ASSET_CONTROL_FIELDS = {
     "path", "source_file", "sha256", "source_sha256", "role", "type", "bbox",
     "contains_full_prompt", "page", "source_page", "source_pages", "width", "height",
-    "x", "y", "w", "h",
+    "x", "y", "w", "h", "source_bbox_pdf_points", "crop_receipt_id",
+    "crop_receipt_schema_version", "crop_spec_sha256",
+    "semantic_purity_sha256", "semantic_purity_schema_version",
+    "required_context_ids", "content_scope", "isolation",
 }
 
 
@@ -1225,8 +1393,15 @@ def _record_item_asset(item_assets, item_id, asset, path):
         "type": asset_type,
         "contains_full_prompt": contains,
     }
-    if asset.get("sha256") is not None:
-        record["sha256"] = asset["sha256"]
+    for field in (
+        "sha256", "source_file", "source_sha256", "source_page",
+        "source_bbox_pdf_points", "crop_receipt_id",
+        "crop_receipt_schema_version", "crop_spec_sha256",
+        "semantic_purity_sha256", "semantic_purity_schema_version",
+        "required_context_ids", "content_scope", "isolation",
+    ):
+        if field in asset:
+            record[field] = copy.deepcopy(asset[field])
     item_assets.setdefault(item_id, {}).setdefault(relative, []).append(record)
 
 
@@ -1490,34 +1665,84 @@ def _workspace_language(ws):
     return language
 
 
-def _validate_quantity(value, language, path):
-    _shape(value, path, ("label",), ("symbol", "value", "unit"))
-    _localized(value["label"], language, path + ".label")
+def _workspace_answer_explanation_mode(ws):
+    """Read the safe effective state choice; missing/invalid state is ordinary."""
+
+    path = os.path.join(ws, "study_state.json")
+    if not os.path.exists(path):
+        return "ordinary"
+    _guard_workspace_child(ws, path, "study_state.json", require_file=True)
+    state = _read_json(path, "study_state.json")
+    if not isinstance(state, dict):
+        raise ContentError("study_state.json must be an object")
+    return exam_start.i18n.workspace_answer_explanation_mode(state)
+
+
+def _validate_quantity(value, language, path, require_provenance=False):
+    required = ["label"]
+    optional = ["symbol", "value", "unit", "provenance"]
+    if require_provenance:
+        required.append("provenance")
+        optional.remove("provenance")
+    _shape(value, path, required, optional)
+    label = _localized(value["label"], language, path + ".label")
+    if "provenance" in value:
+        _field_provenance(
+            value["provenance"], label, path + ".provenance")
     for key in ("symbol", "value", "unit"):
         if key in value:
-            _text(value[key], "%s.%s" % (path, key))
+            if key == "symbol":
+                _inline_tex(value[key], "%s.%s" % (path, key))
+            else:
+                _text(value[key], "%s.%s" % (path, key))
 
 
-def _validate_formula_use(value, language, path):
-    _shape(value, path,
-           ("formula_id", "why_applicable", "variable_mapping", "substitution"))
+def _validate_formula_use(value, language, path, require_provenance=False):
+    required = [
+        "formula_id", "why_applicable", "variable_mapping", "substitution",
+    ]
+    optional = ["why_applicable_provenance", "substitution_provenance"]
+    if require_provenance:
+        required.extend(("why_applicable_provenance", "substitution_provenance"))
+        optional = []
+    _shape(value, path, required, optional)
     formula_id = _identifier(value["formula_id"], path + ".formula_id")
-    _localized(value["why_applicable"], language, path + ".why_applicable")
+    why_applicable = _localized(
+        value["why_applicable"], language, path + ".why_applicable")
+    if "why_applicable_provenance" in value:
+        _field_provenance(
+            value["why_applicable_provenance"], why_applicable,
+            path + ".why_applicable_provenance")
     mappings = _list(value["variable_mapping"], path + ".variable_mapping")
     seen = set()
     for index, mapping in enumerate(mappings):
         mp = "%s.variable_mapping[%d]" % (path, index)
-        _shape(mapping, mp, ("symbol", "maps_to"))
-        symbol = _text(mapping["symbol"], mp + ".symbol")
+        mapping_required = ["symbol", "maps_to"]
+        mapping_optional = ["maps_to_provenance"]
+        if require_provenance:
+            mapping_required.append("maps_to_provenance")
+            mapping_optional = []
+        _shape(mapping, mp, mapping_required, mapping_optional)
+        symbol = _inline_tex(mapping["symbol"], mp + ".symbol")
         if symbol in seen:
             raise ContentError("%s.variable_mapping repeats symbol %r" % (path, symbol))
         seen.add(symbol)
-        _localized(mapping["maps_to"], language, mp + ".maps_to")
+        maps_to = _localized(mapping["maps_to"], language, mp + ".maps_to")
+        if "maps_to_provenance" in mapping:
+            _field_provenance(
+                mapping["maps_to_provenance"], maps_to,
+                mp + ".maps_to_provenance")
     substitution = _text(value["substitution"], path + ".substitution")
     if "\n" in substitution or "\r" in substitution:
         raise ContentError("%s.substitution must be one line of TeX" % path)
     if substitution.strip().startswith("$") or substitution.strip().endswith("$"):
         raise ContentError("%s.substitution stores TeX without Markdown $ delimiters" % path)
+    if "substitution_provenance" in value:
+        provenance = value["substitution_provenance"]
+        if provenance != "ai_supplement":
+            raise ContentError(
+                "%s.substitution_provenance must equal ai_supplement" % path
+            )
     return formula_id, set(seen)
 
 
@@ -1568,9 +1793,16 @@ def _require_current_chapter_refs(refs, chapter, unit_index, path):
 
 
 def _validate_knowledge_point(ws, value, language, path, formula_ids, formula_symbols,
-                              chapter=None, unit_index=None, structured=False):
+                              chapter=None, unit_index=None, structured=False,
+                              require_provenance=False):
     required = ["id", "title", "explanation", "formulas", "source_refs", "example_ids"]
-    optional = ["explanation_provenance"]
+    optional = [
+        "explanation_provenance", "example_note",
+        "teaching_explanation", "teaching_explanation_provenance",
+    ]
+    if require_provenance:
+        required.append("explanation_provenance")
+        optional.remove("explanation_provenance")
     if structured:
         required.append("source_unit_ids")
     else:
@@ -1578,8 +1810,14 @@ def _validate_knowledge_point(ws, value, language, path, formula_ids, formula_sy
     _shape(value, path, required, optional)
     kp_id = _identifier(value["id"], path + ".id")
     _localized(value["title"], language, path + ".title")
-    explanation = _localized(value["explanation"], language, path + ".explanation")
     provenance = value.get("explanation_provenance")
+    material_evidence_codes = {
+        code for code, label in provenance.items() if label == "material"
+    } if isinstance(provenance, dict) and "teaching_explanation" in value else set()
+    explanation = _localized(
+        value["explanation"], language, path + ".explanation",
+        skip_math_codes=material_evidence_codes,
+    )
     if provenance is not None:
         _shape(provenance, path + ".explanation_provenance", (), ("zh", "en"))
         if set(provenance) != set(explanation):
@@ -1593,6 +1831,43 @@ def _validate_knowledge_point(ws, value, language, path, formula_ids, formula_sy
                     "%s.explanation_provenance.%s must be one of %s"
                     % (path, code, sorted(EXPLANATION_PROVENANCE))
                 )
+    if ("teaching_explanation" in value) != (
+            "teaching_explanation_provenance" in value):
+        raise ContentError(
+            "%s teaching_explanation and teaching_explanation_provenance must appear together"
+            % path
+        )
+    if "teaching_explanation" in value:
+        teaching = _localized(
+            value["teaching_explanation"], language, path + ".teaching_explanation")
+        teaching_provenance = value["teaching_explanation_provenance"]
+        _shape(
+            teaching_provenance, path + ".teaching_explanation_provenance",
+            (), ("zh", "en"))
+        if (set(teaching_provenance) != set(teaching)
+                or any(label != "ai_supplement"
+                       for label in teaching_provenance.values())):
+            raise ContentError(
+                "%s.teaching_explanation_provenance must label every language "
+                "ai_supplement" % path
+            )
+        for code, text in teaching.items():
+            hazard = find_math_layout_hazard(text)
+            if hazard:
+                raise ContentError(
+                    "%s.teaching_explanation.%s still contains %s OCR math layout; "
+                    "the reviewed teaching copy itself must use readable typeset math"
+                    % (path, code, hazard["code"])
+                )
+    effective_provenance = provenance or {code: "material" for code in explanation}
+    for code, label in effective_provenance.items():
+        hazard = find_math_layout_hazard(explanation[code]) if label == "material" else None
+        if hazard and "teaching_explanation" not in value:
+            raise ContentError(
+                "%s.explanation.%s contains %s OCR math layout; keep the exact evidence "
+                "but add a reviewed teaching_explanation with typeset math"
+                % (path, code, hazard["code"])
+            )
     concept_refs = _source_refs(
         ws, value["source_refs"], path + ".source_refs",
         unit_index=unit_index, structured=structured,
@@ -1600,6 +1875,12 @@ def _validate_knowledge_point(ws, value, language, path, formula_ids, formula_sy
     source_unit_ids = _unique_strings(
         value.get("source_unit_ids", []), path + ".source_unit_ids", identifiers=True)
     examples = _unique_strings(value["example_ids"], path + ".example_ids", identifiers=True)
+    if "example_note" in value:
+        _localized(value["example_note"], language, path + ".example_note")
+        if examples:
+            raise ContentError(
+                "%s.example_note is allowed only when example_ids is empty" % path
+            )
     formulas = _list(value["formulas"], path + ".formulas")
     local_formula_ids = set()
     derived_source_unit_ids = set()
@@ -1608,8 +1889,16 @@ def _validate_knowledge_point(ws, value, language, path, formula_ids, formula_sy
             concept_refs, "concept", chapter, unit_index, path + ".source_refs"))
     for index, formula in enumerate(formulas):
         fp = "%s.formulas[%d]" % (path, index)
-        _shape(formula, fp,
-               ("id", "latex", "explanation", "variables", "applicability", "source_refs"))
+        formula_required = [
+            "id", "latex", "explanation", "variables", "applicability", "source_refs",
+        ]
+        formula_optional = ["explanation_provenance", "applicability_provenance"]
+        if require_provenance:
+            formula_required.extend((
+                "explanation_provenance", "applicability_provenance",
+            ))
+            formula_optional = []
+        _shape(formula, fp, formula_required, formula_optional)
         formula_id = _identifier(formula["id"], fp + ".id")
         if formula_id in formula_ids:
             raise ContentError("formula id %r is not globally unique" % formula_id)
@@ -1620,18 +1909,37 @@ def _validate_knowledge_point(ws, value, language, path, formula_ids, formula_sy
             raise ContentError("%s.latex must be one line of TeX" % fp)
         if latex.strip().startswith("$") or latex.strip().endswith("$"):
             raise ContentError("%s.latex stores TeX without Markdown $ delimiters" % fp)
-        _localized(formula["explanation"], language, fp + ".explanation")
-        _localized(formula["applicability"], language, fp + ".applicability")
+        formula_explanation = _localized(
+            formula["explanation"], language, fp + ".explanation")
+        formula_applicability = _localized(
+            formula["applicability"], language, fp + ".applicability")
+        if "explanation_provenance" in formula:
+            _field_provenance(
+                formula["explanation_provenance"], formula_explanation,
+                fp + ".explanation_provenance")
+        if "applicability_provenance" in formula:
+            _field_provenance(
+                formula["applicability_provenance"], formula_applicability,
+                fp + ".applicability_provenance")
         variables = _list(formula["variables"], fp + ".variables")
         symbols = set()
         for vi, variable in enumerate(variables):
             vp = "%s.variables[%d]" % (fp, vi)
-            _shape(variable, vp, ("symbol", "meaning"))
-            symbol = _text(variable["symbol"], vp + ".symbol")
+            variable_required = ["symbol", "meaning"]
+            variable_optional = ["meaning_provenance"]
+            if require_provenance:
+                variable_required.append("meaning_provenance")
+                variable_optional = []
+            _shape(variable, vp, variable_required, variable_optional)
+            symbol = _inline_tex(variable["symbol"], vp + ".symbol")
             if symbol in symbols:
                 raise ContentError("%s.variables repeats symbol %r" % (fp, symbol))
             symbols.add(symbol)
-            _localized(variable["meaning"], language, vp + ".meaning")
+            meaning = _localized(variable["meaning"], language, vp + ".meaning")
+            if "meaning_provenance" in variable:
+                _field_provenance(
+                    variable["meaning_provenance"], meaning,
+                    vp + ".meaning_provenance")
         formula_symbols[formula_id] = symbols
         formula_refs = _source_refs(
             ws, formula["source_refs"], fp + ".source_refs",
@@ -1697,6 +2005,164 @@ def _trace_asset_records(source_trace, unit_index):
                 merged.get("contains_full_prompt") or ref.get("contains_full_prompt"))
             output.setdefault(asset_path, []).append(merged)
     return output
+
+
+def _ingestion_source_root(ws):
+    """Return the current compiler-bound materials root for live crop checks."""
+
+    path = os.path.join(ws, ".ingest", "build_manifest.json")
+    _guard_workspace_child(
+        ws, path, ".ingest/build_manifest.json", require_file=True)
+    document = _read_json(path, ".ingest/build_manifest.json")
+    source_root = document.get("source_root") if isinstance(document, dict) else None
+    if not isinstance(source_root, str) or not source_root.strip():
+        raise ContentError(
+            ".ingest/build_manifest.json.source_root is required for live Study "
+            "Guide crop verification"
+        )
+    source_root = os.path.abspath(source_root)
+    if not os.path.isdir(source_root):
+        raise ContentError(
+            ".ingest/build_manifest.json.source_root is no longer a directory"
+        )
+    return source_root
+
+
+def _validate_v2_live_crop_receipts(ws, chapter, walkthroughs, inventory):
+    """Close every rendered page-shaped item asset to current crop/source bytes.
+
+    Authoring packets already perform this check, but their result is not a
+    capability token.  Canonical import and visual rendering call this function
+    again so a hand-authored protocol flag, stale compact declaration, replaced
+    crop, or changed source PDF cannot cross the publication boundary.
+    """
+
+    expected_chapter_id = "ch%02d" % chapter
+    pending = []
+    seen_declarations = set()
+    for walk_index, walk in enumerate(walkthroughs):
+        item_id = walk["item_id"]
+        source_assets = inventory["item_assets"].get(item_id, {})
+        trace_assets = _trace_asset_records(
+            walk.get("source_trace") or [], inventory["unit_index"])
+        for side, field, allowed_roles in (
+            ("prompt", "prompt_asset_paths", PROMPT_ASSET_ROLES),
+            ("answer", "answer_asset_paths", ANSWER_ASSET_ROLES),
+        ):
+            for asset_index, relative in enumerate(walk.get(field) or []):
+                label = "$.walkthroughs[%d].%s[%d]" % (
+                    walk_index, field, asset_index)
+                records = (
+                    list(source_assets.get(relative) or [])
+                    + list(trace_assets.get(relative) or [])
+                )
+                page_records = [
+                    record for record in records
+                    if isinstance(record, dict) and (
+                        record.get("type") in ("page_image", "crop_image")
+                        or bool(record.get("contains_full_prompt"))
+                    )
+                ]
+                if not page_records:
+                    continue
+                for record_index, record in enumerate(page_records):
+                    record_label = "%s record %d" % (label, record_index)
+                    if record.get("role") not in allowed_roles:
+                        raise ContentError(
+                            "%s is page-shaped but is not independently typed for "
+                            "the %s side" % (record_label, side)
+                        )
+                    if not isinstance(record.get("crop_receipt_id"), str):
+                        raise ContentError(
+                            "%s is page-shaped and requires a current target-item "
+                            "crop receipt; authoring_protocol_version is not proof"
+                            % record_label
+                        )
+                    if side == "answer" and (
+                            record.get("isolation") != "target_item_only"
+                            or bool(record.get("required_context_ids"))):
+                        raise ContentError(
+                            "%s answer-side page crop must use "
+                            "isolation=target_item_only with no required context"
+                            % record_label
+                        )
+                    canonical = json.dumps(
+                        record, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"), allow_nan=False,
+                    )
+                    identity = (item_id, side, canonical)
+                    if identity in seen_declarations:
+                        continue
+                    seen_declarations.add(identity)
+                    pending.append((item_id, side, record_label, copy.deepcopy(record)))
+
+    if not pending:
+        return {
+            "required": True,
+            "status": "verified",
+            "verified_asset_count": 0,
+            "crop_receipt_ids": [],
+            "verified_asset_bindings": [],
+        }
+
+    try:
+        unused_report, receipt_index = load_crop_receipt_report(ws)
+    except (CropContractError, OSError, TypeError, ValueError) as exc:
+        raise ContentError(
+            "live Study Guide crop receipt inventory is invalid: %s" % exc
+        ) from exc
+    source_root = _ingestion_source_root(ws)
+    verified_ids = []
+    verified_bindings = {}
+    for item_id, side, label, asset in pending:
+        try:
+            receipt = verify_crop_asset_live_binding(
+                ws,
+                source_root,
+                asset,
+                receipt_index,
+                expected_item_id=item_id,
+                expected_chapter_id=expected_chapter_id,
+            )
+        except (CropContractError, OSError, TypeError, ValueError) as exc:
+            raise ContentError(
+                "%s failed live target-item crop verification: %s" % (label, exc)
+            ) from exc
+        if receipt.side != side:
+            raise ContentError(
+                "%s receipt side=%s does not match the rendered %s side"
+                % (label, receipt.side, side)
+            )
+        if side == "answer" and (
+                receipt.isolation != "target_item_only"
+                or receipt.semantic_purity.required_context_ids):
+            raise ContentError(
+                "%s answer receipt must remain target_item_only with no required "
+                "context" % label
+            )
+        verified_ids.append(receipt.crop_receipt_id)
+        binding = {
+            "path": receipt.output_path,
+            "crop_receipt_id": receipt.crop_receipt_id,
+            "sha256": receipt.output_sha256,
+            "width": receipt.output_width,
+            "height": receipt.output_height,
+        }
+        previous = verified_bindings.get(receipt.output_path)
+        if previous is not None and previous != binding:
+            raise ContentError(
+                "%s resolves to conflicting live crop bindings" % receipt.output_path
+            )
+        verified_bindings[receipt.output_path] = binding
+    return {
+        "required": True,
+        "status": "verified",
+        "verified_asset_count": len(pending),
+        "crop_receipt_ids": sorted(set(verified_ids)),
+        "verified_asset_bindings": [
+            verified_bindings[path] for path in sorted(verified_bindings)
+        ],
+    }
 
 
 def _validate_knowledge_point_uses(value, kp_ids, language, path, structured=False):
@@ -1891,21 +2357,52 @@ def _validate_walkthrough_source_evidence(source_trace, item_id, answer_provenan
 
 def _validate_walkthrough(ws, value, language, path, item_assets=None,
                           unit_index=None, structured=False, item_evidence=None,
-                          profile=None, item_asset_requirements=None, chapter=None):
+                          profile=None, item_asset_requirements=None, chapter=None,
+                          require_answer_explanation=False,
+                          require_answer_explanation_receipt=False,
+                          require_provenance=False):
     required = [
         "item_id", "source_type", "answer_provenance", "knowledge_point_ids", "title",
         "original_language", "prompt_asset_mode", "prompt_asset_paths", "answer_asset_paths",
         "translation", "what_asked", "known_quantities", "unknown_quantities",
-        "formula_uses", "steps", "answer", "self_check", "source_trace",
+        "formula_uses", "steps", "answer", "source_trace",
     ]
     optional = [
         "prompt_text", "solution_kind", "no_formula_reason", "knowledge_point_uses",
-        "notebook_anchor",
+        "notebook_anchor", "notebook_block_sha256",
+        "teaching_answer", "teaching_answer_provenance",
+        "translation_provenance", "what_asked_provenance",
+        "knowledge_point_uses_provenance", "steps_provenance",
+        "self_check_provenance", "no_formula_reason_provenance",
+        "self_check", "answer_explanation", "answer_explanation_provenance",
+        "answer_explanation_receipt",
     ]
+    if require_answer_explanation:
+        required.extend((
+            "answer_explanation", "answer_explanation_provenance",
+        ))
+        optional = [key for key in optional if key not in (
+            "answer_explanation", "answer_explanation_provenance",
+        )]
+    if require_answer_explanation_receipt:
+        if not require_answer_explanation:
+            raise ContentError(
+                "%s internal contract requires an explanation with its receipt" % path
+            )
+        required.append("answer_explanation_receipt")
+        optional.remove("answer_explanation_receipt")
     if structured:
         required.extend(("solution_kind", "knowledge_point_uses", "notebook_anchor"))
         optional = [key for key in optional
                     if key not in ("solution_kind", "knowledge_point_uses", "notebook_anchor")]
+    if require_provenance:
+        provenance_required = (
+            "knowledge_point_uses", "translation_provenance",
+            "what_asked_provenance", "knowledge_point_uses_provenance",
+            "steps_provenance",
+        )
+        required.extend(key for key in provenance_required if key not in required)
+        optional = [key for key in optional if key not in provenance_required]
     _shape(
         value,
         path,
@@ -1916,15 +2413,46 @@ def _validate_walkthrough(ws, value, language, path, item_assets=None,
     notebook_anchor = value.get("notebook_anchor")
     if notebook_anchor is not None:
         _identifier(notebook_anchor, path + ".notebook_anchor")
+    notebook_block_sha256 = value.get("notebook_block_sha256")
+    if notebook_block_sha256 is not None:
+        _sha256(notebook_block_sha256, path + ".notebook_block_sha256")
+        if notebook_anchor is None:
+            raise ContentError(
+                "%s.notebook_block_sha256 requires notebook_anchor" % path
+            )
     source_type = _canonical_source_type(value["source_type"], path + ".source_type",
                                          manifest=True)
+    if require_provenance and not isinstance(value["answer_provenance"], dict):
+        raise ContentError(
+            "%s.answer_provenance must be a per-language object for "
+            "authoring_protocol_version=2" % path
+        )
     answer_provenance = _validate_answer_provenance(
         value["answer_provenance"], language, path + ".answer_provenance", structured)
     kp_ids = _unique_strings(value["knowledge_point_ids"], path + ".knowledge_point_ids",
                              nonempty=True, identifiers=True)
-    _validate_knowledge_point_uses(
+    knowledge_point_uses = _validate_knowledge_point_uses(
         value.get("knowledge_point_uses"), kp_ids, language,
-        path + ".knowledge_point_uses", structured)
+        path + ".knowledge_point_uses", structured or require_provenance)
+    if "knowledge_point_uses_provenance" in value:
+        uses_provenance = value["knowledge_point_uses_provenance"]
+        if not isinstance(uses_provenance, dict):
+            raise ContentError(
+                "%s.knowledge_point_uses_provenance must be an object keyed by "
+                "knowledge-point ID" % path
+            )
+        if set(uses_provenance) != set(knowledge_point_uses):
+            raise ContentError(
+                "%s.knowledge_point_uses_provenance keys must exactly equal "
+                "knowledge_point_uses; missing=%s extra=%s"
+                % (path,
+                   sorted(set(knowledge_point_uses) - set(uses_provenance)),
+                   sorted(set(uses_provenance) - set(knowledge_point_uses)))
+            )
+        for kp_id, provenance in uses_provenance.items():
+            _field_provenance(
+                provenance, knowledge_point_uses[kp_id],
+                "%s.knowledge_point_uses_provenance.%s" % (path, kp_id))
     _localized(value["title"], language, path + ".title")
     original = value["original_language"]
     if original not in ORIGINAL_LANGUAGES:
@@ -2036,18 +2564,41 @@ def _validate_walkthrough(ws, value, language, path, item_assets=None,
         if "prompt_text" not in value:
             raise ContentError("%s.prompt_text is required unless a full prompt image is visible" % path)
         _text(value["prompt_text"], path + ".prompt_text")
-    _translation(value["translation"], language, original, path + ".translation")
-    _localized(value["what_asked"], language, path + ".what_asked")
+    translation = _translation(
+        value["translation"], language, original, path + ".translation")
+    if "translation_provenance" in value:
+        translation_provenance = _field_provenance(
+            value["translation_provenance"], translation,
+            path + ".translation_provenance", allowed={"ai_translation"})
+        if any(label != "ai_translation"
+               for label in translation_provenance.values()):
+            raise ContentError(
+                "%s.translation_provenance must label generated translations "
+                "ai_translation" % path
+            )
+    what_asked = _localized(
+        value["what_asked"], language, path + ".what_asked")
+    if "what_asked_provenance" in value:
+        _field_provenance(
+            value["what_asked_provenance"], what_asked,
+            path + ".what_asked_provenance")
     for field in ("known_quantities", "unknown_quantities"):
         rows = _list(value[field], "%s.%s" % (path, field))
         for index, quantity in enumerate(rows):
-            _validate_quantity(quantity, language, "%s.%s[%d]" % (path, field, index))
+            _validate_quantity(
+                quantity, language, "%s.%s[%d]" % (path, field, index),
+                require_provenance=require_provenance,
+            )
     formula_uses = _list(value["formula_uses"], path + ".formula_uses")
     solution_kind = value.get("solution_kind") or ("formula" if formula_uses else "concept")
     if solution_kind not in SOLUTION_KINDS:
         raise ContentError("%s.solution_kind must be one of %s"
                            % (path, sorted(SOLUTION_KINDS)))
     no_formula_reason = value.get("no_formula_reason")
+    if "no_formula_reason_provenance" in value and no_formula_reason is None:
+        raise ContentError(
+            "%s.no_formula_reason_provenance requires no_formula_reason" % path
+        )
     if solution_kind == "formula":
         if not formula_uses:
             raise ContentError("%s solution_kind=formula requires non-empty formula_uses" % path)
@@ -2058,22 +2609,195 @@ def _validate_walkthrough(ws, value, language, path, item_assets=None,
             raise ContentError("%s solution_kind=%s requires empty formula_uses"
                                % (path, solution_kind))
         if no_formula_reason is None:
-            if structured:
+            if structured or require_provenance:
                 raise ContentError("%s.no_formula_reason is required for non-formula solutions" % path)
         else:
-            _localized(no_formula_reason, language, path + ".no_formula_reason")
+            localized_reason = _localized(
+                no_formula_reason, language, path + ".no_formula_reason")
+            if require_provenance and "no_formula_reason_provenance" not in value:
+                raise ContentError(
+                    "%s.no_formula_reason_provenance is required for "
+                    "authoring_protocol_version=2" % path
+                )
+            if "no_formula_reason_provenance" in value:
+                _field_provenance(
+                    value["no_formula_reason_provenance"], localized_reason,
+                    path + ".no_formula_reason_provenance")
     used_formula_ids = []
     mapped_symbols = []
     for index, formula_use in enumerate(formula_uses):
         formula_id, symbols = _validate_formula_use(
-            formula_use, language, "%s.formula_uses[%d]" % (path, index))
+            formula_use, language, "%s.formula_uses[%d]" % (path, index),
+            require_provenance=require_provenance,
+        )
         used_formula_ids.append(formula_id)
         mapped_symbols.append((formula_id, symbols, index))
     steps = _list(value["steps"], path + ".steps", nonempty=True)
     for index, step in enumerate(steps):
         _localized(step, language, "%s.steps[%d]" % (path, index))
-    _localized(value["answer"], language, path + ".answer")
-    _localized(value["self_check"], language, path + ".self_check")
+    if "steps_provenance" in value:
+        steps_provenance = _list(
+            value["steps_provenance"], path + ".steps_provenance")
+        if len(steps_provenance) != len(steps):
+            raise ContentError(
+                "%s.steps_provenance must align one-to-one with steps" % path
+            )
+        for index, provenance in enumerate(steps_provenance):
+            _field_provenance(
+                provenance, steps[index],
+                "%s.steps_provenance[%d]" % (path, index))
+    material_evidence_codes = {
+        code for code, label in answer_provenance.items() if label == "material"
+    } if "teaching_answer" in value else set()
+    answer = _localized(
+        value["answer"], language, path + ".answer",
+        skip_math_codes=material_evidence_codes,
+    )
+    if ("teaching_answer" in value) != ("teaching_answer_provenance" in value):
+        raise ContentError(
+            "%s teaching_answer and teaching_answer_provenance must appear together" % path
+        )
+    if "teaching_answer" in value:
+        teaching_answer = _localized(
+            value["teaching_answer"], language, path + ".teaching_answer")
+        teaching_provenance = value["teaching_answer_provenance"]
+        _shape(
+            teaching_provenance, path + ".teaching_answer_provenance",
+            (), ("zh", "en"))
+        if (set(teaching_provenance) != set(teaching_answer)
+                or any(label not in ("ai_supplemented", "ai_generated")
+                       for label in teaching_provenance.values())):
+            raise ContentError(
+                "%s.teaching_answer_provenance must label every language "
+                "ai_supplemented or ai_generated" % path
+            )
+        for code, text in teaching_answer.items():
+            hazard = find_math_layout_hazard(text)
+            if hazard:
+                raise ContentError(
+                    "%s.teaching_answer.%s still contains %s OCR math layout; "
+                    "the reviewed teaching copy itself must use readable typeset math"
+                    % (path, code, hazard["code"])
+                )
+    for code, label in answer_provenance.items():
+        hazard = find_math_layout_hazard(answer[code]) if label == "material" else None
+        if hazard and "teaching_answer" not in value:
+            raise ContentError(
+                "%s.answer.%s contains %s OCR math layout; keep the exact evidence but "
+                "add a reviewed teaching_answer with typeset math"
+                % (path, code, hazard["code"])
+            )
+    if ("self_check" in value) != ("self_check_provenance" in value):
+        raise ContentError(
+            "%s legacy self_check and self_check_provenance must appear together" % path
+        )
+    if "self_check" in value:
+        self_check = _localized(
+            value["self_check"], language, path + ".self_check")
+        _field_provenance(
+            value["self_check_provenance"], self_check,
+            path + ".self_check_provenance")
+    has_explanation = "answer_explanation" in value
+    has_explanation_provenance = "answer_explanation_provenance" in value
+    if has_explanation != has_explanation_provenance:
+        raise ContentError(
+            "%s answer_explanation and answer_explanation_provenance must "
+            "appear together" % path
+        )
+    if has_explanation:
+        _validate_detailed_answer_explanation(
+            value["answer_explanation"],
+            value["answer_explanation_provenance"],
+            value.get("teaching_answer", answer), language,
+            path + ".answer_explanation",
+        )
+        has_explanation_receipt = "answer_explanation_receipt" in value
+        if require_answer_explanation_receipt != has_explanation_receipt:
+            raise ContentError(
+                "%s answer_explanation_receipt presence does not match "
+                "answer_explanation_mode" % path
+            )
+        if has_explanation_receipt:
+            receipt = value["answer_explanation_receipt"]
+            _shape(
+                receipt, path + ".answer_explanation_receipt",
+                (
+                    "request_id", "request_sha256", "response_sha256",
+                    "provider_receipt", "provider_receipt_sha256",
+                    "response_event_sha256",
+                ),
+            )
+            if not isinstance(receipt["request_id"], str) or not re.fullmatch(
+                    r"answer_explanation_[0-9a-f]{64}", receipt["request_id"]):
+                raise ContentError(
+                    "%s.answer_explanation_receipt.request_id is invalid" % path
+                )
+            for field in (
+                "request_sha256", "response_sha256", "provider_receipt_sha256",
+                "response_event_sha256",
+            ):
+                _sha256(
+                    receipt[field],
+                    "%s.answer_explanation_receipt.%s" % (path, field),
+                )
+            provider = receipt["provider_receipt"]
+            _shape(
+                provider, path + ".answer_explanation_receipt.provider_receipt",
+                (
+                    "schema_version", "request_id", "request_sha256",
+                    "instruction_sha256", "model_input_sha256",
+                    "attachment_set_sha256", "provider_reported", "provider",
+                    "model", "invocation_id", "isolation_mode", "tool_access",
+                    "normalized_response_sha256",
+                ),
+            )
+            if provider["schema_version"] != 2:
+                raise ContentError(
+                    "%s provider receipt schema_version must equal 2" % path
+                )
+            if provider["request_id"] != receipt["request_id"]:
+                raise ContentError("%s provider receipt request_id disagrees" % path)
+            for field in (
+                "request_sha256", "instruction_sha256", "model_input_sha256",
+                "attachment_set_sha256", "normalized_response_sha256",
+            ):
+                _sha256(
+                    provider[field], "%s provider receipt.%s" % (path, field)
+                )
+            if type(provider["provider_reported"]) is not bool:
+                raise ContentError("%s provider_reported must be boolean" % path)
+            if provider["provider_reported"]:
+                if (not isinstance(provider["provider"], str)
+                        or not provider["provider"].strip()):
+                    raise ContentError(
+                        "%s provider name is required when reported" % path
+                    )
+                if (not isinstance(provider["model"], str)
+                        or not provider["model"].strip()):
+                    raise ContentError(
+                        "%s model name is required when reported" % path
+                    )
+            elif provider["provider"] is not None or provider["model"] is not None:
+                raise ContentError("%s provider/model must be null when unreported" % path)
+            if provider["isolation_mode"] not in ("fresh_context", "stateless_api"):
+                raise ContentError("%s provider isolation_mode is invalid" % path)
+            if provider["tool_access"] != "disabled":
+                raise ContentError(
+                    "%s answer explanation provider tools must be disabled" % path
+                )
+            if (
+                provider["request_sha256"] != receipt["request_sha256"]
+                or provider["normalized_response_sha256"]
+                    != receipt["response_sha256"]
+            ):
+                raise ContentError(
+                    "%s answer explanation provider receipt hashes disagree" % path
+                )
+    elif any(field in value for field in (
+            "answer_explanation_provenance", "answer_explanation_receipt")):
+        raise ContentError(
+            "%s answer explanation fields must appear together" % path
+        )
     if structured:
         _validate_walkthrough_source_evidence(
             source_trace, item_id, answer_provenance, original,
@@ -2090,6 +2814,7 @@ def _validate_walkthrough(ws, value, language, path, item_assets=None,
         "mapped_symbols": mapped_symbols,
         "solution_kind": solution_kind,
         "notebook_anchor": notebook_anchor,
+        "notebook_block_sha256": notebook_block_sha256,
     }
 
 
@@ -2168,7 +2893,20 @@ def _validate_semantic_exclusions(ws, value, language, path, profile, unit_index
     return output
 
 
-def _official_walkthrough_anchors(ws, chapter):
+def _notebook_block_sha256(lines):
+    """Hash one parsed notebook entry in notebook.py's canonical block form."""
+
+    try:
+        try:
+            from scripts import notebook as notebook_engine
+        except ImportError:  # direct ``python scripts/study_guide_content.py`` execution
+            import notebook as notebook_engine
+        return notebook_engine.block_sha256({"lines": lines})
+    except (ImportError, ValueError) as exc:
+        raise ContentError("cannot hash notebook.py walkthrough block: %s" % exc)
+
+
+def _official_walkthrough_entries(ws, chapter):
     notebook_dir = os.path.join(ws, "notebook")
     _guard_workspace_child(
         ws, notebook_dir, "notebook", allow_missing=True)
@@ -2192,12 +2930,22 @@ def _official_walkthrough_anchors(ws, chapter):
         type_label, timestamp = notebook_engine._block_meta(block["lines"])
         if type_by_label.get(type_label) != "walkthrough" or not timestamp:
             continue
-        result[anchor] = block["id"]
+        result[anchor] = {
+            "item_id": block["id"],
+            "notebook_block_sha256": _notebook_block_sha256(block["lines"]),
+        }
     return result
 
 
+def _official_walkthrough_anchors(ws, chapter):
+    return {
+        anchor: row["item_id"]
+        for anchor, row in _official_walkthrough_entries(ws, chapter).items()
+    }
+
+
 def _validate_walkthrough_notebook_anchors(ws, chapter, walkthroughs, require_all=False):
-    official = _official_walkthrough_anchors(ws, chapter)
+    official = _official_walkthrough_entries(ws, chapter)
     validated = 0
     for index, walk in enumerate(walkthroughs):
         path = "$.walkthroughs[%d].notebook_anchor" % index
@@ -2207,13 +2955,21 @@ def _validate_walkthrough_notebook_anchors(ws, chapter, walkthroughs, require_al
                 raise ContentError("%s is required before importing a true Study Guide" % path)
             continue
         _identifier(anchor, path)
-        entry_id = official.get(anchor)
-        if entry_id is None:
+        entry = official.get(anchor)
+        if entry is None:
             raise ContentError(
                 "%s does not identify a pre-existing notebook.py walkthrough entry" % path)
+        entry_id = entry["item_id"]
         if entry_id != walk.get("item_id"):
             raise ContentError("%s belongs to notebook entry %r, not walkthrough item %r"
                                % (path, entry_id, walk.get("item_id")))
+        expected_block_sha256 = walk.get("notebook_block_sha256")
+        if (expected_block_sha256 is not None
+                and entry["notebook_block_sha256"] != expected_block_sha256):
+            raise ContentError(
+                "$.walkthroughs[%d].notebook_block_sha256 disagrees with the live "
+                "official notebook.py walkthrough block" % index
+            )
         validated += 1
     return validated
 
@@ -2251,6 +3007,11 @@ def _ingestion_pipeline_version(ws):
     version = document.get("pipeline_version")
     if version not in ("ingestion-v1", "ingestion-v2"):
         raise ContentError(".ingest/build_manifest.json pipeline_version is unsupported")
+    if version == "ingestion-v2" and document["schema_version"] != 2:
+        raise ContentError(
+            "ingestion-v2 requires build manifest schema_version 2; schema 1 is "
+            "legacy/read-only and cannot claim the current generation gate"
+        )
     return version
 
 
@@ -2335,7 +3096,88 @@ def _validate_v2_claim_gate(ws, chapter, manifest, inventory):
     }
 
 
-def validate_manifest(workspace, chapter, manifest, _enforce_v2_claims=True):
+def _canonical_json_sha256(value):
+    try:
+        payload = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ContentError("answer explanation receipt is not canonical JSON: %s" % exc)
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _validate_answer_explanation_gate(ws, chapter, manifest,
+                                      allow_legacy_isolated=False):
+    """Recompute the isolated per-item receipt and compare every visible field."""
+
+    contract = manifest["answer_explanation_contract"]
+    _shape(
+        contract, "$.answer_explanation_contract",
+        ("receipt_id", "receipt_sha256", "contract_id", "prompt_id", "prompt_sha256"),
+    )
+    _sha256(contract["receipt_sha256"],
+            "$.answer_explanation_contract.receipt_sha256")
+    _sha256(contract["prompt_sha256"],
+            "$.answer_explanation_contract.prompt_sha256")
+    try:
+        try:
+            import study_guide_explain as explain
+        except ImportError:
+            from scripts import study_guide_explain as explain
+        receipt = explain.load_final_receipt(
+            ws, chapter,
+            allow_legacy_isolated=allow_legacy_isolated,
+        )
+    except (OSError, ValueError, TypeError) as exc:
+        raise ContentError(
+            "isolated answer explanation receipt is missing, incomplete, or stale: %s" % exc
+        ) from exc
+    expected_contract = {
+        "receipt_id": receipt["receipt_id"],
+        "receipt_sha256": _canonical_json_sha256(receipt),
+        "contract_id": receipt["contract_id"],
+        "prompt_id": receipt["prompt_id"],
+        "prompt_sha256": receipt["prompt_sha256"],
+    }
+    if contract != expected_contract:
+        raise ContentError(
+            "$.answer_explanation_contract disagrees with the current isolated receipt"
+        )
+    live_items = {row["item_id"]: row for row in receipt["items"]}
+    if set(live_items) != {row["item_id"] for row in manifest["walkthroughs"]}:
+        raise ContentError(
+            "isolated answer explanation receipt does not exactly cover walkthroughs"
+        )
+    receipt_fields = (
+        "request_id", "request_sha256", "response_sha256", "provider_receipt",
+        "provider_receipt_sha256", "response_event_sha256",
+    )
+    for index, walk in enumerate(manifest["walkthroughs"]):
+        live = live_items[walk["item_id"]]
+        if walk["answer_explanation"] != live["answer_explanation"]:
+            raise ContentError(
+                "$.walkthroughs[%d].answer_explanation disagrees with its isolated receipt"
+                % index
+            )
+        if (walk["answer_explanation_provenance"]
+                != live["answer_explanation_provenance"]):
+            raise ContentError(
+                "$.walkthroughs[%d].answer_explanation_provenance drifted" % index
+            )
+        expected_item_receipt = {
+            key: live[key] for key in receipt_fields
+        }
+        if walk["answer_explanation_receipt"] != expected_item_receipt:
+            raise ContentError(
+                "$.walkthroughs[%d].answer_explanation_receipt drifted" % index
+            )
+    return expected_contract
+
+
+def validate_manifest(workspace, chapter, manifest, _enforce_v2_claims=True,
+                      _allow_legacy_isolated=False,
+                      _enforce_v2_crop_receipts=False):
     """Validate a parsed manifest against the current chapter source slices.
 
     ``full`` is an exact set equality gate. ``abridged`` must partition the same expected set
@@ -2347,11 +3189,15 @@ def validate_manifest(workspace, chapter, manifest, _enforce_v2_claims=True):
     _check_controls(manifest)
     inventory = _source_inventory(ws, chapter)
     structured = inventory["structured"]
+    pipeline_version = _ingestion_pipeline_version(ws) if structured else None
     top_required = [
         "schema_version", "chapter", "language", "profile", "knowledge_points",
         "walkthroughs", "omissions",
     ]
-    top_optional = []
+    top_optional = [
+        "authoring_protocol_version", "answer_explanation_mode",
+        "answer_explanation_contract",
+    ]
     if structured:
         top_required.append("semantic_exclusions")
     else:
@@ -2371,6 +3217,58 @@ def validate_manifest(workspace, chapter, manifest, _enforce_v2_claims=True):
     profile = manifest["profile"]
     if profile not in PROFILES:
         raise ContentError("$.profile must be full or abridged")
+    protocol_version = manifest.get("authoring_protocol_version")
+    if protocol_version is not None and protocol_version != 2:
+        raise ContentError("$.authoring_protocol_version must equal 2 when present")
+    has_explanation_contract = "answer_explanation_contract" in manifest
+    explanation_mode_explicit = "answer_explanation_mode" in manifest
+    legacy_isolated_mode_inferred = False
+    if explanation_mode_explicit:
+        answer_explanation_mode = manifest["answer_explanation_mode"]
+        if answer_explanation_mode not in ANSWER_EXPLANATION_MODES:
+            raise ContentError(
+                "$.answer_explanation_mode must be ordinary or isolated"
+            )
+        state_explanation_mode = _workspace_answer_explanation_mode(ws)
+        if answer_explanation_mode != state_explanation_mode:
+            raise ContentError(
+                "$.answer_explanation_mode=%s does not match "
+                "study_state.json.answer_explanation_mode=%s"
+                % (answer_explanation_mode, state_explanation_mode)
+            )
+    elif (protocol_version == 2 and has_explanation_contract
+          and _allow_legacy_isolated):
+        # Historical protocol-v2 manifests predate the explicit mode field but
+        # already carry the complete isolated contract.  Keep that exact route
+        # readable; newly compiled artifacts always bind the state explicitly.
+        answer_explanation_mode = "isolated"
+        legacy_isolated_mode_inferred = True
+    elif protocol_version == 2:
+        raise ContentError(
+            "authoring_protocol_version=2 requires answer_explanation_mode; "
+            "a historical mode-less isolated contract is accepted only by the "
+            "explicit read-only canonical validation path"
+        )
+    else:
+        answer_explanation_mode = None
+    if protocol_version != 2 and (
+            explanation_mode_explicit or has_explanation_contract):
+        raise ContentError(
+            "answer_explanation_mode/contract require authoring_protocol_version=2"
+        )
+    if answer_explanation_mode == "isolated" and not has_explanation_contract:
+        raise ContentError(
+            "isolated answer_explanation_mode requires a complete contract"
+        )
+    if answer_explanation_mode == "ordinary" and has_explanation_contract:
+        raise ContentError(
+            "ordinary answer_explanation_mode forbids an isolated contract"
+        )
+    if pipeline_version == "ingestion-v2" and protocol_version != 2:
+        raise ContentError(
+            "ingestion-v2 Study Guides require authoring_protocol_version=2 "
+            "and detailed per-item answer explanations"
+        )
 
     expected_order = inventory["item_ids"]
     expected_source_types = inventory["source_types"]
@@ -2391,7 +3289,8 @@ def validate_manifest(workspace, chapter, manifest, _enforce_v2_claims=True):
     for index, row in enumerate(knowledge_rows):
         kp_id, example_ids, local_formulas, source_unit_ids = _validate_knowledge_point(
             ws, row, language, "$.knowledge_points[%d]" % index, formula_ids,
-            formula_symbols, chapter, inventory["unit_index"], structured)
+            formula_symbols, chapter, inventory["unit_index"], structured,
+            require_provenance=protocol_version == 2)
         if kp_id in kp_ids:
             raise ContentError("knowledge point id %r is not unique" % kp_id)
         kp_ids.add(kp_id)
@@ -2424,7 +3323,11 @@ def validate_manifest(workspace, chapter, manifest, _enforce_v2_claims=True):
             inventory["item_assets"].get(row.get("item_id"), {}),
             inventory["unit_index"], structured, inventory["item_evidence"], profile,
             inventory["item_asset_requirements"].get(row.get("item_id"), set()),
-            chapter=chapter)
+            chapter=chapter,
+            require_answer_explanation=protocol_version == 2,
+            require_answer_explanation_receipt=(
+                answer_explanation_mode == "isolated"),
+            require_provenance=protocol_version == 2)
         item_id = result["item_id"]
         source_type = result["source_type"]
         linked_kps = result["knowledge_point_ids"]
@@ -2457,6 +3360,13 @@ def validate_manifest(workspace, chapter, manifest, _enforce_v2_claims=True):
             if formula_id not in formula_symbols:
                 continue
             expected_symbols = formula_symbols[formula_id]
+            if not expected_symbols:
+                raise ContentError(
+                    "walkthrough %r formula_uses[%d] uses formula %s but that formula "
+                    "defines no variables; every used formula needs an explicit variable "
+                    "mapping for student-facing substitution"
+                    % (item_id, formula_use_index, formula_id)
+                )
             if mapped_symbols != expected_symbols:
                 raise ContentError(
                     "walkthrough %r formula_uses[%d].variable_mapping must exactly cover formula "
@@ -2505,12 +3415,42 @@ def validate_manifest(workspace, chapter, manifest, _enforce_v2_claims=True):
             raise ContentError("profile=abridged must partition all expected items; unaccounted=%s"
                                % sorted(expected - walkthrough_ids - omission_ids))
 
+    answer_explanation_verification = None
+    if protocol_version == 2:
+        if any("self_check" in row or "self_check_provenance" in row
+               for row in walkthrough_rows):
+            raise ContentError(
+                "authoring_protocol_version=2 forbids deprecated self_check fields"
+            )
+        if answer_explanation_mode == "isolated":
+            answer_explanation_verification = _validate_answer_explanation_gate(
+                ws, chapter, manifest,
+                allow_legacy_isolated=legacy_isolated_mode_inferred,
+            )
+
+    crop_receipt_verification = None
+    if (_enforce_v2_crop_receipts and structured
+            and pipeline_version == "ingestion-v2"):
+        crop_receipt_verification = _validate_v2_live_crop_receipts(
+            ws, chapter, walkthrough_rows, inventory)
+
     claim_verification = None
     if (structured and _enforce_v2_claims
-            and _ingestion_pipeline_version(ws) == "ingestion-v2"):
+            and pipeline_version == "ingestion-v2"):
         claim_verification = _validate_v2_claim_gate(
             ws, chapter, manifest, inventory
         )
+    elif structured and pipeline_version == "ingestion-v1":
+        # Keep the legacy compatibility route explicit in machine output.  An
+        # existing canonical v1 Guide remains readable, but new import,
+        # relocalization, and visual publication are forbidden; it must never
+        # be mistaken for having passed the v2 claim/receipt gate.
+        claim_verification = {
+            "required": False,
+            "status": "not_applicable",
+            "reason": "legacy_ingestion_v1",
+            "verification_scope": None,
+        }
 
     report = {
         "ok": True,
@@ -2523,6 +3463,11 @@ def validate_manifest(workspace, chapter, manifest, _enforce_v2_claims=True):
         "omitted_item_ids": [row["item_id"] for row in omission_rows],
         "knowledge_point_ids": [row["id"] for row in knowledge_rows],
         "structured_workspace": structured,
+        "ingestion_pipeline_version": pipeline_version,
+        "authoring_protocol_version": protocol_version,
+        "answer_explanation_mode": answer_explanation_mode,
+        "answer_explanation_mode_explicit": explanation_mode_explicit,
+        "legacy_isolated_mode_inferred": legacy_isolated_mode_inferred,
         "expected_item_counts": dict(inventory["counts"]),
         "semantic_unit_counts": {
             "expected": len(expected_semantic),
@@ -2535,6 +3480,11 @@ def validate_manifest(workspace, chapter, manifest, _enforce_v2_claims=True):
     }
     if claim_verification is not None:
         report["claim_verification"] = claim_verification
+    if answer_explanation_verification is not None:
+        report["answer_explanation_verification"] = (
+            answer_explanation_verification)
+    if crop_receipt_verification is not None:
+        report["crop_receipt_verification"] = crop_receipt_verification
     return report
 
 
@@ -2556,14 +3506,63 @@ def _study_guide_mutation_lock(ws):
         raise ContentError("cannot mutate Study Guide: %s" % exc) from exc
 
 
-def load_and_validate_manifest(workspace, chapter, path=None):
-    ws = _guard_workspace(workspace)
+def _load_and_validate_manifest_current(ws, chapter, path=None,
+                                        allow_legacy_isolated=False,
+                                        enforce_v2_crop_receipts=False):
     source = os.path.abspath(path) if path else manifest_path(ws, chapter)
     _guard_workspace_child(
         ws, source, "study-guide content manifest", require_file=True)
     manifest = _read_json(source, "study-guide content manifest")
-    report = validate_manifest(ws, chapter, manifest)
+    report = validate_manifest(
+        ws, chapter, manifest,
+        _allow_legacy_isolated=allow_legacy_isolated,
+        _enforce_v2_crop_receipts=enforce_v2_crop_receipts,
+    )
     report["input_path"] = source
+    return manifest, report
+
+
+def load_and_validate_manifest(workspace, chapter, path=None,
+                               allow_legacy_isolated_canonical=False):
+    ws = _guard_workspace(workspace)
+    exam_start.require_full_processing(
+        ws, purpose="Study Guide content validation")
+    if allow_legacy_isolated_canonical and path is not None:
+        raise ContentError(
+            "historical mode-less isolated compatibility may validate only the "
+            "canonical manifest selected by omitting --input"
+        )
+    manifest, report = _load_and_validate_manifest_current(
+        ws, chapter, path,
+        allow_legacy_isolated=allow_legacy_isolated_canonical,
+        enforce_v2_crop_receipts=True,
+    )
+    if report.get("legacy_isolated_mode_inferred"):
+        if not allow_legacy_isolated_canonical:
+            raise ContentError(
+                "historical mode-less isolated Guide is read-only and cannot "
+                "satisfy a current authoring, completion, rendering, or QA gate"
+            )
+        canonical = manifest_path(ws, chapter)
+        source = report["input_path"]
+        if os.path.normcase(os.path.realpath(source)) != os.path.normcase(
+                os.path.realpath(canonical)):
+            raise ContentError(
+                "historical mode-less isolated compatibility may validate only "
+                "notebook/chNN.guide.json"
+            )
+        report["legacy_isolated_compatibility"] = "read_only"
+    if report.get("ingestion_pipeline_version") == "ingestion-v1":
+        canonical = manifest_path(ws, chapter)
+        source = report["input_path"]
+        if os.path.normcase(os.path.realpath(source)) != os.path.normcase(
+                os.path.realpath(canonical)):
+            raise ContentError(
+                "ingestion-v1 Study Guide compatibility is read-only and may "
+                "validate only the existing canonical notebook/chNN.guide.json; "
+                "migrate/re-ingest as ingestion-v2 before authoring a replacement"
+            )
+        report["legacy_compatibility"] = "read_only"
     return manifest, report
 
 
@@ -2575,11 +3574,119 @@ def _inline_text(lines, prefix, value):
         lines.append("%s%s" % (continuation, chunk))
 
 
-def _localized_lines(lines, label_zh, label_en, value, language, bullet="-"):
-    if language in ("zh", "bilingual"):
-        _inline_text(lines, "%s **%s：** " % (bullet, label_zh), value["zh"])
-    if language in ("en", "bilingual"):
-        _inline_text(lines, "%s **%s:** " % (bullet, label_en), value["en"])
+def _inline_english_quote(lines, prefix, value):
+    chunks = value.splitlines() or [value]
+    lines.append("> EN: %s%s" % (prefix, chunks[0]))
+    continuation = "  " + (" " * max(0, len(prefix) - 2))
+    for chunk in chunks[1:]:
+        lines.append("> %s%s" % (continuation, chunk))
+
+
+def _append_bilingual_view(lines, chinese, english):
+    """Append a Chinese view line and its immediately following English mirror."""
+
+    zh_rows = chinese if isinstance(chinese, (list, tuple)) else [chinese]
+    en_rows = english if isinstance(english, (list, tuple)) else [english]
+    lines.extend(zh_rows)
+    for index, row in enumerate(en_rows):
+        lines.append(("> EN: %s" if index == 0 else "> %s") % row)
+
+
+def _provenance_emoji(value, code):
+    if isinstance(value, dict):
+        value = value.get(code)
+    if isinstance(value, (list, tuple)):
+        markers = []
+        for item in value:
+            marker = PROVENANCE_EMOJI.get(item, "")
+            if marker and (not markers or markers[-1] != marker):
+                markers.append(marker)
+        return "".join(markers)
+    return PROVENANCE_EMOJI.get(value, "")
+
+
+def _run_terminal_provenance(values, index):
+    current = values[index]
+    following = values[index + 1] if index + 1 < len(values) else None
+    terminal = {}
+    for code in ("zh", "en"):
+        current_marker = _provenance_emoji(current, code)
+        following_marker = _provenance_emoji(following, code)
+        if current_marker and current_marker != following_marker:
+            terminal[code] = current.get(code) if isinstance(current, dict) else current
+    return terminal
+
+
+_PROVENANCE_UNSET = object()
+
+
+def _clean_notebook_visible(value, code, sidecar=None):
+    try:
+        return clean_visible_provenance(value, code, sidecar)
+    except ProvenanceConflictError as exc:
+        raise ContentError(str(exc)) from exc
+
+
+def _notebook_visible_provenance(value, sidecar=None):
+    """Resolve sidecar/inline compatibility labels before run collapsing."""
+
+    localized = value if isinstance(value, dict) else {"zh": value, "en": value}
+    resolved_by_language = {}
+    for code in ("zh", "en"):
+        if code not in localized:
+            continue
+        unused_cleaned, resolved = _clean_notebook_visible(
+            localized[code], code, sidecar)
+        if resolved:
+            resolved_by_language[code] = resolved
+    return resolved_by_language or sidecar
+
+
+def _with_provenance_marker(value, provenance, code,
+                            source_provenance=_PROVENANCE_UNSET):
+    has_source_provenance = (
+        source_provenance is not _PROVENANCE_UNSET
+        and source_provenance is not None)
+    authoritative = (
+        provenance if not has_source_provenance
+        else source_provenance
+    )
+    cleaned, inferred_or_explicit = _clean_notebook_visible(
+        value, code, authoritative)
+    display = (
+        inferred_or_explicit
+        if not has_source_provenance and provenance is None
+        else provenance
+    )
+    marker = _provenance_emoji(display, code)
+    return "%s%s" % (cleaned, (" " + marker) if marker else "")
+
+
+def _localized_lines(lines, label_zh, label_en, value, language, bullet="-",
+                     provenance=None, source_provenance=_PROVENANCE_UNSET):
+    if language == "bilingual":
+        _inline_text(
+            lines, "%s **%s：** " % (bullet, label_zh),
+            _with_provenance_marker(
+                value["zh"], provenance, "zh", source_provenance),
+        )
+        _inline_english_quote(
+            lines, "**%s:** " % label_en,
+            _with_provenance_marker(
+                value["en"], provenance, "en", source_provenance),
+        )
+    elif language == "zh":
+        _inline_text(
+            lines, "%s **%s：** " % (bullet, label_zh),
+            _with_provenance_marker(
+                value["zh"], provenance, "zh", source_provenance),
+        )
+    elif language == "en":
+        _inline_text(
+            lines, "%s **%s:** " % (bullet, label_en),
+            _with_provenance_marker(
+                value["en"], provenance, "en", source_provenance),
+        )
 
 
 def _heading_title(value, language):
@@ -2601,18 +3708,73 @@ def _answer_provenance_by_language(value, language):
     return {code: value for code in _target_languages(language)}
 
 
-def _format_source(ref):
+def _format_source(ref, language="en"):
     # The notebook lives under ``workspace/notebook`` while source_file is relative to the
     # separately confirmed materials root.  A relative Markdown link would therefore point at
     # the wrong tree.  The HTML renderer receives the confirmed root and emits safe file URIs;
-    # this durable view keeps an honest, copyable page locator instead.
-    pages = ", ".join("p.%d" % page for page in ref["pages"]) or "n/a"
-    result = "%s · %s" % (ref["source_file"], pages)
+    # this durable view keeps an honest, copyable location.  ``pages`` is the
+    # historical schema key for every page-equivalent anchor, not proof that a
+    # PPTX/XLSX/DOCX location is a physical page.
+    suffix = os.path.splitext(ref["source_file"])[1].lower()
+    labels = {
+        ".pdf": ("第 %d 页", "page %d", "无页码", "no page"),
+        ".pptx": ("第 %d 张幻灯片", "slide %d", "无幻灯片锚点", "no slide anchor"),
+        ".ppt": ("第 %d 张幻灯片", "slide %d", "无幻灯片锚点", "no slide anchor"),
+        ".xlsx": ("第 %d 个工作表", "worksheet %d", "无工作表锚点", "no worksheet anchor"),
+        ".xls": ("第 %d 个工作表", "worksheet %d", "无工作表锚点", "no worksheet anchor"),
+        ".docx": ("第 %d 个逻辑段", "logical segment %d", "无逻辑段锚点", "no logical-segment anchor"),
+        ".doc": ("第 %d 个逻辑段", "logical segment %d", "无逻辑段锚点", "no logical-segment anchor"),
+    }
+    zh_pattern, en_pattern, zh_empty, en_empty = labels.get(
+        suffix, ("位置 %d", "location %d", "无位置锚点", "no location anchor"))
+    if language == "zh":
+        locations = "、".join(zh_pattern % location for location in ref["pages"]) or zh_empty
+    else:
+        locations = ", ".join(en_pattern % location for location in ref["pages"]) or en_empty
+    result = "%s · %s" % (ref["source_file"], locations)
     if ref.get("source_unit_id"):
-        result += " · unit %s" % ref["source_unit_id"]
+        result += (" · 内容单元 %s" if language == "zh" else " · unit %s") % ref[
+            "source_unit_id"
+        ]
     if ref.get("role"):
-        result += " · %s" % ref["role"]
+        result += (" · 角色 %s" if language == "zh" else " · role %s") % ref["role"]
     return result
+
+
+def _view_heading(lines, language, level, zh, en):
+    marker = "#" * level
+    if language == "bilingual":
+        _append_bilingual_view(lines, "%s %s" % (marker, zh), "**%s**" % en)
+    else:
+        lines.append("%s %s" % (marker, zh if language == "zh" else en))
+
+
+def _view_scalar(lines, language, label_zh, label_en, value, bullet="-",
+                 code=False, provenance=None,
+                 source_provenance=_PROVENANCE_UNSET):
+    rendered = "`%s`" % value if code else str(value)
+    if language == "bilingual":
+        _append_bilingual_view(
+            lines,
+            "%s **%s：** %s" % (
+                bullet, label_zh,
+                _with_provenance_marker(
+                    rendered, provenance, "zh", source_provenance),
+            ),
+            "**%s:** %s" % (
+                label_en,
+                _with_provenance_marker(
+                    rendered, provenance, "en", source_provenance),
+            ),
+        )
+    else:
+        punctuation = "：" if language == "zh" else ":"
+        label = label_zh if language == "zh" else label_en
+        lines.append("%s **%s%s** %s" % (
+            bullet, label, punctuation,
+            _with_provenance_marker(
+                rendered, provenance, language, source_provenance),
+        ))
 
 
 def render_notebook_block(manifest):
@@ -2620,110 +3782,261 @@ def render_notebook_block(manifest):
     language = manifest["language"]
     colon = "：" if language == "zh" else ":"
     lines = []
-    title = "知识点 / Knowledge points" if language == "bilingual" else (
-        "知识点" if language == "zh" else "Knowledge points")
-    lines.extend(["### %s" % title, ""])
+    _view_heading(lines, language, 3, "知识点", "Knowledge points")
+    lines.append("")
     for kp in manifest["knowledge_points"]:
-        lines.append("#### `%s` · %s" % (kp["id"], _heading_title(kp["title"], language)))
+        if language == "bilingual":
+            _append_bilingual_view(
+                lines,
+                "#### `%s` · %s" % (kp["id"], kp["title"]["zh"]),
+                "**`%s` · %s**" % (kp["id"], kp["title"]["en"]),
+            )
+        else:
+            lines.append("#### `%s` · %s" % (
+                kp["id"], _heading_title(kp["title"], language)))
         lines.append("")
-        _localized_lines(lines, "解释", "Explanation", kp["explanation"], language)
-        explanation_provenance = kp.get("explanation_provenance") or {
-            code: "material" for code in kp["explanation"]
-        }
-        for code in ("zh", "en"):
-            if code not in _target_languages(language):
-                continue
-            label = EXPLANATION_PROVENANCE_LABELS[explanation_provenance[code]][
-                0 if code == "zh" else 1]
-            lines.append("- **%s (%s)%s** %s" % (
-                _view_label(language, "解释来源性质", "Explanation provenance"),
-                "中文" if code == "zh" else "English", colon, label))
-        lines.append("- **%s%s** %s" % (
-            _view_label(language, "例题", "Examples"),
-            "：" if language == "zh" else ":",
-            ", ".join(kp["example_ids"]) or "—"))
+        display_explanation = kp.get("teaching_explanation", kp["explanation"])
+        explanation_provenance = kp.get("teaching_explanation_provenance") or (
+            kp.get("explanation_provenance") or {
+                code: "material" for code in kp["explanation"]
+            }
+        )
+        _localized_lines(
+            lines, "解释", "Explanation", display_explanation, language,
+            provenance=explanation_provenance,
+        )
+        if kp["example_ids"]:
+            _view_scalar(
+                lines, language, "例题", "Examples", ", ".join(kp["example_ids"])
+            )
+        else:
+            note = kp.get("example_note") or {
+                "zh": "材料未提供对应例题。",
+                "en": "The materials do not provide a corresponding example.",
+            }
+            _localized_lines(lines, "例题", "Examples", note, language)
         if kp.get("source_unit_ids"):
-            lines.append("- **%s%s** %s" % (
-                _view_label(language, "覆盖的内容单元", "Covered content units"),
-                "：" if language == "zh" else ":",
-                ", ".join(kp["source_unit_ids"])))
+            _view_scalar(
+                lines, language, "覆盖的内容单元", "Covered content units",
+                ", ".join(kp["source_unit_ids"]),
+            )
         for formula in kp["formulas"]:
-            lines.extend(["- **%s `%s`%s**" % (
-                _view_label(language, "公式", "Formula"), formula["id"],
-                "：" if language == "zh" else ":"), "", "$$%s$$" % formula["latex"], ""])
-            _localized_lines(lines, "公式含义", "Formula meaning", formula["explanation"], language)
-            _localized_lines(lines, "适用条件", "Applicability", formula["applicability"], language)
-            for variable in formula["variables"]:
+            if language == "bilingual":
+                _append_bilingual_view(
+                    lines, "- **公式 `%s`：**" % formula["id"],
+                    "**Formula `%s`:**" % formula["id"],
+                )
+            else:
+                lines.append("- **%s `%s`%s**" % (
+                    _view_label(language, "公式", "Formula"), formula["id"],
+                    "：" if language == "zh" else ":"))
+            lines.extend(["", "$$%s$$" % formula["latex"], ""])
+            formula_provenance = [
+                _notebook_visible_provenance(
+                    formula["explanation"],
+                    formula.get("explanation_provenance")),
+                _notebook_visible_provenance(
+                    formula["applicability"],
+                    formula.get("applicability_provenance")),
+            ]
+            formula_provenance.extend(
+                _notebook_visible_provenance(
+                    variable["meaning"], variable.get("meaning_provenance"))
+                for variable in formula["variables"])
+            _localized_lines(
+                lines, "公式含义", "Formula meaning", formula["explanation"],
+                language,
+                provenance=_run_terminal_provenance(formula_provenance, 0),
+                source_provenance=formula.get("explanation_provenance"),
+            )
+            _localized_lines(
+                lines, "适用条件", "Applicability", formula["applicability"],
+                language,
+                provenance=_run_terminal_provenance(formula_provenance, 1),
+                source_provenance=formula.get("applicability_provenance"),
+            )
+            for variable_index, variable in enumerate(formula["variables"]):
                 _localized_lines(lines, "变量 %s" % variable["symbol"],
                                  "Variable %s" % variable["symbol"],
-                                 variable["meaning"], language)
+                                 variable["meaning"], language,
+                                 provenance=_run_terminal_provenance(
+                                     formula_provenance, variable_index + 2),
+                                 source_provenance=variable.get(
+                                     "meaning_provenance"))
         for source in kp["source_refs"]:
-            lines.append("- **%s%s** %s" % (
-                _view_label(language, "来源", "Source"),
-                "：" if language == "zh" else ":", _format_source(source)))
+            if language == "bilingual":
+                _append_bilingual_view(
+                    lines, "- **来源：** %s" % _format_source(source, "zh"),
+                    "**Source:** %s" % _format_source(source, "en"),
+                )
+            else:
+                _view_scalar(
+                    lines, language, "来源", "Source", _format_source(source, language)
+                )
         lines.append("")
 
-    walkthrough_title = "例题精讲 / Worked examples" if language == "bilingual" else (
-        "例题精讲" if language == "zh" else "Worked examples")
-    lines.extend(["### %s" % walkthrough_title, ""])
+    _view_heading(lines, language, 3, "例题精讲", "Worked examples")
+    lines.append("")
     for walk in manifest["walkthroughs"]:
-        lines.append("#### `%s` · %s" % (walk["item_id"], _heading_title(walk["title"], language)))
+        if language == "bilingual":
+            _append_bilingual_view(
+                lines,
+                "#### `%s` · %s" % (walk["item_id"], walk["title"]["zh"]),
+                "**`%s` · %s**" % (walk["item_id"], walk["title"]["en"]),
+            )
+        else:
+            lines.append("#### `%s` · %s" % (
+                walk["item_id"], _heading_title(walk["title"], language)))
         lines.append("")
-        lines.append("- **%s%s** %s" % (
-            _view_label(language, "知识点", "Knowledge points"), colon,
-            ", ".join(walk["knowledge_point_ids"])))
-        lines.append("- **%s%s** `%s`" % (
-            _view_label(language, "例题来源类型", "Source type"), colon,
-            walk["source_type"]))
-        provenance = _answer_provenance_by_language(walk["answer_provenance"], language)
-        for code in ("zh", "en"):
-            if code not in _target_languages(language):
-                continue
-            lines.append("- **%s (%s)%s** `%s`" % (
-                _view_label(language, "答案来源性质", "Answer provenance"),
-                "中文" if code == "zh" else "English", colon,
-                provenance[code]))
+        _view_scalar(
+            lines, language, "知识点", "Knowledge points",
+            ", ".join(walk["knowledge_point_ids"]),
+        )
+        _view_scalar(
+            lines, language, "例题来源类型", "Source type", walk["source_type"],
+            code=True,
+        )
+        display_answer = walk.get("teaching_answer", walk["answer"])
+        display_answer_provenance = walk.get(
+            "teaching_answer_provenance", walk["answer_provenance"])
+        provenance = _answer_provenance_by_language(
+            display_answer_provenance, language)
         solution_kind = walk.get("solution_kind") or (
             "formula" if walk.get("formula_uses") else "concept")
-        lines.append("- **%s%s** `%s`" % (
-            _view_label(language, "解题类型", "Solution kind"), colon, solution_kind))
-        lines.append("- **%s%s** `%s`" % (
-            _view_label(language, "题面资产模式", "Prompt asset mode"), colon,
-            walk["prompt_asset_mode"]))
+        _view_scalar(
+            lines, language, "解题类型", "Solution kind", solution_kind, code=True
+        )
+        _view_scalar(
+            lines, language, "题面资产模式", "Prompt asset mode",
+            walk["prompt_asset_mode"], code=True,
+        )
         for asset in walk["prompt_asset_paths"]:
-            lines.append("- **%s%s** `%s`" % (
-                _view_label(language, "题面图", "Prompt asset"), colon, asset))
+            _view_scalar(
+                lines, language, "题面图", "Prompt asset", asset, code=True
+            )
         for asset in walk["answer_asset_paths"]:
-            lines.append("- **%s%s** `%s`" % (
-                _view_label(language, "答案图", "Answer asset"), colon, asset))
-        if walk.get("prompt_text"):
+            _view_scalar(
+                lines, language, "答案图", "Answer asset", asset, code=True
+            )
+        full_prompt_image = walk["prompt_asset_mode"] == "full_prompt"
+        if (not full_prompt_image and walk.get("prompt_text")
+                and language != "bilingual"):
             _inline_text(lines, "- **%s%s** " % (
-                _view_label(language, "原题", "Original prompt"), colon), walk["prompt_text"])
+                _view_label(language, "原题", "Original prompt"), colon),
+                _with_provenance_marker(
+                    walk["prompt_text"], "material", language))
         source_languages = {
             "zh": {"zh"}, "en": {"en"}, "mixed": {"zh", "en"}, "unknown": set(),
         }[walk["original_language"]]
         needed_translations = _target_languages(language) - source_languages
-        for key in ("zh", "en"):
-            if key not in needed_translations:
-                continue
-            if key in walk["translation"]:
-                name = ("中文" if language != "en" else "Chinese") if key == "zh" else (
-                    "英文" if language == "zh" else "English")
-                _inline_text(lines, "- **%s (%s)%s** " % (
-                    _view_label(language, "题面翻译", "Prompt translation"), name, colon),
-                    walk["translation"][key])
-        _localized_lines(lines, "题目问什么", "What is asked", walk["what_asked"], language)
-        for kp_id in walk["knowledge_point_ids"]:
+        if language == "bilingual" and full_prompt_image:
+            # The source image already carries the complete original prompt.
+            # Persist only the target-language translation that is absent from
+            # that image; repeating OCR/original text (or a placeholder for it)
+            # defeats the full-prompt de-duplication contract.
+            for key in ("zh", "en"):
+                if key not in needed_translations or key not in walk["translation"]:
+                    continue
+                translated = _with_provenance_marker(
+                    walk["translation"][key],
+                    (walk.get("translation_provenance") or {}).get(key),
+                    key,
+                )
+                if key == "zh":
+                    _inline_text(lines, "- **题面翻译：** ", translated)
+                else:
+                    _inline_english_quote(
+                        lines, "**Prompt translation:** ", translated)
+        elif language == "bilingual":
+            original_language = walk["original_language"]
+            if original_language == "en" and "zh" in walk["translation"]:
+                _append_bilingual_view(
+                    lines,
+                    "- **题面翻译：** %s" % _with_provenance_marker(
+                        walk["translation"]["zh"],
+                        (walk.get("translation_provenance") or {}).get("zh"),
+                        "zh",
+                    ),
+                    "**Original prompt:** %s" % (
+                        _with_provenance_marker(
+                            walk.get("prompt_text")
+                            or "The original material prompt appears in the prompt asset above.",
+                            "material", "en",
+                        )
+                    ),
+                )
+            elif original_language == "zh" and "en" in walk["translation"]:
+                _append_bilingual_view(
+                    lines,
+                    "- **原题：** %s" % _with_provenance_marker(
+                        walk.get("prompt_text") or "资料原题见上方题面图。",
+                        "material", "zh",
+                    ),
+                    "**Prompt translation:** %s" % _with_provenance_marker(
+                        walk["translation"]["en"],
+                        (walk.get("translation_provenance") or {}).get("en"),
+                        "en",
+                    ),
+                )
+            elif walk.get("prompt_text"):
+                _append_bilingual_view(
+                    lines, "- **原题（资料原文）：** %s" % (
+                        _with_provenance_marker(
+                            walk["prompt_text"], "material", "zh")
+                    ),
+                    "**Original prompt (material text):** %s" % (
+                        _with_provenance_marker(
+                            walk["prompt_text"], "material", "en")
+                    ),
+                )
+        else:
+            for key in ("zh", "en"):
+                if key not in needed_translations:
+                    continue
+                if key in walk["translation"]:
+                    name = ("中文" if language != "en" else "Chinese") if key == "zh" else (
+                        "英文" if language == "zh" else "English")
+                    _inline_text(lines, "- **%s (%s)%s** " % (
+                        _view_label(language, "题面翻译", "Prompt translation"), name, colon),
+                        _with_provenance_marker(
+                            walk["translation"][key],
+                            (walk.get("translation_provenance") or {}).get(key),
+                            language,
+                        ))
+        question_provenance = [
+            _notebook_visible_provenance(
+                walk["what_asked"], walk.get("what_asked_provenance"))]
+        question_provenance.extend(
+            _notebook_visible_provenance(
+                (walk.get("knowledge_point_uses") or {}).get(kp_id),
+                (walk.get("knowledge_point_uses_provenance") or {}).get(kp_id))
+            for kp_id in walk["knowledge_point_ids"])
+        _localized_lines(
+            lines, "题目问什么", "What is asked", walk["what_asked"], language,
+            provenance=_run_terminal_provenance(question_provenance, 0),
+            source_provenance=walk.get("what_asked_provenance"),
+        )
+        for kp_index, kp_id in enumerate(walk["knowledge_point_ids"]):
             usage = (walk.get("knowledge_point_uses") or {}).get(kp_id)
             if usage:
                 _localized_lines(lines, "知识点 %s 如何用" % kp_id,
                                  "How knowledge point %s is used" % kp_id,
-                                 usage, language)
+                                 usage, language,
+                                 provenance=_run_terminal_provenance(
+                                     question_provenance, kp_index + 1),
+                                 source_provenance=(
+                                     walk.get("knowledge_point_uses_provenance")
+                                     or {}).get(kp_id))
         for field, zh_label, en_label in (
             ("known_quantities", "已知量", "Known quantity"),
             ("unknown_quantities", "未知量", "Unknown quantity"),
         ):
-            for quantity in walk[field]:
+            quantity_provenance = [
+                _notebook_visible_provenance(
+                    quantity["label"], quantity.get("provenance"))
+                for quantity in walk[field]
+            ]
+            for quantity_index, quantity in enumerate(walk[field]):
                 suffix = ""
                 for key in ("symbol", "value", "unit"):
                     if quantity.get(key):
@@ -2731,52 +4044,147 @@ def render_notebook_block(manifest):
                 localized = dict(quantity["label"])
                 if suffix:
                     localized = {key: text + suffix for key, text in localized.items()}
-                _localized_lines(lines, zh_label, en_label, localized, language)
+                _localized_lines(
+                    lines, zh_label, en_label, localized, language,
+                    provenance=_run_terminal_provenance(
+                        quantity_provenance, quantity_index),
+                    source_provenance=quantity.get("provenance"),
+                )
         for formula_use in walk["formula_uses"]:
-            lines.append("- **%s%s** `%s`" % (
-                _view_label(language, "使用公式", "Formula used"), colon,
-                formula_use["formula_id"]))
-            _localized_lines(lines, "为什么适用", "Why it applies",
-                             formula_use["why_applicable"], language)
-            for mapping in formula_use["variable_mapping"]:
+            _view_scalar(
+                lines, language, "使用公式", "Formula used",
+                formula_use["formula_id"], code=True,
+            )
+            use_provenance = [
+                _notebook_visible_provenance(
+                    formula_use["why_applicable"],
+                    formula_use.get("why_applicable_provenance"))]
+            use_provenance.extend(
+                _notebook_visible_provenance(
+                    mapping["maps_to"], mapping.get("maps_to_provenance"))
+                for mapping in formula_use["variable_mapping"])
+            use_provenance.append(formula_use.get("substitution_provenance"))
+            substitution_code = language if language in ("zh", "en") else "zh"
+            substitution, unused_substitution_provenance = _clean_notebook_visible(
+                formula_use["substitution"], substitution_code,
+                formula_use.get("substitution_provenance"),
+            )
+            if (not use_provenance[-1]
+                    and unused_substitution_provenance):
+                use_provenance[-1] = unused_substitution_provenance
+            _localized_lines(
+                lines, "为什么适用", "Why it applies",
+                formula_use["why_applicable"], language,
+                provenance=_run_terminal_provenance(use_provenance, 0),
+                source_provenance=formula_use.get(
+                    "why_applicable_provenance"),
+            )
+            for mapping_index, mapping in enumerate(formula_use["variable_mapping"]):
                 _localized_lines(lines, "变量映射 %s" % mapping["symbol"],
                                  "Variable mapping %s" % mapping["symbol"],
-                                 mapping["maps_to"], language)
-            lines.append("- **%s%s** $%s$" % (
-                _view_label(language, "代入", "Substitution"), colon,
-                formula_use["substitution"]))
+                                 mapping["maps_to"], language,
+                                 provenance=_run_terminal_provenance(
+                                     use_provenance, mapping_index + 1),
+                                 source_provenance=mapping.get(
+                                     "maps_to_provenance"))
+            substitution_display_provenance = _run_terminal_provenance(
+                use_provenance, len(use_provenance) - 1)
+            if (not substitution_display_provenance
+                    and unused_substitution_provenance):
+                substitution_display_provenance = unused_substitution_provenance
+            _view_scalar(
+                lines, language, "代入", "Substitution",
+                "$%s$" % substitution,
+                provenance=substitution_display_provenance,
+                source_provenance=formula_use.get(
+                    "substitution_provenance"),
+            )
         if not walk["formula_uses"] and walk.get("no_formula_reason"):
-            _localized_lines(lines, "为什么不用公式", "Why no formula is needed",
-                             walk["no_formula_reason"], language)
-        for index, step in enumerate(walk["steps"], 1):
-            _localized_lines(lines, "步骤 %d" % index, "Step %d" % index, step, language)
-        _localized_lines(lines, "答案", "Answer", walk["answer"], language)
-        _localized_lines(lines, "自检", "Self-check", walk["self_check"], language)
+            _localized_lines(
+                lines, "为什么不用公式", "Why no formula is needed",
+                walk["no_formula_reason"], language,
+                provenance=walk.get("no_formula_reason_provenance"),
+            )
+        raw_step_provenance = walk.get("steps_provenance") or [
+            None for unused_step in walk["steps"]]
+        step_provenance = [
+            _notebook_visible_provenance(step, raw_step_provenance[index])
+            for index, step in enumerate(walk["steps"])
+        ]
+        for index, step in enumerate(walk["steps"]):
+            _localized_lines(
+                lines, "步骤 %d" % (index + 1), "Step %d" % (index + 1),
+                step, language,
+                provenance=_run_terminal_provenance(step_provenance, index),
+                source_provenance=step_provenance[index],
+            )
+        _localized_lines(
+            lines, "答案", "Answer", display_answer, language,
+            provenance=provenance,
+        )
+        if walk.get("answer_explanation"):
+            _localized_lines(
+                lines, "为什么这个答案成立", "Why this answer works",
+                walk["answer_explanation"], language,
+                provenance=walk.get("answer_explanation_provenance"),
+            )
         for source in walk["source_trace"]:
-            lines.append("- **%s%s** %s" % (
-                _view_label(language, "来源追踪", "Source trace"), colon,
-                _format_source(source)))
+            if language == "bilingual":
+                _append_bilingual_view(
+                    lines,
+                    "- **来源追踪：** %s" % _format_source(source, "zh"),
+                    "**Source trace:** %s" % _format_source(source, "en"),
+                )
+            else:
+                _view_scalar(
+                    lines, language, "来源追踪", "Source trace",
+                    _format_source(source, language),
+                )
         lines.append("")
 
     semantic_exclusions = manifest.get("semantic_exclusions") or []
     if semantic_exclusions:
-        lines.extend(["### %s" % _view_label(
-            language, "非教学语义单元排除", "Excluded semantic units"), ""])
+        _view_heading(
+            lines, language, 3, "非教学语义单元排除", "Excluded semantic units"
+        )
+        lines.append("")
         for exclusion in semantic_exclusions:
-            lines.append("- **`%s`**" % exclusion["source_unit_id"])
+            if language == "bilingual":
+                _append_bilingual_view(
+                    lines,
+                    "- **内容单元 `%s`**" % exclusion["source_unit_id"],
+                    "**Source unit `%s`**" % exclusion["source_unit_id"],
+                )
+            else:
+                lines.append("- **`%s`**" % exclusion["source_unit_id"])
             _localized_lines(lines, "排除原因", "Reason excluded",
                              exclusion["reason"], language)
 
     if manifest["profile"] == "abridged":
-        lines.extend(["### %s" % _view_label(language, "省略清单", "Omission ledger"), ""])
+        _view_heading(lines, language, 3, "省略清单", "Omission ledger")
+        lines.append("")
         for omission in manifest["omissions"]:
-            lines.append("- **`%s` · %s**" % (
-                omission["item_id"], ", ".join(omission["knowledge_point_ids"])))
+            identifier = "`%s` · %s" % (
+                omission["item_id"], ", ".join(omission["knowledge_point_ids"])
+            )
+            if language == "bilingual":
+                _append_bilingual_view(
+                    lines, "- **%s**" % identifier, "**%s**" % identifier
+                )
+            else:
+                lines.append("- **%s**" % identifier)
             _localized_lines(lines, "省略原因", "Reason omitted", omission["reason"], language)
             for source in omission["source_refs"]:
-                lines.append("- **%s%s** %s" % (
-                    _view_label(language, "来源", "Source"), colon,
-                    _format_source(source)))
+                if language == "bilingual":
+                    _append_bilingual_view(
+                        lines, "- **来源：** %s" % _format_source(source, "zh"),
+                        "**Source:** %s" % _format_source(source, "en"),
+                    )
+                else:
+                    _view_scalar(
+                        lines, language, "来源", "Source",
+                        _format_source(source, language),
+                    )
     result = "\n".join(lines).rstrip() + "\n"
     if len(result) > MAX_NOTEBOOK_BLOCK_CHARS:
         raise ContentError("generated notebook marker block exceeds %d characters"
@@ -2793,7 +4201,7 @@ def _markers(chapter):
     )
 
 
-def _merge_notebook(existing, chapter, rendered):
+def _merge_notebook(existing, chapter, rendered, language):
     begin, end, header = _markers(chapter)
     lines = (existing or "").splitlines()
     begin_at = [index for index, line in enumerate(lines) if line == begin]
@@ -2801,10 +4209,12 @@ def _merge_notebook(existing, chapter, rendered):
     reserved_headers = [index for index, line in enumerate(lines)
                         if re.match(r"^##\s+\[#study-guide-content-ch%02d\](?:\s|$)" % chapter,
                                     line)]
-    block = [begin] + rendered.rstrip("\n").splitlines() + [end]
     if not begin_at and not end_at:
         if reserved_headers or any(MARKER_PREFIX in line for line in lines):
             raise ContentError("notebook contains a reserved or malformed study-guide marker")
+        if not notebook_has_provenance_legend("\n".join(lines)):
+            rendered = "\n".join(notebook_legend_lines(language)) + "\n\n" + rendered
+        block = [begin] + rendered.rstrip("\n").splitlines() + [end]
         section = [header, ""] + block
         if lines and any(line.strip() for line in lines):
             while lines and not lines[-1].strip():
@@ -2822,6 +4232,10 @@ def _merge_notebook(existing, chapter, rendered):
         previous_nonblank -= 1
     if previous_nonblank < 0 or lines[previous_nonblank] != header:
         raise ContentError("notebook marker block is detached from its reserved entry heading")
+    outside = lines[:begin_at[0]] + lines[end_at[0] + 1:]
+    if not notebook_has_provenance_legend("\n".join(outside)):
+        rendered = "\n".join(notebook_legend_lines(language)) + "\n\n" + rendered
+    block = [begin] + rendered.rstrip("\n").splitlines() + [end]
     lines[begin_at[0]:end_at[0] + 1] = block
     return "\n".join(lines).rstrip() + "\n"
 
@@ -3013,7 +4427,8 @@ def _publish_manifest(ws, chapter, manifest, report):
     md_path, json_path = _guard_notebook_targets(ws, chapter)
     existing = _read_optional_text(md_path)
     rendered = render_notebook_block(manifest)
-    updated_notebook = _merge_notebook(existing, chapter, rendered)
+    updated_notebook = _merge_notebook(
+        existing, chapter, rendered, manifest["language"])
     canonical_json = json.dumps(
         manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     expected_facts = (
@@ -3135,116 +4550,66 @@ def _publish_manifest(ws, chapter, manifest, report):
 def import_manifest(workspace, chapter, input_path):
     """Validate and transactionally publish canonical notebook/JSON content."""
     ws = _guard_workspace(workspace)
+    exam_start.require_full_processing(
+        ws, purpose="Study Guide content import")
     with _study_guide_mutation_lock(ws):
-        manifest, report = load_and_validate_manifest(ws, chapter, input_path)
+        exam_start.require_full_processing(
+            ws, purpose="Study Guide content import publication")
+        manifest, report = _load_and_validate_manifest_current(
+            ws, chapter, input_path, enforce_v2_crop_receipts=True)
+        pipeline_version = report.get("ingestion_pipeline_version")
+        if pipeline_version == "ingestion-v1":
+            raise ContentError(
+                "ingestion-v1 Study Guide compatibility is read-only; new imports "
+                "must migrate/re-ingest as ingestion-v2 so target-item crops and "
+                "mode-bound detailed per-item answer explanations are mandatory"
+            )
+        if pipeline_version != "ingestion-v2":
+            raise ContentError(
+                "non-structured Study Guide compatibility is read-only; new imports "
+                "require an explicit full ingestion-v2 workspace so source revisions, "
+                "target-item crops, claims, and answer-explanation receipts can be "
+                "verified"
+            )
         report["notebook_anchor_count"] = _validate_walkthrough_notebook_anchors(
             ws, chapter, manifest["walkthroughs"], require_all=True)
         return _publish_manifest(ws, chapter, manifest, report)
 
 
 def relocalize_manifest(workspace, chapter, language, output_path=None):
-    """Project already-authored locale blocks into a selected language.
-
-    This performs no translation.  In ingestion-v2 a language change alters the
-    canonical guide hash and may add new material-claim slots, so the command
-    writes a staging draft when ``output_path`` is supplied.  The caller then
-    refreshes claims/receipt and imports that exact draft.  v1 keeps the legacy
-    one-command publish behavior.
-    """
+    """Reject stale-language mutation; rebuild through the v2 authoring chain."""
 
     ws = _guard_workspace(workspace)
+    exam_start.require_full_processing(
+        ws, purpose="Study Guide content relocalization")
     if language not in LANGUAGES:
         raise ContentError("language must be zh/en/bilingual")
     with _study_guide_mutation_lock(ws):
+        exam_start.require_full_processing(
+            ws, purpose="Study Guide content relocalization publication")
         path = manifest_path(ws, chapter)
         original = _read_json(path, "study-guide content manifest")
         if not isinstance(original, dict) or original.get("language") not in LANGUAGES:
             raise ContentError("existing study-guide manifest has no valid canonical language")
-        manifest = copy.deepcopy(original)
-        walks = manifest.get("walkthroughs")
-        if not isinstance(walks, list):
-            raise ContentError("existing study-guide manifest walkthroughs must be an array")
-        for index, walk in enumerate(walks):
-            if not isinstance(walk, dict):
-                raise ContentError("walkthroughs[%d] must be an object" % index)
-            original_language = walk.get("original_language")
-            if original_language not in ORIGINAL_LANGUAGES:
-                raise ContentError("walkthroughs[%d].original_language is invalid" % index)
-            translation = walk.get("translation")
-            if not isinstance(translation, dict):
-                raise ContentError("walkthroughs[%d].translation must be an object" % index)
-            source_languages = {
-                "zh": {"zh"}, "en": {"en"}, "mixed": {"zh", "en"}, "unknown": set(),
-            }[original_language]
-            needed = _target_languages(language) - source_languages
-            missing = needed - set(translation)
-            if missing:
-                raise ContentError(
-                    "cannot relocalize walkthrough %r to %s; authored prompt translation is missing: %s"
-                    % (walk.get("item_id"), language, sorted(missing)))
-            # Preserve authored non-source locale blocks so a later language switch is reversible.
-            walk["translation"] = dict(translation)
-        manifest["language"] = language
         pipeline_version = (
             _ingestion_pipeline_version(ws)
             if os.path.lexists(os.path.join(ws, ".ingest")) else "ingestion-v1"
         )
         if pipeline_version == "ingestion-v2":
-            if output_path is None:
-                raise ContentError(
-                    "ingestion-v2 relocalize requires --output staging JSON; refresh its claims "
-                    "and chNN receipt, then run study_guide_content import"
-                )
-            if os.path.isabs(output_path):
-                raise ContentError(
-                    "ingestion-v2 relocalize --output must be a workspace-relative notebook draft"
-                )
-            relative_output = _safe_relative_path(
-                output_path, "relocalized staging manifest"
+            raise ContentError(
+                "ingestion-v2 answer explanations, crops, notebook blocks, claims, and "
+                "receipts are language-bound; rerun study_guide_author.py prepare, "
+                "complete the new-language annotations, and—only when the selected "
+                "mode is isolated—run study_guide_explain.py for every item; then "
+                "persist/compile/verify/import instead of "
+                "relocalizing an old manifest"
             )
-            staging_pattern = r"notebook/ch%02d(?:\.[A-Za-z0-9_-]+)*\.draft\.json" % chapter
-            if not re.fullmatch(staging_pattern, relative_output):
-                raise ContentError(
-                    "ingestion-v2 relocalize --output must match "
-                    "notebook/ch%02d.*.draft.json" % chapter
-                )
-            destination = os.path.join(ws, *relative_output.split("/"))
-            _guard_workspace_child(
-                ws, destination, "relocalized staging manifest", allow_missing=True
-            )
-            if destination == os.path.abspath(path):
-                raise ContentError("relocalized staging output must not overwrite the canonical manifest")
-            report = validate_manifest(
-                ws, chapter, manifest, _enforce_v2_claims=False
-            )
-            parent = os.path.dirname(destination)
-            os.makedirs(parent, exist_ok=True)
-            _guard_workspace_child(ws, parent, "relocalized staging directory")
-            _atomic_write_text(
-                destination,
-                json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
-            )
-            report.update({
-                "relocalized_from": original["language"],
-                "relocalized_to": language,
-                "prepared": True,
-                "imported": False,
-                "artifact_ready": False,
-                "claim_verification": {
-                    "required": True,
-                    "status": "pending",
-                    "verification_scope": "location_only",
-                },
-                "staging_path": destination,
-                "invalidated_artifacts": [],
-            })
-            return report
-        if output_path is not None:
-            raise ContentError("--output is only needed for ingestion-v2 relocalization")
-        report = validate_manifest(ws, chapter, manifest)
-        report["relocalized_from"] = original["language"]
-        report["relocalized_to"] = language
-        return _publish_manifest(ws, chapter, manifest, report)
+        raise ContentError(
+            "ingestion-v1 Study Guide compatibility is read-only; the existing "
+            "canonical manifest may be inspected but not relocalized or republished. "
+            "Migrate/re-ingest as ingestion-v2 and rerun the complete authoring, "
+            "crop, selected explanation-mode, claim, and import workflow"
+        )
 
 
 def _parser():
@@ -3267,7 +4632,7 @@ def _parser():
     relocalize.add_argument("--language", required=True, choices=sorted(LANGUAGES))
     relocalize.add_argument(
         "--output",
-        help="ingestion-v2 staging JSON inside the workspace; verify claims, then import it",
+        help="deprecated; v2 language changes rerun the complete authoring workflow",
     )
     relocalize.add_argument("--json", action="store_true")
     return parser
@@ -3276,18 +4641,32 @@ def _parser():
 def run(argv=None):
     args = _parser().parse_args(argv)
     try:
+        workspace = _guard_workspace(args.workspace)
+        exam_start.require_full_processing(
+            workspace, purpose="Study Guide content command")
         if args.command == "validate":
             _manifest, report = load_and_validate_manifest(
-                args.workspace, args.chapter, args.input)
+                workspace, args.chapter, args.input,
+                allow_legacy_isolated_canonical=args.input is None,
+            )
             report["command"] = "validate"
         elif args.command == "import":
-            report = import_manifest(args.workspace, args.chapter, args.input)
+            report = import_manifest(workspace, args.chapter, args.input)
             report["command"] = "import"
         else:
             report = relocalize_manifest(
-                args.workspace, args.chapter, args.language, args.output
+                workspace, args.chapter, args.language, args.output
             )
             report["command"] = "relocalize"
+    except exam_start.FullProcessingRequired as exc:
+        if getattr(args, "json", False):
+            print(json.dumps(
+                {"ok": False, "error": str(exc), "exit_code": 2},
+                ensure_ascii=False,
+            ))
+        else:
+            sys.stderr.write("study_guide_content: %s\n" % exc)
+        return 2
     except ContentError as exc:
         if getattr(args, "json", False):
             print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))

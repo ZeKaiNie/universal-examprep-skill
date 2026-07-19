@@ -508,11 +508,12 @@ def _validate_payload(name, exit_code, payload):
         raise CommandCoreError("%s must return a JSON object" % name)
     if name in ("exam_start.status", "exam_start.confirm"):
         _require_bool(payload, "process_success", name)
+        _require_bool(payload, "ready_to_start", name)
         _require_bool(payload, "ready_to_ingest", name)
         if exit_code != 0 and payload["process_success"]:
             raise CommandCoreError("%s nonzero exit contradicts process_success=true" % name)
-        if name == "exam_start.confirm" and exit_code == 0 and not payload["ready_to_ingest"]:
-            raise CommandCoreError("successful confirm did not open the ingestion gate")
+        if name == "exam_start.confirm" and exit_code == 0 and not payload["ready_to_start"]:
+            raise CommandCoreError("successful confirm did not open the selected start gate")
     elif name == "ingest_course":
         _require_bool(payload, "process_success", name)
         readiness = payload.get("readiness")
@@ -623,7 +624,8 @@ def exam_start_status(workspace, materials, runner=None):
 
 
 def exam_start_confirm(workspace, materials, course, mode, time_budget, language,
-                       artifact_mode=None, urgent=False, runner=None):
+                       artifact_mode=None, urgent=False, processing_mode=None,
+                       runner=None):
     workspace = _absolute(workspace, "workspace")
     materials = _absolute(materials, "materials")
     values = {"course": course, "mode": mode, "time_budget": time_budget,
@@ -640,6 +642,10 @@ def exam_start_confirm(workspace, materials, course, mode, time_budget, language
         if artifact_mode not in ("chat", "visual"):
             raise CommandCoreError("artifact_mode must be chat or visual")
         argv.extend(("--artifact-mode", artifact_mode))
+    if processing_mode is not None:
+        if processing_mode not in ("lightweight", "full"):
+            raise CommandCoreError("processing_mode must be lightweight or full")
+        argv.extend(("--processing-mode", processing_mode))
     if urgent:
         argv.append("--urgent")
     argv.append("--json")

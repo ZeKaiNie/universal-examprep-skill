@@ -120,41 +120,50 @@ class IngestLanguagePersistence(unittest.TestCase):
          "wiki_content": "# Lists\ncontent"}], "quiz_bank": []}
 
     def _ingest(self, tmp, *extra):
-        rp = os.path.join(tmp, "raw.json")
+        materials = os.path.join(tmp, "materials")
+        os.makedirs(materials, exist_ok=True)
+        rp = os.path.join(materials, "raw.json")
         with open(rp, "w", encoding="utf-8") as f:
             json.dump(self.RAW, f)
         ws = os.path.join(tmp, "ws")
+        env = dict(os.environ)
+        env["EXAMPREP_HOME"] = os.path.join(tmp, ".examprep-home")
+        confirmed = subprocess.run(
+            [
+                PY, os.path.join(SCRIPTS, "exam_start.py"), "confirm",
+                "--course", "codex-r5-fixture",
+                "--materials", materials, "--workspace", ws,
+                "--mode", "from_scratch", "--time-budget", "le1d",
+                "--language", "en", "--processing-mode", "full", "--json",
+            ],
+            capture_output=True, text=True, encoding="utf-8", env=env,
+        )
+        assert confirmed.returncode == 0, confirmed.stdout + confirmed.stderr
         r = subprocess.run([PY, os.path.join(SCRIPTS, "ingest.py"), "--input", rp,
                             "--output-dir", ws] + list(extra),
-                           capture_output=True, text=True, encoding="utf-8")
+                           capture_output=True, text=True, encoding="utf-8", env=env)
         assert r.returncode == 0, r.stdout + r.stderr
         return ws
 
-    def test_explicit_lang_survives_init(self):
+    def test_explicit_lang_preserves_confirmed_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             ws = self._ingest(tmp, "--lang", "en")
             prog = open(os.path.join(ws, "study_progress.md"), encoding="utf-8").read()
-            self.assertIn("Language preference", prog)
-            r = subprocess.run([PY, os.path.join(SCRIPTS, "update_progress.py"),
-                                "--workspace", ws, "init"],
-                               capture_output=True, text=True, encoding="utf-8")
-            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("语言偏好", prog)
+            self.assertIn("English", prog)
             st = json.load(open(os.path.join(ws, "study_state.json"), encoding="utf-8"))
             self.assertEqual(st["language"], "en",
-                             "显式 --lang en 必须经 init 迁移进 state，否则工具全回落 zh")
+                             "显式 --lang en 不得覆盖已确认的 English 学习状态")
 
-    def test_no_lang_flag_leaves_language_unset(self):
+    def test_no_lang_flag_preserves_confirmed_language(self):
         with tempfile.TemporaryDirectory() as tmp:
             ws = self._ingest(tmp)
             prog = open(os.path.join(ws, "study_progress.md"), encoding="utf-8").read()
             self.assertNotIn("<!-- LANGUAGE -->", prog)
-            self.assertNotIn("语言偏好", prog, "未显式给 --lang 不得预占语言（留给合并首问）")
-            r = subprocess.run([PY, os.path.join(SCRIPTS, "update_progress.py"),
-                                "--workspace", ws, "init"],
-                               capture_output=True, text=True, encoding="utf-8")
-            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("语言偏好", prog)
+            self.assertIn("English", prog)
             st = json.load(open(os.path.join(ws, "study_state.json"), encoding="utf-8"))
-            self.assertIsNone(st["language"])
+            self.assertEqual(st["language"], "en")
 
 
 class TermsReadDiscipline(unittest.TestCase):

@@ -4,12 +4,20 @@
 
 ## Unreleased
 
+## V4.3 — 2026-07-18
+
+- **学生入口改写**：中英文 README 改为从“交什么材料、第一次选什么、每章会怎样讲”开始，用学生能直接执行的例子解释轻量按需、完整建库、普通功能与延展功能；中文正文移除不必要的英文工程术语，底层状态机、回执和适配器细节改由维护文档承载。
+- **默认轻量按需学习**：启动时明确区分普通的 `lightweight` 与延展的 `full` 处理；默认只盘点文件、按当前章节分批视觉读取，保留题图、学习状态机与完整教学输出，同时不预建全库、不自动生成 Study Guide/PDF。MinerU、Docling 与 LangGraph 继续保持显式点名、远端托管且另行同意后才可用。
+- **可恢复的逐题精讲节奏**：完整建库模式新增 `batch|step_by_step` 规范化选择；逐题模式严格按 manifest 顺序推进，用稳定题号、来源修订、notebook marker 与内容哈希记录完成证据。过期证据可审计地重开，结构损坏则失败关闭，不能用一句“继续”冒充学习完成。
+- **隔离式答案详解与可选 OpenAI 适配**：Study Guide 的每道题都可生成只包含该题、答案和目标裁剪图的独立无工具请求，并以宿主收据绑定输入、附件和覆盖元数据；OpenAI 适配器默认关闭，调用前先给出模型、调用数、图片字节数和计划 ID，只有用户明确同意才上传。
+- **语义纯净裁剪与可验证教材**：题面/答案组件必须通过目标级裁剪复核，禁止整页夹带无关题目、答案或学生作答；逐字段 `claim → quote span → source unit`、材料代次、解释收据、双语翻译和可读公式共同进入 typed Guide 门禁。
+
 - **材料代次显式恢复与可审计替代**：Pending generation 遇到 runtime receipt 缺失/漂移时，普通 `confirm` 不再形成互锁或覆盖 provenance；新增 generation-bound `recover-material-build --action resume|supersede`。`resume` 只允许同代精确重建，candidate 不同即零发布失败；`supersede` 通过 schema `2` 逐条绑定 direct predecessor。Generation-addressed 恢复日志、64-event/64-edge/65-receipt 上限、compiler 全事务回滚、receipt completion 与 manifest 精确保留键/hash 集合共同阻止静默丢代、shortcut ancestry 与崩溃后的半完成状态。
 - **Builder→compiler 代际失败关闭**：`ingest_course.py` 只在 builder 成功时发布新一代，且在任何资产、raw input 或 parse report 变更前先写入 hash-bound `material_build_pending.json`；builder 返回非零时不覆盖 canonical parse report/raw input，也不发布候选资产，而发布回滚若不完整则保留 blocker。Pending 绑定旧 build manifest、新 raw/report、完整候选资产策略与迁移收据；普通 mutation/publication（含 review、claim 与 Guide）以及 validation 在 pending 期间全部 fail closed。编译器只接受实际角色差异与收据一一对应的 `answer_context → student_attempt`。
 - **全编译器事务与可恢复意图**：material generation 的结构化事实、build manifest、wiki/题库/教学例题、检索索引、报告/计划及 pending→receipt 切换现在纳入同一个有界 `pending_ingest.json` 回滚事务。进程中断时 validator 拒绝读为 ready，下一次 mutation 先恢复全部登记 target 再继续；成功后写入 build-manifest schema `2` 的严格 `material_build` 契约与 raw/report/receipt 三元 hash，不得降格到 schema `1`。`ingest_course.py` 后置的 learner-state 初始化/偏好写入不在该编译事务内。
 - **旧版作业截图角色迁移**：仅在路径、章节/题目归属、作业来源、嵌套 provenance、源文件与资产 SHA-256、实时字节及物理文件身份全部唯一且一致时，允许把旧版 `answer_context` 精确升级为 `student_attempt`；候选策略会被冻结并在资产处理后、首个 JSON 替换前重新审计，任何别名、hardlink 或并发漂移都失败关闭。
 - **失败建库不再污染最后一次成功报告**：builder 返回非零时，`ingest_course.py` 不替换 canonical raw input、parse report 或公开资产；失败诊断只返回在当次命令 payload/stderr。Marker 仍只接受布尔值，成功却请求抑制发布、或使用非布尔值都会拒绝执行。
-- **跨平台发行包可复现且保持轻量**：`build_dist.py` 在压缩前把运行时文本统一规范化为 LF，并仅移除 Python tokenizer 标记为非语义布局的 `NL`；显著 token、AST、shebang 与编码声明均有回归保护。CRLF/LF checkout 因而生成同一份 ZIP，同时继续执行原有 570 KB 上限。
+- **跨平台发行包可复现且边界受控**：`build_dist.py` 在压缩前把运行时文本统一规范化为 LF，并仅移除 Python tokenizer 标记为非语义布局的 `NL`；显著 token、AST、shebang 与编码声明均有回归保护。CRLF/LF checkout 因而生成同一份 ZIP。v4.3 同包交付默认轻量路径与按需启用的完整建库/严格 Guide 工具链，审计候选约 776 KiB，硬上限相应调整为 850,000 B；默认启动仍不加载或执行延展路径。
 
 - **完整章节 Study Guide 门禁**：`profile=full` 现在以当前章全部 teaching examples、全部 bank 记录（含 `gradable=false` 教学项）和 typed question units 为去重分母；章节/语言、题面替代、答案 provenance、notebook、逐字段 claim 与 live source revision 均在导入和渲染前失败关闭。
 - **来源与资产完整性**：统一按安全物理身份识别 hardlink/路径别名和全局 `student_attempt` 污染，绑定声明 SHA-256 与 live bytes；PNG/JPEG/WebP/GIF/BMP 使用共享严格解码校验，损坏图片不能进入建库、教学显示、Guide、QA 或小抄。

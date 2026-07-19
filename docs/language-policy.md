@@ -37,7 +37,7 @@ English output uses these byte-exact forms:
 | | ③ 图里要读的量 | ③ What to read off the figure |
 | | ④ 核心公式 | ④ Core formula |
 | | ⑤ 逐步演算 | ⑤ Step-by-step solution |
-| | ⑥ 答案自检 | ⑥ Answer self-check |
+| | ⑥ 为什么这个答案成立 | ⑥ Why this answer works |
 | | ⑦ 知识点溯源 | ⑦ Source trace |
 | Source block | `题目来源：…｜答案来源：…｜<标签>` | `Question source: … \| Answer source: … \| <label>` |
 | Unknown source | 来源未知 / 来源页未知 | Source unknown / Source page unknown |
@@ -51,11 +51,15 @@ English output uses these byte-exact forms:
 
 A source line ends with one full provenance sentence, never an emoji alone. English uses `|`, Chinese `｜`. Optional closers require a request or stored preference. Unknown filenames/pages are never invented.
 
+The printable Study Guide uses a separate low-noise convention: explain every provenance emoji and its full meaning exactly once in the opening legend, then place only the emoji at the end of the relevant paragraph/run. Consecutive paragraphs with the same provenance share one terminal marker. This display compaction never removes the full typed provenance sidecars or receipts.
+
 ## 4. THREE-LAYER CONTRACT: PERSISTED / JUDGING-LAYER VOCABULARY
 
 1. **Machine schema:** JSON keys, stable IDs, issue/patch statuses, reason codes, CLI commands, and automation JSON keep their defined spelling; never translate tokens such as `issue_id`, `content_unit_id`, `pending`, `validated`, or `applied`.
 2. **Canonical values:** new state writes use `from_scratch|shore_up|fill_gaps`, `le1d|d1_3|d3_7|gt7d`, `zh|en|bilingual`, and documented status codes. Historical display values are migration inputs/generated-view wording only.
 3. **Human views:** chat, notebook prose, guides, receipts, and summaries use the selected language. Restate a nonlocalized compatibility view; do not paste it as student prose.
+
+`notebook.py` accepts all three canonical values. In `bilingual`, the agent-authored body keeps the required Chinese block plus `> EN:` mirror, while the single durable entry's metadata and derived index use compact `中文 / English` labels; callers must not force `--lang zh` merely to bypass a bilingual CLI error.
 
 A language change stales the prior-language typed guide, HTML/PDF, receipt, and QA: relocalize/source-consciously author, re-import, and, when visual output is requested, rerender and repeat every-page QA. `≤1天` may shorten bilingual blocks, never omit one side. Script automation JSON stays machine-stable; student messages use locale catalogs.
 

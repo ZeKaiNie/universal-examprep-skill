@@ -559,11 +559,23 @@ class CompletionAndDependencyBoundaryTest(unittest.TestCase):
         }
         self.assertEqual("operation_error", adapter.route_after_validation(state))
 
-    def test_graph_factory_requires_host_checkpointer_before_optional_import(self):
-        with self.assertRaisesRegex(adapter.LangGraphAdapterError, "checkpointer"):
-            adapter.build_exam_graph(None)
+    def test_graph_factory_refuses_local_execution_before_optional_import(self):
+        original_import = __import__
+        imported_langgraph = []
 
-    def test_graph_factory_reports_optional_dependency_when_langgraph_is_absent(self):
+        def record_import(name, *args, **kwargs):
+            if name == "langgraph" or name.startswith("langgraph."):
+                imported_langgraph.append(name)
+            return original_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=record_import):
+            with self.assertRaisesRegex(
+                    adapter.OptionalDependencyUnavailable,
+                    "local LangGraph execution is disabled.*remote/cloud"):
+                adapter.build_exam_graph(None)
+        self.assertEqual([], imported_langgraph)
+
+    def test_graph_factory_is_remote_only_when_langgraph_is_absent(self):
         original_import = __import__
 
         def without_langgraph(name, *args, **kwargs):
@@ -572,23 +584,20 @@ class CompletionAndDependencyBoundaryTest(unittest.TestCase):
             return original_import(name, *args, **kwargs)
 
         with mock.patch("builtins.__import__", side_effect=without_langgraph):
-            with self.assertRaises(adapter.OptionalDependencyUnavailable):
+            with self.assertRaisesRegex(
+                    adapter.OptionalDependencyUnavailable, "remote/cloud"):
                 adapter.build_exam_graph(object())
 
-    def test_graph_really_compiles_when_optional_langgraph_is_installed(self):
+    def test_graph_factory_remains_disabled_when_langgraph_is_installed(self):
         try:
             from langgraph.checkpoint.memory import MemorySaver
         except ImportError:
             self.skipTest("optional LangGraph is not installed")
-        graph = adapter.build_exam_graph(MemorySaver())
-        self.assertIsNotNone(graph)
+        with self.assertRaisesRegex(
+                adapter.OptionalDependencyUnavailable, "remote/cloud"):
+            adapter.build_exam_graph(MemorySaver())
 
-    def test_real_graph_stops_at_confirmation_interrupt_before_ingest(self):
-        try:
-            from langgraph.checkpoint.memory import MemorySaver
-        except ImportError:
-            self.skipTest("optional LangGraph is not installed")
-
+    def test_local_graph_refusal_does_not_call_start_api(self):
         class StartOnlyApi:
             def __init__(self):
                 self.calls = []
@@ -598,27 +607,12 @@ class CompletionAndDependencyBoundaryTest(unittest.TestCase):
                 return receipt({"process_success": True, "ready_to_ingest": False})
 
         api = StartOnlyApi()
-        graph = adapter.build_exam_graph(MemorySaver(), api)
-        config = {"configurable": {"thread_id": "confirmation-smoke"}}
-        graph.invoke({
-            "workspace": adapter.os.path.abspath("course"),
-            "materials": adapter.os.path.abspath("materials"),
-            "course": "course", "mode": "from_scratch", "time_budget": "le1d",
-            "language": "bilingual", "artifact_mode": "visual", "chapter": 1,
-        }, config)
-        snapshot = graph.get_state(config)
-        self.assertEqual(("confirmation_interrupt",), snapshot.next)
-        self.assertEqual(1, len(api.calls))
-        self.assertEqual(
-            {"confirmed": True}, snapshot.tasks[0].interrupts[0].value["resume_contract"])
+        with self.assertRaisesRegex(
+                adapter.OptionalDependencyUnavailable, "remote/cloud"):
+            adapter.build_exam_graph(object(), api)
+        self.assertEqual([], api.calls)
 
-    def test_real_graph_invalid_source_drift_resume_never_calls_ingest(self):
-        try:
-            from langgraph.checkpoint.memory import MemorySaver
-            from langgraph.types import Command
-        except ImportError:
-            self.skipTest("optional LangGraph is not installed")
-
+    def test_local_graph_refusal_never_calls_ingest(self):
         class DriftApi:
             def __init__(self):
                 self.ingest_calls = 0
@@ -636,21 +630,11 @@ class CompletionAndDependencyBoundaryTest(unittest.TestCase):
                 self.ingest_calls += 1
                 return receipt({"process_success": True, "readiness": "ready"})
 
-        with tempfile.TemporaryDirectory() as workspace:
-            adapter.os.makedirs(adapter.os.path.join(workspace, ".ingest"))
-            api = DriftApi()
-            graph = adapter.build_exam_graph(MemorySaver(), api)
-            config = {"configurable": {"thread_id": "invalid-drift-resume"}}
-            graph.invoke({
-                "workspace": workspace, "materials": adapter.os.path.abspath("materials"),
-                "course": "course", "mode": "from_scratch", "time_budget": "le1d",
-                "language": "bilingual", "artifact_mode": "visual", "chapter": 1,
-            }, config)
-            self.assertEqual(("reingest_interrupt",), graph.get_state(config).next)
-            graph.invoke(Command(resume={"done": True}), config)
-            final = graph.get_state(config)
-            self.assertEqual(0, api.ingest_calls)
-            self.assertEqual("blocked_operation", final.values["terminal_status"])
+        api = DriftApi()
+        with self.assertRaisesRegex(
+                adapter.OptionalDependencyUnavailable, "remote/cloud"):
+            adapter.build_exam_graph(object(), api)
+        self.assertEqual(0, api.ingest_calls)
 
     def test_review_list_and_resume_contracts_fail_closed(self):
         with self.assertRaisesRegex(adapter.LangGraphAdapterError, "review list"):

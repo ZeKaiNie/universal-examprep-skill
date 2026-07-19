@@ -14,7 +14,12 @@ from scripts.asset_policy import (
     legacy_attempt_promotion_receipts,
     physical_asset_key,
 )
-from scripts import asset_policy, retrieve, validate_workspace
+from scripts import (
+    asset_policy,
+    retrieve,
+    study_guide_content as sgc,
+    validate_workspace,
+)
 from scripts.ingestion import (
     ContentUnit,
     IngestionStore,
@@ -41,9 +46,10 @@ from scripts.ingestion.pipeline import (
     build_payload,
     compile_review_outputs,
     compile_structured_visuals,
+    finalize_material_build_generation,
     persist_payload,
 )
-from scripts.ingestion.storage import atomic_write_json, atomic_write_jsonl
+from scripts.ingestion.storage import atomic_write_json, atomic_write_jsonl, canonical_json
 from scripts.material_generation import build_pending_generation
 
 
@@ -106,6 +112,25 @@ class IngestionPipelineTest(unittest.TestCase):
             asset_role=asset_role,
         )
 
+    @staticmethod
+    def replace_operation(current, replacement):
+        current_payload = (
+            current.to_dict() if isinstance(current, ContentUnit) else current
+        )
+        replacement_payload = (
+            replacement.to_dict()
+            if isinstance(replacement, ContentUnit)
+            else replacement
+        )
+        return {
+            "op": "replace_unit",
+            "unit_id": current_payload["unit_id"],
+            "expected_unit_sha256": hashlib.sha256(
+                canonical_json(current_payload).encode("utf-8")
+            ).hexdigest(),
+            "unit": replacement_payload,
+        }
+
     def test_metadata_assets_is_attempt_dominant_order_invariant_and_canonical(self):
         official = self.asset_unit("official", assets=({
             "path": "references/assets/X.png",
@@ -143,6 +168,240 @@ class IngestionPipelineTest(unittest.TestCase):
         },))
         with self.assertRaisesRegex(ValueError, "conflicting caption"):
             _metadata_assets(first, second)
+
+    def test_reviewed_full_prompt_asset_rebuilds_quiz_teaching_and_guide_inventory(self):
+        asset_relative = "references/assets/q1-complete-prompt.png"
+        asset_file = self.workspace / asset_relative
+        asset_file.parent.mkdir(parents=True)
+        asset_file.write_bytes(b"complete prompt crop revision one")
+        asset_sha = hashlib.sha256(asset_file.read_bytes()).hexdigest()
+        source_sha = hashlib.sha256(self.source.read_bytes()).hexdigest()
+        item = {
+            "id": "q1",
+            "chapter": 1,
+            "type": "subjective",
+            "question": "See the attached prompt-only crop.",
+            "answer": "",
+            "source": "material",
+            "source_type": "homework",
+            "source_file": "ch01.txt",
+            "source_pages": [1],
+            "source_language": "en",
+            "question_text_status": "page_reference",
+            "requires_assets": True,
+            "assets": [{
+                "path": asset_relative,
+                "role": "question_context",
+                "type": "crop_image",
+                "contains_full_prompt": False,
+                "sha256": asset_sha,
+                "source_file": "ch01.txt",
+                "source_sha256": source_sha,
+            }],
+        }
+        payload = build_payload(
+            str(self.materials),
+            [str(self.source)],
+            [{
+                "file": "ch01.txt", "page": 1,
+                "text": "Chapter 1\nCore concept",
+                "source_language": "en",
+            }],
+            sections=[{"chapter": 1, "page_keys": [("ch01.txt", 1)]}],
+            quiz_items=[item],
+            report={"warnings": [], "skipped": [], "ai_review": []},
+        )
+        initial_question = next(
+            row for row in payload["content_units"]
+            if row["kind"] == "question" and row["external_id"] == "q1"
+        )
+        self.assertEqual(
+            "crop_image", initial_question["metadata"]["assets"][0]["type"]
+        )
+        self.assertIs(
+            False,
+            initial_question["metadata"]["assets"][0]["contains_full_prompt"],
+        )
+        teaching_seed = dict(item)
+        teaching_seed["teaching_role"] = "worked_example"
+        raw = {
+            "course_name": "Prompt recovery fixture",
+            "phases": [],
+            "quiz_bank": [item],
+            "teaching_examples": [teaching_seed],
+            "ingestion": payload,
+        }
+        parse_report = {
+            "asset_role_promotions": [], "warnings": [], "ai_review": []
+        }
+        ingest = self.workspace / ".ingest"
+        ingest.mkdir()
+        raw_path = ingest / "source_raw_input.json"
+        report_path = ingest / "parse_report.json"
+        atomic_write_json(raw_path, raw)
+        atomic_write_json(report_path, parse_report)
+        pending = build_pending_generation(
+            hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+            hashlib.sha256(report_path.read_bytes()).hexdigest(),
+            raw,
+            parse_report,
+        )
+        atomic_write_json(ingest / "material_build_pending.json", pending)
+        store = IngestionStore(self.workspace, source_root=self.materials)
+        with store.mutation_lock(allow_material_generation=True):
+            authorization = authorize_material_build_generation(
+                self.workspace, raw
+            )
+            _persist_payload_unlocked(
+                self.workspace, payload,
+                material_generation=authorization,
+            )
+            finalize_material_build_generation(
+                self.workspace, authorization
+            )
+
+        references = self.workspace / "references"
+        quiz_path = references / "quiz_bank.json"
+        teaching_path = references / "teaching_examples.json"
+        quiz_path.write_text(json.dumps([item]), encoding="utf-8")
+        teaching = dict(teaching_seed)
+        teaching_path.write_text(json.dumps([teaching]), encoding="utf-8")
+        wiki = references / "wiki"
+        wiki.mkdir()
+        (wiki / "ch01.md").write_text("# Chapter 1\n\nCore concept\n", encoding="utf-8")
+        (self.workspace / "ingest_report.json").write_text(
+            json.dumps({"missing_answer_ids": ["q1"]}), encoding="utf-8"
+        )
+
+        store = IngestionStore(self.workspace, source_root=self.materials)
+        question = next(
+            unit for unit in store.units().values()
+            if unit.kind == "question" and unit.external_id == "q1"
+        )
+        issue = next(
+            issue for issue in store.review_queue.issues()
+            if "missing_answer" in issue.reason_codes
+        )
+        replacement = question.to_dict()
+        replacement["metadata"] = dict(replacement["metadata"])
+        replacement["metadata"]["assets"] = [
+            dict(asset, type="crop_image", contains_full_prompt=True)
+            for asset in replacement["metadata"]["assets"]
+        ]
+        answer = ContentUnit.create(
+            question.source_id,
+            question.source_sha256,
+            question.source_file,
+            "answer",
+            "Recovered answer",
+            question.page,
+            ordinal=question.ordinal + 1,
+            external_id=question.external_id,
+            chapter_id=question.chapter_id,
+            phase_id=question.phase_id,
+            metadata={"source_language": "en", "answer_value": "Recovered answer"},
+            method="ai_recovered",
+            confidence=0.9,
+            provenance="ai_recovered",
+        )
+        patch = ReviewPatch.create(
+            issue.issue_id,
+            issue.source_id,
+            issue.source_sha256,
+            [
+                self.replace_operation(question, replacement),
+                {"op": "add_unit", "unit": answer.to_dict()},
+                {
+                    "op": "pair_qa",
+                    "question_unit_id": question.unit_id,
+                    "answer_unit_id": answer.unit_id,
+                },
+            ],
+            list(issue.evidence),
+            reviewer="visual-review-test",
+            created_at="2026-07-17T18:00:00Z",
+            status="validated",
+        )
+        store.apply_patch(patch)
+        compiled = compile_review_outputs(self.workspace)
+        self.assertGreater(compiled["quiz_updates"], 0)
+        self.assertGreater(compiled["teaching_updates"], 0)
+
+        for path in (quiz_path, teaching_path):
+            rebuilt = json.loads(path.read_text(encoding="utf-8"))[0]
+            prompt = next(
+                asset for asset in rebuilt["assets"]
+                if asset["path"] == asset_relative
+            )
+            self.assertEqual("crop_image", prompt["type"])
+            self.assertIs(True, prompt["contains_full_prompt"])
+            self.assertEqual(asset_sha, prompt["sha256"])
+
+        replayed = IngestionStore(
+            self.workspace, source_root=self.materials
+        ).units()[question.unit_id]
+        self.assertIs(
+            True, replayed.metadata["assets"][0]["contains_full_prompt"]
+        )
+        inventory = sgc._source_inventory(str(self.workspace), 1)
+        prompt_records = inventory["item_assets"]["q1"][asset_relative]
+        self.assertTrue(any(
+            record.get("type") == "crop_image"
+            and record.get("contains_full_prompt") is True
+            and record.get("sha256") == asset_sha
+            for record in prompt_records
+        ))
+
+        def localized(zh, en):
+            return {"zh": zh, "en": en}
+
+        walkthrough = {
+            "item_id": "q1",
+            "source_type": "homework",
+            "answer_provenance": {"zh": "ai_generated", "en": "ai_generated"},
+            "knowledge_point_ids": ["kp1"],
+            "knowledge_point_uses": {
+                "kp1": localized("识别完整题面中的条件。", "Identify conditions in the full prompt.")
+            },
+            "notebook_anchor": "q1-example-q1",
+            "title": localized("作业题 q1", "Homework q1"),
+            "original_language": "en",
+            "prompt_asset_mode": "full_prompt",
+            "prompt_asset_paths": [asset_relative],
+            "answer_asset_paths": [],
+            "translation": {"zh": "完整题面的中文翻译。"},
+            "what_asked": localized("按完整题面作答。", "Answer the complete prompt."),
+            "known_quantities": [],
+            "unknown_quantities": [],
+            "solution_kind": "concept",
+            "formula_uses": [],
+            "no_formula_reason": localized(
+                "本题按概念判断，无需公式。", "This is conceptual and needs no formula."
+            ),
+            "steps": [localized("读取题面并作答。", "Read the prompt and answer.")],
+            "answer": localized("这是 AI 补充答案。", "This is an AI-supplied answer."),
+            "self_check": localized("对照题面逐项检查。", "Check each part against the prompt."),
+            "source_trace": [{
+                "source_file": question.source_file,
+                "pages": [question.page],
+                "source_unit_id": question.unit_id,
+                "role": "question",
+                "asset_path": asset_relative,
+            }],
+        }
+        # Current v2 authoring omits the deprecated generic answer-self-check.
+        walkthrough.pop("self_check")
+        self.assertNotIn("prompt_text", walkthrough)
+        sgc._validate_walkthrough(
+            str(self.workspace), walkthrough, "bilingual", "walkthroughs[0]",
+            item_assets=inventory["item_assets"]["q1"],
+            unit_index=inventory["unit_index"],
+            structured=True,
+            item_evidence=inventory["item_evidence"],
+            profile="full",
+            item_asset_requirements=inventory["item_asset_requirements"]["q1"],
+            chapter=1,
+        )
 
     def test_publishable_qa_rejects_direct_leak_but_allows_distinct_attempt_path(self):
         question = self.asset_unit("question", assets=({
@@ -1396,7 +1655,7 @@ class IngestionPipelineTest(unittest.TestCase):
         invalid["confidence"] = 1.0
         invalid_patch = ReviewPatch.create(
             issue.issue_id, issue.source_id, issue.source_sha256,
-            [{"op": "replace_unit", "unit_id": answer.unit_id, "unit": invalid}],
+            [self.replace_operation(answer, invalid)],
             list(issue.evidence), reviewer="test",
             created_at="2026-07-15T12:00:00Z", status="validated",
         )
@@ -1411,7 +1670,7 @@ class IngestionPipelineTest(unittest.TestCase):
         curated["metadata"]["keywords"] = ["invariant", "final value 42"]
         patch = ReviewPatch.create(
             issue.issue_id, issue.source_id, issue.source_sha256,
-            [{"op": "replace_unit", "unit_id": answer.unit_id, "unit": curated}],
+            [self.replace_operation(answer, curated)],
             list(issue.evidence), reviewer="test",
             created_at="2026-07-15T12:01:00Z", status="validated",
         )
@@ -1695,11 +1954,7 @@ class IngestionPipelineTest(unittest.TestCase):
             issue.issue_id,
             issue.source_id,
             issue.source_sha256,
-            [{
-                "op": "replace_unit",
-                "unit_id": damaged["unit_id"],
-                "unit": still_damaged,
-            }],
+            [self.replace_operation(damaged, still_damaged)],
             list(issue.evidence),
             reviewer="test",
             created_at="2026-07-14T12:00:00Z",
@@ -1714,11 +1969,7 @@ class IngestionPipelineTest(unittest.TestCase):
             issue.issue_id,
             issue.source_id,
             issue.source_sha256,
-            [{
-                "op": "replace_unit",
-                "unit_id": damaged["unit_id"],
-                "unit": replacement,
-            }],
+            [self.replace_operation(damaged, replacement)],
             list(issue.evidence),
             reviewer="test",
             created_at="2026-07-14T12:00:00Z",
@@ -1726,6 +1977,28 @@ class IngestionPipelineTest(unittest.TestCase):
         )
         store.apply_patch(patch)
         self.assertNotIn("\x00", store.units()[damaged["unit_id"]].text)
+
+        references = self.workspace / "references"
+        references.mkdir(exist_ok=True)
+        (references / "quiz_bank.json").write_text("[]\n", encoding="utf-8")
+        (references / "teaching_examples.json").write_text("[]\n", encoding="utf-8")
+        wiki = references / "wiki"
+        wiki.mkdir()
+        wiki_path = wiki / "ch01.md"
+        wiki_path.write_text(
+            "# Chapter 1\n\n保留 Unicode\tand newline\n"
+            "damaged\x00control\x01replacement\ufffddelete\x7f\n",
+            encoding="utf-8",
+        )
+        compile_review_outputs(self.workspace)
+        rebuilt = wiki_path.read_text(encoding="utf-8")
+        self.assertIn("保留 Unicode\tand newline\n", rebuilt)
+        self.assertIn("Chapter 1 recovered extraction", rebuilt)
+        self.assertFalse(any(
+            char == "\ufffd"
+            or ((ord(char) < 32 and char not in "\t\n\r") or ord(char) == 0x7F)
+            for char in rebuilt
+        ))
 
     def test_mixed_formula_and_control_page_keeps_two_obligations(self):
         payload = build_payload(
@@ -1766,9 +2039,7 @@ class IngestionPipelineTest(unittest.TestCase):
             unit = store.units()[unit_id]
             repaired = unit.to_dict()
             repaired["text"] = repaired["text"].replace("\x00", " ")
-            repair_operations.append({
-                "op": "replace_unit", "unit_id": unit_id, "unit": repaired,
-            })
+            repair_operations.append(self.replace_operation(unit, repaired))
         store.apply_patch(ReviewPatch.create(
             control_issue.issue_id,
             control_issue.source_id,
@@ -1878,8 +2149,7 @@ class IngestionPipelineTest(unittest.TestCase):
                 issue.issue_id,
                 issue.source_id,
                 issue.source_sha256,
-                [{"op": "replace_unit", "unit_id": heading_id,
-                  "unit": repaired_heading}],
+                [self.replace_operation(current[heading_id], repaired_heading)],
                 list(issue.evidence),
                 reviewer="test",
                 created_at="2026-07-15T12:01:00Z",
@@ -1894,10 +2164,8 @@ class IngestionPipelineTest(unittest.TestCase):
             issue.source_id,
             issue.source_sha256,
             [
-                {"op": "replace_unit", "unit_id": heading_id,
-                 "unit": repaired_heading},
-                {"op": "replace_unit", "unit_id": body_id,
-                 "unit": repaired_body},
+                self.replace_operation(current[heading_id], repaired_heading),
+                self.replace_operation(current[body_id], repaired_body),
             ],
             list(issue.evidence),
             reviewer="test",
@@ -2071,6 +2339,11 @@ class IngestionPipelineTest(unittest.TestCase):
 
     def test_asset_source_file_survives_payload_normalization(self):
         source_sha256 = hashlib.sha256(self.source.read_bytes()).hexdigest()
+        crop_spec_sha256 = "c" * 64
+        crop_path = (
+            "references/assets/ch01-p1_crop_%s.png"
+            % crop_spec_sha256[:12]
+        )
         payload = build_payload(
             str(self.materials),
             [str(self.source)],
@@ -2083,10 +2356,18 @@ class IngestionPipelineTest(unittest.TestCase):
                 "source": "material", "source_file": "ch01.txt",
                 "source_pages": [1], "answer_source_pages": [1],
                 "assets": [{
-                    "path": "references/assets/ch01-p1.png",
+                    "path": crop_path,
                     "role": "answer_context",
+                    "type": "crop_image",
+                    "sha256": "e" * 64,
                     "source_file": "ch01.txt",
                     "source_sha256": source_sha256,
+                    "source_page": 1,
+                    "source_bbox_pdf_points": [10.0, 20.0, 300.0, 400.0],
+                    "crop_receipt_id": "crop_" + "d" * 64,
+                    "crop_spec_sha256": crop_spec_sha256,
+                    "content_scope": "full_answer",
+                    "isolation": "target_item_only",
                 }],
             }],
             report={"warnings": [], "skipped": [], "ai_review": []},
@@ -2095,9 +2376,17 @@ class IngestionPipelineTest(unittest.TestCase):
             row for row in payload["content_units"]
             if row["kind"] == "question" and row["external_id"] == "asset-q1"
         )
+        stored = question["metadata"]["assets"][0]
+        self.assertEqual("ch01.txt", stored["source_file"])
+        self.assertEqual(1, stored["source_page"])
         self.assertEqual(
-            "ch01.txt", question["metadata"]["assets"][0]["source_file"]
+            [10.0, 20.0, 300.0, 400.0],
+            stored["source_bbox_pdf_points"],
         )
+        self.assertEqual("crop_" + "d" * 64, stored["crop_receipt_id"])
+        self.assertEqual(crop_spec_sha256, stored["crop_spec_sha256"])
+        self.assertEqual("full_answer", stored["content_scope"])
+        self.assertEqual("target_item_only", stored["isolation"])
 
     def test_persist_payload_rejects_globally_tainted_official_unit_before_write(self):
         payload = self.payload(missing_answer=False)
@@ -2535,11 +2824,7 @@ class IngestionPipelineTest(unittest.TestCase):
         patch = ReviewPatch.create(
             issue.issue_id, issue.source_id, issue.source_sha256,
             [
-                {
-                    "op": "replace_unit",
-                    "unit_id": existing_question.unit_id,
-                    "unit": question.to_dict(),
-                },
+                self.replace_operation(existing_question, question),
                 {"op": "add_unit", "unit": answer.to_dict()},
                 {
                     "op": "pair_qa",

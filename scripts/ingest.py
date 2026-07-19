@@ -29,6 +29,10 @@ try:
 except ImportError:  # imported as scripts.ingest in unit tests
     from scripts.stable_ids import stable_item_id_problem
 try:
+    import exam_start
+except ImportError:  # imported as scripts.ingest in unit tests
+    from scripts import exam_start
+try:
     from asset_policy import (
         STUDENT_ATTEMPT,
         audit_asset_policy,
@@ -240,8 +244,15 @@ def _atomic_json(path, value, label):
     _atomic_text(path, rendered, label)
 
 
-def _merge_teaching_baseline(path, current_by_chapter):
-    """Merge the current teaching IDs into an append-only independent retention baseline."""
+def _plan_teaching_baseline(path, current_by_chapter):
+    """Plan the append-only teaching baseline without mutating the workspace.
+
+    Every retained ID must still have a current ``teaching_examples.json``
+    snapshot.  A matching quiz row is intentionally irrelevant: assessment
+    data cannot stand in for the tutor/Guide roster.  Keeping this function
+    pure lets the compiler reject a shrunken roster before publishing any
+    derived target.
+    """
     previous = {}
     if os.path.lexists(path):
         _guard_write_target(path, "教学例题保留基线")
@@ -250,13 +261,12 @@ def _merge_teaching_baseline(path, current_by_chapter):
                 payload = strict_json.load(stream)
         except (OSError, UnicodeDecodeError, ValueError) as exc:
             fail([f"教学例题保留基线无法读取，拒绝用较小快照覆盖：{exc}"])
-        if (not isinstance(payload, dict)
-                or payload.get("schema_version") != 1
-                or payload.get("policy") != "append_only"):
-            fail([
-                "references/teaching_baseline.json 必须精确为 "
-                "schema_version=1、policy=append_only，拒绝缩减基线"
-            ])
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != 1
+            or payload.get("policy") != "append_only"
+        ):
+            fail(["references/teaching_baseline.json 结构或 schema_version 无效，拒绝缩减基线"])
         raw_map = payload.get("teaching_example_ids_by_chapter")
         raw_ids = payload.get("teaching_example_ids")
         if not isinstance(raw_map, dict) or not isinstance(raw_ids, list):
@@ -264,13 +274,24 @@ def _merge_teaching_baseline(path, current_by_chapter):
         for chapter, values in raw_map.items():
             if (not isinstance(chapter, str) or not chapter.strip()
                     or not isinstance(values, list)
-                    or not all(stable_item_id_problem(value) is None
-                               for value in values)
+                    or not all(
+                        stable_item_id_problem(value) is None
+                        for value in values
+                    )
                     or len(values) != len(set(values))):
                 fail([f"teaching_baseline 的章节 {chapter!r} 含无效或重复 ID"])
-            previous[chapter.strip()] = set(values)
+            scope = _positive_int(chapter) or _chapter_from_id(chapter)
+            canonical_chapter = str(scope) if scope is not None else None
+            if canonical_chapter is None or canonical_chapter in previous:
+                fail([
+                    "teaching_baseline contains an invalid or duplicate canonical chapter: %r"
+                    % chapter
+                ])
+            previous[canonical_chapter] = set(values)
         flattened = set().union(*previous.values()) if previous else set()
-        if (not all(stable_item_id_problem(value) is None for value in raw_ids)
+        if (not all(
+                    stable_item_id_problem(value) is None
+                    for value in raw_ids)
                 or len(raw_ids) != len(set(raw_ids))
                 or flattened != set(raw_ids)):
             fail(["teaching_baseline 的逐章映射与 ID 全集不一致，拒绝缩减基线"])
@@ -278,6 +299,20 @@ def _merge_teaching_baseline(path, current_by_chapter):
     merged = {chapter: set(values) for chapter, values in previous.items()}
     for chapter, values in current_by_chapter.items():
         merged.setdefault(str(chapter), set()).update(values)
+    current_ids = {
+        ident
+        for values in current_by_chapter.values()
+        for ident in values
+        if stable_item_id_problem(ident) is None
+    }
+    retained_ids = set().union(*merged.values()) if merged else set()
+    missing_snapshots = retained_ids - current_ids
+    if missing_snapshots:
+        fail([
+            "teaching baseline IDs missing from the current teaching_examples snapshot: %s; "
+            "quiz-only fallback is forbidden, so restore/rebuild the teaching roster before publication"
+            % ", ".join(sorted(missing_snapshots))
+        ])
     id_to_chapter = {}
     for chapter, values in merged.items():
         for ident in values:
@@ -292,8 +327,13 @@ def _merge_teaching_baseline(path, current_by_chapter):
         "teaching_example_ids": ordered_ids,
         "teaching_example_ids_by_chapter": ordered_map,
     }
-    _atomic_json(path, baseline, "教学例题保留基线")
     return baseline
+
+
+def _publish_teaching_baseline(path, baseline):
+    """Publish a previously validated baseline plan."""
+
+    _atomic_json(path, baseline, "教学例题保留基线")
 
 
 def validate(data):
@@ -422,26 +462,35 @@ def validate(data):
         if not isinstance(q, dict):
             errors.append(f"题目 {tag} 不是对象。")
             continue
-        if not is_blank(raw_id):
-            if (isinstance(raw_id, bool) or not isinstance(raw_id, (str, int, float))
-                    or (isinstance(raw_id, float) and not math.isfinite(raw_id))):
-                errors.append(f"题目 {tag} 的 id 必须是有限数字或非空字符串。")
+        if q.get("answer_origin") == "inline_material":
+            errors.append(
+                f"题目 {tag} 的 inline_material 只能进入 teaching_examples，"
+                "不能进入 quiz_bank。"
+            )
+        if not is_blank(raw_id) and (
+            isinstance(raw_id, bool)
+            or not isinstance(raw_id, (str, int, float))
+            or (isinstance(raw_id, float) and not math.isfinite(raw_id))
+        ):
+            errors.append(f"题目 {tag} 的 id 必须是有限数字或非空字符串。")
+        elif not is_blank(raw_id):
+            # Canonical public quiz identity is always a string.  This preserves
+            # legacy finite numeric labels while making selectors, progress,
+            # notebook anchors, and the typed Guide compare one exact type.
+            canonical_id = str(raw_id).strip()
+            id_problem = stable_item_id_problem(canonical_id)
+            if id_problem:
+                errors.append(
+                    f"题目 {tag} 的 id 不符合稳定 notebook/Guide 契约：{id_problem}"
+                )
+            elif canonical_id in seen_quiz_ids:
+                errors.append(
+                    f"题目 id「{canonical_id}」在第 {seen_quiz_ids[canonical_id]} "
+                    f"和第 {i + 1} 道题重复。"
+                )
             else:
-                canonical_id = str(raw_id).strip()
-                id_problem = stable_item_id_problem(canonical_id)
-                if id_problem:
-                    errors.append(
-                        f"题目 {tag} 的 id 不符合稳定 notebook/Guide 契约："
-                        f"{id_problem}"
-                    )
-                elif canonical_id in seen_quiz_ids:
-                    errors.append(
-                        f"题目 id「{canonical_id}」在第 {seen_quiz_ids[canonical_id]} "
-                        f"和第 {i + 1} 道题重复。"
-                    )
-                else:
-                    seen_quiz_ids[canonical_id] = i + 1
-                    q["id"] = canonical_id
+                seen_quiz_ids[canonical_id] = i + 1
+                q["id"] = canonical_id
         qtype = q.get("type")
         if qtype not in VALID_QUIZ_TYPES:
             errors.append(f"题目 {tag} 的 type 必须是 {'/'.join(sorted(VALID_QUIZ_TYPES))} 之一（当前为 {qtype!r}）。")
@@ -471,6 +520,11 @@ def validate(data):
             if not isinstance(ex, dict):
                 errors.append(f"{tag} 不是对象。")
                 continue
+            if ex.get("answer_origin") == "inline_material":
+                errors.append(
+                    f"{tag} 不能从 raw input 直接声明 inline_material；"
+                    "请走 ingest_review.py 的显式 review-ledger 迁移。"
+                )
             ex_id = ex.get("id")
             if not isinstance(ex_id, str) or not ex_id.strip():
                 errors.append(f"{tag} 缺少非空字符串 id。")
@@ -485,8 +539,8 @@ def validate(data):
                 elif canonical_ex_id in seen_teaching_ids:
                     errors.append(f"重复的教学例题 id: {canonical_ex_id}")
                 else:
-                    ex["id"] = canonical_ex_id
                     seen_teaching_ids.add(canonical_ex_id)
+                    ex["id"] = canonical_ex_id
                     tag = f"教学例题 {canonical_ex_id}"
             role = ex.get("teaching_role")
             if role not in VALID_TEACHING_ROLES:
@@ -499,8 +553,33 @@ def validate(data):
                 errors.append(
                     f"{tag} 的 gradable 必须是布尔型 true/false（当前为 {gradable!r}）。"
                 )
-            if ex.get("chapter") in (None, "") and ex.get("phase") in (None, ""):
+            raw_chapter = ex.get("chapter")
+            raw_phase = ex.get("phase")
+            chapter_scope = (
+                _positive_int(raw_chapter) or _chapter_from_id(raw_chapter)
+                if raw_chapter not in (None, "") else None
+            )
+            phase_scope = (
+                _positive_int(raw_phase) or _chapter_from_id(raw_phase)
+                if raw_phase not in (None, "") else None
+            )
+            if raw_chapter not in (None, "") and chapter_scope is None:
+                errors.append(f"{tag} 的 chapter 必须是可解析的正整数章号。")
+            if raw_phase not in (None, "") and phase_scope is None:
+                errors.append(f"{tag} 的 phase 必须是可解析的正整数章号。")
+            if chapter_scope is not None and phase_scope is not None \
+                    and chapter_scope != phase_scope:
+                errors.append(
+                    f"{tag} 的 chapter={raw_chapter!r} 与 phase={raw_phase!r} 冲突。"
+                )
+            resolved_scope = chapter_scope or phase_scope
+            if resolved_scope is None:
                 errors.append(f"{tag} 缺少 chapter 或 phase，无法按当前章惰性列举。")
+            else:
+                if raw_chapter not in (None, ""):
+                    ex["chapter"] = resolved_scope
+                if raw_phase not in (None, ""):
+                    ex["phase"] = resolved_scope
             if not isinstance(ex.get("question"), str) or not ex.get("question", "").strip():
                 errors.append(f"{tag} 缺少非空教学内容 question。")
             if not isinstance(ex.get("source_file"), str) or not ex.get("source_file", "").strip():
@@ -833,6 +912,63 @@ def _main_unlocked(args, prepared):
     except Exception as exc:
         fail(["material build generation authorization failed: %s" % exc])
 
+    # Plan the complete teaching roster and append-only baseline before any
+    # compiler target is written.  Legacy raw input may omit the teaching
+    # field, in which case the existing safe manifest is the current snapshot;
+    # it is never replaced by quiz rows or an inferred empty list.
+    output_dir = os.path.abspath(args.output_dir)
+    teaching_path = os.path.join(output_dir, "references", "teaching_examples.json")
+    _teaching_list = teaching_examples or []
+    _teaching_manifest_preserved = False
+    if teaching_examples is None and os.path.lexists(teaching_path):
+        if is_link_or_reparse(teaching_path) or not os.path.isfile(teaching_path):
+            fail(["existing references/teaching_examples.json is not a safe regular file"])
+        try:
+            with open(teaching_path, "r", encoding="utf-8") as tf:
+                _existing_teaching = strict_json.load(tf)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            fail(["existing references/teaching_examples.json cannot be read: %s" % exc])
+        if not (
+            isinstance(_existing_teaching, list)
+            and all(
+                isinstance(ex, dict)
+                and isinstance(ex.get("id"), str)
+                and ex["id"].strip()
+                and (ex.get("chapter") not in (None, "")
+                     or ex.get("phase") not in (None, ""))
+                for ex in _existing_teaching
+            )
+        ):
+            fail(["existing references/teaching_examples.json is not a valid teaching roster"])
+        _existing_ids = [ex["id"].strip() for ex in _existing_teaching]
+        if len(_existing_ids) != len(set(_existing_ids)):
+            fail(["existing references/teaching_examples.json contains duplicate IDs"])
+        _teaching_list = _existing_teaching
+        _teaching_manifest_preserved = True
+
+    _teaching_by_chapter = {}
+    _teaching_ids_by_chapter = {}
+    for _ex in _teaching_list:
+        _ch = (
+            _ex.get("chapter")
+            if _ex.get("chapter") not in (None, "")
+            else _ex.get("phase")
+        )
+        _scope = _positive_int(_ch) or _chapter_from_id(_ch)
+        if _scope is None:
+            fail([
+                "teaching example %r has no canonical positive chapter/phase"
+                % _ex.get("id")
+            ])
+        _key = str(_scope)
+        _ident = _ex["id"].strip()
+        _teaching_by_chapter[_key] = _teaching_by_chapter.get(_key, 0) + 1
+        _teaching_ids_by_chapter.setdefault(_key, []).append(_ident)
+    teaching_baseline_path = os.path.join(
+        output_dir, "references", "teaching_baseline.json")
+    teaching_baseline = _plan_teaching_baseline(
+        teaching_baseline_path, _teaching_ids_by_chapter)
+
     print(f"[+] 识别到科目: {course_name}")
     print(f"[+] 阶段数量: {len(phases)} 个")
     print(f"[+] 题目数量: {len(quiz_bank)} 道")
@@ -845,7 +981,6 @@ def _main_unlocked(args, prepared):
         print("    ⚠️ 若由 AI 代为生成答案，必须向学生明确标注「⚠️ AI生成答案，非老师/教材提供」，")
         print("       严禁把 AI 生成的答案伪装成老师的标准答案（详见 SKILL.md 知识来源透明化协议）。")
 
-    output_dir = os.path.abspath(args.output_dir)
     wiki_dir = _safe_output_tree(output_dir)
     real_wiki_dir = os.path.realpath(wiki_dir)
     print(f"[+] 创建 Wiki 目录: {wiki_dir}")
@@ -1177,41 +1312,13 @@ def _main_unlocked(args, prepared):
         print("[+] 已写入教学例题索引: references/teaching_examples.json")
 
     # 导入报告持久化——缺答案清单只留在控制台会随会话丢失，后续会话的 AI 无从接手
-    _teaching_list = teaching_examples or []
-    _teaching_manifest_preserved = False
-    if (teaching_examples is None and os.path.isfile(teaching_path)
-            and not is_link_or_reparse(teaching_path)):
-        # Legacy rerun: preserve not only the file but also its retention baseline.  Replacing the
-        # report IDs with [] would make validate_workspace unable to notice a later deletion from
-        # both quiz_bank and the teaching layer.
-        try:
-            with open(teaching_path, "r", encoding="utf-8") as tf:
-                _existing_teaching = strict_json.load(tf)
-            if (isinstance(_existing_teaching, list)
-                    and all(isinstance(ex, dict) and isinstance(ex.get("id"), str)
-                            and ex["id"].strip() for ex in _existing_teaching)):
-                _teaching_list = _existing_teaching
-                _teaching_manifest_preserved = True
-                print("[+] legacy raw input 未带 teaching_examples；已保留现有教学例题索引与报告基线")
-            else:
-                print("[!] 现有 references/teaching_examples.json 结构无效；文件未覆盖，但报告无法沿用其基线")
-        except (OSError, ValueError) as e:
-            print(f"[!] 现有 references/teaching_examples.json 无法读取；文件未覆盖，但报告无法沿用其基线: {e}")
-    _teaching_by_chapter = {}
-    _teaching_ids_by_chapter = {}
-    for _ex in _teaching_list:
-        _ch = _ex.get("chapter") if _ex.get("chapter") is not None else _ex.get("phase")
-        _key = str(_ch)
-        _teaching_by_chapter[_key] = _teaching_by_chapter.get(_key, 0) + 1
-        _teaching_ids_by_chapter.setdefault(_key, []).append(_ex["id"])
-    teaching_baseline_path = os.path.join(
-        output_dir, "references", "teaching_baseline.json")
-    teaching_baseline = _merge_teaching_baseline(
-        teaching_baseline_path, _teaching_ids_by_chapter)
+    if _teaching_manifest_preserved:
+        print("[+] legacy raw input 未带 teaching_examples；已保留现有教学例题索引与报告基线")
+    _publish_teaching_baseline(teaching_baseline_path, teaching_baseline)
     ingest_report = {
         "course_name": course_name, "phases": len(phases), "quiz_bank": len(quiz_bank),
         "teaching_examples": len(_teaching_list),
-        "current_teaching_example_ids": [ex["id"] for ex in _teaching_list],
+        "current_teaching_example_ids": [ex["id"].strip() for ex in _teaching_list],
         "current_teaching_example_ids_by_chapter": _teaching_ids_by_chapter,
         "teaching_baseline_manifest": "references/teaching_baseline.json",
         "teaching_example_ids": teaching_baseline["teaching_example_ids"],
@@ -1333,6 +1440,13 @@ def _main_unlocked(args, prepared):
 
 def main():
     args = _argument_parser().parse_args()
+    output_candidate = os.path.abspath(args.output_dir)
+    try:
+        exam_start.require_full_processing(
+            output_candidate, purpose="workspace ingestion compiler publication"
+        )
+    except exam_start.FullProcessingRequired as exc:
+        fail([str(exc)])
     output_dir = _ensure_workspace_root(args.output_dir)
     ingest_path = os.path.join(output_dir, ".ingest")
     ingest_preexisting = os.path.lexists(ingest_path)
@@ -1345,6 +1459,12 @@ def main():
         with workspace_publication_lock(
                 output_dir, allow_material_generation=True):
             try:
+                # Recheck under the publication lock so a concurrent mode switch
+                # cannot turn a previously authorized full build into a lightweight
+                # workspace mutation (TOCTOU between the first gate and this lock).
+                exam_start.require_full_processing(
+                    output_dir, purpose="workspace ingestion compiler publication"
+                )
                 prepared = _prepare_cli_input(args)
                 data = prepared[0]
                 structured = data.get("ingestion") is not None

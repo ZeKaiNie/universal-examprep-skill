@@ -2,14 +2,17 @@
 import base64
 import hashlib
 import importlib.util
+import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -18,6 +21,10 @@ sys.path.insert(0, SCRIPTS)
 import study_guide_render as sgr  # noqa: E402
 
 PY = sys.executable
+ALT_VALID_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+    "0000000c49444154789c63f8ffff3f0005fe02fe0def46b80000000049454e44ae426082"
+)
 
 
 def fake_math(latex, display="inline"):
@@ -516,11 +523,20 @@ class MathContract(WorkspaceMixin, unittest.TestCase):
                 self.assertIn("标准分隔符", str(ctx.exception))
 
     def test_validator_command_vocabulary_is_fail_loud(self):
-        for text in ("x \\mid y", "\\operatorname{Var}(X)"):
+        for text in (
+                "x \\mid y", "\\operatorname{Var}(X)", r"Use \boxed{x}",
+                r"A \implies B", r"A \land B", r"\bigcup_i A_i",
+                r"x_1,\ldots,x_n", r"\varnothing"):
             with self.subTest(text=text):
                 with self.assertRaises(sgr.GuideError) as ctx:
                     sgr.prepare_math(text, fake_math)
                 self.assertIn("raw/伪 LaTeX", str(ctx.exception))
+
+    def test_absolute_windows_paths_are_not_mistaken_for_bare_tex(self):
+        text = r"Materials: D:\min\notes and C:\beta\file plus \\server\share\quad"
+        prepared, tokens = sgr.prepare_math(text, fake_math)
+        self.assertEqual(text, prepared)
+        self.assertEqual({}, tokens)
 
     def test_code_fence_does_not_convert_or_flag_documented_tex(self):
         text = "```latex\n(A\\cup B)\n$raw$\n```\n\n正文 $x$"
@@ -554,6 +570,63 @@ class MathContract(WorkspaceMixin, unittest.TestCase):
             sgr.prepare_math("$A \\cup B$", still_raw)
         self.assertIn("raw LaTeX", str(ctx.exception))
 
+    def test_pmod_converter_gap_uses_narrow_render_only_rewrite(self):
+        seen = []
+
+        def converter(latex, display="inline"):
+            seen.append((latex, display))
+            return "<math><mrow><mi>mod</mi><mn>2</mn></mrow></math>"
+
+        prepared, tokens = sgr.prepare_math(
+            r"$N_V\equiv0\pmod2$ and $x\pmod{12}$", converter)
+        self.assertEqual([
+            (r"N_V\equiv0\;(\operatorname{mod}\;2)", "inline"),
+            (r"x\;(\operatorname{mod}\;12)", "inline"),
+        ], seen)
+        self.assertNotIn(r"\pmod", prepared)
+        self.assertEqual(2, len(tokens))
+
+    def test_pmod_rewrite_accepts_simple_braced_operand_and_leaves_complex_unknown(self):
+        self.assertEqual(
+            r"x\;(\operatorname{mod}\;n+1)",
+            sgr._latex_for_mathml(r"x\pmod{n+1}"),
+        )
+        for value in (r"x\pmodn", r"x\pmod\alpha", r"x\pmod{n+{1}}", r"x\pmod"):
+            with self.subTest(value=value):
+                self.assertEqual(value, sgr._latex_for_mathml(value))
+
+    def test_legal_unbraced_frac_arguments_are_braced_for_the_pinned_converter(self):
+        seen = []
+
+        def converter(latex, display="inline"):
+            seen.append((latex, display))
+            return "<math><mfrac><mn>1</mn><mn>2</mn></mfrac></math>"
+
+        sgr.prepare_math(
+            r"$\frac12+\frac 3 4+\frac\alpha2+\frac{20}{140}$", converter)
+        self.assertEqual([
+            (r"\frac{1}{2}+\frac{3}{4}+\frac{\alpha}{2}+\frac{20}{140}", "inline"),
+        ], seen)
+
+    def test_malformed_frac_arguments_fail_closed_before_conversion(self):
+        for value in (r"\frac", r"\frac1", r"\frac{1", r"\frac}2"):
+            with self.subTest(value=value):
+                with self.assertRaises(sgr.GuideError):
+                    sgr._latex_for_mathml(value)
+
+    def test_typed_inline_tex_renders_without_paragraph_or_code_wrapper(self):
+        ws = self.make_ws()
+        try:
+            renderer = sgr.MarkdownRenderer(ws, fake_math)
+            rendered = renderer.render_inline_math(r"\alpha")
+            self.assertIn('class="math-inline" role="math"', rendered)
+            self.assertNotIn("<p>", rendered)
+            self.assertNotIn("<code>", rendered)
+            with self.assertRaisesRegex(sgr.GuideError, "without Markdown"):
+                renderer.render_inline_math(r"$\alpha$")
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
     def test_unreviewed_installed_mathml_version_fails_before_import(self):
         with mock.patch.object(sgr, "installed_distribution_version", return_value="3.81.0"):
             with self.assertRaises(sgr.MissingMathDependency) as ctx:
@@ -571,8 +644,28 @@ class MathContract(WorkspaceMixin, unittest.TestCase):
         self.assertEqual(len(tokens), 1)
         rendered = next(iter(tokens.values()))
         self.assertIn("<math", rendered)
-        self.assertNotIn(r"\\frac", rendered)
+        self.assertNotIn(r"\frac", rendered)
         self.assertNotIn("<script", rendered.lower())
+
+        _prepared, pmod_tokens = sgr.prepare_math(r"$N_V\equiv0\pmod2$")
+        pmod_rendered = next(iter(pmod_tokens.values()))
+        self.assertIn("mod", pmod_rendered)
+        self.assertNotIn(r"\pmod", pmod_rendered)
+
+        _prepared, fraction_tokens = sgr.prepare_math(r"$\frac12+\frac34$")
+        fraction_rendered = next(iter(fraction_tokens.values()))
+        self.assertEqual(2, fraction_rendered.count("<mfrac"))
+
+        _prepared, eec_tokens = sgr.prepare_math(
+            r"$\Pr(B_1\cap B_2)=\frac28=\frac14=\Pr(B_1)\Pr(B_2)$")
+        eec_rendered = next(iter(eec_tokens.values()))
+        self.assertEqual(2, eec_rendered.count("<mfrac"))
+        self.assertIn("<mn>2</mn>", eec_rendered)
+        self.assertIn("<mn>8</mn>", eec_rendered)
+        self.assertIn("<mn>1</mn>", eec_rendered)
+        self.assertIn("<mn>4</mn>", eec_rendered)
+        for fraction in re.findall(r"<mfrac>.*?</mfrac>", eec_rendered):
+            self.assertNotIn("<mo>=</mo>", fraction)
 
 
 class PathSafety(WorkspaceMixin, unittest.TestCase):
@@ -728,6 +821,27 @@ class PathSafety(WorkspaceMixin, unittest.TestCase):
 
 
 class CliContract(WorkspaceMixin, unittest.TestCase):
+    @staticmethod
+    def _full_gate(ws):
+        return {
+            "ready_to_use": True,
+            "ready_to_ingest": True,
+            "processing_mode": "full",
+            "answer_explanation_mode": "ordinary",
+            "workspace": ws,
+            "materials": ws,
+            "registered_course": "fixture-course",
+            "runtime_provenance": {"receipt": {
+                "runtime_digest": "a" * 64,
+                "runtime_file_count": 1,
+                "skill_version": "test",
+                "git_commit": "b" * 40,
+                "git_branch": "codex/test",
+                "git_dirty": False,
+                "python_executable": sys.executable,
+            }},
+        }
+
     def test_html_href_allowlist_accepts_only_existing_fragments_and_material_files(self):
         materials = tempfile.mkdtemp(prefix="study-guide-materials-")
         outside_dir = tempfile.mkdtemp(prefix="study-guide-outside-")
@@ -807,14 +921,19 @@ class CliContract(WorkspaceMixin, unittest.TestCase):
             shutil.rmtree(directory, ignore_errors=True)
 
     def run_cli(self, ws, *extra, env=None):
-        merged = dict(os.environ)
-        if env:
-            merged.update(env)
-        return subprocess.run(
-            [PY, os.path.join(SCRIPTS, "study_guide_render.py"), "--workspace", ws,
-             "--chapter", "1", "--artifact-type", "source_packet"] + list(extra),
-            capture_output=True, text=True, encoding="utf-8", env=merged,
-        )
+        argv = [
+            "--workspace", ws, "--chapter", "1",
+            "--artifact-type", "source_packet",
+        ] + list(extra)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env or {}, clear=False), \
+                mock.patch.object(
+                    sgr, "_start_gate_or_raise",
+                    return_value=self._full_gate(ws)), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            code = sgr.main(argv)
+        return subprocess.CompletedProcess(
+            argv, code, stdout=stdout.getvalue(), stderr=stderr.getvalue())
 
     def test_missing_math_dependency_exit_3_and_removes_stale_outputs(self):
         ws = self.make_ws()
@@ -864,8 +983,13 @@ class CliContract(WorkspaceMixin, unittest.TestCase):
     def test_direct_run_with_injected_converter_writes_atomically(self):
         ws = self.make_ws()
         try:
-            self.assertEqual(sgr.run(["--workspace", ws, "--chapter", "1",
-                                      "--artifact-type", "source_packet"], fake_math), 0)
+            with mock.patch.object(
+                    sgr, "_start_gate_or_raise",
+                    return_value=self._full_gate(ws)):
+                self.assertEqual(sgr.run([
+                    "--workspace", ws, "--chapter", "1",
+                    "--artifact-type", "source_packet",
+                ], fake_math), 0)
             path = os.path.join(ws, "study_guide", "ch01.source-packet.html")
             self.assertTrue(os.path.isfile(path))
             self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(os.path.dirname(path))))
@@ -891,7 +1015,9 @@ class TypedManifestPublicationTOCTOU(WorkspaceMixin, unittest.TestCase):
     def _manifest_path(ws):
         return os.path.join(ws, "notebook", "ch01.guide.json")
 
-    def _write_manifest(self, ws, payload=b'{"generation":1}'):
+    def _write_manifest(
+            self, ws,
+            payload=b'{"authoring_protocol_version":2,"generation":1}'):
         path = self._manifest_path(ws)
         with open(path, "wb") as stream:
             stream.write(payload)
@@ -901,6 +1027,9 @@ class TypedManifestPublicationTOCTOU(WorkspaceMixin, unittest.TestCase):
     def _gate(ws, digest="a" * 64):
         return {
             "ready_to_use": True,
+            "ready_to_ingest": True,
+            "processing_mode": "full",
+            "answer_explanation_mode": "ordinary",
             "workspace": ws,
             "materials": ws,
             "registered_course": "TOCTOU",
@@ -920,6 +1049,9 @@ class TypedManifestPublicationTOCTOU(WorkspaceMixin, unittest.TestCase):
         return {
             "ok": True,
             "schema_version": 1,
+            "authoring_protocol_version": 2,
+            "answer_explanation_mode": "ordinary",
+            "ingestion_pipeline_version": "ingestion-v2",
             "chapter": 1,
             "language": "en",
             "profile": "full",
@@ -928,7 +1060,8 @@ class TypedManifestPublicationTOCTOU(WorkspaceMixin, unittest.TestCase):
             "omitted_item_ids": [],
         }
 
-    def _run_typed(self, ws, renderer, gate_side_effect=None):
+    def _run_typed(self, ws, renderer, gate_side_effect=None,
+                   validation_report=None):
         import study_guide_content as content
         import study_guide_document as document
 
@@ -939,7 +1072,9 @@ class TypedManifestPublicationTOCTOU(WorkspaceMixin, unittest.TestCase):
         )
         with gate_patch, \
                 mock.patch.object(content, "validate_manifest",
-                                  return_value=self._validation_report()), \
+                                  return_value=(validation_report
+                                                if validation_report is not None
+                                                else self._validation_report())), \
                 mock.patch.object(document, "render_manifest", side_effect=renderer):
             return sgr.run([
                 "--workspace", ws, "--chapter", "1", "--profile", "full",
@@ -959,12 +1094,53 @@ class TypedManifestPublicationTOCTOU(WorkspaceMixin, unittest.TestCase):
 
         def render_and_mutate(*_args, **_kwargs):
             with open(manifest_path, "wb") as stream:
-                stream.write(b'{"generation":2}')
+                stream.write(
+                    b'{"authoring_protocol_version":2,"generation":2}')
             return self.DOCUMENT, {}
 
         try:
             with self.assertRaisesRegex(sgr.ArtifactDriftError, "SHA-256 changed"):
                 self._run_typed(ws, render_and_mutate)
+            self._assert_no_publication(ws)
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_crop_replaced_after_validation_cannot_cross_publication_boundary(self):
+        ws = self.make_ws(language="en")
+        self._write_manifest(ws)
+        relative = "references/assets/prompt.png"
+        crop_path = os.path.join(ws, *relative.split("/"))
+        with open(crop_path, "rb") as stream:
+            approved = stream.read()
+        self.assertNotEqual(approved, ALT_VALID_PNG)
+        report = self._validation_report()
+        report["crop_receipt_verification"] = {
+            "required": True,
+            "status": "verified",
+            "verified_asset_count": 1,
+            "crop_receipt_ids": ["crop_" + "c" * 64],
+            "verified_asset_bindings": [{
+                "path": relative,
+                "crop_receipt_id": "crop_" + "c" * 64,
+                "sha256": hashlib.sha256(approved).hexdigest(),
+                "width": 1,
+                "height": 1,
+            }],
+        }
+
+        def render_and_replace(*_args, **_kwargs):
+            replacement = crop_path + ".replacement"
+            with open(replacement, "wb") as stream:
+                stream.write(ALT_VALID_PNG)
+            os.replace(replacement, crop_path)
+            return self.DOCUMENT, {}
+
+        try:
+            with self.assertRaisesRegex(
+                    sgr.ArtifactDriftError,
+                    "receipt-bound Study Guide crop.*path was replaced"):
+                self._run_typed(
+                    ws, render_and_replace, validation_report=report)
             self._assert_no_publication(ws)
         finally:
             shutil.rmtree(ws, ignore_errors=True)
@@ -1065,7 +1241,8 @@ class TypedManifestPublicationTOCTOU(WorkspaceMixin, unittest.TestCase):
 
         def mutate_before_receipt_stage(path, value, before_publish=None):
             with open(manifest_path, "wb") as stream:
-                stream.write(b'{"generation":3}')
+                stream.write(
+                    b'{"authoring_protocol_version":2,"generation":3}')
             return original_atomic_json(
                 path, value, before_publish=before_publish)
 

@@ -424,7 +424,7 @@ class LiveRoundSixFixes(unittest.TestCase):
         "③ 图里要读的量：\n顶点数 V、边数 E。\n\n"
         "④ 核心公式：\n每次取最小 O(logV)，松弛 E 次 → O((V+E)logV)。\n\n"
         "⑤ 逐步演算：\n1. 初始化距离。\n2. 反复取堆顶最小并松弛邻边。\n3. 得 O((V+E)logV)。\n\n"
-        "⑥ 答案自检：\n稠密图约 O(V^2 logV)，结论合理。\n\n"
+        "⑥ 为什么这个答案成立：\n每条边的松弛和每次取最小值共同决定复杂度，因此得到上述数量级。\n\n"
         "⑦ 知识点溯源：\n第 7 章《图》 · references/wiki/ch07_graph.md · 原文 [lecture12.pdf 第 3 页](../lecture12.pdf#page=3)\n\n"
         "题目来源：hw07.pdf 第 1 页（homework）｜答案来源：hw07_sol.pdf 第 1 页｜🟢 来自资料\n")
 

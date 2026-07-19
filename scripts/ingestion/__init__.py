@@ -27,6 +27,7 @@ from .language import (
 )
 from .models import (
     ASSET_ROLES,
+    ASSET_TYPES,
     ISSUE_STATUSES,
     PATCH_OPERATIONS,
     PATCH_STATUSES,
@@ -53,8 +54,10 @@ from .storage import (
     atomic_write_json,
     atomic_write_jsonl,
     atomic_write_text,
+    lightweight_stable_file_sha256,
     read_json,
     read_jsonl,
+    stable_file_sha256,
     stable_read_bytes,
     workspace_publication_lock,
     workspace_state_lock,
@@ -63,6 +66,7 @@ from .storage import (
 
 __all__ = [
     "ASSET_ROLES",
+    "ASSET_TYPES",
     "ISSUE_STATUSES",
     "MATERIAL_TEXT_LANGUAGE_CODES",
     "PATCH_OPERATIONS",
@@ -93,6 +97,7 @@ __all__ = [
     "file_sha256",
     "is_link_or_reparse",
     "is_language_neutral_formula",
+    "lightweight_stable_file_sha256",
     "make_issue_id",
     "make_patch_id",
     "make_source_id",
@@ -103,6 +108,7 @@ __all__ = [
     "render_answer_value",
     "safe_workspace_entry",
     "safe_workspace_path",
+    "stable_file_sha256",
     "stable_read_bytes",
     "source_language_evidence",
     "workspace_publication_lock",

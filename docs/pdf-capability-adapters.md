@@ -4,6 +4,11 @@
 `exam-study-guide` skill 与 `scripts/study_guide_render.py` 负责；后者可以复用宿主原生能力，
 但不能改变本仓库的来源标注、题面图先于答案图、路径安全和逐页视觉验收契约。
 
+本页所有 Study Guide/PDF 路线只属于显式 `processing_mode=full`。轻量模式即使保存了
+`artifact_mode=visual`，该偏好也处于 dormant，effective output 仍为 `chat`；一次性 PDF
+请求也不能绕过 full-processing gate。轻量页批次的宿主原生 PDF 视觉读取不是“生成
+Study Guide”，其证据必须留在 `.lightweight/assets/` 并遵守轻量会话契约。
+
 机器可读路由表见 [`pdf-capability-adapters.json`](pdf-capability-adapters.json)。表中的 GitHub
 引用固定到 `review_commit`；安装命令仍会获取上游当前版本，因此只能在用户明确同意后执行，
 并应重新检查许可证、实际加载的 skill 和行为差异。
@@ -34,6 +39,21 @@ python scripts/check_deps.py --workspace <ws> --chapter <N> --artifact-mode visu
 解释成“本章没有公式”。只有选中 `browser` 后端时才把 Edge/Chrome 标为需要。缺失时只给固定安装建议，
 仍须用户同意。
 
+`native` 不是“把一个 PDF 放进目录就算完成”。以 `--pdf-backend native` 生成 HTML 后，章节 receipt 会保持
+`awaiting_native_pdf`，并公开本次转换必须使用的 `html_sha256` 与 `conversion_start_gate_sha256`。宿主适配器
+在转换前记录这两个值、机器表声明的 `adapter_id`、实际加载的精确版本和 UTC 开始时间，只消费这份精确 HTML，
+并把结果写到规范路径 `<ws>/study_guide/chNN.pdf`。记录 UTC 完成时间后运行：
+
+```text
+python scripts/study_guide_render.py --workspace <ws> --chapter <N> --pdf-backend native --bind-native --native-pdf-path <ws>/study_guide/chNN.pdf --native-adapter-id <declared-id> --native-adapter-version <exact-version> --conversion-input-html-sha256 <receipt-html-sha256> --conversion-start-gate-sha256 <receipt-gate-sha256> --conversion-started-at <UTC-Z> --conversion-completed-at <UTC-Z> --json
+```
+
+该命令不调用适配器、不联网、不安装依赖，也不渲染 PDF；它在 workspace publication lock 内重新验证当前 typed
+manifest、HTML、full-processing/runtime gate、适配器 allow-list、规范 PDF 路径/签名/哈希和时间顺序，然后原子地
+把 receipt 变为 `qa_pending`。任一不匹配都会保留原来的未绑定 receipt，因此旁路写入、旧 PDF 或手工改 receipt
+都不能进入 QA。适配器 ID/版本是由宿主声明并纳入 conversion hash 的身份，不是对宿主沙箱行为的证明；宿主若
+无法提供实际加载的精确版本，就不能使用 `native` 绑定，应明确回退到 `browser` 或只交付 HTML。
+
 无论走哪条路径，最终 PDF 都必须把每一页渲染为 PNG，检查最新渲染，并在已知视觉缺陷为零后运行：
 
 ```text
@@ -50,6 +70,7 @@ python scripts/study_guide_qa.py --workspace <ws> --chapter <N> accept --inspect
 ### Codex
 
 - 首选：运行时已经可见的 `pdf` skill。
+- 原生绑定使用机器表中的稳定 ID `codex.pdf`，版本必须填写宿主实际加载的精确 skill/plugin 版本，不能写 `latest` 或猜测值。
 - 探测成功后先生成 `study_guide/chNN.html`，再由该原生 skill 把这份 HTML 转成规范路径的 PDF；预检使用
   `--pdf-backend native`，不得因为本地浏览器缺失提前失败。
 - 当前插件目录：[`openai/plugins`](https://github.com/openai/plugins)。
@@ -60,6 +81,7 @@ python scripts/study_guide_qa.py --workspace <ws> --chapter <N> accept --inspect
 ### Claude Code
 
 - 若 `pdf` 或 `document-skills:pdf` 已可见，直接使用。
+- 原生绑定使用机器表中的稳定 ID `claude_code.document-skills.pdf`，版本必须填写宿主实际加载的精确插件版本。
 - 已安装能力探测成功时，预检使用 `--pdf-backend native`，并让它消费已经校验的章节 HTML；只有回退到
   仓库浏览器打印时才改用 `--pdf-backend browser`。
 - 缺失时可在得到用户同意后运行官方命令：

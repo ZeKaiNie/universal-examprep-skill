@@ -156,7 +156,7 @@ def _phase_evidence_ws():
         json.dump([{"id": "ex1", "chapter": 1}, {"id": "ex2", "chapter": 2}], f)
     with open(os.path.join(ws, "references", "quiz_bank.json"), "w", encoding="utf-8") as f:
         json.dump([{"id": "q1", "chapter": 1, "type": "choice", "question": "1+1?",
-                    "options": ["A. 2"], "answer": "A", "source": "teacher"},
+                    "options": ["A. 2", "B. 3"], "answer": "A", "source": "teacher"},
                    {"id": "q2", "chapter": 1, "type": "true_false", "question": "2>1?",
                     "answer": True, "source": "teacher"},
                    {"id": "q3", "chapter": 2, "type": "true_false", "question": "3>2?",
@@ -181,6 +181,24 @@ def _phase_evidence_ws():
     r = _up(ws, ["init"])
     if r.returncode != 0:
         raise AssertionError(r.stderr)
+    r = _up(ws, ["set", "--processing-mode", "full"])
+    if r.returncode != 0:
+        raise AssertionError(r.stderr)
+    state = _state(ws)
+    env = dict(os.environ)
+    env["EXAMPREP_HOME"] = fixture_home
+    confirmed = subprocess.run([
+        sys.executable, os.path.join(SCRIPTS, "exam_start.py"), "confirm",
+        "--course", "phase-fixture", "--workspace", ws,
+        "--materials", os.path.join(os.path.dirname(ws), "materials"),
+        "--mode", state.get("mode") or "from_scratch",
+        "--time-budget", state.get("time_budget") or "le1d",
+        "--language", state.get("language") or "en",
+        "--artifact-mode", state.get("artifact_mode") or "chat",
+        "--processing-mode", "full", "--json",
+    ], capture_output=True, text=True, encoding="utf-8", env=env)
+    if confirmed.returncode != 0:
+        raise AssertionError(confirmed.stdout + confirmed.stderr)
     return ws
 
 
@@ -275,7 +293,6 @@ def _write_phase_guide(ws, profile="full", language="en"):
             "no_formula_reason": localized("This conceptual item needs no formula."),
             "steps": [localized("Work the problem.")],
             "answer": localized("Answer " + item_id),
-            "self_check": localized("Check it."),
             "source_trace": [{
                 "source_file": "course.pdf", "pages": [index * 2],
                 "source_unit_id": "phase-q-" + item_id, "role": "question",
@@ -322,7 +339,8 @@ def _write_visual_receipt(ws):
         "--mode", state.get("mode") or "from_scratch",
         "--time-budget", state.get("time_budget") or "le1d",
         "--language", state.get("language") or "en",
-        "--artifact-mode", state.get("artifact_mode") or "chat", "--json",
+        "--artifact-mode", state.get("artifact_mode") or "chat",
+        "--processing-mode", "full", "--json",
     ], capture_output=True, text=True, encoding="utf-8", env=env)
     if confirmed.returncode != 0:
         raise AssertionError(confirmed.stdout + confirmed.stderr)
@@ -352,21 +370,30 @@ def _write_visual_receipt(ws):
         converter = os.path.abspath("C:/browser/msedge.exe")
         started = "2026-07-14T10:00:00Z"
         completed = "2026-07-14T10:00:01Z"
+        conversion_gate_hash = artifact_qa._canonical_hash(start_gate)
+        manifest_rel = "notebook/ch01.guide.json"
+        html_rel = "study_guide/ch01.html"
+        pdf_rel = "study_guide/ch01.pdf"
+        manifest_hash = artifact_qa._sha256_file(manifest_path)
         receipt = {
-            "schema_version": 2, "artifact_type": "study_guide", "chapter": 1,
+            "schema_version": 3, "artifact_type": "study_guide", "chapter": 1,
             "profile": "full", "language": state.get("language") or "en",
-            "content_manifest": "notebook/ch01.guide.json",
-            "content_manifest_sha256": artifact_qa._sha256_file(manifest_path),
+            "content_manifest": manifest_rel,
+            "content_manifest_sha256": manifest_hash,
             "expected_item_ids": ["ex1", "q1", "q2"],
             "rendered_item_ids": ["ex1", "q1", "q2"], "omitted_item_ids": [],
-            "html_file": "study_guide/ch01.html", "html_sha256": digests["html"],
-            "pdf_file": "study_guide/ch01.pdf", "pdf_sha256": digests["pdf"],
+            "html_file": html_rel, "html_sha256": digests["html"],
+            "pdf_file": pdf_rel, "pdf_sha256": digests["pdf"],
             "pdf_backend": "browser", "converter": converter,
+            "native_adapter_id": None, "native_adapter_version": None,
             "conversion_input_html_sha256": input_hash,
             "conversion_started_at": started, "conversion_completed_at": completed,
+            "conversion_start_gate_sha256": conversion_gate_hash,
             "conversion_run_sha256": artifact_qa._conversion_run_hash(
-                1, "full", state.get("language") or "en", digests["html"],
-                digests["pdf"], input_hash, converter, started, completed, start_gate),
+                1, "full", state.get("language") or "en",
+                manifest_rel, manifest_hash, html_rel, digests["html"],
+                pdf_rel, digests["pdf"], "browser", input_hash, converter,
+                None, None, started, completed, conversion_gate_hash, start_gate),
             "preflight": {"status": "passed", "pdf_backend": "browser"},
             "start_gate": start_gate, "generated_at": "2026-07-14T10:00:02Z",
             "status": "qa_pending",
@@ -582,7 +609,9 @@ class Migration(unittest.TestCase):
     def test_set_check_official_path(self):
         md = LEGACY_MD + "\n## 📊 知识点打卡状态\n- [ ] **阶段 1**：栈与队列\n- [ ] **模拟测试**：综合自测\n"
         ws = _mk_ws(tempfile.mkdtemp(), md=md)
-        _up(ws, ["init"])
+        self.assertEqual(_up(ws, ["init"]).returncode, 0)
+        self.assertEqual(_up(ws, ["set", "--phase", "1",
+                                  "--processing-mode", "full"]).returncode, 0)
         r = _up(ws, ["set-check", "--match", "阶段 1"])
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(_state(ws)["phase_checklist"][0]["done"])  # 勾选走官方路径
@@ -594,7 +623,9 @@ class Migration(unittest.TestCase):
     def test_legacy_set_check_warns_but_stays_compatible(self):
         md = LEGACY_MD + "\n## 📊 知识点打卡状态\n- [ ] **阶段 1**：栈与队列\n"
         ws = _mk_ws(tempfile.mkdtemp(), md=md)
-        _up(ws, ["init"])
+        self.assertEqual(_up(ws, ["init"]).returncode, 0)
+        self.assertEqual(_up(ws, ["set", "--phase", "1",
+                                  "--processing-mode", "full"]).returncode, 0)
         r = _up(ws, ["set-check", "--match", "阶段 1"])
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("旧工作区", r.stderr)
@@ -609,6 +640,8 @@ class Migration(unittest.TestCase):
         json.dump({"suspects": []}, open(os.path.join(ws, "references", "image_question_index.json"),
                                          "w", encoding="utf-8"))
         self.assertEqual(_up(ws, ["init"]).returncode, 0)
+        self.assertEqual(_up(ws, ["set", "--phase", "1",
+                                  "--processing-mode", "full"]).returncode, 0)
         r = _up(ws, ["set-check", "--match", "阶段 1"])
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("旧工作区", r.stderr)
@@ -622,6 +655,8 @@ class Migration(unittest.TestCase):
                       "w", encoding="utf-8") as f:
                 f.write(teaching_text)
             self.assertEqual(_up(ws, ["init"]).returncode, 0)
+            self.assertEqual(_up(ws, ["set", "--phase", "1",
+                                      "--processing-mode", "full"]).returncode, 0)
             before = open(os.path.join(ws, "study_state.json"), "rb").read()
             r = _up(ws, ["set-check", "--match", "阶段 1"])
             self.assertNotEqual(r.returncode, 0)
@@ -706,7 +741,7 @@ class PhaseEvidence(unittest.TestCase):
             "--ref", "q1", "--outcome", "passed",
         ])
         self.assertNotEqual(0, result.returncode)
-        self.assertIn("student_attempt", result.stderr)
+        self.assertIn("prompt_asset_missing", result.stderr)
 
     def test_new_global_attempt_conflict_invalidates_existing_completion_evidence(self):
         ws = _phase_evidence_ws()
@@ -816,7 +851,7 @@ class PhaseEvidence(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(os.path.exists(os.path.join(ws, "study_guide", "ch01.pdf")))
 
-    def test_structured_visual_phase_requires_artifact_ready_then_accepts_full_page_qa(self):
+    def test_structured_visual_phase_requires_artifact_ready_and_v1_is_read_only(self):
         ws = _phase_evidence_ws()
         _enable_phase_structured(ws)
         _write_phase_guide(ws, profile="full")
@@ -829,9 +864,10 @@ class PhaseEvidence(unittest.TestCase):
         self.assertIn("chapter_artifact_receipt_missing", result.stderr)
         self.assertEqual(open(os.path.join(ws, "study_state.json"), "rb").read(), before)
 
-        _write_visual_receipt(ws)
-        result = _up(ws, ["complete-phase", "--status", "covered_unverified"])
-        self.assertEqual(result.returncode, 0, result.stderr)
+        with self.assertRaisesRegex(
+                artifact_qa.QAError, "ingestion-v1 Study Guide compatibility is read-only"):
+            _write_visual_receipt(ws)
+        self.assertEqual(open(os.path.join(ws, "study_state.json"), "rb").read(), before)
 
     def test_language_change_makes_old_typed_guide_invalid_until_relocalized(self):
         ws = _phase_evidence_ws()
@@ -1001,7 +1037,7 @@ class PhaseEvidence(unittest.TestCase):
         r = _up(ws, ["record-phase-evidence", "--kind", "checkpoint", "--ref", "fake1",
                      "--outcome", "passed"])
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("quiz_bank.json", r.stderr)
+        self.assertIn("absent from the runtime-eligible bank", r.stderr)
         self.assertEqual(open(os.path.join(ws, "study_state.json"), "rb").read(), before)
 
     def test_scope_normalization_and_unscoped_suspects_are_fail_closed(self):
@@ -2672,10 +2708,34 @@ class EnTemplateMigration(unittest.TestCase):
         with open(raw_path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(self.RAW_EN, f, ensure_ascii=False)
         ws = os.path.join(tmp, "ws")
+        materials = os.path.join(tmp, "materials")
+        fixture_home = os.path.join(tmp, "examprep-home")
+        os.makedirs(materials)
+        env = dict(os.environ)
+        env["EXAMPREP_HOME"] = fixture_home
+        confirmed = subprocess.run([
+            sys.executable, os.path.join(SCRIPTS, "exam_start.py"), "confirm",
+            "--course", "english-template-fixture",
+            "--workspace", ws, "--materials", materials,
+            "--mode", "from_scratch", "--time-budget", "le1d",
+            "--language", "en", "--artifact-mode", "chat",
+            "--processing-mode", "full", "--json",
+        ], capture_output=True, text=True, encoding="utf-8", env=env)
+        self.assertEqual(confirmed.returncode, 0,
+                         confirmed.stdout + confirmed.stderr)
+        with open(os.path.join(ws, ".phase-test-examprep-home"), "w",
+                  encoding="utf-8") as stream:
+            stream.write(fixture_home)
         r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "ingest.py"),
-                            "--input", raw_path, "--output-dir", ws, "--lang", "en"],
-                           capture_output=True, text=True, encoding="utf-8")
+                            "--input", raw_path, "--output-dir", ws, "--lang", "en",
+                            "--force"],
+                           capture_output=True, text=True, encoding="utf-8", env=env)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # ``exam_start confirm`` seeds canonical state before the compiler runs.
+        # These tests intentionally exercise migration from the compiler's English
+        # Markdown template, so remove only that seed while retaining the exact-pair
+        # registry and runtime receipt required by the compiler.
+        os.remove(os.path.join(ws, "study_state.json"))
         return ws
 
     def test_en_init_does_not_ingest_header_rows(self):

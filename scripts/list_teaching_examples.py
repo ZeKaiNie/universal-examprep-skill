@@ -21,6 +21,7 @@ import re
 import sys
 from urllib.parse import unquote
 
+import i18n
 import notebook as notebook_engine
 from ingestion import (
     ConflictError,
@@ -134,38 +135,8 @@ def _stable_unique_strings(values, label):
     return result
 
 
-def _no_questions(state):
-    preferences = state.get("preferences") if isinstance(state, dict) else None
-    for key in ("no_questions", "no-questions", "不要出题", "不要问我"):
-        if not isinstance(preferences, dict) or key not in preferences:
-            continue
-        value = str(preferences.get(key) or "").strip().lower()
-        if value in ("1", "true", "yes", "on", "是", "不出题", "不要问"):
-            return True
-    return False
-
-
-def _interaction_style_preference(state):
-    preferences = state.get("preferences") if isinstance(state, dict) else None
-    raw = preferences.get("interaction_style", "batch") \
-        if isinstance(preferences, dict) else "batch"
-    return raw if raw in ("batch", "step_by_step") else "batch"
-
-
-def _effective_interaction_style(state):
-    if (isinstance(state, dict)
-            # This PR lands on a runtime that predates the explicit processing
-            # selector, where a missing field is the existing implicit full
-            # route.  An explicit non-full value still makes pacing dormant.
-            and state.get("processing_mode", "full") == "full"
-            and not _no_questions(state)
-            and _interaction_style_preference(state) == "step_by_step"):
-        return "step_by_step"
-    return "batch"
-
-
 def _load_full_mode_state(workspace, chapter):
-    """Load only the state fields needed by the pending selector.
+    """Load only the state fields needed by the pending selector under its lock.
 
     Missing or malformed state fails closed.  The selector is intentionally a
     full-mode feature; lightweight teaching has a different page-batch state
@@ -189,11 +160,12 @@ def _load_full_mode_state(workspace, chapter):
     if not isinstance(preferences, dict):
         _die("study_state.json.preferences must be an object")
     interaction_style = preferences.get("interaction_style", "batch")
-    if interaction_style not in ("batch", "step_by_step"):
+    if interaction_style not in i18n.INTERACTION_STYLES:
         _die("study_state.json.preferences.interaction_style must be batch|step_by_step")
-    if _effective_interaction_style(state) != "step_by_step":
-        _die("--next-pending requires effective interaction_style=step_by_step; "
-             "lightweight or no_questions makes the saved preference dormant")
+    if i18n.workspace_effective_interaction_style(state) != "step_by_step":
+        _die(
+            "--next-pending requires effective interaction_style=step_by_step; "
+            "lightweight or no_questions makes the saved preference dormant")
     current = state.get("current_phase")
     if not isinstance(current, int) or isinstance(current, bool) or current < 1:
         _die("study_state.json.current_phase must be a positive integer")
@@ -278,8 +250,8 @@ def _item_sha256(item):
     return hashlib.sha256(payload).hexdigest()
 
 
-def _require_complete_roster(workspace, items):
-    """A retained example must have a live teaching snapshot; the bank is not a fallback."""
+def _require_complete_roster(workspace, chapter, items):
+    """Require every retained ID to have a current same-chapter teaching snapshot."""
     path = os.path.join(workspace, "references", "teaching_baseline.json")
     if not os.path.lexists(path):
         return
@@ -290,58 +262,80 @@ def _require_complete_roster(workspace, items):
             payload = json.load(stream, parse_constant=_reject_constant)
     except (OSError, ValueError) as exc:
         _die("invalid teaching baseline: %s" % exc)
-    if (not isinstance(payload, dict)
-            or payload.get("schema_version") != 1
-            or payload.get("policy") != "append_only"):
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("policy") != "append_only"
+    ):
         _die("step-by-step requires a valid append-only teaching baseline")
     mapping = payload.get("teaching_example_ids_by_chapter")
     flat = payload.get("teaching_example_ids")
     if not isinstance(mapping, dict) or not isinstance(flat, list):
         _die("step-by-step requires a valid chapter-mapped teaching baseline")
-    if (any(stable_item_id_problem(value) is not None for value in flat)
-            or len(flat) != len(set(flat))):
+    if (
+        any(
+            stable_item_id_problem(value) is not None
+            for value in flat
+        )
+        or len(flat) != len(set(flat))
+    ):
         _die("teaching baseline ID list is invalid or duplicated")
     mapped = set()
-    baseline_scope_by_id = {}
     for raw_scope, values in mapping.items():
         scope = _scope_key(raw_scope)
-        if (not isinstance(raw_scope, str)
-                or not scope.isdigit()
-                or raw_scope != scope
-                or not isinstance(values, list)
-                or any(stable_item_id_problem(value) is not None
-                       for value in values)
-                or len(values) != len(set(values))):
+        if (
+            not isinstance(raw_scope, str)
+            or not scope.isdigit()
+            or str(int(scope)) != scope
+            or not isinstance(values, list)
+            or any(
+                stable_item_id_problem(value) is not None
+                for value in values
+            )
+            or len(values) != len(set(values))
+        ):
             _die("teaching baseline chapter mapping is invalid")
         if mapped & set(values):
             _die("teaching baseline assigns one ID to multiple chapters")
         mapped.update(values)
-        for value in values:
-            baseline_scope_by_id[value] = scope
     if mapped != set(flat):
         _die("teaching baseline flat IDs disagree with the chapter mapping")
-    manifest_scope_by_id = {
-        item["id"]: _scope_key(
-            item.get("chapter") if item.get("chapter") is not None else item.get("phase"))
-        for item in items
-    }
-    missing = sorted(set(flat) - set(manifest_scope_by_id))
+    manifest_ids = {item["id"] for item in items}
+    missing = sorted(set(flat) - manifest_ids)
     if missing:
-        _die("teaching roster is incomplete; baseline IDs missing from "
-             "teaching_examples.json (quiz-only fallback is forbidden): %s; "
-             "rebuild/review the full roster" % ", ".join(missing))
-    drifted = sorted(
-        ident for ident, baseline_scope in baseline_scope_by_id.items()
-        if ident in manifest_scope_by_id
-        and manifest_scope_by_id[ident] != baseline_scope
-    )
-    if drifted:
-        _die("teaching roster chapter drift: baseline IDs no longer have a current "
-             "snapshot in the same canonical chapter: %s" % ", ".join(drifted))
+        _die(
+            "teaching roster is incomplete; baseline IDs missing from "
+            "teaching_examples.json (quiz-only fallback is forbidden): %s; rebuild/review "
+            "the full roster" % ", ".join(missing))
+
+    # Presence in the flat manifest is not enough: a retained baseline item must
+    # still belong to the same canonical chapter.  Otherwise moving an item to a
+    # different chapter could make the old chapter look exhausted even though its
+    # append-only baseline evidence has silently disappeared from that scope.
+    manifest_scope_by_id = {
+        item["id"]: next(iter(_chapter_keys(item))) for item in items
+    }
+    scope_drift = []
+    for baseline_scope, values in mapping.items():
+        for item_id in values:
+            actual_scope = manifest_scope_by_id.get(item_id)
+            if actual_scope is not None and actual_scope != baseline_scope:
+                scope_drift.append((item_id, baseline_scope, actual_scope))
+    if scope_drift:
+        _die(
+            "teaching roster chapter drift detected: %s; rebuild/review the full roster"
+            % ", ".join(
+                "%s baseline=%s manifest=%s" % row for row in scope_drift
+            )
+        )
 
 
 def _binding_structure(workspace, chapter, binding):
-    """Validate immutable binding shape/identity and return its live target."""
+    """Validate immutable binding shape/identity and return its live target.
+
+    These failures are structural corruption, not recoverable content staleness,
+    so callers must continue to fail closed rather than treating them as pending.
+    """
 
     if not isinstance(binding, dict) or set(binding) != _BINDING_FIELDS:
         _die("teaching_example_bindings entries must use the exact binding schema")
@@ -367,12 +361,15 @@ def _binding_structure(workspace, chapter, binding):
         or any(char in fragment for char in ("\x00", "\r", "\n"))
     ):
         _die("teaching-example binding must target %s#<anchor>" % expected_relative)
-    for digest_field in ("notebook_block_sha256", "manifest_item_sha256"):
-        if not re.fullmatch(r"[0-9a-f]{64}", str(binding.get(digest_field) or "")):
-            _die("teaching-example binding %s must be lowercase SHA-256" % digest_field)
+    for field in ("notebook_block_sha256", "manifest_item_sha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(binding.get(field) or "")):
+            _die("teaching-example binding %s must be lowercase SHA-256" % field)
     notebook_dir = os.path.join(workspace, "notebook")
     path = os.path.join(workspace, *relative.split("/"))
-    if os.path.lexists(notebook_dir) and is_link_or_reparse(notebook_dir):
+    if (
+        os.path.lexists(notebook_dir)
+        and is_link_or_reparse(notebook_dir)
+    ):
         _die("workspace notebook directory must not be a link or reparse point")
     if os.path.lexists(notebook_dir) and not os.path.isdir(notebook_dir):
         _die("workspace notebook path exists but is not a directory")
@@ -422,15 +419,17 @@ def _live_notebook_binding(target, binding):
         return "notebook_anchor_not_unique"
     block = matches[0]
     label, _timestamp = notebook_engine._block_meta(block.get("lines") or [])
-    if (block.get("id") != item_id
-            or notebook_engine._label_to_type().get(label) != "walkthrough"
-            or not notebook_engine.block_has_teaching_example_marker(block, item_id)):
+    if (
+        block.get("id") != item_id
+        or notebook_engine._label_to_type().get(label) != "walkthrough"
+        or not notebook_engine.block_has_teaching_example_marker(block, item_id)
+    ):
         return "notebook_marked_walkthrough_mismatch"
     try:
-        live_digest = notebook_engine.block_sha256(block)
+        live_hash = notebook_engine.block_sha256(block)
     except ValueError as exc:
         _die("teaching-example walkthrough block is structurally invalid: %s" % exc)
-    if live_digest != binding.get("notebook_block_sha256"):
+    if live_hash != binding.get("notebook_block_sha256"):
         return "notebook_block_revision_changed"
     return None
 
@@ -442,7 +441,8 @@ def _validated_step_completed(workspace, chapter, hits, state):
     binding_value = record.get("teaching_example_bindings")
     recorded = _stable_unique_strings(
         [] if recorded_value is None else recorded_value,
-        "study_state.json.phase_evidence[%s].teaching_examples" % chapter)
+        "study_state.json.phase_evidence[%s].teaching_examples" % chapter,
+    )
     if any(stable_item_id_problem(value) is not None for value in recorded):
         _die(
             "study_state.json.phase_evidence[%s].teaching_examples violates "
@@ -450,7 +450,8 @@ def _validated_step_completed(workspace, chapter, hits, state):
         )
     notebook_refs = _stable_unique_strings(
         [] if notebook_value is None else notebook_value,
-        "study_state.json.phase_evidence[%s].notebook" % chapter)
+        "study_state.json.phase_evidence[%s].notebook" % chapter,
+    )
     bindings = [] if binding_value is None else binding_value
     if not isinstance(bindings, list):
         _die("study_state.json teaching_example_bindings must be an array")
@@ -479,12 +480,15 @@ def _validated_step_completed(workspace, chapter, hits, state):
             _die("teaching-example binding lacks matching notebook evidence: %s" % item_id)
     missing_ids = set(by_id) - set(recorded)
     if missing_ids:
-        _die("teaching-example bindings lack matching teaching IDs: %s" %
-             ", ".join(sorted(missing_ids)))
+        _die(
+            "teaching-example bindings lack matching teaching IDs: %s"
+            % ", ".join(sorted(missing_ids)))
     unexpected = set(recorded) - set(item_by_id)
     if unexpected:
-        _die("teaching-example evidence is outside the current chapter roster: %s" %
-             ", ".join(sorted(unexpected)))
+        _die(
+            "teaching-example evidence is outside the current chapter roster: %s"
+            % ", ".join(sorted(unexpected)))
+
     stale_by_id = {}
     for item in hits:
         item_id = item["id"]
@@ -498,10 +502,12 @@ def _validated_step_completed(workspace, chapter, hits, state):
         if live_problem is not None:
             problems.append(live_problem)
         if problems:
+            # At most one manifest and one notebook condition are reported for
+            # each roster item.  No file content or exception text enters JSON.
             stale_by_id[item_id] = problems
 
-    # Unbound IDs are legitimate batch-mode evidence. Bound IDs count only
-    # while their exact notebook and manifest revisions remain live.
+    # Unbound IDs are legitimate batch-mode evidence from before a cadence switch;
+    # bound IDs are step events and count only while their live checks pass.
     recorded_set = set(recorded)
     valid = (recorded_set - set(by_id)) | (set(by_id) - set(stale_by_id))
     completed = [item["id"] for item in hits if item["id"] in valid]
@@ -512,13 +518,14 @@ def _pending_payload(workspace, chapter, items, hits, missing):
     if missing:
         _die("--next-pending requires references/teaching_examples.json")
     _validate_pending_scopes(items)
-    _require_complete_roster(workspace, items)
+    manifest_ids = [item["id"] for item in hits]
+    _require_complete_roster(workspace, chapter, items)
     state = _load_full_mode_state(workspace, chapter)
     completed_ids, recorded, stale_by_id = _validated_step_completed(
         workspace, chapter, hits, state)
+    manifest_set = set(manifest_ids)
     completed_set = set(completed_ids)
     pending_items = [item for item in hits if item["id"] not in completed_set]
-    manifest_set = {item["id"] for item in hits}
     unexpected = [item_id for item_id in recorded if item_id not in manifest_set]
     stale_ids = [item["id"] for item in hits if item["id"] in stale_by_id]
     reported_stale_ids = stale_ids[:_STALE_DIAGNOSTIC_LIMIT]
@@ -526,11 +533,12 @@ def _pending_payload(workspace, chapter, items, hits, missing):
         "chapter": chapter,
         "manifest_missing": False,
         "processing_mode": "full",
-        "interaction_style_preference": _interaction_style_preference(state),
-        "interaction_style_effective": _effective_interaction_style(state),
+        "interaction_style_preference": (
+            i18n.workspace_interaction_style_preference(state)),
+        "interaction_style_effective": (
+            i18n.workspace_effective_interaction_style(state)),
         "interaction_style_dormant": (
-            _interaction_style_preference(state) == "step_by_step"
-            and _effective_interaction_style(state) != "step_by_step"),
+            i18n.workspace_interaction_style_dormant(state)),
         "total": len(hits),
         "completed": len(completed_ids),
         "pending": len(pending_items),
@@ -582,7 +590,8 @@ def main(argv=None):
             with workspace_validation_lock(workspace):
                 items, missing = load_manifest(workspace)
                 hits = [item for item in items if chapter in _chapter_keys(item)]
-                payload = _pending_payload(workspace, chapter, items, hits, missing)
+                payload = _pending_payload(
+                    workspace, chapter, items, hits, missing)
         except ConflictError as exc:
             _die("cannot acquire a consistent workspace snapshot: %s" % exc)
         if args.json:
