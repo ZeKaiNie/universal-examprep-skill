@@ -33,17 +33,18 @@ not to an already confirmed `full` workspace. Keep this choice independent from
 `artifact_mode=chat|visual`.
 
 `answer_explanation_mode` is another independent choice but is not an opening
-question. Missing/legacy/invalid means `ordinary`: full Guides still contain a
-detailed beginner-first explanation for every item, authored in the normal context,
-without a second Provider or isolation claim. `isolated` is full-ingestion-v2-only
-and uses two consent stages. After confirming the host can support fresh/stateless
-tool-disabled per-item calls, disclose Provider/API-billing and retention/privacy,
-then obtain a no-upload planning opt-in before persisting `isolated` and preparing
-its packet, annotations, requests, and plan. Before any call, inspect and disclose
-that plan's exact item/image scope and count, separately check current official
-pricing and give a bounded estimate, then obtain exact-plan upload consent. Never
-infer it from a GPT model, subscription, key, `full`, or `visual`; a host that lacks
-the capability stays `ordinary`.
+question. Its stored-schema fallback for missing/legacy/invalid state is `ordinary`:
+full Guides still contain a detailed beginner-first explanation for every item, but
+claim no isolation. At full-v2 Guide entry, run a native-child capability handshake.
+If the host can prove one fresh independent child context per item and can restrict
+that child's task input and tools to the exact request, default to `isolated` unless
+the learner opted out. Persist the mode, tell the learner once that it consumes extra
+host model quota/time, and require no separate API key or external-upload consent.
+If any part is missing, inherited, or unverified, stay `ordinary` and say why. A
+separately billed external Provider is an explicit-request fallback only; it retains
+no-upload exact planning, current pricing/privacy disclosure, and exact-plan upload
+consent. A model name, subscription, key, `full`, or `visual` alone proves neither
+native isolation nor permission to upload.
 
 Teaching cadence is another optional, independent preference, not an opening
 question. `preferences.interaction_style` stores only `batch|step_by_step`; missing
@@ -87,9 +88,11 @@ Run these gates before routing any learning action:
 
    `python "${CLAUDE_SKILL_DIR}/scripts/exam_start.py" confirm --course <course> --materials <dir> --workspace <ws> --mode <mode> --time-budget <tier> --language <zh|en|bilingual> --processing-mode <lightweight|full> [--artifact-mode chat|visual] [--answer-explanation-mode ordinary|isolated] [--urgent] --json`
 
-   Omit `--answer-explanation-mode` during ordinary confirmation; omission preserves an
-   existing canonical choice, while new/legacy/invalid state safely resolves to
-   `ordinary`. Supply `isolated` only after the separate extension gate above.
+   Omit `--answer-explanation-mode` during ordinary startup confirmation; omission
+   preserves an existing canonical choice, while new/legacy/invalid state safely
+   resolves to `ordinary`. At full-v2 Guide entry, the capability handshake above may
+   persist native `isolated`; an external fallback may persist it only after its
+   separate consent gate.
 
    `--urgent` may infer only mode and budget; the caller supplies the opening language. Use `exam_start.py status ... --json` for read-only checks. Lightweight requires `ready_to_start=true`; the separate `ready_to_ingest=true` gate is intentionally false until processing is explicit `full`. Every opening panel shows the absolute workspace path.
 

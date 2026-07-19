@@ -48,13 +48,16 @@ The card must say:
   receipt hashes, every-page QA, and `artifact_ready=ready`. A one-shot artifact
   leaves stored state unchanged. In lightweight, a saved `visual` preference is
   dormant and effective output remains `chat`; it never builds a Study Guide.
-- `answer_explanation_mode` is also independent. Missing/legacy/invalid means
-  `ordinary`: every full-Guide item still gets a detailed beginner-first explanation,
-  but no second Provider or isolation receipt is claimed. `isolated` is an off-by-
-  default, full-v2-only extension requiring two-stage consent: Provider/API-billing
-  and retention/privacy disclosure before no-upload planning, then exact plan-bound
-  item/image scope, call count, current-pricing estimate, and upload consent before calls.
-  A GPT model, subscription, API key, `full`, or `visual` does not enable it.
+- `answer_explanation_mode` is also independent. Its stored-schema fallback is
+  `ordinary`, and every full-Guide item still gets a detailed beginner-first
+  explanation. At full-v2 Guide entry, a verified host-native child with a fresh
+  independent context plus exact single-item input/tool restrictions makes
+  `isolated` the default unless the learner opted out; tell the learner once about
+  extra host quota/time, with no second API key or external upload. Missing or
+  incomplete capability stays `ordinary` and is stated honestly. A separately
+  billed external Provider is explicit-request-only and retains no-upload planning,
+  current pricing/privacy disclosure, and exact-plan upload consent. A model name,
+  subscription, key, `full`, or `visual` alone proves neither route.
 - `ingest_course.py` is the full-mode build entry; exit 10 is process success with
   blocked readiness, and teaching remains forbidden. `.ingest/` is full-mode
   build/review truth, `.lightweight/session.json` is on-demand page-batch truth,

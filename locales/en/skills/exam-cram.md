@@ -25,14 +25,15 @@ may be abandoned with a reason and replanned; taught progress cannot be abandone
 Full performs the complete structured build. Do not mix this choice with chat/visual
 artifact output; a saved visual preference is dormant/effectively chat in lightweight.
 
-Do not make answer-explanation isolation an ordinary startup question. Default
-`ordinary` still writes detailed beginner-first explanations for every full-Guide
-item, but makes no second Provider call and claims no isolation. `isolated` is
-full-v2-only and uses two consents: after an explicit request and truthful
-fresh/stateless tool-disabled host capability, disclose Provider/API billing and
-retention/privacy and obtain a no-upload planning opt-in; then disclose the generated
-plan's exact item/image scope and count plus a current-pricing estimate and obtain
-exact-plan upload consent. Never infer it from GPT, subscription, key, full, or visual.
+Do not make answer-explanation isolation an ordinary startup question. At full-v2
+Guide entry, first perform a host-capability handshake. If official host capabilities
+verifiably provide a fresh independent child context and can restrict both input and
+tools to one exact item, use the internal isolated subagent by default after one notice
+that it consumes extra model quota and time; it needs no API key and makes no external
+upload. If any capability is incomplete, including tool restriction, or cannot be
+confirmed, use `ordinary` and explain why. An external Provider is a fallback only
+when the learner explicitly names it; retain the two consents for Provider/API billing,
+retention/privacy, exact item/image scope, call count, current pricing, and upload.
 
 Do not add teaching cadence to the required opening question. If the learner asks
 for one-question pacing, explain once that the stored choice is `step_by_step` but

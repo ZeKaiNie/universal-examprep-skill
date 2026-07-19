@@ -1,14 +1,36 @@
-# OpenAI isolated Study Guide adapter
+# Optional external OpenAI API fallback
 
-This is an opt-in host adapter for the `answer_explanation_mode=isolated`
-extension in a confirmed full ingestion-v2 Study Guide workspace. It is unavailable
-in lightweight mode, is not part of ordinary full Guide authoring, and is never enabled
-from a model name, subscription, API-key presence, `processing_mode`, or `artifact_mode`.
+This adapter is a separately billed, opt-in fallback for per-item Study Guide
+explanations in a confirmed full ingestion-v2 workspace. It is **not** the default
+isolated route. When the current host can launch a fresh child Agent with only the exact
+item packet and restricted tools, use that native child instead: it needs no additional
+API key and stays within the host account's own quota and privacy boundary.
 
-## Capability and consent gate
+Never select this adapter merely because a key exists or because the host/model is from
+OpenAI. Use it only when the user explicitly asks to send the selected items to the
+OpenAI API after the native route is unavailable or deliberately declined. It remains
+unavailable in lightweight mode and is never enabled from a model name, subscription,
+`processing_mode`, or `artifact_mode`.
 
-Consent has two distinct stages. Before changing the mode or authoring a plan, the Agent
-must establish a **no-upload planning opt-in**:
+## Native route before external fallback
+
+The native child-agent route must create one fresh child per item and pass only:
+
+- the fixed beginner-first instruction and target language;
+- the exact original question and official answer, when one exists; and
+- target-scoped question/answer assets.
+
+It must not pass the main-chat history, other questions, course wiki, notebook, or
+unrelated assets, and must deny filesystem, network, and other tools. If the host cannot
+truthfully enforce both the context and tool boundary, use ordinary authoring. Do not
+automatically fall through to this external adapter. A native host receipt and an API
+adapter receipt are declarations of the applied controls, not cryptographic sandbox
+attestations.
+
+## External API capability and consent gate
+
+The external fallback retains two distinct consent stages. Before changing the mode or
+authoring an API plan, the Agent must establish a **no-upload planning opt-in**:
 
 1. The host can make direct HTTPS calls to the OpenAI API and can keep a secret out
    of the course workspace, receipts, logs, and Git.
@@ -25,7 +47,8 @@ current official pricing and give a bounded cost estimate with assumptions; then
 explicit consent for that exact `plan_id`. The plan cannot know exact final input tokens,
 output tokens, or dollars.
 
-An API key, planning opt-in, or previous visual-mode choice is not final upload consent.
+An API key, planning opt-in, native-isolation preference, or previous visual-mode choice
+is not final upload consent.
 If planning consent is missing, keep `answer_explanation_mode=ordinary`; if only final
 consent is missing, the prepared isolated plan stays dormant and no Provider call occurs.
 The ordinary Guide still requires a detailed beginner-first explanation for every item.

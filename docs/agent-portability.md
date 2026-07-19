@@ -1,15 +1,61 @@
-# Agent Portability
+# Agent portability
 
-Behavior lives in `skills/`; `AGENTS.md` is the compact fallback. Prefer references over copies; any host copy must stay aligned. Install the whole runtime, including `scripts/`, `locales/`, `docs/`, and `prompts/`; confusion capture is [`skills/confusion-tracker/SKILL.md`](../skills/confusion-tracker/SKILL.md).
+Behavior lives in `skills/`; `AGENTS.md` is the compact fallback. Install the whole
+runtime, including `scripts/`, `locales/`, `docs/`, and `prompts/`. Root `SKILL.md` is
+language-neutral; skill-aware hosts may enter at `skills/exam-cram/SKILL.md`.
 
-| Host | Entry/boundary |
+## Installation and host entry points
+
+An Agent with terminal and network access can install from GitHub after the user grants
+the required command, network, and out-of-workspace write permissions. A ZIP download
+is only a fallback when the host cannot clone a repository.
+
+| Host | Supported install/entry route |
 | --- | --- |
-| Claude Code | root `SKILL.md` or `skills/*` |
-| Codex | `AGENTS.md` or `skills/*` |
-| Cursor / Windsurf / generic | aligned `AGENTS.md` fallback |
-| ChatGPT / Claude Web | `prompts/web_prompt.md`; English: [`prompts/web_prompt.en.md`](../prompts/web_prompt.en.md); mounted data only, no local-write claims |
+| [Codex](https://learn.chatgpt.com/docs/agent-configuration/skills.md) | Clone into `$CODEX_HOME/skills/universal-exam-cram-coach`, then reload skills; enter through `SKILL.md`, `skills/*`, or `AGENTS.md`. |
+| [Claude Code](https://code.claude.com/docs/en/slash-commands) | Clone into `~/.claude/skills/universal-exam-cram-coach` or `.claude/skills/universal-exam-cram-coach`; enter through `SKILL.md` or `skills/*`. |
+| [Cursor](https://cursor.com/docs/skills) | Clone into `~/.cursor/skills/universal-exam-cram-coach`, `~/.agents/skills/universal-exam-cram-coach`, or the corresponding project directory. |
+| [Windsurf](https://docs.windsurf.com/zh/windsurf/cascade/skills) | Clone into `~/.codeium/windsurf/skills/universal-exam-cram-coach`, `.windsurf/skills/universal-exam-cram-coach`, or `.agents/skills/universal-exam-cram-coach`. |
+| [Gemini CLI](https://geminicli.com/docs/cli/skills/) | Run `gemini skills install https://github.com/ZeKaiNie/universal-examprep-skill.git`, then reload skills. |
+| [Antigravity](https://antigravity.google/docs/skills) | Clone into `~/.gemini/config/skills/universal-exam-cram-coach` or `.agents/skills/universal-exam-cram-coach`. |
+| ChatGPT / Claude Web | Use [`prompts/web_prompt.md`](../prompts/web_prompt.md) or [`prompts/web_prompt.en.md`](../prompts/web_prompt.en.md); do not claim local writes that the web host cannot perform. |
 
-Root `SKILL.md` is language-neutral; locale compatibility indices include [`locales/en/SKILL.md`](../locales/en/SKILL.md). Skill-aware hosts may enter at `skills/exam-cram/SKILL.md`.
+Copyable generic request for a network-capable Agent:
+
+```text
+Install the latest Agent Skill from https://github.com/ZeKaiNie/universal-examprep-skill into your officially supported user-level or project-level skills directory. Ask before running terminal commands, using the network, or writing outside the workspace. Load the skill after installation and report the installed path and version; do not merely download it.
+```
+
+When the course contains PDFs, formulas, or question images, prefer the host's desktop
+app or IDE UI. A terminal remains useful for installation and diagnostics, but its
+ordinary chat view may not render local images or clickable links consistently. This is
+a recommendation, not a claim that every desktop host supports every rich-media format.
+
+## Native per-item child-agent capability
+
+The preferred isolated explanation route uses the current host's own child Agent and
+does not require a separate API key. Enable it by default only when the active host can
+start a fresh or independent child context **and** restrict that child's effective input
+and tools to one exact question packet. Otherwise use ordinary authoring; never label an
+ordinary turn as isolated and never switch to an external Provider automatically.
+
+| Host | Documented boundary | Default for per-item explanation |
+| --- | --- | --- |
+| [Codex](https://learn.chatgpt.com/docs/agent-configuration/subagents.md) | Native subagents; use a no-history child and a restricted/read-only agent profile for the exact packet. | Native isolated when those controls are active. |
+| [Claude Code](https://code.claude.com/docs/en/sub-agents) | A non-fork custom subagent has an independent context and can have an explicit tool allowlist. Its system prompt still exists, and general-purpose agents may load project instructions. | Native isolated only with a dedicated minimal subagent. |
+| [Cursor](https://cursor.com/docs/subagents) | Subagents have a clean context but inherit the parent Agent's tools. | Ordinary when the project requires a hard tool-disabled boundary. |
+| [Gemini CLI](https://github.com/google-gemini/gemini-cli/blob/main/docs/core/subagents.md) | Subagents use independent context loops and can have restricted tool lists. | Native isolated when the restricted child is available. |
+| [Antigravity](https://antigravity.google/docs/cli-features) | Independent subagent sessions are available and the host can control child tools. | Native isolated when those controls are active. |
+| [Windsurf](https://docs.windsurf.com/zh/windsurf/cascade/skills) | No official general-purpose clean-context child-agent contract was confirmed for this use. | Ordinary. |
+| Other or web-only hosts | Capability is unknown or unavailable. | Ordinary. |
+
+Each native child receives only the fixed beginner-first instruction, target language,
+the exact original question, the official answer when one exists, and target-scoped
+question/answer assets. It receives no other questions, course wiki, notebook, main-chat
+history, filesystem, network, or tools. The host imports only the structured explanation
+and coverage result. This boundary reduces accidental context leakage; it is a host
+declaration, not a cryptographic sandbox attestation. Native calls still consume the
+host account's model quota, time, and tokens.
 
 ## 文件型 host
 
@@ -153,20 +199,19 @@ workspace/runtime/full-processing gate is stale or blocked: it returns structure
 
 Missing/unknown `artifact_mode` is `chat`. `artifact_mode` remains an independent durable preference: if it is `visual` while `processing_mode=lightweight`, status/readiness report `artifact_mode_preference=visual`, `artifact_mode_effective=chat`, and `artifact_mode_dormant=true`. The preference is retained for a later explicit switch to `full`; lightweight never enters Study Guide authoring/rendering. In full mode, explicit standing `visual` or a one-shot request may enter the linked [`PDF capability routes`](pdf-capability-adapters.md); no mode permits silent installation. Structured completion requires the current full-mode typed guide. Visual delivery additionally requires matching hashes, every-page QA, no unresolved defect, and `artifact_ready=ready`; language changes stale prior artifacts.
 
-`answer_explanation_mode` is another independent host boundary. Its safe effective value is
-`ordinary`: the normal authoring context still writes and validates a detailed beginner-first
-answer explanation for every Guide item, but it makes no second Provider call and creates no
-isolation receipt. `isolated` is a full-ingestion-v2 extension, not a GPT-family guarantee. A
-host must be able to create truly fresh/stateless tool-disabled calls, keep credentials outside
-the student workspace/logs/Git, bind exact item-scoped inputs, and import the structured result
-through the canonical receipt chain. Consent is two-stage: Provider/API-billing and current
-retention/privacy disclosure precedes a no-upload planning opt-in; only after that plan exposes
-the exact item/image scope and call count, the Agent checks current official pricing and gives a
-bounded estimate, and the user accepts the exact plan; only then may calls begin. A ChatGPT/Codex
-subscription is not OpenAI API billing, and an API key's presence is not upload consent. A
-file-less web host or any Agent that cannot truthfully meet this contract must stay on
-`ordinary`; it must not fabricate a receipt or describe an ordinary model turn as isolated. The
-optional OpenAI implementation and its limitations are documented in
+`answer_explanation_mode` is another independent host boundary. The normal authoring
+context always provides a detailed beginner-first explanation. The effective value may
+default to `isolated` only when the host passes the native child-agent gate above; each
+item then gets a fresh restricted child and the result enters the canonical receipt
+chain. No extra API key or Provider upload consent is needed for that native route.
+Hosts that fail the gate remain `ordinary` and must not fabricate an isolation receipt.
+
+The separate OpenAI API implementation is an explicit-request fallback, not the default
+isolated route. It keeps credentials outside the student workspace and retains its
+two-stage consent boundary: first a no-upload plan after Provider/billing/privacy
+disclosure, then consent for the exact item/image scope, call count, plan ID, and bounded
+price estimate before upload. A host subscription is not OpenAI API billing, and an API
+key is not upload consent. See
 [`openai-study-guide-adapter.md`](openai-study-guide-adapter.md).
 
 Ingestion-v2 Guide claims bind exact same-unit refs and current guide/source/content/fact/parser-receipt hashes; the receipt proves authored-text membership plus location/revision, not semantic support. Legacy/v1 does not claim this gate.

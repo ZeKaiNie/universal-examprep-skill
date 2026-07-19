@@ -17,7 +17,7 @@
   "notebook_type.walkthrough": "Walkthrough",
   "processing.full": "full knowledge-base build",
   "processing.lightweight": "lightweight on-demand (recommended)",
-  "answer_explanation.isolated": "isolated per-item explanation (extended)",
+  "answer_explanation.isolated": "native isolated per-item explanation (recommended when supported)",
   "answer_explanation.ordinary": "ordinary per-item explanation",
   "row.corrected": "corrected",
   "row.resolved": "resolved",

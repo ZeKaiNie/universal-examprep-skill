@@ -6,10 +6,12 @@
 
 ## V4.3 — 2026-07-18
 
+- **入口与发行说明更正**：v4.3 中英文 README 与 Release Notes 现在保持双语；英文页语言切换恢复显示“中文”。安装说明改为各智能体可直接复制并自行联网安装的提示词，手动下载只作无网络备用；同时恢复完整 benchmark 图表、成本表和 Star History，并为每项延展功能给出 5 分制建议与可复制启用口令。
+- **宿主内部逐题子智能体优先**：full-v2 Study Guide 在宿主可验证“每题全新独立上下文 + 单题输入/工具限制”时默认使用内部子智能体，无需另一把 API Key；首次说明额外额度/时间。能力不完整或无法确认则保持普通详解。另行计费的外部 Provider 降为用户明确点名后的备用路线，继续执行两阶段价格、隐私、范围和上传授权。
 - **学生入口改写**：中英文 README 改为从“交什么材料、第一次选什么、每章会怎样讲”开始，用学生能直接执行的例子解释轻量按需、完整建库、普通功能与延展功能；中文正文移除不必要的英文工程术语，底层状态机、回执和适配器细节改由维护文档承载。
 - **默认轻量按需学习**：启动时明确区分普通的 `lightweight` 与延展的 `full` 处理；默认只盘点文件、按当前章节分批视觉读取，保留题图、学习状态机与完整教学输出，同时不预建全库、不自动生成 Study Guide/PDF。MinerU、Docling 与 LangGraph 继续保持显式点名、远端托管且另行同意后才可用。
 - **可恢复的逐题精讲节奏**：完整建库模式新增 `batch|step_by_step` 规范化选择；逐题模式严格按 manifest 顺序推进，用稳定题号、来源修订、notebook marker 与内容哈希记录完成证据。过期证据可审计地重开，结构损坏则失败关闭，不能用一句“继续”冒充学习完成。
-- **隔离式答案详解与可选 OpenAI 适配**：Study Guide 的每道题都可生成只包含该题、答案和目标裁剪图的独立无工具请求，并以宿主收据绑定输入、附件和覆盖元数据；OpenAI 适配器默认关闭，调用前先给出模型、调用数、图片字节数和计划 ID，只有用户明确同意才上传。
+- **隔离式答案详解与可选 OpenAI 适配**：Study Guide 的每道题都可生成只包含该题、答案和目标裁剪图的独立无工具请求，并以宿主收据绑定输入、附件和覆盖元数据；优先使用宿主内部独立子智能体，OpenAI 适配器默认关闭且只在用户明确要求、完成准确计划与上传授权后调用。
 - **语义纯净裁剪与可验证教材**：题面/答案组件必须通过目标级裁剪复核，禁止整页夹带无关题目、答案或学生作答；逐字段 `claim → quote span → source unit`、材料代次、解释收据、双语翻译和可读公式共同进入 typed Guide 门禁。
 
 - **材料代次显式恢复与可审计替代**：Pending generation 遇到 runtime receipt 缺失/漂移时，普通 `confirm` 不再形成互锁或覆盖 provenance；新增 generation-bound `recover-material-build --action resume|supersede`。`resume` 只允许同代精确重建，candidate 不同即零发布失败；`supersede` 通过 schema `2` 逐条绑定 direct predecessor。Generation-addressed 恢复日志、64-event/64-edge/65-receipt 上限、compiler 全事务回滚、receipt completion 与 manifest 精确保留键/hash 集合共同阻止静默丢代、shortcut ancestry 与崩溃后的半完成状态。

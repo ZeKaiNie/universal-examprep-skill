@@ -17,7 +17,7 @@
   "notebook_type.walkthrough": "精讲",
   "processing.full": "完整建库",
   "processing.lightweight": "轻量按需（推荐）",
-  "answer_explanation.isolated": "隔离逐题详解（延展功能）",
+  "answer_explanation.isolated": "内部隔离逐题详解（宿主支持时推荐）",
   "answer_explanation.ordinary": "普通逐题详解",
   "row.corrected": "已订正",
   "row.resolved": "已解决",
