@@ -1,4 +1,6 @@
-# 能力 × 测试层覆盖矩阵 (Feature × Tier Coverage Matrix)
+# 能力 × 测试层覆盖矩阵
+
+中文 · [English](coverage-matrix.en.md)
 
 > 配套 [`testing-audit.md`](testing-audit.md)。一句话结论：**很多能力被「结构/指令」层静态测到，却没有被「行为」层执行验证。**
 

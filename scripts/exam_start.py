@@ -99,10 +99,17 @@ RUNTIME_FILE_EXCLUDES = frozenset((
     "scripts/retrieval_evaluation.py",
     "scripts/ingestion/evaluation.py",
     "docs/formula-audit-importer.md",
+    "docs/agent-portability.zh.md",
+    "docs/exam-audit.zh.md",
+    "docs/file-format.en.md",
+    "docs/language-policy.zh.md",
     "docs/localization.md",
+    "docs/openai-study-guide-adapter.zh.md",
+    "docs/pdf-capability-adapters.en.md",
     "docs/retrieval-evaluation.md",
     "docs/runtime-file-contract.md",
     "docs/skill-architecture.md",
+    "docs/skill-architecture.en.md",
 ))
 RUNTIME_DIFF_LIMIT = 20
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")

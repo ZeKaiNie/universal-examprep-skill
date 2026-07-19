@@ -100,8 +100,18 @@ class DocumentationConsistency(unittest.TestCase):
 
     def test_static_markdown_relative_links_resolve(self):
         rels = ["SKILL.md", "README.md", "README.zh.md",
-                "docs/language-policy.md", "docs/localization.md",
-                "docs/skill-architecture.md", "docs/agent-portability.md"]
+                "CONTRIBUTING.md", "CONTRIBUTING.zh.md", "CHANGELOG.md",
+                "CHANGELOG.en.md", "docs/language-policy.md",
+                "docs/language-policy.zh.md", "docs/localization.md",
+                "docs/skill-architecture.md", "docs/skill-architecture.en.md",
+                "docs/agent-portability.md", "docs/agent-portability.zh.md",
+                "docs/file-format.md", "docs/file-format.en.md",
+                "docs/pdf-capability-adapters.md",
+                "docs/pdf-capability-adapters.en.md",
+                "docs/openai-study-guide-adapter.md",
+                "docs/openai-study-guide-adapter.zh.md",
+                "docs/exam-audit.zh.md", "benchmark/docs/coverage-matrix.md",
+                "benchmark/docs/coverage-matrix.en.md"]
         rels += [os.path.relpath(path, ROOT).replace("\\", "/")
                  for pattern in ("skills/*/SKILL.md", "locales/*/SKILL.md",
                                  "locales/*/skills/*.md")
@@ -121,6 +131,39 @@ class DocumentationConsistency(unittest.TestCase):
                 if not os.path.exists(resolved):
                     broken.append("%s -> %s" % (rel, target))
         self.assertFalse(broken, "Broken Markdown links:\n" + "\n".join(broken))
+
+    def test_readme_reader_links_follow_selected_language(self):
+        en = read("README.md")
+        zh = read("README.zh.md")
+
+        en_targets = (
+            "docs/file-format.en.md",
+            "docs/skill-architecture.en.md",
+            "docs/pdf-capability-adapters.en.md",
+            "CHANGELOG.en.md",
+            "benchmark/docs/coverage-matrix.en.md",
+            "locales/en/skills/confusion-tracker.md",
+            "CONTRIBUTING.md",
+        )
+        zh_targets = (
+            "docs/openai-study-guide-adapter.zh.md",
+            "docs/agent-portability.zh.md",
+            "docs/language-policy.zh.md",
+            "docs/exam-audit.zh.md",
+            "locales/zh/skills/confusion-tracker.md",
+            "CONTRIBUTING.zh.md",
+        )
+        for target in en_targets:
+            self.assertIn(target, en, "English README misses English reader target %s" % target)
+            self.assertNotIn(target, zh, "Chinese README points to English reader target %s" % target)
+        for target in zh_targets:
+            self.assertIn(target, zh, "Chinese README misses Chinese reader target %s" % target)
+            self.assertNotIn(target, en, "English README points to Chinese reader target %s" % target)
+
+        self.assertIn("English · [中文](README.zh.md)", en)
+        self.assertIn("中文 · [English](README.md)", zh)
+        self.assertIn("English · [中文](CONTRIBUTING.zh.md)", read("CONTRIBUTING.md"))
+        self.assertIn("中文 · [English](CONTRIBUTING.md)", read("CONTRIBUTING.zh.md"))
 
     def test_compatibility_entries_stay_compact_and_point_to_control(self):
         for rel in ("locales/zh/SKILL.md", "locales/en/SKILL.md"):

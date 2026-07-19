@@ -44,6 +44,20 @@ class Manifest(unittest.TestCase):
         self.assertNotIn("scripts/retrieval_evaluation.py", self.files)
         self.assertTrue(build_dist.is_runtime_path("docs/language-policy.md"))
 
+    def test_source_readme_language_mirrors_do_not_inflate_runtime(self):
+        reader_docs = (
+            "docs/agent-portability.zh.md",
+            "docs/exam-audit.zh.md",
+            "docs/file-format.en.md",
+            "docs/language-policy.zh.md",
+            "docs/openai-study-guide-adapter.zh.md",
+            "docs/pdf-capability-adapters.en.md",
+            "docs/skill-architecture.en.md",
+        )
+        for rel in reader_docs:
+            self.assertFalse(build_dist.is_runtime_path(rel), rel)
+            self.assertNotIn(rel, self.files, rel)
+
     def test_every_skill_referenced_script_ships(self):
         # every scripts/<name>.py referenced from runtime skill texts must be in the manifest
         refs = set()

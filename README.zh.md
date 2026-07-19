@@ -153,7 +153,7 @@
 
 根据目前的官方说明，Codex、Claude Code、Gemini CLI 和 Antigravity 可以提供适合这项工作的内部子智能体。Cursor 明确提供全新上下文，但子智能体会继承工具，所以只有当前平台还能关闭无关工具时才自动开启。Windsurf 尚未正式说明它有适合这项工作的通用独立子智能体，因此默认关闭；以后能力检查通过再开。
 
-调用另一家外部模型服务只保留为用户明确要求的备用方案，绝不会自动发生。它仍需两次同意：先在本地列出准确题目、图片和调用次数，不上传；再说明当前价格以及服务商怎样保留材料，只允许上传这份准确清单。**不要把接口密钥放进聊天、课程材料、截图、日志或会提交到 Git 的文件。** 详见[可选外部模型适配说明](docs/openai-study-guide-adapter.md)。
+调用另一家外部模型服务只保留为用户明确要求的备用方案，绝不会自动发生。它仍需两次同意：先在本地列出准确题目、图片和调用次数，不上传；再说明当前价格以及服务商怎样保留材料，只允许上传这份准确清单。**不要把接口密钥放进聊天、课程材料、截图、日志或会提交到 Git 的文件。** 详见[可选外部模型适配说明](docs/openai-study-guide-adapter.zh.md)。
 
 ## 复习方式、剩余时间和语言
 
@@ -229,7 +229,7 @@ gemini skills install https://github.com/ZeKaiNie/universal-examprep-skill.git
 
 **课程里有 PDF、公式、图表或大量有图题时，尽量在智能体的桌面软件或编辑器界面里学习，不要只用终端。** 终端适合安装和排错，但通常不如图形界面方便显示本地图片、公式和可点击文件链接。Claude Desktop Code、Codex 桌面版、Cursor、Windsurf 和 Antigravity 更适合作为教材界面。
 
-各平台的官方目录、能力边界和资料链接见[平台兼容说明](docs/agent-portability.md)。
+各平台的官方目录、能力边界和资料链接见[平台兼容说明](docs/agent-portability.zh.md)。
 
 ## 你会在学习工作区看到什么
 
@@ -291,11 +291,11 @@ gemini skills install https://github.com/ZeKaiNie/universal-examprep-skill.git
 
 **一道题太难，能跳过吗？** 可以。说“跳过”或“这题不会”，它会把题记入错题记录，继续往下，并在复盘时重新出现。
 
-**怎样审查一个已经生成的工作区？** 使用 [`skills/exam-audit/`](skills/exam-audit/) 做只读检查。它会列出材料版本、缺图、待审问题、题库和学习状态是否一致，不会默认修改文件。
+**怎样审查一个已经生成的工作区？** 阅读 [`exam-audit` 中文说明](docs/exam-audit.zh.md)，再让智能体做只读检查。它会列出材料版本、缺图、待审问题、题库和学习状态是否一致，不会默认修改文件。
 
 ## 给开发者和维护者
 
-根 [`SKILL.md`](SKILL.md) 负责入口路由；共享行为规则位于 [`skills/`](skills/)；中英文兼容入口位于 [`locales/`](locales/)。十个子技能中包括授课、建库、测验、错题复盘、复习讲义、速记小抄、审计和 [`skills/confusion-tracker`](skills/confusion-tracker/SKILL.md) 疑难追踪。
+`SKILL.md` 负责语言中性的入口路由；面向中文读者的入口是 [`locales/zh/SKILL.md`](locales/zh/SKILL.md)，学生可见中文文案位于 [`locales/zh/skills/`](locales/zh/skills/)。十个子技能中包括授课、建库、测验、错题复盘、复习讲义、速记小抄、审计和[概念疑难追踪](locales/zh/skills/confusion-tracker.md)。
 
 内部状态约定：用户明确要求“不出题、不提问”时保存 `no_questions=true`；因此章节完成状态最多为 `covered_unverified`。这些名称只供脚本、测试和维护者使用，学生不需要手动设置。
 
@@ -307,7 +307,11 @@ python scripts/validate_workspace.py path/to/workspace
 python scripts/build_dist.py
 ```
 
-架构和边界见[技能架构](docs/skill-architecture.md)、[平台兼容说明](docs/agent-portability.md)、[PDF 能力适配](docs/pdf-capability-adapters.md)和[语言规则](docs/language-policy.md)。历史版本只记录在 [`CHANGELOG.md`](CHANGELOG.md)。
+架构和边界见[技能架构](docs/skill-architecture.md)、[平台兼容说明](docs/agent-portability.zh.md)、[PDF 能力适配](docs/pdf-capability-adapters.md)和[语言规则](docs/language-policy.zh.md)。历史版本只记录在 [`CHANGELOG.md`](CHANGELOG.md)。
+
+## 参与贡献
+
+提交 PR 前请先看[中文贡献指南](CONTRIBUTING.zh.md)。项目优先处理调试与可靠性问题，其次是真实教材效果和维护，再其次是范围清楚的新功能。我们欢迎小而专注的 PR；只要说明问题并提供合理验证，大多数贡献经过正常审查和必要调整后都可以合并。
 
 ## 开源协议
 

@@ -79,6 +79,17 @@ PATH_EXCLUDES = (
     # Maintainer-facing audit JSON reference; the shipped exam-ingest skill
     # carries the complete runtime command and fail-closed handoff contract.
     "docs/formula-audit-importer.md",
+    # Full reader-language mirrors are linked from the source-checkout READMEs.
+    # The README does not ship in the compact student runtime, and the canonical
+    # runtime contracts below remain present, so duplicating their translations
+    # would only increase every installation without changing agent behavior.
+    "docs/agent-portability.zh.md",
+    "docs/exam-audit.zh.md",
+    "docs/file-format.en.md",
+    "docs/language-policy.zh.md",
+    "docs/openai-study-guide-adapter.zh.md",
+    "docs/pdf-capability-adapters.en.md",
+    "docs/skill-architecture.en.md",
     # Build-only source for the compact student copy of docs/file-format.md.
     "docs/runtime-file-contract.md",
 )

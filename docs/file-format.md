@@ -1,4 +1,4 @@
-# 工作区文件格式 (Workspace File Format)
+# 工作区文件格式
 
 本技能建出的备考工作区有一套固定结构与题库 schema。本文件是**规范化文档**，也是
 [`scripts/validate_workspace.py`](../scripts/validate_workspace.py) 校验的依据。

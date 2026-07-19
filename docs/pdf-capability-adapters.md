@@ -1,4 +1,4 @@
-# PDF capability adapters
+# PDF 能力适配
 
 本仓库把“如何组织考试教材”和“某个 Agent 如何操作 PDF”分开。前者由本仓库的
 `exam-study-guide` skill 与 `scripts/study_guide_render.py` 负责；后者可以复用宿主原生能力，

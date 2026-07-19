@@ -233,7 +233,7 @@ Students usually need to recognize only these paths:
 | `.ingest/` | Full-build parsing records, review items, and provenance evidence; mainly for the agent and audit tools |
 | `.lightweight/` | Current-page images and processing records for lightweight mode |
 
-See [workspace file formats](docs/file-format.md) for the full contract.
+See [workspace file formats](docs/file-format.en.md) for the full contract.
 
 ## Numbers
 
@@ -279,11 +279,11 @@ Full method, three-arm design, judge calibration, costs, and limitations → **[
 
 **Can I skip a hard question?** Yes. Say that you want to skip it; the item is saved to the mistake record, teaching continues, and the item returns during review.
 
-**How do I audit an existing workspace?** Use [`skills/exam-audit/`](skills/exam-audit/) for a read-only check of material revisions, missing visuals, review issues, bank coverage, and learning state.
+**How do I audit an existing workspace?** Use [`exam-audit`](skills/exam-audit/SKILL.md) for a read-only check of material revisions, missing visuals, review issues, bank coverage, and learning state.
 
 ## For developers and maintainers
 
-The root [`SKILL.md`](SKILL.md) routes activation. Shared behavior lives under [`skills/`](skills/), while [`locales/`](locales/) contains compact language compatibility and wording entries. The sub-skills cover orchestration, ingestion, tutoring, quizzes, review, Study Guides, cheat sheets, audits, help, and concept-confusion tracking at [`skills/confusion-tracker`](skills/confusion-tracker/SKILL.md).
+The root [`SKILL.md`](SKILL.md) routes activation. Shared behavior starts at [`skills/exam-cram/SKILL.md`](skills/exam-cram/SKILL.md), while [`locales/en/SKILL.md`](locales/en/SKILL.md) is the compact English compatibility and wording entry. The sub-skills cover orchestration, ingestion, tutoring, quizzes, review, Study Guides, cheat sheets, audits, help, and [concept-confusion tracking](locales/en/skills/confusion-tracker.md).
 
 Useful checks:
 
@@ -293,7 +293,7 @@ python scripts/validate_workspace.py path/to/workspace
 python scripts/build_dist.py
 ```
 
-See [skill architecture](docs/skill-architecture.md), [agent portability](docs/agent-portability.md), [PDF capability adapters](docs/pdf-capability-adapters.md), and [language policy](docs/language-policy.md). Release history belongs in [`CHANGELOG.md`](CHANGELOG.md).
+See [skill architecture](docs/skill-architecture.en.md), [agent portability](docs/agent-portability.md), [PDF capability adapters](docs/pdf-capability-adapters.en.md), and [language policy](docs/language-policy.md). Release history belongs in the [English changelog](CHANGELOG.en.md).
 
 <details>
 <summary>Maintainer-only behavior-smoke scenario registry</summary>
@@ -318,9 +318,13 @@ These fixture identifiers are kept here so documentation coverage cannot silentl
 - `notebook_persist_ok`
 - `workspace_confirm_ok`
 
-The corresponding intent and coverage live in the [behavior-smoke coverage matrix](benchmark/docs/coverage-matrix.md).
+The corresponding intent and coverage live in the [behavior-smoke coverage matrix](benchmark/docs/coverage-matrix.en.md).
 
 </details>
+
+## Contributing
+
+Read the [contribution guide](CONTRIBUTING.md) before opening a PR. Debugging and reliability come first, followed by real-course teaching evidence and maintenance, then focused new features. Small PRs are welcome, and most can be merged after ordinary review and reasonable verification.
 
 ## License
 

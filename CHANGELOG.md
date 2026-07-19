@@ -1,4 +1,6 @@
-# Changelog / 版本沿革
+# 版本沿革
+
+中文 · [English](CHANGELOG.en.md)
 
 > 运行时技能文本（`SKILL.md` / `AGENTS.md` / `skills/**` / `prompts/` / `docs/`）直接描述当前行为、**不再提版本号**；版本历史集中记录在本文件，便于追溯。
 

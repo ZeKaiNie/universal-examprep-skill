@@ -59,7 +59,7 @@ and coverage result. This boundary reduces accidental context leakage; it is a h
 declaration, not a cryptographic sandbox attestation. Native calls still consume the
 host account's model quota, time, and tokens.
 
-## 文件型 host
+## File-based hosts
 
 Only after the student confirms exact, separate materials/workspace paths and the three learning choices:
 
@@ -197,7 +197,7 @@ workspace/runtime/full-processing gate is stale or blocked: it returns structure
 `readiness=blocked`, fatal errors, blocked capability reason
 `full_processing_gate_blocked`, and exit `2` instead of leaking a Python traceback.
 
-## 教材与宿主扩展
+## Teaching artifacts and host extensions
 
 Missing/unknown `artifact_mode` is `chat`. `artifact_mode` remains an independent durable preference: if it is `visual` while `processing_mode=lightweight`, status/readiness report `artifact_mode_preference=visual`, `artifact_mode_effective=chat`, and `artifact_mode_dormant=true`. The preference is retained for a later explicit switch to `full`; lightweight never enters Study Guide authoring/rendering. In full mode, explicit standing `visual` or a one-shot request may enter the linked [`PDF capability routes`](pdf-capability-adapters.md); no mode permits silent installation. Structured completion requires the current full-mode typed guide. Visual delivery additionally requires matching hashes, every-page QA, no unresolved defect, and `artifact_ready=ready`; language changes stale prior artifacts.
 
