@@ -3,6 +3,8 @@
 Behavior lives in `skills/`; `AGENTS.md` is the compact fallback. Install the whole
 runtime, including `scripts/`, `locales/`, `docs/`, and `prompts/`. Root `SKILL.md` is
 language-neutral; skill-aware hosts may enter at `skills/exam-cram/SKILL.md`.
+Concept-confusion capture lives at [`skills/confusion-tracker/SKILL.md`](../skills/confusion-tracker/SKILL.md).
+The English compatibility entry is [`locales/en/SKILL.md`](../locales/en/SKILL.md).
 
 ## Installation and host entry points
 

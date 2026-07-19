@@ -64,7 +64,14 @@ def _confirm_full_workspace(workspace, materials):
     global _RUNTIME_IDENTITY
     workspace = os.path.abspath(workspace)
     materials = os.path.abspath(materials)
-    key = (os.path.normcase(workspace), os.path.normcase(materials))
+    # Match the production receipt's long-form path identity.  GitHub's Windows
+    # runner can expose TEMP as RUNNER~1 while build_payload persists the same
+    # directory under its long spelling; caching only abspath would reconfirm
+    # the pair after a no-write snapshot and refresh exam_runtime_receipt.json.
+    key = (
+        os.path.normcase(exam_start._resolved_path(workspace)),
+        os.path.normcase(exam_start._resolved_path(materials)),
+    )
     if key in _CONFIRMED_FULL_PAIRS:
         return
     os.makedirs(materials, exist_ok=True)

@@ -138,11 +138,11 @@ _EN.update({
 })
 _ZH.update({
     "answer_explanation.ordinary": "普通逐题详解",
-    "answer_explanation.isolated": "隔离逐题详解（延展功能）",
+    "answer_explanation.isolated": "内部隔离逐题详解（宿主支持时推荐）",
 })
 _EN.update({
     "answer_explanation.ordinary": "ordinary per-item explanation",
-    "answer_explanation.isolated": "isolated per-item explanation (extended)",
+    "answer_explanation.isolated": "native isolated per-item explanation (recommended when supported)",
 })
 _EMBEDDED = {"zh": _ZH, "en": _EN}
 
