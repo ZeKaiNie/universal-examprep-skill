@@ -1,36 +1,3 @@
-# Slim source archives: GitHub's auto-generated release zip/tarball ("Source code" links)
-# exclude the large dev/test trees, but remain a source archive with README-linked docs.
-# They are deliberately not the exact student runtime manifest; scripts/build_dist.py is
-# authoritative for that surface and exam_start.py hashes the same custom manifest.
-# Mark both the tree entry and its contents: Git attributes do not make a
-# directory pattern recursive, while a contents-only pattern leaves an empty
-# directory entry in `git archive`.
-benchmark       export-ignore
-benchmark/**    export-ignore
-tests           export-ignore
-tests/**        export-ignore
-spike           export-ignore
-spike/**        export-ignore
-assets          export-ignore
-assets/**       export-ignore
-.github         export-ignore
-.github/**      export-ignore
-docs/plans      export-ignore
-docs/plans/**   export-ignore
-docs/history    export-ignore
-docs/history/** export-ignore
-docs/releases   export-ignore
-docs/releases/** export-ignore
-.gitattributes  export-ignore
-.gitignore      export-ignore
-
-# Reproducible Gold Set/media fixtures must never receive text/EOL conversion.
-*.pdf binary
+* text=auto eol=lf
 *.png binary
-*.xlsx binary
-
-# Gold Set manifests participate in byte-for-byte and SHA-256 regression
-# checks, so Windows checkouts must retain the generator's canonical LF form.
-tests/fixtures/ingestion_gold/*.json text eol=lf
-tests/fixtures/ingestion_gold/LICENSE text eol=lf
-tests/fixtures/ingestion_gold/*.py text eol=lf
+*.pdf binary

@@ -1,4 +1,0 @@
-{"step": 1, "role": "assistant", "tool": "read_file", "path": "study_progress.md", "note": "读进度，确认当前在阶段 2"}
-{"step": 2, "role": "assistant", "tool": "read_file", "path": "references/wiki/ch2_trees.md", "note": "惰性加载：只读当前阶段 2 对应的章节"}
-{"step": 3, "role": "assistant", "tool": "read_file", "path": "references/quiz_bank.json", "note": "从题库抽题，不即兴编题"}
-{"step": 4, "role": "assistant", "text": "本阶段从 quiz_bank 抽题：[#mc_q4] [#mc_q5]"}

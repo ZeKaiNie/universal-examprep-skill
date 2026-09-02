@@ -1,6 +1,0 @@
-学生：请把长期偏好保存成 chat，只在对话里教学。
-`python scripts/update_progress.py --workspace D:\Study\mini set --artifact-mode chat`
-STATE_WRITE=ok artifact_mode=chat
-`python scripts/notebook.py --workspace D:\Study\mini add-entry --chapter 1 --type walkthrough --id unit_done`
-第 1 章教学单元已完成；完整讲解已保存到 notebook，聊天中给出本章摘要。
-保持对话省额模式：本次不自动制作 HTML/PDF。

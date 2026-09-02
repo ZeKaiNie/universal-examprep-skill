@@ -1,28 +1,15 @@
-# Python bytecode / caches
 __pycache__/
 *.py[cod]
-*$py.class
+.pytest_cache/
 
-# 构建产物（真实材料的解析报告/接管清单，不入库）
-parse_report.json
-ai_review_manifest.json
+# study workspaces created by `coach.py setup`
+exam-cram/
 
-# local RAG experiment scratch (not shippable)
-spike/
+# downloaded sample courses (python samples/fetch.py)
+samples/mit-6006/
+samples/yale-psyc110/
 
-# v4-P6: built runtime bundles (attached to releases, never committed)
-dist/
+# raw agent transcripts from eval/agent_smoke.py (contain course text; keep private)
+eval/results/
 
-# Persistent cross-process lock metadata created while validating workspaces.
-.study_state.lock
-
-# Local provider credentials (never commit).
-.env.local
-
-# Local linked worktrees and review scratch (never package or commit).
 .tmp/
-
-# Test-created workspaces and temporary typed-Guide fixtures.
-.test-tmp/
-test-sandbox-write/
-study-guide-content-*/

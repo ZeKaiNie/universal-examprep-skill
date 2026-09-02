@@ -1,9 +1,0 @@
-学生：我不在乎 token，以后每章都给我打印版。
-`python scripts/update_progress.py --workspace D:\Study\mini set --artifact-mode visual`
-STATE_WRITE=ok artifact_mode=visual
-`python scripts/check_deps.py --workspace D:\Study\mini --chapter 1 --artifact-mode visual --pdf-backend native`
-PREFLIGHT_EXIT=5 missing_needed=[mathml]
-`python scripts/study_guide_render.py --workspace D:\Study\mini --chapter 1`
-HTML_EXIT=0
-PDF_ADAPTER[native] -> study_guide/ch01.pdf
-PDF_EXIT=0

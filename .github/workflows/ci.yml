@@ -1,38 +1,8 @@
 name: CI
 
-on:
-  push:
-  pull_request:
-  release:
-    types: [published]
+on: [push, pull_request]
 
 jobs:
-  dist:
-    # v4-P6：release 发布时自动构建运行时精简包并挂为附件（README 安装主路径）
-    name: attach runtime bundle
-    if: github.event_name == 'release'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Verify release tag matches root skill metadata
-        env:
-          EXPECTED_RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: >-
-          python -m unittest
-          tests.test_skill_structure.TestSkillCollectionStructure.test_release_tag_matches_root_skill_metadata_when_provided
-          -v
-      - name: Build runtime zip (explicit manifest, stdlib only)
-        run: python scripts/build_dist.py --out dist/universal-exam-cram-coach.zip
-      - name: Attach to release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/universal-exam-cram-coach.zip --clobber
-
   test:
     name: test (${{ matrix.os }} / py${{ matrix.python-version }})
     strategy:
@@ -43,11 +13,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install audited optional render dependencies for real integration coverage
-        run: python -m pip install latex2mathml==3.60.0 Pillow==10.4.0
-      - name: Run unittest (core is stdlib; renderer also exercises the pinned optional converter)
+      - name: Install the optional PDF dependencies (text + figure cropping)
+        run: python -m pip install pypdfium2 pypdf
+      - name: Unit tests
         run: python -m unittest discover -s tests -v
+      - name: Smoke run on the bundled sample course
+        run: |
+          python coach.py setup samples/zh-data-structures --days 1
+          python coach.py -w samples/zh-data-structures/exam-cram next
+          python coach.py -w samples/zh-data-structures/exam-cram quiz
