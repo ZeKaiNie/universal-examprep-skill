@@ -1,10 +1,42 @@
-# 版本沿革
+# 版本沿革 / Changelog
 
-中文 · [English](CHANGELOG.en.md)
+中文在前，English below.
 
-> 运行时技能文本（`SKILL.md` / `AGENTS.md` / `skills/**` / `prompts/` / `docs/`）直接描述当前行为、**不再提版本号**；版本历史集中记录在本文件，便于追溯。
+> 运行时文本（`SKILL.md`、`README*.md`）只描述当前行为，版本历史集中记录在本文件。
 
-## Unreleased
+## V5.1 — 2026-09-02 · 图片回到对话里
+
+- **自动裁图**：`setup` 用 `pypdfium2` 读取 PDF 页面对象，把讲义里的矢量图/嵌入图按区域裁成 PNG（`figures/`），`next`、`chapter`、`ask` 在对应页下方列出路径；PPTX/DOCX 的嵌入图直接抽出；`figure <文件> <页> --crop` 可手动截任意区域。
+- **题面图 / 答案图**：题目或解答所在的印刷区域含图时自动裁出，`quiz` 先给题面图，`check` 才给答案图；SKILL §4 要求把图真正放进对话而不是打印路径。
+- **真实作业结构**：`hw2 (4)(1).pdf` ↔ `homework2solutions.pdf` 这类文件名自动配对；教材题号 `Problem 1.3.10` 与 `Problem 1.3.10 Solution` 按标号配对；扫描/手写页（学生自己交的作业）识别并跳过，绝不当作题面或答案；题干只有教材题号时明确提示“题干不在材料里”。
+- **更快的 PDF 文本**：优先 `pypdfium2`（EEC 160 约 1000 页 3 秒），`pypdf` 仍可作后备。
+- **弱模型实测工具**：`eval/agent_smoke.py` 可驱动 Antigravity 的 Gemini（flash_lite / flash / pro）或 Claude Code（Haiku）跑完整学习回合并打分（是否只用给定命令、是否引用页码、是否展示图片、是否标注来源）。
+- 文档：`docs/feature-audit.md` 逐项核查 v4.3 功能在 v5 的状态。
+
+### V5.1 (English)
+
+Figures are back in the chat: `setup` crops vector drawings and embedded images from PDF pages with `pypdfium2` (plus PPTX/DOCX media), lists them under each slice, and crops the printed question / solution regions that contain a picture (question figure before asking, answer figure only when explaining). Real homework layouts are handled: `hw2 (4)(1).pdf` pairs with `homework2solutions.pdf`, textbook labels `Problem 1.3.10` pair with their solutions, scanned/handwritten pages are detected and skipped. `eval/agent_smoke.py` drives Antigravity (Gemini) or Claude Code headlessly through a session and scores the transcript.
+
+## V5.0 — 2026-09-01 · 推倒重来：给普通学生用的版本
+
+**为什么重写。** v4.3 的运行时有 14.4 万行 Python、495 个文件、36 个子命令、108 个参数；智能体开讲前要读约 14 万字符的技能说明，再跑 5 条脚本、自己把 PDF 逐页渲染成 PNG、做 contact sheet 和逐块 crop review。大部分代码在做回执、代际账本、哈希绑定和回滚事务，而不是教学生。小模型根本跑不动，大模型也要十几轮才能开讲。
+
+**现在是什么。** 一份不到 1000 词的 `SKILL.md` + 一个 `coach.py`（约 1800 行，纯标准库，PDF 可选装 `pypdf`）：
+
+- `setup <文件夹>` 一条命令约 1 秒完成整门课：读 PDF/PPTX/DOCX/MD/TXT/HTML，按“一个文件一章”或“文件内 第N章/Chapter N 标题”切章节，从作业/试卷抽题并与解答文件自动配对（如 `q1.pdf` ↔ `q1_sol.pdf`、`作业2.txt` ↔ `作业2答案.txt`），建 BM25 检索（英文分词 + 中文双字组），写出可读的 `chapters/chNN_标题.md`。
+- `next` 按固定长度分段吐出带 `[文件 p.页码]` 锚点的原文，智能体只负责讲；`ask` 检索并在无命中时明确返回“资料没讲”（退出码 4）；`quiz` → `check` → `answer` 完成出题、看参考答案、记录；`done` 区分“已验证”（答对过本章材料题）与“已讲完”；`note`/`cheatsheet` 把章节总结、疑难点和错题拼成小抄；`status` 跨对话恢复。
+- 小模型适配：`--slice` 控制每段长度；每条命令最后一行写明下一条命令；`--lang zh|en` 让 CLI 输出与学生语言一致；不要求模型写任何 JSON。
+- 保留并简化的原有能力：三色来源标签、只从资料出题、错题/疑难点、进度持久化、小抄、双语。删除：完整建库/轻量按需双模式、Study Guide HTML/PDF 渲染与逐页 QA、crop 回执、答案污染契约、代际恢复、LangGraph/OpenAI/MinerU/Docling 适配、benchmark 矩阵、三层语言包、知识点窗口、3×4 模式矩阵、工作区注册表、运行时哈希回执。
+- 测试从 1000+ 用例 / 12 分钟降到 6 个文件 / 约 1 秒；CI 仍覆盖 Ubuntu/Windows × Python 3.8/3.12。
+- 样例：仓库内置一门中文《数据结构》三章 + 作业 + 模拟卷；`python samples/fetch.py` 下载 MIT 6.006 六讲讲义 + Quiz 1 与官方解答、耶鲁 PSYC 110 四讲文字稿。实测记录见 `docs/v5-refactor.md`。
+
+**兼容性。** v4 工作区（`references/wiki`、`.ingest/`、`study_state.json` v1）不再被读取；对原资料夹重新运行 `setup` 即可，约一秒。
+
+### V5.0 (English)
+
+Ground-up rewrite. v4.3 had grown to 144k lines of Python, 495 files, 36 sub-commands and 108 flags; an agent had to read ~140 KB of skill text and run five scripts, then render PDF pages to PNG itself, before teaching anything. Most of that code produced receipts, generation ledgers, hash bindings and rollback journals rather than teaching.
+
+v5 is a <1,000-word `SKILL.md` plus one `coach.py` (~1.8k lines, stdlib; `pypdf` optional for PDF text). `setup` ingests a whole course in about a second (PDF/PPTX/DOCX/MD/TXT/HTML → chapters → questions paired with solution files → BM25 index with CJK bigrams). `next` streams material slices with `[file p.N]` anchors; `ask` retrieves or says the materials do not cover it; `quiz`/`check`/`answer`/`done` run the drill loop and distinguish *verified* from *covered*; `note`/`cheatsheet` build the handout; `status` restores across chats. Small-model friendly: `--slice`, next-command hints on every output, no JSON authoring. Removed: full/lightweight dual mode, Study Guide HTML/PDF and page QA, crop receipts, answer-taint contracts, generation recovery, LangGraph/OpenAI/MinerU/Docling adapters, the benchmark matrix, three-layer language packs, knowledge windows, the 3×4 mode matrix, workspace registry and runtime hash receipts. Tests: 1000+ cases / 12 min → 6 files / ~1 s. Old v4 workspaces are not read; re-run `setup` on the materials folder.
 
 ## V4.3 — 2026-07-18
 

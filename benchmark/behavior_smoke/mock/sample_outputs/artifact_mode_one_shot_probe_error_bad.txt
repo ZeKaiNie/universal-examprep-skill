@@ -1,9 +1,0 @@
-当前长期状态：artifact_mode=chat
-学生：当前这章给我一份 PDF 打印版，但以后还是只在对话里讲。
-`python scripts/check_deps.py --workspace D:\Study\mini --chapter 1 --artifact-mode visual --pdf-backend browser`
-probe_error: browser registry I/O
-`python scripts/study_guide_render.py --workspace D:\Study\mini --chapter 1`
-HTML_EXIT=0
-`python scripts/study_guide_render.py --workspace D:\Study\mini --chapter 1 --pdf`
-PDF_EXIT=0
-完成后复核长期状态：artifact_mode=chat
