@@ -188,11 +188,20 @@ def render_region(path, page_number, box, out_path, scale=RENDER_SCALE):
 
 
 def find_text_top(info, needle):
-    """Top y (PDF points) of the first text box whose text starts with `needle`."""
-    key = " ".join(needle.split())[:40].lower()
-    for l, b, r, t, text in info.text_boxes:
-        if " ".join(text.split()).lower().startswith(key):
-            return t
+    """Top y (PDF points) of the first text box whose text starts with `needle`.
+
+    PDF text rectangles may split a heading ("Problem 4." | "[10 points] Trees"), so shorter
+    prefixes are tried when the long one is not found.
+    """
+    flat = " ".join(needle.split()).lower()
+    boxes = [(t, " ".join(text.split()).lower()) for l, b, r, t, text in info.text_boxes]
+    for n in (40, 20, 10):
+        key = flat[:n]
+        if not key:
+            continue
+        for top, text in boxes:
+            if text.startswith(key):
+                return top
     return None
 
 

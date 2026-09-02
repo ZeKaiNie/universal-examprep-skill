@@ -1,6 +1,10 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  release:
+    types: [published]
 
 jobs:
   test:
@@ -25,3 +29,24 @@ jobs:
           python coach.py setup samples/zh-data-structures --days 1
           python coach.py -w samples/zh-data-structures/exam-cram next
           python coach.py -w samples/zh-data-structures/exam-cram quiz
+      - name: Build the skill bundle
+        run: python release.py
+
+  bundle:
+    name: attach skill bundle to the release
+    if: github.event_name == 'release'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build exam-cram-coach-flash.zip
+        run: python release.py dist/exam-cram-coach-flash.zip
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/exam-cram-coach-flash.zip --clobber

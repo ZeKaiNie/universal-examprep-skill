@@ -76,6 +76,7 @@ tests/            8 个文件，40+ 用例，约 1 秒
 - 题目：Quiz 1 共 9 题（含“写名字”那题）全部抽出，9/9 与 `q1_sol.pdf` 自动配对得到官方解答，多小问的 `Solution:` 段落按顺序保留，`Common Mistakes` 一并保留；分值 `[8 points]` 全部抽出。
 - 章节归属：Quiz 是跨章的，按 BM25 自动推测并标注“章节为自动推测”；9 题中 6 题落在合理章（排序题→Linear Sorting、堆/AVL→Binary Trees），3 题（含数据库设计题）落到 Introduction。归属只影响 `quiz` 默认范围，`quiz --all` 不受影响。
 - 检索：`ask "counting sort radix sort running time"` → Lecture 5 p.4 Radix Sort 段落；`ask "quantum entanglement"` → 退出码 4。
+- 裁图（v5.1）：讲义 34 张图区域（表格、树、图示）；Quiz 1 中带图或带表的 5 题各裁出题面图和答案图（如 Problem 4 “Transforming Trees” 的树）。README 里的两张示例图就来自这里。
 
 **Yale PSYC 110（HTML 转 Markdown 文字稿，每讲 2–5 万字符）**
 

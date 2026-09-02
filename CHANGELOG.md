@@ -4,7 +4,7 @@
 
 > 运行时文本（`SKILL.md`、`README*.md`）只描述当前行为，版本历史集中记录在本文件。
 
-## V5.1 — 2026-09-02 · 图片回到对话里
+## V5.1 Flash — 2026-09-02 · 图片回到对话里（发布：`v5.1.0-flash`，附 `exam-cram-coach-flash.zip`）
 
 - **自动裁图**：`setup` 用 `pypdfium2` 读取 PDF 页面对象，把讲义里的矢量图/嵌入图按区域裁成 PNG（`figures/`），`next`、`chapter`、`ask` 在对应页下方列出路径；PPTX/DOCX 的嵌入图直接抽出；`figure <文件> <页> --crop` 可手动截任意区域。
 - **题面图 / 答案图**：题目或解答所在的印刷区域含图时自动裁出，`quiz` 先给题面图，`check` 才给答案图；SKILL §4 要求把图真正放进对话而不是打印路径。
@@ -17,7 +17,7 @@
 
 Figures are back in the chat: `setup` crops vector drawings and embedded images from PDF pages with `pypdfium2` (plus PPTX/DOCX media), lists them under each slice, and crops the printed question / solution regions that contain a picture (question figure before asking, answer figure only when explaining). Real homework layouts are handled: `hw2 (4)(1).pdf` pairs with `homework2solutions.pdf`, textbook labels `Problem 1.3.10` pair with their solutions, scanned/handwritten pages are detected and skipped. `eval/agent_smoke.py` drives Antigravity (Gemini) or Claude Code headlessly through a session and scores the transcript.
 
-## V5.0 — 2026-09-01 · 推倒重来：给普通学生用的版本
+## V5.0 — 2026-09-01 · 推倒重来：给普通学生用的版本（Flash 版的第一版）
 
 **为什么重写。** v4.3 的运行时有 14.4 万行 Python、495 个文件、36 个子命令、108 个参数；智能体开讲前要读约 14 万字符的技能说明，再跑 5 条脚本、自己把 PDF 逐页渲染成 PNG、做 contact sheet 和逐块 crop review。大部分代码在做回执、代际账本、哈希绑定和回滚事务，而不是教学生。小模型根本跑不动，大模型也要十几轮才能开讲。
 
