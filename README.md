@@ -206,6 +206,8 @@ The tool works on any layout, but a few habits make the automatic chapter split 
 
 Supported input: `.pdf` (needs `pypdfium2` or `pypdf`), `.pptx`, `.docx`, `.md`, `.txt`, `.html`, and image files. Excel files and audio are not read.
 
+**Audio courseware and web material aren't course files yet — make them course files.** A lecture recording, an audio-only course module, or a tutorial that lives on a web page (with in-page video/attachments) won't be read as-is. Run them through [cue-omni-reader](https://github.com/sensedeal/cue-skills/tree/main/cue-omni-reader) first and drop the resulting Markdown into the same materials folder — web pages including in-page video/attachments, plus authorized local documents, audio, or video (several local files at once) — and the coach will split and quiz from it like any other chapter. Install: `npx skills add sensedeal/cue-skills --skill cue-omni-reader` (MIT; may bill).
+
 ## Flash vs. the full edition
 
 | | **Flash (root of this repository, v5.x)** | Full (v4.3, `full/`) |

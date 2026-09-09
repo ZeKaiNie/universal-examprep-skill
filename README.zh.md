@@ -206,6 +206,8 @@ python 技能路径/exam-cram-coach/coach.py doctor
 
 支持的输入：`.pdf`（需要 `pypdfium2` 或 `pypdf`）、`.pptx`、`.docx`、`.md`、`.txt`、`.html` 和图片文件。不读 Excel 和音频。
 
+**音频课件和网页资料先变成课程文件。** 讲座录音、只有音频的课程模块、或活在网页上的教程（含页内视频/附件），直接放进来不会被读取。先用 [cue-omni-reader](https://github.com/sensedeal/cue-skills/tree/main/cue-omni-reader) 收成 Markdown，再把得到的 `.md` 丢进同一个材料夹——网页含页内视频/附件，加已授权本地文档/音频/视频，一次可选多个本地文件——coach 就会像切其他章节一样切它、用它出题。安装：`npx skills add sensedeal/cue-skills --skill cue-omni-reader`（MIT，可能计费）。
+
 ## Flash 版与完整版
 
 | | **Flash 版（仓库根目录，v5.x）** | 完整版（v4.3，`full/`） |
