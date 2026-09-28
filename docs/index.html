@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Exam Cram Coach — AI exam-prep tutor skill for Claude Code, Codex and Cursor</title>
+<meta name="description" content="Free, open-source Agent Skill that turns your lecture slides, notes, homework and past papers into an exam tutor inside Claude Code, Codex, Cursor, Windsurf, Antigravity and Gemini CLI. Page citations, figures cropped from your PDFs, quizzes from your own homework. Offline, small-model friendly.">
+<meta name="keywords" content="exam prep, AI tutor, study from lecture slides, quiz from homework, past papers, cheat sheet, study plan, Claude Code skill, Codex skill, Cursor skill, agent skill, 期末复习, 考前突击, 刷题, 错题本, 小抄">
+<link rel="canonical" href="https://zekainie.github.io/universal-examprep-skill/">
+<link rel="alternate" hreflang="en" href="https://zekainie.github.io/universal-examprep-skill/">
+<link rel="alternate" hreflang="zh-CN" href="https://zekainie.github.io/universal-examprep-skill/zh/">
+<link rel="alternate" hreflang="x-default" href="https://zekainie.github.io/universal-examprep-skill/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Exam Cram Coach — your slides become an AI tutor">
+<meta property="og:description" content="Teaches from your own course files with page citations, shows the figures, quizzes you with your own homework. Agent Skill for Claude Code, Codex, Cursor, Windsurf, Antigravity, Gemini CLI.">
+<meta property="og:url" content="https://zekainie.github.io/universal-examprep-skill/">
+<meta property="og:image" content="https://raw.githubusercontent.com/ZeKaiNie/universal-examprep-skill/main/assets/social-preview.png">
+<meta property="og:locale" content="en_US">
+<meta property="og:locale:alternate" content="zh_CN">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#f7f5ef">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Exam Cram Coach",
+  "alternateName": ["期末极速备考教练", "universal-exam-cram-coach"],
+  "applicationCategory": "EducationalApplication",
+  "operatingSystem": "Windows, macOS, Linux",
+  "description": "Open-source Agent Skill and Python tool that turns a student's own course files into an exam tutor inside coding agents: page-cited explanations, figures cropped from the PDFs, quizzes from the student's homework and past papers, progress kept across chats.",
+  "url": "https://zekainie.github.io/universal-examprep-skill/",
+  "downloadUrl": "https://github.com/ZeKaiNie/universal-examprep-skill/releases/latest",
+  "installUrl": "https://github.com/ZeKaiNie/universal-examprep-skill",
+  "softwareVersion": "5.2.0",
+  "license": "https://opensource.org/licenses/MIT",
+  "inLanguage": ["en", "zh-CN"],
+  "isAccessibleForFree": true,
+  "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"},
+  "author": {"@type": "Person", "name": "ZeKaiNie", "url": "https://github.com/ZeKaiNie"},
+  "sameAs": ["https://github.com/ZeKaiNie/universal-examprep-skill", "https://skills.sh/zekainie/universal-examprep-skill/universal-exam-cram-coach"]
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {"@type": "Question", "name": "Which AI agents does Exam Cram Coach work with?",
+     "acceptedAnswer": {"@type": "Answer", "text": "Any coding agent that can run shell commands and read files: Claude Code, Codex, Cursor, Windsurf, Antigravity, Gemini CLI, GitHub Copilot and others. Install with npx skills add ZeKaiNie/universal-examprep-skill."}},
+    {"@type": "Question", "name": "Does it make up answers?",
+     "acceptedAnswer": {"@type": "Answer", "text": "Every sentence is labelled: from your materials (with file and page), AI supplement, or AI-generated answer. Quizzes use only questions found in your homework and past papers, and when the materials do not cover a question the tutor says so."}},
+    {"@type": "Question", "name": "Can it show the diagrams from my lecture PDFs?",
+     "acceptedAnswer": {"@type": "Answer", "text": "Yes. Setup crops figures out of lecture pages and the printed questions and solutions, and the tutor puts them in the chat next to the explanation."}},
+    {"@type": "Question", "name": "Does it upload my course files?",
+     "acceptedAnswer": {"@type": "Answer", "text": "No. The tool runs offline, needs no API key and writes only into a local exam-cram folder next to your materials."}},
+    {"@type": "Question", "name": "Does it work with small or cheap models?",
+     "acceptedAnswer": {"@type": "Answer", "text": "Yes. It was tested end to end with Gemini flash-lite, Gemini flash and Claude Haiku on a real 1,000-page probability course."}}
+  ]
+}
+</script>
+<style>
+:root{--bg:#f7f5ef;--fg:#1f2328;--muted:#5b6168;--card:#ffffff;--line:#e4e0d6;--accent:#e8702a;--accent-2:#1f6feb;--code:#1f2328;--code-fg:#f5f5f5}
+@media (prefers-color-scheme:dark){:root{--bg:#15171a;--fg:#e8e6e1;--muted:#a3a8ae;--card:#1d2024;--line:#30343a;--accent:#ff9147;--accent-2:#6ea8ff;--code:#0c0d0f;--code-fg:#e8e6e1}}
+*{box-sizing:border-box}
+header.hero>div,.card,.shots>figure{min-width:0}
+.table-wrap{overflow-x:auto;border-radius:12px}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif}
+main{max-width:920px;margin:0 auto;padding:0 20px 64px}
+a{color:var(--accent-2)}
+header.hero{display:grid;grid-template-columns:160px 1fr;gap:28px;align-items:center;padding:56px 0 28px}
+header.hero img{width:160px;height:auto}
+h1{font-size:2.2rem;line-height:1.2;margin:0 0 6px}
+.sub{color:var(--accent);font-weight:600;margin:0 0 12px}
+.lead{font-size:1.1rem;margin:0 0 18px}
+.lang{float:right;font-size:.9rem;margin-top:18px}
+pre{background:var(--code);color:var(--code-fg);padding:14px 16px;border-radius:10px;overflow-x:auto;font:14px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;margin:0 0 10px}
+.buttons a{display:inline-block;margin:6px 10px 0 0;padding:8px 14px;border-radius:8px;border:1px solid var(--line);background:var(--card);text-decoration:none;color:var(--fg);font-weight:600}
+.buttons a.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+h2{font-size:1.5rem;margin:48px 0 14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+.card h3{margin:0 0 6px;font-size:1.05rem}
+.card p{margin:0;color:var(--muted)}
+blockquote{margin:0;background:var(--card);border-left:4px solid var(--accent);border-radius:0 12px 12px 0;padding:14px 18px}
+blockquote p{margin:.4em 0}
+figure{margin:0}
+.shots{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-top:14px}
+.shots img{width:100%;height:auto;border:1px solid var(--line);border-radius:10px;background:#fff}
+figcaption{color:var(--muted);font-size:.85rem;margin-top:4px}
+table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;font-size:.95rem}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{background:rgba(127,127,127,.08)}
+.faq h3{margin:18px 0 4px;font-size:1.05rem}
+.faq p{margin:0;color:var(--muted)}
+footer{border-top:1px solid var(--line);margin-top:56px;padding-top:18px;color:var(--muted);font-size:.9rem}
+@media (max-width:640px){header.hero{grid-template-columns:1fr;text-align:left;padding-top:32px}header.hero img{width:110px}h1{font-size:1.8rem}.lang{float:none;display:block;margin:0 0 8px}}
+</style>
+</head>
+<body>
+<main>
+<a class="lang" href="zh/" hreflang="zh-CN" lang="zh-CN">中文</a>
+<header class="hero">
+  <img src="https://raw.githubusercontent.com/ZeKaiNie/universal-examprep-skill/main/assets/exam-panic.png" alt="Exam Cram Coach mascot">
+  <div>
+    <h1>Exam Cram Coach</h1>
+    <p class="sub">期末极速备考教练 · free and open source</p>
+    <p class="lead">Drop your course folder on a coding agent. It teaches from your own slides with page citations, shows the figures, quizzes you with your own homework and past papers, and remembers where you stopped.</p>
+    <pre><code>npx skills add ZeKaiNie/universal-examprep-skill
+pip install pypdfium2</code></pre>
+    <div class="buttons">
+      <a class="primary" href="https://github.com/ZeKaiNie/universal-examprep-skill">View on GitHub</a>
+      <a href="https://github.com/ZeKaiNie/universal-examprep-skill/releases/latest">Download</a>
+      <a href="https://skills.sh/zekainie/universal-examprep-skill/universal-exam-cram-coach">skills.sh</a>
+    </div>
+  </div>
+</header>
+
+<p>Works in Claude Code, Codex, Cursor, Windsurf, Antigravity, Gemini CLI, GitHub Copilot and other agents that can run a shell. Reads PDF, PPTX, DOCX, Markdown, TXT and HTML. English and Chinese.</p>
+
+<h2>What it does</h2>
+<div class="grid">
+  <div class="card"><h3>Teaches chapter by chapter</h3><p>Splits the course into chapters and explains each slice in plain words, citing <code>file p.N</code> for every fact.</p></div>
+  <div class="card"><h3>Shows the figures</h3><p>Crops diagrams from lecture pages and printed questions and solutions, and puts them in the chat while it explains.</p></div>
+  <div class="card"><h3>Quizzes from your homework</h3><p>Pairs <code>hw2.pdf</code> with <code>hw2solutions.pdf</code> and “Problem 1.3.10” with its solution. Only real questions are used.</p></div>
+  <div class="card"><h3>Never hides what it made up</h3><p>🟢 from your materials · 🟡 AI supplement · ⚠️ AI-generated answer. If the materials don't cover it, it says so.</p></div>
+  <div class="card"><h3>Remembers across chats</h3><p>Progress, mistakes, notes and a day-by-day plan live in a local folder. A new chat continues where you stopped.</p></div>
+  <div class="card"><h3>Small, offline, safe</h3><p>13 files, no API key, no network. Course text is treated as data: lines aimed at the AI are flagged, never followed.</p></div>
+</div>
+
+<h2>What a session looks like</h2>
+<blockquote>
+  <p><strong>Chapter 1: Set Theory</strong></p>
+  <p>🟢 <strong>Union A ∪ B</strong>: everything in A or in B or in both — on a Venn diagram, the whole area both circles cover. (ch01.pdf p.4)</p>
+  <p><em>[the Venn diagram cropped from ch01.pdf p.4 appears here]</em></p>
+  <p>🟢 <strong>Partition</strong>: sets that are mutually exclusive and collectively exhaustive. (ch01.pdf p.9)</p>
+  <p><code>📍 ch 1/9 Experiments, Models, an… · part 1/8 · quiz 0/0 · 0/9 chapters done · 0 open mistakes · 3 day(s) to exam → python coach.py next</code></p>
+</blockquote>
+<div class="shots">
+  <figure><img src="img/mit_lecture_figure.png" alt="A table cropped from a lecture page" loading="lazy" width="973" height="418"><figcaption>A figure cropped from a lecture page (MIT 6.006, CC BY-NC-SA)</figcaption></figure>
+  <figure><img src="img/mit_question_figure.png" alt="A quiz problem cropped with its tree diagram" loading="lazy"><figcaption>A quiz problem cropped with its diagram, shown before the question is asked</figcaption></figure>
+</div>
+
+<h2>Install</h2>
+<div class="grid">
+  <div class="card"><h3>Any agent</h3><pre><code>npx skills add ZeKaiNie/universal-examprep-skill</code></pre><p>Pick your agents when asked. Add <code>-g</code> to install for your user.</p></div>
+  <div class="card"><h3>Claude Code plugin</h3><pre><code>/plugin marketplace add ZeKaiNie/universal-examprep-skill
+/plugin install universal-exam-cram-coach@exam-cram-coach</code></pre></div>
+  <div class="card"><h3>Offline</h3><p>Download <code>universal-exam-cram-coach-flash.zip</code> and <code>SHA256SUMS.txt</code> from the <a href="https://github.com/ZeKaiNie/universal-examprep-skill/releases/latest">latest release</a> and unzip into your agent's skills folder.</p></div>
+</div>
+<p>Then tell your agent: <em>“Use the Exam Cram Coach skill. My materials are in D:\Courses\Probability, the exam is in 3 days, start from chapter 1.”</em></p>
+
+<h2>Measured on real courses</h2>
+<div class="table-wrap"><table>
+  <tr><th>Course</th><th>Files</th><th>Setup</th><th>Result</th></tr>
+  <tr><td>EEC 160 Applied Probability</td><td>27 PDFs, 1,000 pages, scanned homework</td><td>9 s</td><td>9/9 chapters · 89/89 problems paired with solutions · 235 lecture figures</td></tr>
+  <tr><td>MIT 6.006 (OCW)</td><td>8 PDFs</td><td>1.4 s</td><td>6/6 chapters · 9/9 quiz problems with official solutions</td></tr>
+  <tr><td>Yale PSYC 110</td><td>4 transcripts</td><td>0.1 s</td><td>4/4 chapters, retrieval hits the right lecture</td></tr>
+</table></div>
+<p>Gemini flash-lite, Gemini flash and Claude Haiku each ran setup → teach → quiz → check from the skill text alone, citing pages and embedding the figures without inventing commands. Details: <a href="https://github.com/ZeKaiNie/universal-examprep-skill/blob/main/docs/weak-model-test.en.md">weak-model test</a>.</p>
+
+<h2>FAQ</h2>
+<div class="faq">
+  <h3>Which agents does it work with?</h3><p>Any coding agent with a shell: Claude Code, Codex, Cursor, Windsurf, Antigravity, Gemini CLI, GitHub Copilot and more.</p>
+  <h3>Does it make up answers?</h3><p>Every sentence carries a label, quizzes use only questions from your files, and when the materials don't cover a question the tutor says so.</p>
+  <h3>Can it show the diagrams from my PDFs?</h3><p>Yes: figures are cropped from lecture pages and printed questions and solutions during setup.</p>
+  <h3>Does it upload my files?</h3><p>No. It runs offline and writes only into a local <code>exam-cram</code> folder.</p>
+  <h3>Does it work with small models?</h3><p>Yes, it was tested with Gemini flash-lite, Gemini flash and Claude Haiku.</p>
+</div>
+
+<footer>
+  MIT licensed · <a href="https://github.com/ZeKaiNie/universal-examprep-skill">GitHub</a> · <a href="https://github.com/ZeKaiNie/universal-examprep-skill/blob/main/README.md">README</a> · <a href="https://github.com/ZeKaiNie/universal-examprep-skill/blob/main/SECURITY.md">Security</a> · <a href="zh/" hreflang="zh-CN">中文</a>
+</footer>
+</main>
+</body>
+</html>

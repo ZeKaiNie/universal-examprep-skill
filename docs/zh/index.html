@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>期末极速备考教练 Exam Cram Coach — 用你的课件和作业复习的 AI 备考技能（Claude Code / Codex / Cursor）</title>
+<meta name="description" content="免费开源的智能体技能：把课件 PDF/PPTX、笔记、作业和往年卷交给 Claude Code、Codex、Cursor、Windsurf、Antigravity 或 Gemini CLI，它按章节讲解并标出处页码，把讲义里的图裁出来给你看，只用你自己的作业和真题出题，记住错题和进度。期末复习、考前突击、刷题、小抄。离线运行，小模型也能用。">
+<meta name="keywords" content="期末复习, 考前突击, 备考, 刷题, 真题, 错题本, 小抄, 复习计划, 课件讲解, AI 家教, AI 助教, 考研复习, Claude Code 技能, Codex 技能, Cursor 技能, 智能体技能, exam prep, AI tutor">
+<link rel="canonical" href="https://zekainie.github.io/universal-examprep-skill/zh/">
+<link rel="alternate" hreflang="en" href="https://zekainie.github.io/universal-examprep-skill/">
+<link rel="alternate" hreflang="zh-CN" href="https://zekainie.github.io/universal-examprep-skill/zh/">
+<link rel="alternate" hreflang="x-default" href="https://zekainie.github.io/universal-examprep-skill/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="期末极速备考教练：你的课件变成 AI 助教">
+<meta property="og:description" content="按你的资料讲课并标页码、把讲义里的图放到你面前、用你自己的作业和真题考你。适用于 Claude Code、Codex、Cursor、Windsurf、Antigravity、Gemini CLI。">
+<meta property="og:url" content="https://zekainie.github.io/universal-examprep-skill/zh/">
+<meta property="og:image" content="https://raw.githubusercontent.com/ZeKaiNie/universal-examprep-skill/main/assets/social-preview.png">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:locale:alternate" content="en_US">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#f7f5ef">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "期末极速备考教练",
+  "alternateName": ["Exam Cram Coach", "universal-exam-cram-coach"],
+  "applicationCategory": "EducationalApplication",
+  "operatingSystem": "Windows, macOS, Linux",
+  "description": "开源智能体技能加一个小 Python 工具：把学生自己的课程资料变成编程智能体里的备考老师，讲解标页码、从 PDF 裁图展示、只用作业和往年卷出题、跨对话记住进度。",
+  "url": "https://zekainie.github.io/universal-examprep-skill/zh/",
+  "downloadUrl": "https://github.com/ZeKaiNie/universal-examprep-skill/releases/latest",
+  "installUrl": "https://github.com/ZeKaiNie/universal-examprep-skill",
+  "softwareVersion": "5.2.0",
+  "license": "https://opensource.org/licenses/MIT",
+  "inLanguage": ["zh-CN", "en"],
+  "isAccessibleForFree": true,
+  "offers": {"@type": "Offer", "price": "0", "priceCurrency": "CNY"},
+  "author": {"@type": "Person", "name": "ZeKaiNie", "url": "https://github.com/ZeKaiNie"},
+  "sameAs": ["https://github.com/ZeKaiNie/universal-examprep-skill", "https://skills.sh/zekainie/universal-examprep-skill/universal-exam-cram-coach"]
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {"@type": "Question", "name": "期末极速备考教练支持哪些 AI 智能体？",
+     "acceptedAnswer": {"@type": "Answer", "text": "任何能运行命令、读文件的编程智能体：Claude Code、Codex、Cursor、Windsurf、Antigravity、Gemini CLI、GitHub Copilot 等。用 npx skills add ZeKaiNie/universal-examprep-skill 一条命令安装。"}},
+    {"@type": "Question", "name": "它会编造答案吗？",
+     "acceptedAnswer": {"@type": "Answer", "text": "每句话都有来源标签：来自资料（带文件和页码）、AI 补充、AI 生成答案。测验只用你作业和往年卷里的题；资料没讲到的内容会直接说明。"}},
+    {"@type": "Question", "name": "能把讲义 PDF 里的图给我看吗？",
+     "acceptedAnswer": {"@type": "Answer", "text": "能。准备阶段会从讲义页、题目和解答里裁出图，讲到对应内容时直接放进对话。"}},
+    {"@type": "Question", "name": "会上传我的课程资料吗？",
+     "acceptedAnswer": {"@type": "Answer", "text": "不会。工具离线运行，不需要 API 密钥，只往资料旁边的本地 exam-cram 文件夹写文件。"}},
+    {"@type": "Question", "name": "便宜的小模型能用吗？",
+     "acceptedAnswer": {"@type": "Answer", "text": "能。用 Gemini flash-lite、Gemini flash 和 Claude Haiku 在一门 1000 页的真实概率论课程上完整实测过。"}}
+  ]
+}
+</script>
+<style>
+:root{--bg:#f7f5ef;--fg:#1f2328;--muted:#5b6168;--card:#ffffff;--line:#e4e0d6;--accent:#e8702a;--accent-2:#1f6feb;--code:#1f2328;--code-fg:#f5f5f5}
+@media (prefers-color-scheme:dark){:root{--bg:#15171a;--fg:#e8e6e1;--muted:#a3a8ae;--card:#1d2024;--line:#30343a;--accent:#ff9147;--accent-2:#6ea8ff;--code:#0c0d0f;--code-fg:#e8e6e1}}
+*{box-sizing:border-box}
+header.hero>div,.card,.shots>figure{min-width:0}
+.table-wrap{overflow-x:auto;border-radius:12px}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC","PingFang SC","Microsoft YaHei",Roboto,sans-serif}
+main{max-width:920px;margin:0 auto;padding:0 20px 64px}
+a{color:var(--accent-2)}
+header.hero{display:grid;grid-template-columns:160px 1fr;gap:28px;align-items:center;padding:56px 0 28px}
+header.hero img{width:160px;height:auto}
+h1{font-size:2.1rem;line-height:1.25;margin:0 0 6px}
+.sub{color:var(--accent);font-weight:600;margin:0 0 12px}
+.lead{font-size:1.08rem;margin:0 0 18px}
+.lang{float:right;font-size:.9rem;margin-top:18px}
+pre{background:var(--code);color:var(--code-fg);padding:14px 16px;border-radius:10px;overflow-x:auto;font:14px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;margin:0 0 10px}
+.buttons a{display:inline-block;margin:6px 10px 0 0;padding:8px 14px;border-radius:8px;border:1px solid var(--line);background:var(--card);text-decoration:none;color:var(--fg);font-weight:600}
+.buttons a.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+h2{font-size:1.45rem;margin:48px 0 14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+.card h3{margin:0 0 6px;font-size:1.05rem}
+.card p{margin:0;color:var(--muted)}
+blockquote{margin:0;background:var(--card);border-left:4px solid var(--accent);border-radius:0 12px 12px 0;padding:14px 18px}
+blockquote p{margin:.4em 0}
+figure{margin:0}
+.shots{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-top:14px}
+.shots img{width:100%;height:auto;border:1px solid var(--line);border-radius:10px;background:#fff}
+figcaption{color:var(--muted);font-size:.85rem;margin-top:4px}
+table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;font-size:.95rem}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{background:rgba(127,127,127,.08)}
+.faq h3{margin:18px 0 4px;font-size:1.05rem}
+.faq p{margin:0;color:var(--muted)}
+footer{border-top:1px solid var(--line);margin-top:56px;padding-top:18px;color:var(--muted);font-size:.9rem}
+@media (max-width:640px){header.hero{grid-template-columns:1fr;padding-top:32px}header.hero img{width:110px}h1{font-size:1.7rem}.lang{float:none;display:block;margin:0 0 8px}}
+</style>
+</head>
+<body>
+<main>
+<a class="lang" href="../" hreflang="en" lang="en">English</a>
+<header class="hero">
+  <img src="https://raw.githubusercontent.com/ZeKaiNie/universal-examprep-skill/main/assets/exam-panic.png" alt="期末极速备考教练吉祥物">
+  <div>
+    <h1>期末极速备考教练</h1>
+    <p class="sub">Exam Cram Coach · 免费开源</p>
+    <p class="lead">把课程文件夹交给编程智能体：它按你的课件讲课并标出处页码，把讲义里的图放到你面前，用你自己的作业和往年卷考你，还记得你学到哪。</p>
+    <pre><code>npx skills add ZeKaiNie/universal-examprep-skill
+pip install pypdfium2</code></pre>
+    <div class="buttons">
+      <a class="primary" href="https://github.com/ZeKaiNie/universal-examprep-skill/blob/main/README.zh.md">查看 GitHub</a>
+      <a href="https://github.com/ZeKaiNie/universal-examprep-skill/releases/latest">下载</a>
+      <a href="https://skills.sh/zekainie/universal-examprep-skill/universal-exam-cram-coach">skills.sh</a>
+    </div>
+  </div>
+</header>
+
+<p>适用于 Claude Code、Codex、Cursor、Windsurf、Antigravity、Gemini CLI、GitHub Copilot 等能运行命令的智能体。支持 PDF、PPTX、DOCX、Markdown、TXT、HTML，中英双语。</p>
+
+<h2>它能做什么</h2>
+<div class="grid">
+  <div class="card"><h3>一章一章讲</h3><p>自动把整门课切成章节，用大白话讲每一段，每个结论都标出处 <code>文件 p.页码</code>。</p></div>
+  <div class="card"><h3>讲到哪张图就给你看哪张</h3><p>从讲义页、题目和解答里裁出图，讲解时直接放进对话。</p></div>
+  <div class="card"><h3>用你的作业和真题考你</h3><p><code>hw2.pdf</code> 自动配 <code>hw2solutions.pdf</code>，“Problem 1.3.10” 自动配它的解答，只出资料里的真题。</p></div>
+  <div class="card"><h3>编的内容绝不冒充资料</h3><p>🟢 来自资料 · 🟡 AI 补充 · ⚠️ AI 生成答案。资料没讲的，直接说没讲。</p></div>
+  <div class="card"><h3>换个对话也记得</h3><p>进度、错题、笔记和按天排好的复习计划都存在本地文件夹里，新对话从上次停下的地方继续。</p></div>
+  <div class="card"><h3>小巧、离线、安全</h3><p>13 个文件，不需要 API 密钥，不联网。课件只当数据：里面对 AI 下指令的句子会被标出，绝不照做。</p></div>
+</div>
+
+<h2>一次复习长什么样</h2>
+<blockquote>
+  <p><strong>第 1 章：集合论</strong></p>
+  <p>🟢 <strong>并集 A ∪ B</strong>：属于 A 或属于 B（或两者都属于）的所有元素，在文氏图上就是两个圆覆盖的总面积。（ch01.pdf p.4）</p>
+  <p><em>［此处显示从 ch01.pdf 第 4 页裁出的文氏图］</em></p>
+  <p>🟢 <strong>划分</strong>：一组集合既互斥又共同穷举，就是全集的一个划分。（ch01.pdf p.9）</p>
+  <p><code>📍 第 1/9 章《Experiments, Models, an…》段 1/13 · 本章题 0/0 · 已完成 0/9 章 · 错题 0 · 距考试 3 天 → python coach.py next</code></p>
+</blockquote>
+<div class="shots">
+  <figure><img src="../img/mit_lecture_figure.png" alt="从讲义页裁出的表格" loading="lazy" width="973" height="418"><figcaption>从讲义页裁出的图（MIT 6.006，CC BY-NC-SA）</figcaption></figure>
+  <figure><img src="../img/mit_question_figure.png" alt="连同树形图一起裁出的测验题" loading="lazy"><figcaption>连同题图一起裁出的测验题，出题前先展示</figcaption></figure>
+</div>
+
+<h2>安装</h2>
+<div class="grid">
+  <div class="card"><h3>任意智能体</h3><pre><code>npx skills add ZeKaiNie/universal-examprep-skill</code></pre><p>按提示选择你的智能体；加 <code>-g</code> 装给整个用户。</p></div>
+  <div class="card"><h3>Claude Code 插件</h3><pre><code>/plugin marketplace add ZeKaiNie/universal-examprep-skill
+/plugin install universal-exam-cram-coach@exam-cram-coach</code></pre></div>
+  <div class="card"><h3>离线安装</h3><p>到<a href="https://github.com/ZeKaiNie/universal-examprep-skill/releases/latest">最新发布页</a>下载 <code>universal-exam-cram-coach-flash.zip</code> 和 <code>SHA256SUMS.txt</code>，解压到智能体的技能目录。</p></div>
+</div>
+<p>然后对智能体说：<em>“用期末极速备考教练。资料在 D:\课程\概率论，三天后考试，我零基础，用中文从第 1 章开始讲。”</em></p>
+
+<h2>真实课程实测</h2>
+<div class="table-wrap"><table>
+  <tr><th>课程</th><th>资料</th><th>准备耗时</th><th>结果</th></tr>
+  <tr><td>EEC 160 应用概率</td><td>27 个 PDF、1000 页，含手写扫描作业</td><td>9 秒</td><td>9/9 章 · 89/89 道题配上官方解答 · 裁出 235 张讲义图</td></tr>
+  <tr><td>MIT 6.006（OCW）</td><td>8 个 PDF</td><td>1.4 秒</td><td>6/6 章 · Quiz 1 的 9/9 题配上官方解答</td></tr>
+  <tr><td>耶鲁 PSYC 110</td><td>4 讲文字稿</td><td>0.1 秒</td><td>4/4 章，检索命中正确的讲次</td></tr>
+</table></div>
+<p>Gemini flash-lite、Gemini flash 和 Claude Haiku 只凭技能说明就完成了“准备 → 讲解 → 出题 → 看答案”，引用页码、在回复中嵌入裁好的图，没有编造命令。详见<a href="https://github.com/ZeKaiNie/universal-examprep-skill/blob/main/docs/weak-model-test.md">弱模型实测</a>。</p>
+
+<h2>常见问题</h2>
+<div class="faq">
+  <h3>支持哪些智能体？</h3><p>任何能运行命令的编程智能体：Claude Code、Codex、Cursor、Windsurf、Antigravity、Gemini CLI、GitHub Copilot 等。</p>
+  <h3>会编造答案吗？</h3><p>每句话都有来源标签，测验只用你文件里的题；资料没讲到的内容会直接说明。</p>
+  <h3>能把 PDF 里的图给我看吗？</h3><p>能：准备阶段会从讲义页、题目和解答里裁出图。</p>
+  <h3>会上传我的资料吗？</h3><p>不会。它离线运行，只往本地的 <code>exam-cram</code> 文件夹写文件。</p>
+  <h3>小模型能用吗？</h3><p>能，用 Gemini flash-lite、Gemini flash 和 Claude Haiku 实测过。</p>
+</div>
+
+<footer>
+  MIT 开源 · <a href="https://github.com/ZeKaiNie/universal-examprep-skill">GitHub</a> · <a href="https://github.com/ZeKaiNie/universal-examprep-skill/blob/main/README.zh.md">中文说明</a> · <a href="https://github.com/ZeKaiNie/universal-examprep-skill/blob/main/SECURITY.md">安全说明</a> · <a href="../" hreflang="en">English</a>
+</footer>
+</main>
+</body>
+</html>
