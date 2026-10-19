@@ -2,6 +2,7 @@
 """Progress footer, day-by-day plan and figure export."""
 from tests import skillpath  # noqa: F401  (skill folder on sys.path)
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -59,13 +60,17 @@ class PlanExportTest(unittest.TestCase):
         self.run_cli("setup", self.mat, "--days", "3")
         rc, out = self.run_cli("plan")
         # 3 days → 2 study days (last day reserved): ch1+ch2, then ch3
-        self.assertIn("第 1 天: → ch1 线性表, ch2 栈和队列", out)
-        self.assertIn("第 2 天: ch3 树与二叉树", out)
+        self.assertIn("第 1 天: → ch1 线性表 [2题 · 真题 2], ch2 栈和队列 [6题 · 真题 1]", out)
+        self.assertIn("第 2 天: ch3 树与二叉树 [4题 · 真题 4]", out)
         self.assertIn("最后一天", out)
         self.assertIn("今天目标: ch1, ch2", out)
+        self.assertNotIn("⏰", out)
         rc, out = self.run_cli("plan", "--days", "1")
-        self.assertEqual(self.state()["exam_days"], 1)
-        self.assertIn("第 1 天: → ch1 线性表, ch2 栈和队列, ch3 树与二叉树", out)
+        tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        self.assertEqual(self.state()["exam_date"], tomorrow)
+        self.assertIn("第 1 天: → ch1 线性表 [2题 · 真题 2], ch2 栈和队列 [6题 · 真题 1], ch3 树与二叉树 [4题 · 真题 4]", out)
+        # three chapters in one day: point at the chapters past exams ask most
+        self.assertIn("先讲真题最多的：ch3, ch1", out)
 
     def test_plan_without_days(self):
         self.run_cli("setup", self.mat)

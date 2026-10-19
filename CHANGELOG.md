@@ -4,6 +4,14 @@ English · [中文](CHANGELOG.zh.md)
 
 > Runtime text (`SKILL.md`, `README*.md`) describes only the current behavior; version history is kept in this file.
 
+## V5.3.0 Flash — 2026-10-18 · Answers graded by the script, a real countdown, profiles for small and frontier models (release: `v5.3.0-flash`)
+
+- **`grade`: the script grades short answers.** `python coach.py grade <id> "student's answer"` grades multiple-choice (letters, or the option text), true/false, number (fractions, percentages and rounding allowed) and short fill-in answers against the reference answer and records the result, so a model no longer has to compare answers or remember to run `answer`. A wrong answer prints the fenced reference answer and its figure for the explanation. Anything else (proofs, derivations, open questions) prints the reference and leaves the judgement to the agent, which then runs `answer`. It never marks a reworded fill-in answer wrong; only exact matches are graded automatically. On the Chinese sample, 8 of 12 questions get a key; on the MIT 6.006 quiz, none of the 9 proof and algorithm questions do, so they are never graded by mistake.
+- **A countdown that counts down.** `setup --days N` used to store the number, so “3 days to exam” stayed 3 and the plan stayed on day 1 however many days passed. The workspace now stores the exam date (`--date YYYY-MM-DD` also works) and every command counts the days from today; older workspaces get a date from their creation day.
+- **High-yield chapters first.** `plan` shows how many questions, and how many past-exam questions, each chapter has. When more than two chapters fall on one day, it names the chapters past exams ask most so the agent can `goto` them first. `quiz` asks past-exam questions before homework questions.
+- **Profiles for small and frontier models.** `setup --profile small` (short slices, one question per quiz) or `--profile large` (slices about three times longer, five questions per quiz); the agent picks it for itself from SKILL.md §7. Re-running `setup` keeps the profile and progress. In a test session Claude Haiku 4.5 chose `small` and Claude Opus 5.5 chose `large`, and both graded the student's answer with `grade`.
+- The skill stays 13 files; `SKILL.md` grew by about 80 words (now about 1,600). The README shows the Awesome Claude Code badge.
+
 ## V5.2.0 Flash — 2026-09-27 · Smaller install, fixes for the skills.sh security audits, course files are data (release: `v5.2.0-flash`)
 
 - **Installs only the skill.** The installable skill moved to `skills/universal-exam-cram-coach/` (`SKILL.md`, `LICENSE`, `coach.py`, `coach/`). With `SKILL.md` at the repository root, `npx skills add` used to copy the whole repository into every agent (545 files, 12 MB, including v4.3, benchmark scripts and tests); now it copies 13 files, 150 KB (measured with skills CLI 1.7.0). The root `coach.py` stays as a developer shortcut.

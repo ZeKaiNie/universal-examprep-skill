@@ -13,12 +13,32 @@ def now():
     return _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
-def new_state(course, language, days, materials, chapters, slice_chars):
+def exam_date_in(days, today=None):
+    """ISO date `days` from today (the exam day), or None."""
+    if days is None:
+        return None
+    return ((today or _dt.date.today()) + _dt.timedelta(days=max(0, days))).isoformat()
+
+
+def days_left(state, today=None):
+    """Whole days until the exam date (0 on the day itself), or None when no date is set."""
+    d = state.get("exam_date")
+    if not d:
+        return None
+    try:
+        exam = _dt.date.fromisoformat(d)
+    except ValueError:
+        return None
+    return max(0, (exam - (today or _dt.date.today())).days)
+
+
+def new_state(course, language, exam_date, materials, chapters, slice_chars, profile="standard"):
     return {
         "version": 5,
         "course": course,
         "language": language,
-        "exam_days": days,
+        "exam_date": exam_date,
+        "profile": profile,
         "materials": materials,
         "created": now(),
         "updated": now(),
@@ -44,7 +64,18 @@ def load(ws):
     if not os.path.exists(p):
         return None
     with open(p, encoding="utf-8") as fh:
-        return json.load(fh)
+        state = json.load(fh)
+    if "exam_days" in state:  # before 5.3 the count was stored and never went down
+        days = state.pop("exam_days")
+        if days is not None and not state.get("exam_date"):
+            try:
+                start = _dt.date.fromisoformat(state.get("created", "")[:10])
+            except ValueError:
+                start = _dt.date.today()
+            state["exam_date"] = exam_date_in(days, start)
+    state.setdefault("exam_date", None)
+    state.setdefault("profile", "standard")
+    return state
 
 
 def _atomic_write(p, text):

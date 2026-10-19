@@ -2,6 +2,7 @@
 """End-to-end: the bundled Chinese sample course through a full study session."""
 from tests import skillpath  # noqa: F401  (skill folder on sys.path)
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -105,7 +106,7 @@ class CliTest(unittest.TestCase):
         # re-running setup keeps progress; --fresh drops it
         rc, out = self.run_cli("setup", self.mat)
         self.assertEqual(self.state()["chapters"][0]["status"], "verified")
-        self.assertEqual(self.state()["exam_days"], 2)
+        self.assertEqual(self.state()["exam_date"], (datetime.date.today() + datetime.timedelta(days=2)).isoformat())
         rc, out = self.run_cli("setup", self.mat, "--fresh")
         self.assertEqual(self.state()["chapters"][0]["status"], "todo")
 

@@ -13,6 +13,7 @@
 [![发布](https://img.shields.io/github/v/release/ZeKaiNie/universal-examprep-skill?label=release&color=orange)](https://github.com/ZeKaiNie/universal-examprep-skill/releases/latest)
 [![MIT](https://img.shields.io/badge/协议-MIT-blue.svg)](LICENSE)
 [![持续集成](https://github.com/ZeKaiNie/universal-examprep-skill/actions/workflows/ci.yml/badge.svg)](https://github.com/ZeKaiNie/universal-examprep-skill/actions)
+[![Mentioned in Awesome Claude Code](https://awesome.re/mentioned-badge.svg)](https://github.com/hesreallyhim/awesome-claude-code)
 
 ```bash
 # 一键安装技能 (支持 Claude Code / Cursor / Codex / Antigravity / Windsurf 等)
@@ -51,7 +52,7 @@ npx skills add zekainie/universal-examprep-skill
 | README | 本页 · [English](README.md) | [full/README.zh.md](full/README.zh.md) · [full/README.md](full/README.md) |
 | 安装 | `npx skills add ZeKaiNie/universal-examprep-skill`，或[最新发布](https://github.com/ZeKaiNie/universal-examprep-skill/releases/latest)里的 `universal-exam-cram-coach-flash.zip` | `npx skills add ZeKaiNie/universal-examprep-skill --skill universal-exam-cram-coach-full`；更新方法和 v4.3 发布包见 [full/README.zh.md](full/README.zh.md) |
 
-本页其余内容讲 **Flash 版**：整门课几秒钟准备完，技能说明只有约 1500 词，学习循环只有 7 条命令，小模型也能跑（实测 Gemini flash-lite 和 Claude Haiku）。逐项对比见 [Flash 版与完整版](#flash-版与完整版)。
+本页其余内容讲 **Flash 版**：整门课几秒钟准备完，技能说明只有约 1600 词，学习循环只有 7 条命令，小模型也能跑（实测 Gemini flash-lite 和 Claude Haiku）。逐项对比见 [Flash 版与完整版](#flash-版与完整版)。
 
 ## 目录
 
@@ -148,10 +149,10 @@ python ~/.claude/skills/universal-exam-cram-coach/coach.py doctor
 |---|---|
 | “继续” / “下一段” | 本章下一段资料，用大白话讲，带 `[lec2.pdf p.3]` 出处和这几页裁出的图 |
 | “什么是……？”“为什么……？” | 在你的资料里检索，只根据命中的段落回答；查不到就明说“资料里没有” |
-| “考考我” | 一道作业或试卷真题（带题面图），按参考答案判分；错题自动记入错题本 |
+| “考考我” | 一道作业或试卷真题（带题面图），真题优先；选择、判断、数字和短填空由脚本直接判分，其余由智能体对照参考答案判；错题自动记入错题本 |
 | “这章学完了” | 本章标为“已验证”（答对过本章材料题）或“已讲完”，进入下一章 |
 | “看看错题” / “做小抄” | 重讲待复习错题；由你的章节总结、疑难点、错题生成 `cheatsheet.md` |
-| “今天该学什么？” | `coach.py plan` 把剩余章节按剩余天数分配（最后一天留给错题和小抄） |
+| “今天该学什么？” | `coach.py plan` 按离考试日期还剩几天分配剩余章节（最后一天留给错题和小抄）；时间不够时列出真题最多的章节 |
 | 几天后开新对话 | 说“继续备考”，它会从上次停的地方接着讲 |
 
 每次回复末尾都有一行从工具照抄的 📍 进度（第几章第几段、本章做题、错题、剩余天数、下一步），会话再长也不会丢线。
@@ -245,20 +246,21 @@ python ~/.claude/skills/universal-exam-cram-coach/coach.py doctor
 平时不用你敲，智能体会自己跑；用来查看状态或做自动化时有用。
 
 ```text
-python coach.py setup <文件夹> [--days N] [--lang zh|en] [--name 课程名] [--start 章] [--slice 字数] [--fresh]
+python coach.py setup <文件夹> [--days N | --date 考试日] [--profile small|standard|large] [--lang zh|en] [--name 课程名] [--start 章] [--slice 字数] [--fresh]
 python coach.py status                        进度面板
 python coach.py next [--repeat|--back]        当前章下一段 + 本段配图
 python coach.py chapter N [--part K]          查看第 N 章（列出分段或打印某段）
 python coach.py goto N [--restart]            切换章节
 python coach.py ask "关键词" [-k 5] [--chapter N]        在资料里检索（退出码 4 = 没找到）
-python coach.py quiz [-n 3] [--chapter N] [--all]        抽题（错题优先）
+python coach.py quiz [-n N] [--chapter N] [--all]        抽题（错题优先，其次真题）
+python coach.py grade <题号> "学生答案"        选择/判断/数字/短填空自动判分并记录，其他题打印参考答案
 python coach.py check <题号>                  参考答案、出处与答案图
 python coach.py answer <题号> right|wrong|skip [--note …]  记录作答
 python coach.py done [--chapter N]            本章讲完，进入下一章
 python coach.py note "…" [--type summary|confusion|note] [--chapter N]
 python coach.py mistakes [--answers]          待复习错题
 python coach.py cheatsheet [--out 文件]       生成小抄
-python coach.py plan [--days N]               按剩余天数排每日目标（--days 更新考试日期）
+python coach.py plan [--days N|--date 考试日]  按离考试还剩几天排每日目标，并标出每章题数
 python coach.py export [--to 目录] [--qid …] [--chapter N] [路径…]   把图复制到聊天界面能显示的目录
 python coach.py figures [--chapter N] [--file F] [--page P]   列出裁好的图
 python coach.py figure <文件> <页> [--crop x0,y0,x1,y1] [--scale 2]   截整页或局部
@@ -266,7 +268,7 @@ python coach.py doctor                        环境检查
 python coach.py help
 ```
 
-`--workspace 路径`（或环境变量 `EXAM_CRAM_WORKSPACE`）指定工作区，不指定则用上次的。`--slice 2000` 让每段更短，适合小模型。
+`--workspace 路径`（或环境变量 `EXAM_CRAM_WORKSPACE`）指定工作区，不指定则用上次的。`--profile` 让输出适配模型：`small`（每段更短、每次出一道题）给小模型和快速模型，`large`（每段约三倍长、每次出五道题）给旗舰模型，由智能体自己选。`--slice 字数` 直接设定每段长度。
 
 ## 实测数据
 

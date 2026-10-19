@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "Exam Cram Coach: an offline exam-prep tutor skill that teaches from your own lecture files with page citations, shows the figures cropped from them, and quizzes you with your own homework and past papers.",
-    "version": "5.2.0"
+    "version": "5.3.0"
   },
   "plugins": [
     {
@@ -14,7 +14,7 @@
       "source": "./skills",
       "strict": false,
       "description": "Exam prep from your own course files: chapter-by-chapter teaching with page citations, figures cropped from the PDFs, quizzes from your homework and past papers, mistakes and progress kept across chats. 期末复习·考前突击·刷题·错题本·小抄.",
-      "version": "5.2.0",
+      "version": "5.3.0",
       "author": {
         "name": "ZeKaiNie",
         "url": "https://github.com/ZeKaiNie"

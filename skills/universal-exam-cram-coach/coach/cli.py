@@ -18,7 +18,6 @@ CHAPTERS_FILE = "chapters.json"
 BANK_FILE = "quiz_bank.json"
 FIGURES_FILE = "figures.json"
 POINTER = os.path.join(os.path.expanduser("~"), ".exam-cram-coach", "last_workspace")
-DEFAULT_SLICE = {"zh": 3000, "en": 5000}
 
 for _s in ("stdout", "stderr"):
     try:
@@ -49,8 +48,6 @@ _T = {
     "read_error": ("读取失败", "could not be read"),
     "next_steps": ("下一步", "Next"),
     "course": ("课程", "Course"),
-    "exam_in": ("距考试", "Exam in"),
-    "days": ("天", "day(s)"),
     "lang": ("语言", "Language"),
     "progress": ("进度", "Progress"),
     "current": ("当前", "Current"),
@@ -126,7 +123,53 @@ _T = {
                     "Nothing to export: run next / quiz / check first, or pass --qid / --chapter."),
     "export_hint": ("聊天界面不显示这些图片时：python coach.py export --to <打开的工作区或宿主 artifact 目录>，再用它打印的相对路径嵌入",
                     "If your chat cannot render these paths: python coach.py export --to <open workspace or the host's artifact folder>, then embed the printed relative paths"),
+    "hint_grade": ("学生作答后：python coach.py grade <题号> \"学生的答案\"（选择/判断/数字/短填空自动判分并记录）",
+                   "After the student answers: python coach.py grade <id> \"their answer\" (choice, true/false, number and short fill-in answers are graded and recorded for you)"),
+    "grade_right": ("✅ 正确，已记录（参考答案：%s）", "✅ Correct, recorded (reference: %s)"),
+    "grade_wrong": ("❌ 不正确，已记入错题（学生答：%s；参考答案：%s）。对照下面的参考答案讲清楚错在哪。",
+                    "❌ Not correct, added to mistakes (student: %s; reference: %s). Use the reference answer below to explain the mistake."),
+    "grade_unsure": ("这道题不能自动判分。对照下面的参考答案判断学生的答案（意思对即可），再记录：python coach.py answer %s right|wrong",
+                     "This answer cannot be graded automatically. Compare it with the reference answer below (same meaning counts), then record: python coach.py answer %s right|wrong"),
+    "exam_today": ("今天考试", "exam today"),
+    "plan_focus": ("⏰ 时间不够讲完全部章节。先讲真题最多的：%s（python coach.py goto N）",
+                   "⏰ Not enough time for every chapter. Start with the ones past exams ask most: %s (python coach.py goto N)"),
+    "q_count": ("题", "q"),
+    "exam_q": ("真题", "exam"),
 }
+
+# Model profiles: one switch, chosen by the agent for itself, sets how much text each step prints.
+PROFILES = {
+    "small": {"slice": {"zh": 1800, "en": 3000}, "quiz_n": 1, "examples": 3},
+    "standard": {"slice": {"zh": 3000, "en": 5000}, "quiz_n": 3, "examples": 8},
+    "large": {"slice": {"zh": 8000, "en": 12000}, "quiz_n": 5, "examples": 15},
+}
+
+
+def profile_of(state):
+    return PROFILES.get(state.get("profile") or "standard", PROFILES["standard"])
+
+
+def exam_date_arg(args):
+    """The exam date from --date YYYY-MM-DD or --days N, else None."""
+    if getattr(args, "date", None):
+        try:
+            import datetime as _dt
+            return _dt.date.fromisoformat(args.date).isoformat()
+        except ValueError:
+            sys.stderr.write("--date must look like 2026-12-15\n")
+            sys.exit(2)
+    if getattr(args, "days", None) is not None:
+        return st.exam_date_in(args.days)
+    return None
+
+
+def days_text(state, w):
+    d = st.days_left(state)
+    if d is None:
+        return None
+    if d == 0:
+        return w("exam_today")
+    return ("距考试 %d 天" if w.zh else "%d day(s) to exam") % d
 
 
 # ------------------------------------------------------------------ progress line
@@ -135,10 +178,10 @@ _SHOWN = []  # figure paths printed by the current command (for `export` without
 
 
 def days_for_study(state):
-    days = state.get("exam_days")
-    if not days or days < 1:
+    days = st.days_left(state)
+    if days is None:
         return None
-    return max(1, days - 1) if days >= 2 else 1  # keep the last day for mistakes + cheat sheet
+    return days - 1 if days >= 2 else 1  # keep the last day for mistakes + cheat sheet
 
 
 def daily_groups(state):
@@ -172,8 +215,8 @@ def footer(state, w, next_cmd):
         parts.append(("本章题 %d/%d" if w.zh else "quiz %d/%d") % (right, asked))
     parts.append(("已完成 %d/%d 章" if w.zh else "%d/%d chapters done") % (done, total))
     parts.append(("错题 %d" if w.zh else "%d open mistakes") % len(st.open_mistakes(state)))
-    if state.get("exam_days") is not None:
-        parts.append(("距考试 %d 天" if w.zh else "%d day(s) to exam") % state["exam_days"])
+    if days_text(state, w):
+        parts.append(days_text(state, w))
     return "📍 " + " · ".join(parts) + " → " + next_cmd
 
 
@@ -395,7 +438,10 @@ def cmd_setup(args):
             ch.title = ("第 %d 章" if lang == "zh" else "Chapter %d") % ch.number
         elif len(ch.title) > 80:
             ch.title = shorten(ch.title, 80)
-    slice_chars = args.slice or DEFAULT_SLICE[lang]
+    prev = st.load(ws)
+    keep_old = bool(prev and prev.get("version") == 5 and not args.fresh)
+    profile = args.profile or (prev.get("profile") if keep_old else None) or "standard"
+    slice_chars = args.slice or PROFILES[profile]["slice"][lang]
     bank = qmod.extract_questions(sources, chapters)
     fig_records += attach_question_figures(materials, ws, bank, pdf_infos, sources)
     chunks = idx.build_chunks(chapters)
@@ -423,7 +469,6 @@ def cmd_setup(args):
     idx.save_index(ws, chunks)
 
     course = args.name or os.path.basename(materials.rstrip("\\/")) or "course"
-    old = st.load(ws)
     ch_summaries = []
     for ch in chapters:
         ch_summaries.append({
@@ -431,19 +476,20 @@ def cmd_setup(args):
             "parts": len(chapter_parts(ch, slice_chars)),
             "questions": sum(1 for q in bank if q["chapter"] == ch.number),
         })
-    state = st.new_state(course, lang, args.days, materials, ch_summaries, slice_chars)
-    if old and old.get("version") == 5 and not args.fresh:
+    exam_date = exam_date_arg(args)
+    state = st.new_state(course, lang, exam_date, materials, ch_summaries, slice_chars, profile)
+    if keep_old:
         # keep progress on re-setup
-        keep = {c["n"]: c for c in old["chapters"]}
+        keep = {c["n"]: c for c in prev["chapters"]}
         for c in state["chapters"]:
             if c["n"] in keep:
                 c["status"] = keep[c["n"]]["status"]
                 c["part"] = min(keep[c["n"]]["part"], c["parts"])
-        state["history"], state["mistakes"], state["notes"] = old["history"], old["mistakes"], old["notes"]
-        state["current"] = old["current"] if st.chapter(state, old["current"]) else state["current"]
-        state["created"] = old["created"]
-        if args.days is None:
-            state["exam_days"] = old.get("exam_days")
+        state["history"], state["mistakes"], state["notes"] = prev["history"], prev["mistakes"], prev["notes"]
+        state["current"] = prev["current"] if st.chapter(state, prev["current"]) else state["current"]
+        state["created"] = prev["created"]
+        if exam_date is None:
+            state["exam_date"] = prev.get("exam_date")
     if args.start:
         state["current"] = args.start
     st.save(ws, state)
@@ -495,8 +541,8 @@ def cmd_status(args):
     total = len(state["chapters"])
     cur = st.chapter(state)
     line = ["%s: %s" % (w("course"), state["course"]), "%s: %s" % (w("lang"), state["language"])]
-    if state.get("exam_days") is not None:
-        line.append("%s %s %s" % (w("exam_in"), state["exam_days"], w("days")))
+    if days_text(state, w):
+        line.append("%s (%s)" % (days_text(state, w), state["exam_date"]))
     print(" | ".join(line))
     print("%s: %s %d/%d" % (w("progress"), st.bar(done, total), done, total))
     for c in state["chapters"]:
@@ -525,6 +571,7 @@ def _advance_to_next_todo(state):
 
 def _print_examples(w, ws, bank, n, limit=8):
     items = [q for q in bank if q["chapter"] == n]
+    items.sort(key=lambda q: q["source"].get("kind") != "exam")  # past-exam questions first
     print("--- %s (%d) ---" % (w("ch_examples"), len(items)))
     if not items:
         print(w("no_examples"))
@@ -591,7 +638,7 @@ def cmd_next(args):
             for f in ch.figures:
                 print("  - " + os.path.join(state["materials"], f))
         cur["part"] = 0
-        _print_examples(w, ws, bank, cur["n"])
+        _print_examples(w, ws, bank, cur["n"], profile_of(state)["examples"])
         print("%s | %s" % (w("hint_quiz"), w("hint_done")))
         st.save(ws, state)
         print(footer(state, w, "python coach.py quiz"))
@@ -599,7 +646,7 @@ def cmd_next(args):
     if k >= len(parts):
         print("=== %s (%s %d/%d) ===" % (head, w("part"), len(parts), len(parts)))
         print(w("ch_end"))
-        _print_examples(w, ws, bank, cur["n"])
+        _print_examples(w, ws, bank, cur["n"], profile_of(state)["examples"])
         print("%s | %s" % (w("hint_quiz"), w("hint_done")))
         st.save(ws, state)
         print(footer(state, w, "python coach.py quiz"))
@@ -625,7 +672,7 @@ def cmd_next(args):
     cur["part"] = k + 1
     if cur["part"] >= len(parts):
         print("")
-        _print_examples(w, ws, bank, cur["n"])
+        _print_examples(w, ws, bank, cur["n"], profile_of(state)["examples"])
         print("%s | %s" % (w("hint_quiz"), w("hint_done")))
         next_cmd = "python coach.py quiz"
     else:
@@ -712,11 +759,12 @@ def _pick_quiz(state, bank, n, count, include_all):
     open_ids = {m["qid"] for m in st.open_mistakes(state)}
 
     def rank(q):
+        exam_first = 0 if q["source"].get("kind") == "exam" else 1
         if q["id"] in open_ids:
-            return (0, q["id"])
+            return (0, exam_first, q["id"])
         if q["id"] not in asked:
-            return (1, q["id"])
-        return (2, q["id"])
+            return (1, exam_first, q["id"])
+        return (2, exam_first, q["id"])
 
     pool.sort(key=rank)
     return pool[:count]
@@ -766,7 +814,7 @@ def _print_question(q, w, ws, with_answer=False):
 def cmd_quiz(args):
     ws, state, w = load_ws(args)
     n = args.chapter or state["current"]
-    picked = _pick_quiz(state, load_bank(ws), n, args.n, args.all)
+    picked = _pick_quiz(state, load_bank(ws), n, args.n or profile_of(state)["quiz_n"], args.all)
     print("=== %s: ch%s ===" % (w("quiz_head"), "*" if args.all else n))
     if not picked:
         print(w("no_quiz"))
@@ -775,9 +823,10 @@ def cmd_quiz(args):
     for q in picked:
         _print_question(q, w, ws)
         print("")
+    print(w("hint_grade"))
     print(w("hint_check"))
     _remember_shown(ws, state)
-    print(footer(state, w, "python coach.py check %s" % picked[0]["id"]))
+    print(footer(state, w, "python coach.py grade %s \"…\"" % picked[0]["id"]))
     return 0
 
 
@@ -794,6 +843,39 @@ def cmd_check(args):
     _print_question(q, w, ws, with_answer=True)
     _remember_shown(ws, state)
     print(footer(state, w, "python coach.py answer %s right|wrong|skip" % q["id"]))
+    return 0
+
+
+def cmd_grade(args):
+    ws, state, w = load_ws(args)
+    q = _find_q(load_bank(ws), args.qid)
+    if q is None:
+        print("%s: %s" % (w("unknown_q"), args.qid))
+        return 2
+    given = " ".join(args.reply).strip()
+    verdict, key = qmod.grade_answer(q, given)
+    if verdict == "unsure":
+        print(w("grade_unsure") % q["id"])
+        _print_question(q, w, ws, with_answer=True)
+        _remember_shown(ws, state)
+        print(footer(state, w, "python coach.py answer %s right|wrong" % q["id"]))
+        return 0
+    st.record_result(state, q["id"], q["chapter"], verdict)
+    st.save(ws, state)
+    if verdict == "right":
+        print(w("grade_right") % key)
+    else:
+        print(w("grade_wrong") % (shorten(given, 60), key))
+        print("--- %s ---" % w("ref_answer"))
+        src = q.get("answer_source") or q["source"]
+        print("🟢 (%s p.%s)" % (src["file"], src["page"]))
+        print_material(q["answer"], w)
+        _print_figs(ws, w("a_fig"), q.get("answer_figures"))
+        _remember_shown(ws, state)
+    right, asked = st.chapter_results(state, q["chapter"])
+    print("ch%s quiz %d/%d | %s %d" % (q["chapter"], right, asked, w("mistakes"), len(st.open_mistakes(state))))
+    cur = st.chapter(state)
+    print(footer(state, w, "python coach.py quiz" if cur and cur["part"] >= cur["parts"] else "python coach.py next"))
     return 0
 
 
@@ -971,10 +1053,31 @@ def cmd_figure(args):
     return 0
 
 
+def question_counts(bank):
+    """{chapter: (questions, past-exam questions)} from the question bank."""
+    counts = {}
+    for q in bank:
+        n, e = counts.get(q["chapter"], (0, 0))
+        counts[q["chapter"]] = (n + 1, e + (1 if q["source"].get("kind") == "exam" else 0))
+    return counts
+
+
+def focus_chapters(state, bank, groups):
+    """When a day holds more than two chapters, the remaining ones that past exams ask most."""
+    days = days_for_study(state)
+    todo = [c for g in groups for c in g]
+    if not days or len(todo) <= 2 * days:
+        return []
+    counts = question_counts(bank)
+    ranked = sorted((c for c in todo if counts.get(c["n"], (0, 0))[1]), key=lambda c: -counts[c["n"]][1])
+    return ranked[: 2 * days]
+
+
 def cmd_plan(args):
     ws, state, w = load_ws(args)
-    if args.days is not None:
-        state["exam_days"] = args.days
+    new_date = exam_date_arg(args)
+    if new_date:
+        state["exam_date"] = new_date
         st.save(ws, state)
     total = len(state["chapters"])
     done = sum(1 for c in state["chapters"] if c["status"] in ("done", "verified"))
@@ -983,18 +1086,28 @@ def cmd_plan(args):
         print(w("plan_done"))
         print(footer(state, w, "python coach.py mistakes --answers"))
         return 0
-    if state.get("exam_days") is None:
+    if st.days_left(state) is None:
         print(w("plan_no_days"))
         print("  " + ", ".join("ch%d %s" % (c["n"], shorten(c["title"], 30)) for c in groups[0]))
         return 0
-    print("%s: %s %d %s · %d/%d %s" % (w("plan_head"), ("距考试" if w.zh else "exam in"), state["exam_days"],
-                                        ("天" if w.zh else "day(s)"), done, total, ("章已完成" if w.zh else "chapters done")))
+    bank = load_bank(ws)
+    counts = question_counts(bank)
+    print("%s: %s (%s) · %d/%d %s" % (w("plan_head"), days_text(state, w), state["exam_date"],
+                                      done, total, ("章已完成" if w.zh else "chapters done")))
     cur = st.chapter(state)
+
+    def label(c):
+        n, e = counts.get(c["n"], (0, 0))
+        tag = " [%d%s%s]" % (n, w("q_count"), (" · %s %d" % (w("exam_q"), e)) if e else "") if n else ""
+        return ("→ " if cur and c["n"] == cur["n"] else "") + "ch%d %s%s" % (c["n"], shorten(c["title"], 28), tag)
+
     for d, group in enumerate(groups, 1):
-        names = ", ".join(("→ " if cur and c["n"] == cur["n"] else "") + "ch%d %s" % (c["n"], shorten(c["title"], 28)) for c in group)
-        print("  %s: %s" % (w("plan_day") % d, names))
-    if state["exam_days"] >= 2:
+        print("  %s: %s" % (w("plan_day") % d, ", ".join(label(c) for c in group)))
+    if st.days_left(state) >= 2:
         print("  %s" % w("plan_last"))
+    focus = focus_chapters(state, bank, groups)
+    if focus:
+        print(w("plan_focus") % ", ".join("ch%d" % c["n"] for c in focus))
     print("%s: %s" % (w("plan_today"), ", ".join("ch%d" % c["n"] for c in groups[0])))
     print(w("plan_loop"))
     print(footer(state, w, "python coach.py next"))
@@ -1061,40 +1174,42 @@ def cmd_doctor(args):
 
 
 HELP_ZH = """用法：python coach.py <命令> [--workspace 路径]
-  setup <材料文件夹> [--lang zh|en] [--days N] [--name 课程名] [--start 章] [--slice 字数] [--fresh]
+  setup <材料文件夹> [--lang zh|en] [--days N | --date 考试日] [--profile small|standard|large] [--name 课程名] [--start 章] [--slice 字数] [--fresh]
   status                 进度面板
   next [--repeat|--back] 打印当前章下一段资料原文 + 本段配图路径（讲课用）
   chapter N [--part K]   查看第 N 章（列出分段或打印第 K 段）
   goto N [--restart]     切换到第 N 章
   ask "关键词" [-k 5]    在材料里检索（用于回答学生提问）
-  quiz [-n 3] [--chapter N] [--all]   抽题（错题优先），附题面图
-  check <题号>           查看参考答案、出处与答案图
+  quiz [-n N] [--chapter N] [--all]   抽题（错题优先、真题在前），附题面图
+  grade <题号> "学生答案"  判分并记录（选择/判断/数字/短填空自动判；其他打印参考答案）
+  check <题号>           查看参考答案、出处与答案图（学生放弃作答时）
   answer <题号> right|wrong|skip [--note 说明]   记录作答
   done [--chapter N]     标记本章讲完，进入下一章
   note "内容" [--type summary|confusion|note] [--chapter N]   写笔记
   mistakes [--answers]   列出待复习错题
   cheatsheet [--out 文件] 由笔记+错题生成小抄
-  plan [--days N]        按剩余天数排每日目标（--days 更新考试日期）
+  plan [--days N|--date 考试日]   按剩余天数排每日目标，时间不够时列出真题最多的章节
   export [--to 目录] [--qid q001 ...] [--chapter N] [图片路径...]   把要展示的图复制到聊天界面能显示的目录（默认取上一条命令列出的图）
   figures [--chapter N] [--file F] [--page P]   列出已裁好的配图
   figure <文件> <页码> [--crop x0,y0,x1,y1] [--scale 2]   截整页或局部（坐标为 0-1 比例，左上角原点）
   doctor                 环境检查"""
 
 HELP_EN = """Usage: python coach.py <command> [--workspace PATH]
-  setup <materials folder> [--lang zh|en] [--days N] [--name COURSE] [--start N] [--slice CHARS] [--fresh]
+  setup <materials folder> [--lang zh|en] [--days N | --date YYYY-MM-DD] [--profile small|standard|large] [--name COURSE] [--start N] [--slice CHARS] [--fresh]
   status                 progress panel
   next [--repeat|--back] print the next slice of the current chapter + its figure paths (teach from it)
   chapter N [--part K]   inspect chapter N (list parts or print part K)
   goto N [--restart]     switch to chapter N
   ask "keywords" [-k 5]  search the materials (to answer questions)
-  quiz [-n 3] [--chapter N] [--all]   pick questions (open mistakes first), with question figures
-  check <id>             show the reference answer, its source and answer figures
+  quiz [-n N] [--chapter N] [--all]   pick questions (open mistakes first, past-exam questions early), with question figures
+  grade <id> "answer"    grade and record (choice, true/false, number, short fill-in; otherwise prints the reference)
+  check <id>             show the reference answer, its source and answer figures (when the student gives up)
   answer <id> right|wrong|skip [--note TEXT]   record a result
   done [--chapter N]     mark the chapter finished and move on
   note "text" [--type summary|confusion|note] [--chapter N]   save a note
   mistakes [--answers]   list open mistakes
   cheatsheet [--out FILE] build a cheat sheet from notes + mistakes
-  plan [--days N]        split the remaining chapters over the days left (--days updates the exam date)
+  plan [--days N|--date YYYY-MM-DD]   split the remaining chapters over the days left; when time is short, list the chapters past exams ask most
   export [--to DIR] [--qid q001 ...] [--chapter N] [paths...]   copy figures where the chat UI can render them (default: the figures listed by the last command)
   figures [--chapter N] [--file F] [--page P]   list cropped figures
   figure <file> <page> [--crop x0,y0,x1,y1] [--scale 2]   shoot a whole page or a region (0-1 fractions, top-left origin)
@@ -1119,10 +1234,12 @@ def build_parser():
     s = sub.add_parser("setup")
     s.add_argument("materials")
     s.add_argument("--lang", choices=["zh", "en"])
-    s.add_argument("--days", type=int)
+    s.add_argument("--days", type=int, help="days until the exam")
+    s.add_argument("--date", help="exam date, YYYY-MM-DD")
+    s.add_argument("--profile", choices=sorted(PROFILES), help="small: short slices for small/fast models; large: long slices for frontier models")
     s.add_argument("--name")
     s.add_argument("--start", type=int)
-    s.add_argument("--slice", type=int, help="characters per teaching slice (smaller for small models)")
+    s.add_argument("--slice", type=int, help="characters per teaching slice (overrides --profile)")
     s.add_argument("--fresh", action="store_true", help="discard previous progress")
     s.set_defaults(fn=cmd_setup)
 
@@ -1153,7 +1270,7 @@ def build_parser():
     s.set_defaults(fn=cmd_ask)
 
     s = sub.add_parser("quiz")
-    s.add_argument("-n", type=int, default=3)
+    s.add_argument("-n", type=int, help="number of questions (default: 1 small, 3 standard, 5 large)")
     s.add_argument("--chapter", type=int)
     s.add_argument("--all", action="store_true")
     s.set_defaults(fn=cmd_quiz)
@@ -1161,6 +1278,11 @@ def build_parser():
     s = sub.add_parser("check")
     s.add_argument("qid")
     s.set_defaults(fn=cmd_check)
+
+    s = sub.add_parser("grade")
+    s.add_argument("qid")
+    s.add_argument("reply", nargs="+", help="the student's answer")
+    s.set_defaults(fn=cmd_grade)
 
     s = sub.add_parser("answer")
     s.add_argument("qid")
@@ -1203,6 +1325,7 @@ def build_parser():
 
     s = sub.add_parser("plan")
     s.add_argument("--days", type=int)
+    s.add_argument("--date", help="exam date, YYYY-MM-DD")
     s.set_defaults(fn=cmd_plan)
 
     s = sub.add_parser("export")

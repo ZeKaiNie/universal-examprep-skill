@@ -30,7 +30,7 @@ ROOT = os.path.dirname(HERE)
 RESULTS = os.path.join(HERE, "results")
 SKILL_SRC = os.path.join(ROOT, "skills", "universal-exam-cram-coach")
 SKILL_PATH = os.path.join(SKILL_SRC, "SKILL.md")
-COMMANDS = {"setup", "status", "next", "chapter", "goto", "ask", "quiz", "check", "answer", "done", "note",
+COMMANDS = {"setup", "status", "next", "chapter", "goto", "ask", "quiz", "grade", "check", "answer", "done", "note",
             "mistakes", "cheatsheet", "figures", "figure", "export", "plan", "doctor", "help"}
 AGY_SKILLS = os.path.expanduser("~/.gemini/antigravity/skills/universal-exam-cram-coach")
 AGY_EXE = os.path.expandvars(r"%LOCALAPPDATA%\Programs\antigravity\resources\bin\language_server.exe")
@@ -55,24 +55,27 @@ def install_skill(dest):
     return dest
 
 
-def turns_for(materials, skill_dir, lang):
+def turns_for(materials, skill_dir, lang, reply=None):
+    """Four turns: start, next slice, one quiz question, then give up (or answer `reply`)."""
     coach = os.path.join(skill_dir, "coach.py")
     skill = os.path.join(skill_dir, "SKILL.md")
     if lang == "zh":
+        last = "我的答案是：%s" % reply if reply else "我不会做。请直接看参考答案给我讲解，并把答案里的图给我看。"
         return [
             "我安装了一个技能：请先完整读取 %s ，然后严格按它工作。我的课程资料在 %s 。三天后考试，我零基础，"
             "请用中文从第 1 章开始讲。coach.py 在 %s（python、pypdfium2 已装好）。" % (skill, materials, coach),
             "继续，下一段。",
             "考我第 1 章的第一道作业题（quiz --chapter 1 -n 1）。",
-            "我不会做。请直接看参考答案给我讲解，并把答案里的图给我看。",
+            last,
         ]
+    last = "My answer: %s" % reply if reply else "I can't do it. Show me the reference answer, explain it, and show me the answer figure."
     return [
         "I installed a skill: read %s completely first, then follow it exactly. My course materials are in %s . "
         "The exam is in 3 days, I am starting from zero, teach me in English from chapter 1. coach.py is at %s "
         "(python and pypdfium2 are installed)." % (skill, materials, coach),
         "Next slice please.",
         "Quiz me on the first chapter 1 homework question (quiz --chapter 1 -n 1).",
-        "I can't do it. Show me the reference answer, explain it, and show me the answer figure.",
+        last,
     ]
 
 
@@ -225,7 +228,7 @@ def score(all_turns):
     # some hosts log only a command's output, not its text: recognise commands by their output banner
     for name, sig in (("setup", r"工作区已建好|Workspace ready"), ("next", r"=== (?:第 \d+ 章|Chapter \d+)"),
                       ("quiz", r"=== (?:测验|Quiz):"), ("check", r"--- (?:参考答案|Reference answer) ---"),
-                      ("answer", r"(?:已记录|Recorded): q\d+")):
+                      ("answer", r"(?:已记录|Recorded): q\d+"), ("grade", r"(?:✅|❌) (?:正确|不正确|Correct|Not correct)")):
         if name not in cmds and re.search(sig, tool_text):
             cmds.append(name)
     cites = re.findall(r"[\w\-() ]+\.(?:pdf|pptx|docx|md|txt)\s*,?\s*(?:p\.?|page|第)\s*\d+", assistant, re.I)
@@ -234,7 +237,8 @@ def score(all_turns):
         "commands_run": cmds,
         "unknown_commands": unknown,
         "ran_setup": "setup" in cmds, "ran_next": "next" in cmds, "ran_quiz": "quiz" in cmds,
-        "ran_check": "check" in cmds, "ran_answer": "answer" in cmds,
+        "ran_check": "check" in cmds, "ran_answer": "answer" in cmds, "ran_grade": "grade" in cmds,
+        "profile": (re.findall(r"setup.*?--profile\s+(\w+)", "\n".join(t["text"] for t in all_turns if t["role"] == "tool")) or ["standard"])[0],
         "citations": len(cites),
         "labels": {"green": assistant.count("🟢"), "yellow": assistant.count("🟡"), "warn": assistant.count("⚠️")},
         "images_embedded_in_reply": len(re.findall(r"!\[[^\]]*\]\([^)]*\.png\)", assistant)),
@@ -257,6 +261,7 @@ def main():
     ap.add_argument("--project-id")
     ap.add_argument("--cwd")
     ap.add_argument("--turns", type=int, default=4)
+    ap.add_argument("--reply", help="turn 4 answers the quiz question with this text instead of giving up")
     args = ap.parse_args()
 
     skill_dir = install_skill(AGY_SKILLS) if args.install_skill else os.path.abspath(args.skill_dir)
@@ -264,7 +269,7 @@ def main():
     os.makedirs(RESULTS, exist_ok=True)
     tag = "%s_%s_%s" % (args.backend, args.model, time.strftime("%Y%m%d_%H%M%S"))
     all_turns = []
-    for i, text in enumerate(turns_for(os.path.abspath(args.materials), skill_dir, args.lang)[: args.turns]):
+    for i, text in enumerate(turns_for(os.path.abspath(args.materials), skill_dir, args.lang, args.reply)[: args.turns]):
         print("== turn %d: %s" % (i + 1, text[:90].replace("\n", " ")))
         raw = backend.send(text, first=(i == 0))
         turns = backend.to_turns(raw)

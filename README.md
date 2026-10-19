@@ -13,6 +13,7 @@ English · [中文](README.zh.md)
 [![release](https://img.shields.io/github/v/release/ZeKaiNie/universal-examprep-skill?label=release&color=orange)](https://github.com/ZeKaiNie/universal-examprep-skill/releases/latest)
 [![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/ZeKaiNie/universal-examprep-skill/actions/workflows/ci.yml/badge.svg)](https://github.com/ZeKaiNie/universal-examprep-skill/actions)
+[![Mentioned in Awesome Claude Code](https://awesome.re/mentioned-badge.svg)](https://github.com/hesreallyhim/awesome-claude-code)
 
 ```bash
 # One command for Claude Code, Codex, Cursor, Windsurf, Antigravity, Gemini CLI and 40+ agents
@@ -51,7 +52,7 @@ Core workflow:
 | README | this page · [中文](README.zh.md) | [full/README.md](full/README.md) · [full/README.zh.md](full/README.zh.md) |
 | Install | `npx skills add ZeKaiNie/universal-examprep-skill`, or `universal-exam-cram-coach-flash.zip` from the [latest release](https://github.com/ZeKaiNie/universal-examprep-skill/releases/latest) | `npx skills add ZeKaiNie/universal-examprep-skill --skill universal-exam-cram-coach-full`; updating and the v4.3 zip are covered in [full/README.md](full/README.md) |
 
-The rest of this page is about **Flash**: setup takes seconds even for a whole course, the whole skill is about 1,500 words, the study loop is seven commands, and it works with small models (tested with Gemini flash-lite and Claude Haiku). A feature-by-feature comparison is in [Flash vs. the full edition](#flash-vs-the-full-edition).
+The rest of this page is about **Flash**: setup takes seconds even for a whole course, the whole skill is about 1,600 words, the study loop is seven commands, and it works with small models (tested with Gemini flash-lite and Claude Haiku). A feature-by-feature comparison is in [Flash vs. the full edition](#flash-vs-the-full-edition).
 
 ## Contents
 
@@ -148,10 +149,10 @@ The agent will run one command (`coach.py setup`), which takes a few seconds eve
 |---|---|
 | “next” / “continue” | the next slice of the chapter, explained in plain words, with `[lec2.pdf p.3]` sources and the figures from those pages |
 | “what is …?” / “why …?” | it searches your materials and answers only from the matching passages; if nothing matches it says so |
-| “quiz me” | a homework or exam question (with its printed figure), graded against the reference answer; wrong ones go to your mistake list |
+| “quiz me” | a homework or exam question (with its printed figure), past-exam questions first; multiple-choice, true/false, number and short fill-in answers are graded by the script itself, the rest by the agent against the reference answer; wrong ones go to your mistake list |
 | “I'm done with this chapter” | the chapter is marked *verified* (you answered a material question right) or *covered*, and it moves on |
 | “show me my mistakes” / “make a cheat sheet” | re-teaches open mistakes; writes `cheatsheet.md` from your chapter summaries, confusions and mistakes |
-| “what should I do today?” | `coach.py plan` splits the remaining chapters over the days left (the last day is kept for mistakes and the cheat sheet) |
+| “what should I do today?” | `coach.py plan` splits the remaining chapters over the days left until the exam date (the last day is kept for mistakes and the cheat sheet); when there is not enough time, it names the chapters past exams ask most |
 | new chat, days later | say “continue my exam prep” and it resumes exactly where you stopped |
 
 Every reply ends with a 📍 progress line (chapter and part, quiz score, mistakes, days left, next step) copied from the tool, so a long session never loses its place.
@@ -245,20 +246,21 @@ Delete the folder to start over, or run `setup … --fresh`.
 You normally never type these; the agent does. They are useful for checking on things or for automation.
 
 ```text
-python coach.py setup <folder> [--days N] [--lang zh|en] [--name COURSE] [--start N] [--slice CHARS] [--fresh]
+python coach.py setup <folder> [--days N | --date YYYY-MM-DD] [--profile small|standard|large] [--lang zh|en] [--name COURSE] [--start N] [--slice CHARS] [--fresh]
 python coach.py status                        progress panel
 python coach.py next [--repeat|--back]        next slice of the current chapter + its figures
 python coach.py chapter N [--part K]          inspect chapter N (list parts or print one)
 python coach.py goto N [--restart]            switch chapter
 python coach.py ask "keywords" [-k 5] [--chapter N]      search the materials (exit code 4 = nothing found)
-python coach.py quiz [-n 3] [--chapter N] [--all]        pick questions (open mistakes first)
+python coach.py quiz [-n N] [--chapter N] [--all]        pick questions (open mistakes first, then past-exam questions)
+python coach.py grade <id> "student's answer"  grade and record choice / true-false / number / short fill-in; otherwise print the reference
 python coach.py check <id>                    reference answer, its source and answer figure
 python coach.py answer <id> right|wrong|skip [--note …]  record a result
 python coach.py done [--chapter N]            finish the chapter, move on
 python coach.py note "…" [--type summary|confusion|note] [--chapter N]
 python coach.py mistakes [--answers]          open mistakes
 python coach.py cheatsheet [--out FILE]       build the cheat sheet
-python coach.py plan [--days N]               day-by-day plan for the remaining chapters (--days updates the exam date)
+python coach.py plan [--days N|--date D]      day-by-day plan to the exam date, with questions per chapter
 python coach.py export [--to DIR] [--qid …] [--chapter N] [paths…]   copy figures where the chat UI can render them
 python coach.py figures [--chapter N] [--file F] [--page P]   list cropped figures
 python coach.py figure <file> <page> [--crop x0,y0,x1,y1] [--scale 2]   render a page or a region
@@ -266,7 +268,7 @@ python coach.py doctor                        environment check
 python coach.py help
 ```
 
-`--workspace PATH` (or the environment variable `EXAM_CRAM_WORKSPACE`) selects a workspace; otherwise the last one used is remembered. `--slice 2000` makes each teaching slice shorter for small models.
+`--workspace PATH` (or the environment variable `EXAM_CRAM_WORKSPACE`) selects a workspace; otherwise the last one used is remembered. `--profile` matches the output to the model: `small` (short slices, one question per quiz) for small or fast models, `large` (slices about three times longer, five questions per quiz) for frontier models; the agent picks it for itself. `--slice CHARS` sets the slice length directly.
 
 ## Measured results
 

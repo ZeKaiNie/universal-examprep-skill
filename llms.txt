@@ -8,7 +8,7 @@ Use this project when a user asks for: exam preparation, final exam cramming, re
 
 - [README (English)](README.md): install prompts per host, materials layout, session example, command reference, measured results, FAQ.
 - [README（中文）](README.zh.md): 同上，中文。
-- [skills/universal-exam-cram-coach/SKILL.md](skills/universal-exam-cram-coach/SKILL.md): the ~1,500-word skill an agent follows (Flash edition).
+- [skills/universal-exam-cram-coach/SKILL.md](skills/universal-exam-cram-coach/SKILL.md): the ~1,600-word skill an agent follows (Flash edition).
 - [SECURITY.md](SECURITY.md): what the installed skill can and cannot do; course files are treated as untrusted data.
 - [full/README.md](full/README.md) and [full/SKILL.md](full/SKILL.md): the v4.3 full edition.
 - [CHANGELOG.md](CHANGELOG.md), [docs/feature-audit.en.md](docs/feature-audit.en.md), [docs/v5-refactor.en.md](docs/v5-refactor.en.md), [docs/weak-model-test.en.md](docs/weak-model-test.en.md). Each has a Chinese version: `CHANGELOG.zh.md`, and the same doc names without `.en`.

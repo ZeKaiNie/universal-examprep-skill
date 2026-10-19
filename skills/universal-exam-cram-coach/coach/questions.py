@@ -9,6 +9,7 @@ labels such as `Problem 1.3.10` (matched to `Problem 1.3.10 Solution` in a solut
 """
 import os
 import re
+import unicodedata
 
 from .index import BM25
 from .text import chinese_numeral, tokenize
@@ -214,6 +215,139 @@ def extract_questions(sources, chapters):
     for i, it in enumerate(items, 1):
         it["id"] = "q%03d" % i
     return items
+
+
+# ------------------------------------------------------------------ grading short answers
+#
+# Only answers that can be compared mechanically are graded here: option letters, true/false,
+# numbers and short fill-ins. Anything else is left to the tutor, who sees the reference answer.
+
+_KEY_PREFIX = re.compile(r"^\s*(?:正确答案|参考答案|答案|答|解|answer|ans|key|solution)\s*(?:是|为|is)?\s*[:：.．]?\s*", re.I)
+_LETTERS = re.compile(r"^[（(]?\s*([A-H](?:\s*[,，、/和与]?\s*[A-H])*)\s*[)）]?(?![A-Za-z])")
+_LETTER_ANYWHERE = re.compile(r"(?:答案|选|answer\s+is|correct\s+(?:answer|option)\s+is)\s*[:：是为]?\s*[（(]?\s*([A-H])(?![A-Za-z])", re.I)
+_TRUE = {"正确", "对", "是", "√", "✓", "✔", "t", "true", "yes", "y", "correct", "right"}
+_FALSE = {"错误", "错", "否", "不对", "×", "✗", "✘", "x", "f", "false", "no", "n", "incorrect", "wrong"}
+_STRONG_TRUTH = {"正确", "错误", "√", "×", "✓", "✗", "✔", "✘", "true", "false"}  # unambiguous even outside T/F items
+_NEG = re.compile(r"错|不|否|×|✗|✘|false|incorrect|wrong|\bno\b", re.I)
+_POS = re.compile(r"对|正确|是|√|✓|✔|true|correct|right|\byes\b", re.I)
+_NUMBER = re.compile(r"[-+]?(?:\d+(?:\.\d+)?|\.\d+)(?:\s*/\s*\d+(?:\.\d+)?)?\s*%?")
+_PUNCT = re.compile(r"[\s,，.。;；:：、!！?？'\"“”‘’()（）\[\]【】<>《》]+")
+
+
+def _norm(text):
+    return unicodedata.normalize("NFKC", text or "").strip()
+
+
+def _first_line(answer):
+    for line in (answer or "").split("\n"):
+        if line.strip():
+            return _KEY_PREFIX.sub("", _norm(line)).strip()
+    return ""
+
+
+def _number(text, strict=True):
+    """The single number in `text` (fractions and percentages allowed), else None.
+
+    strict: nothing but the number may be there (reference keys); otherwise a unit or a word
+    around it is fine (the student's reply), as long as there is exactly one number.
+    """
+    found = _NUMBER.findall(text)
+    if len(found) != 1 or (strict and _NUMBER.sub("", text).strip(" =≈约是为:：")):
+        return None
+    tok = found[0].replace(" ", "")
+    pct = tok.endswith("%")
+    tok = tok.rstrip("%")
+    try:
+        if "/" in tok:
+            a, b = tok.split("/")
+            val = float(a) / float(b)
+        else:
+            val = float(tok)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return val / 100 if pct else val
+
+
+def _decimals(text):
+    m = re.search(r"\.(\d+)", text)
+    return len(m.group(1)) if m else 0
+
+
+def _truth(text, loose=False):
+    t = _PUNCT.sub("", _norm(text)).lower()
+    if t in _TRUE:
+        return True
+    if t in _FALSE:
+        return False
+    if loose and len(t) <= 12:  # the student's reply: "对的", "不正确", "it's false"
+        if _NEG.search(t):
+            return False
+        if _POS.search(t):
+            return True
+    return None
+
+
+def answer_key(q):
+    """(kind, value) for answers that can be compared mechanically, else None.
+
+    kind is "choice" (set of letters), "truth" (bool), "number" (float, decimals) or "text".
+    """
+    answer = _norm(q.get("answer"))
+    if not answer:
+        return None
+    head = _first_line(answer)
+    if q.get("options"):
+        m = _LETTERS.match(head) or _LETTER_ANYWHERE.search(answer)
+        if m:
+            return "choice", frozenset(re.findall(r"[A-H]", m.group(1)))
+        return None
+    lead = re.match(r"^(\S+?)(?=$|[\s.,;:!，。；：！])", head)  # "False. The heap property ..." → "False"
+    lead = lead.group(1) if lead else head
+    if q.get("type") == "true_false" or _PUNCT.sub("", lead).lower() in _STRONG_TRUTH:
+        truth = _truth(lead) if lead != head or q.get("type") == "true_false" else _truth(head)
+        if truth is not None:
+            return "truth", truth
+    if len(head) > 40:
+        return None
+    num = _number(head)
+    if num is not None:
+        return "number", (num, _decimals(head))
+    if q.get("type") == "fill_blank" and len(head) <= 30:
+        return "text", _PUNCT.sub("", head).lower()
+    return None
+
+
+def grade_answer(q, given):
+    """("right" | "wrong" | "unsure", shown_key) for the student's answer `given`."""
+    key = answer_key(q)
+    given = _norm(given)
+    if key is None or not given:
+        return "unsure", None
+    kind, value = key
+    if kind == "choice":
+        # capital letters anywhere ("I'd pick B"); lower case only in a bare reply ("b", "b,d"),
+        # so the article "a" in a sentence is not read as option A
+        pattern = r"(?<![A-Za-z])([A-Ha-h])(?![A-Za-z])" if len(given) <= 5 else r"(?<![A-Za-z])([A-H])(?![A-Za-z])"
+        letters = re.findall(pattern, given)
+        if not letters:  # the student may have typed the option text instead of its letter
+            g = _PUNCT.sub("", given).lower()
+            letters = [o[0] for o in q.get("options") or [] if _PUNCT.sub("", o[2:]).lower() == g]
+        if not letters:
+            return "unsure", "".join(sorted(value))
+        return ("right" if frozenset(l.upper() for l in letters) == value else "wrong"), "".join(sorted(value))
+    if kind == "truth":
+        t = _truth(given, loose=True)
+        shown = "√" if value else "×"
+        return ("unsure" if t is None else "right" if t == value else "wrong"), shown
+    if kind == "number":
+        num, dec = value
+        g = _number(given, strict=False)
+        if g is None:
+            return "unsure", _first_line(q["answer"])
+        tol = max(0.5 * 10 ** -dec, 0.01 * abs(num), 1e-9)
+        return ("right" if abs(g - num) <= tol else "wrong"), _first_line(q["answer"])
+    same = _PUNCT.sub("", given).lower() == value
+    return ("right" if same else "unsure"), _first_line(q["answer"])
 
 
 def assign_chapters(items, chapters):
