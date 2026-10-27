@@ -13,7 +13,10 @@ English · [中文](README.zh.md)
 [![release](https://img.shields.io/github/v/release/ZeKaiNie/universal-examprep-skill?label=release&color=orange)](https://github.com/ZeKaiNie/universal-examprep-skill/releases/latest)
 [![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/ZeKaiNie/universal-examprep-skill/actions/workflows/ci.yml/badge.svg)](https://github.com/ZeKaiNie/universal-examprep-skill/actions)
+
 [![Mentioned in Awesome Claude Code](https://awesome.re/mentioned-badge.svg)](https://github.com/hesreallyhim/awesome-claude-code)
+[![Featured in Awesome Agent Skills](https://img.shields.io/badge/Featured_in-Awesome_Agent_Skills-8A2BE2?style=flat&logo=github)](https://github.com/VoltAgent/awesome-agent-skills)
+[![Featured in Awesome Gemini CLI](https://img.shields.io/badge/Featured_in-Awesome_Gemini_CLI-4285F4?style=flat&logo=google)](https://github.com/Piebald-AI/awesome-gemini-cli)
 
 ```bash
 # One command for Claude Code, Codex, Cursor, Windsurf, Antigravity, Gemini CLI and 40+ agents
@@ -42,6 +45,14 @@ Core workflow:
 | 🟢 **From your materials** | traceable to a file and page |
 | 🟡 **AI supplement** | background the agent added; may differ from what your teacher taught |
 | ⚠️ **AI-generated answer** | the materials contain no answer; this one is the agent's own |
+
+## 🌟 Featured & Curated By
+
+Universal Exam Cram Coach is officially indexed and recommended across major AI agent ecosystems:
+
+- **[Awesome Claude Code](https://github.com/hesreallyhim/awesome-claude-code)** (56k+ ⭐) — The premier curated directory for Claude Code; featured in *Documentation, Knowledge & Learning* (manually approved by maintainer).
+- **[Awesome Agent Skills](https://github.com/VoltAgent/awesome-agent-skills)** (36k+ ⭐) — The cross-ecosystem directory for AI agent skills; featured in *Community Skills · Specialized Domains*.
+- **[Awesome Gemini CLI](https://github.com/Piebald-AI/awesome-gemini-cli)** — Curated tools and skills for Google Gemini CLI.
 
 ## Two editions, pick one
 

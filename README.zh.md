@@ -13,7 +13,10 @@
 [![发布](https://img.shields.io/github/v/release/ZeKaiNie/universal-examprep-skill?label=release&color=orange)](https://github.com/ZeKaiNie/universal-examprep-skill/releases/latest)
 [![MIT](https://img.shields.io/badge/协议-MIT-blue.svg)](LICENSE)
 [![持续集成](https://github.com/ZeKaiNie/universal-examprep-skill/actions/workflows/ci.yml/badge.svg)](https://github.com/ZeKaiNie/universal-examprep-skill/actions)
+
 [![Mentioned in Awesome Claude Code](https://awesome.re/mentioned-badge.svg)](https://github.com/hesreallyhim/awesome-claude-code)
+[![Featured in Awesome Agent Skills](https://img.shields.io/badge/Featured_in-Awesome_Agent_Skills-8A2BE2?style=flat&logo=github)](https://github.com/VoltAgent/awesome-agent-skills)
+[![Featured in Awesome Gemini CLI](https://img.shields.io/badge/Featured_in-Awesome_Gemini_CLI-4285F4?style=flat&logo=google)](https://github.com/Piebald-AI/awesome-gemini-cli)
 
 ```bash
 # 一键安装技能 (支持 Claude Code / Cursor / Codex / Antigravity / Windsurf 等)
@@ -42,6 +45,14 @@ npx skills add zekainie/universal-examprep-skill
 | 🟢 **来自资料** | 能追到原文件和页码 |
 | 🟡 **AI 补充** | 智能体补的背景，可能和你老师讲的不完全一致 |
 | ⚠️ **AI 生成答案** | 资料里没有答案，这是智能体自己算的 |
+
+## 🌟 权威收录与推荐
+
+本项目已被全球主流智能体生态权威精选总库官方收录推荐：
+
+- **[Awesome Claude Code](https://github.com/hesreallyhim/awesome-claude-code)** (56k+ ⭐) — 全球最大 Claude Code 资源总榜（收录于 *Documentation, Knowledge & Learning*，由项目维护者亲自审核 `/approve` 推荐）
+- **[Awesome Agent Skills](https://github.com/VoltAgent/awesome-agent-skills)** (36k+ ⭐) — 全生态跨平台 Agent 技能权威总库（收录于 *Community Skills · Specialized Domains*）
+- **[Awesome Gemini CLI](https://github.com/Piebald-AI/awesome-gemini-cli)** — Google Gemini CLI 官方社区精选扩展工具与推荐技能
 
 ## 两个版本，任选其一
 
